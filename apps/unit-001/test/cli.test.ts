@@ -51,7 +51,7 @@ describe("main", () => {
 	it("prints help and exits 0", async () => {
 		const run = runtime({});
 		expect(await main(["--help"], run.runtime, signal)).toBe(0);
-		expect(run.out()).toContain("Usage: unit-001");
+		expect(run.out()).toContain("Usage: u1");
 	});
 
 	it("prints the package version", async () => {
@@ -67,7 +67,7 @@ describe("main", () => {
 		const run = runtime({});
 		expect(await main(["--bogus"], run.runtime, signal)).toBe(2);
 		expect(run.err()).toContain("Unknown option: --bogus");
-		expect(run.err()).toContain("unit-001 --help");
+		expect(run.err()).toContain("u1 --help");
 	});
 
 	it("exits 1 and says how to configure a provider when none is set", async () => {
@@ -115,5 +115,14 @@ describe("built binary", () => {
 		const result = spawnSync(process.execPath, [bin, "--bogus"], { encoding: "utf8" });
 		expect(result.status).toBe(2);
 		expect(result.stderr).toContain("Unknown option");
+	});
+});
+
+describe("package", () => {
+	it("installs the command as u1, with unit-001 as an alias", async () => {
+		const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as {
+			bin: Record<string, string>;
+		};
+		expect(manifest.bin).toEqual({ u1: "./dist/bin.js", "unit-001": "./dist/bin.js" });
 	});
 });

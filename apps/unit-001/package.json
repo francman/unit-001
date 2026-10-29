@@ -14,6 +14,7 @@
 		}
 	},
 	"bin": {
+		"u1": "./dist/bin.js",
 		"unit-001": "./dist/bin.js"
 	},
 	"files": [

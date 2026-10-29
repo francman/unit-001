@@ -14,20 +14,19 @@ From the repository root:
 ```bash
 npm install
 npm run build
+cd apps/unit-001 && npm link         # once: puts `u1` (and `unit-001`) on your PATH
 export ANTHROPIC_API_KEY=...         # or OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY
-npx unit-001                         # or: node apps/unit-001/dist/bin.js
+u1
 ```
 
 On Windows PowerShell, set the key with `$env:ANTHROPIC_API_KEY = "..."`.
 
-The examples below write `unit-001` for `npx unit-001`.
-
 ```text
-unit-001                         chat interactively
-unit-001 -p "what changed?"      answer one prompt and exit
-echo "summarize this" | unit-001 -p -
-unit-001 --session work          open or create another session
-unit-001 --model openai/gpt-5    pick a model (provider/model-id)
+u1                        chat interactively
+u1 -p "what changed?"     answer one prompt and exit
+echo "summarize this" | u1 -p -
+u1 --session work         open or create another session
+u1 --model openai/gpt-5   pick a model (provider/model-id)
 ```
 
 In the chat, `/help` lists commands, `/exit` or Ctrl+D quits, and Ctrl+C stops the current run (and quits when idle). The agent works in the directory you start it from, with Pi Durable's `read`, `write`, `edit`, and `bash` tools, plus `powershell` on Windows. On Windows the `bash` tool needs a bash installed, such as Git Bash; `powershell` does not.
