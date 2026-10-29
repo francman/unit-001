@@ -1,0 +1,47 @@
+name: Unit upstream guard
+
+# Tenet: unit-001 never modifies Pi Durable or any other upstream file; it only adds files.
+# Compares the branch against earendil-works/pi (the `upstream-pi` remote) and fails on any modified, deleted, or
+# retyped upstream path. package-lock.json is the one allowed exception. See .github/scripts/unit-upstream-guard.mjs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: unit-upstream-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The merge base with upstream needs full history. Pull request runs check out the head commit, not the
+          # merge commit, so the diff is exactly the branch's own changes.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream-pi https://github.com/earendil-works/pi.git
+          git fetch --no-tags upstream-pi main
+
+      - name: Test guard
+        run: node --test .github/scripts/unit-upstream-guard.test.mjs
+
+      - name: Check for upstream changes
+        run: node .github/scripts/unit-upstream-guard.mjs --upstream upstream-pi/main
