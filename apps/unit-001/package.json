@@ -1,0 +1,48 @@
+{
+	"name": "unit-001",
+	"version": "0.0.1",
+	"description": "unit-001: a durable agent built on Pi Durable",
+	"private": true,
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		}
+	},
+	"bin": {
+		"unit-001": "./dist/bin.js"
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsc -p tsconfig.build.json",
+		"typecheck": "tsc -p tsconfig.json",
+		"test": "vitest --run",
+		"start": "node dist/bin.js"
+	},
+	"keywords": [
+		"agent",
+		"durable-execution",
+		"pi-durable"
+	],
+	"license": "MIT",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"dependencies": {
+		"@earendil-works/chord": "1.4.0",
+		"@earendil-works/pi-ai": "1.4.0",
+		"@earendil-works/pi-durable": "1.4.0"
+	},
+	"devDependencies": {
+		"shx": "0.3.4",
+		"vitest": "4.1.12"
+	}
+}
