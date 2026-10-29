@@ -5,11 +5,13 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Report } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { Agent } from "./agent.ts";
-import { parseArguments, type RunOptions, USAGE } from "./args.ts";
+import { type Command, parseArguments, type RunOptions, USAGE } from "./args.ts";
+import { FileCredentialStore } from "./credentials.ts";
 import { ConfigurationError, UsageError } from "./errors.ts";
 import { acquireSessionLock } from "./lock.ts";
-import { dataDirectory, sessionFile } from "./paths.ts";
-import { createConfiguredModels } from "./provider.ts";
+import { describeStatus, runLogin, runLogout, subscriptionFor } from "./login.ts";
+import { credentialsFile, dataDirectory, sessionFile } from "./paths.ts";
+import { createConfiguredModels, createModelsFor } from "./provider.ts";
 import { runPrint, runRepl, type Terminal } from "./repl.ts";
 
 /** What the CLI reads from its process, so tests can run it against fakes. */
@@ -56,24 +58,57 @@ function describeReport(report: Report): string {
 	return `[report] ${report.kind}${error instanceof Error ? `: ${error.message}` : ""}\n`;
 }
 
-async function run(options: RunOptions, runtime: Runtime, signal: AbortSignal): Promise<number> {
-	const directory =
-		options.dataDir === undefined
-			? dataDirectory({ platform: runtime.platform, env: runtime.env, home: runtime.home })
-			: resolve(runtime.cwd, options.dataDir);
-	const file = sessionFile(directory, options.session, runtime.platform);
-	const { models, choice } = await createConfiguredModels(runtime.env, options.model);
+function resolveDirectory(dataDir: string | undefined, runtime: Runtime): string {
+	return dataDir === undefined
+		? dataDirectory({ platform: runtime.platform, env: runtime.env, home: runtime.home })
+		: resolve(runtime.cwd, dataDir);
+}
 
-	let prompt = options.print;
-	if (prompt === "-") prompt = (await readAll(runtime.stdin)).trim();
-	if (prompt === "") throw new UsageError("The prompt is empty.");
-
-	const terminal: Terminal = {
+function terminalFor(runtime: Runtime): Terminal {
+	return {
 		input: runtime.stdin,
 		...(runtime.interactive ? { output: runtime.stdout } : {}),
 		out: (text) => void runtime.stdout.write(text),
 		err: (text) => void runtime.stderr.write(text),
 	};
+}
+
+function credentialStore(directory: string, runtime: Runtime): FileCredentialStore {
+	return new FileCredentialStore(credentialsFile(directory, runtime.platform));
+}
+
+async function account(
+	command: Command & { kind: "login" | "logout" | "status" },
+	runtime: Runtime,
+	signal: AbortSignal,
+) {
+	const directory = resolveDirectory(command.dataDir, runtime);
+	const credentials = credentialStore(directory, runtime);
+	const terminal = terminalFor(runtime);
+	if (command.kind === "status") {
+		for (const line of await describeStatus(credentials, runtime.env)) terminal.out(`${line}\n`);
+		return 0;
+	}
+	const { provider } = subscriptionFor(command.provider);
+	if (command.kind === "logout") return runLogout(credentials, command.provider, terminal);
+	const models = await createModelsFor(provider, credentials);
+	return runLogin(models, command.provider, terminal, signal, runtime.platform);
+}
+
+async function run(options: RunOptions, runtime: Runtime, signal: AbortSignal): Promise<number> {
+	const directory = resolveDirectory(options.dataDir, runtime);
+	const file = sessionFile(directory, options.session, runtime.platform);
+	const { models, choice } = await createConfiguredModels(
+		runtime.env,
+		options.model,
+		credentialStore(directory, runtime),
+	);
+
+	let prompt = options.print;
+	if (prompt === "-") prompt = (await readAll(runtime.stdin)).trim();
+	if (prompt === "") throw new UsageError("The prompt is empty.");
+
+	const terminal = terminalFor(runtime);
 
 	const release = await acquireSessionLock(`${file}.lock`);
 	let agent: Agent | undefined;
@@ -115,7 +150,8 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 			runtime.stdout.write(`${await version()}\n`);
 			return 0;
 		}
-		const code = await run(command.options, runtime, signal);
+		const code =
+			command.kind === "run" ? await run(command.options, runtime, signal) : await account(command, runtime, signal);
 		return signal.aborted ? 130 : code;
 	} catch (error) {
 		if (signal.aborted) return 130;

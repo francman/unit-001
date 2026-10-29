@@ -50,3 +50,8 @@ export function validateSessionName(name: string): string {
 export function sessionFile(directory: string, name: string, platform: NodeJS.Platform): string {
 	return pathFor(platform).join(directory, "sessions", `${validateSessionName(name)}.sqlite`);
 }
+
+/** The file holding stored sign-ins and keys, next to the sessions. */
+export function credentialsFile(directory: string, platform: NodeJS.Platform): string {
+	return pathFor(platform).join(directory, "auth.json");
+}

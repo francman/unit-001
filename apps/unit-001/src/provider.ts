@@ -1,3 +1,4 @@
+import type { CredentialStore } from "@earendil-works/pi-ai";
 import { createModels, type MutableModels, type Provider } from "@earendil-works/pi-ai/models";
 import { ConfigurationError } from "./errors.ts";
 
@@ -58,41 +59,47 @@ export function parseModelSpec(spec: string): ModelChoice {
 	return { provider: spec.slice(0, slash), modelId: spec.slice(slash + 1) };
 }
 
-/** The first provider with credentials in the environment, with its default model. */
-export function detectModel(env: Environment): ModelChoice | undefined {
+/** The first provider the user has signed in to (`stored`) or set a key for, with its default model. */
+export function detectModel(env: Environment, stored: ReadonlySet<string> = new Set()): ModelChoice | undefined {
 	for (const entry of PROVIDERS) {
-		if (entry.keys.some((key) => env[key] !== undefined && env[key] !== "")) {
+		if (stored.has(entry.id) || entry.keys.some((key) => env[key] !== undefined && env[key] !== "")) {
 			return { provider: entry.id, modelId: entry.defaultModelId };
 		}
 	}
 	return undefined;
 }
 
+/** A `Models` with only this provider installed, resolving auth from `credentials` and the environment. */
+export async function createModelsFor(providerId: string, credentials?: CredentialStore): Promise<MutableModels> {
+	const entry = PROVIDERS.find((candidate) => candidate.id === providerId);
+	if (entry === undefined) {
+		const supported = PROVIDERS.map((candidate) => candidate.id).join(", ");
+		throw new ConfigurationError(`Provider "${providerId}" is not supported. Supported providers: ${supported}.`);
+	}
+	const models = createModels(credentials === undefined ? undefined : { credentials });
+	models.setProvider(await entry.load());
+	return models;
+}
+
 /**
- * Chooses the model (an explicit spec, else `UNIT_001_MODEL`, else the detected provider's default) and returns a
- * `Models` with only that provider installed, checked against the catalog.
+ * Chooses the model (an explicit spec, else `UNIT_001_MODEL`, else the default of the first provider that is signed in
+ * or has a key) and returns a `Models` with only that provider installed, checked against the catalog.
  */
 export async function createConfiguredModels(
 	env: Environment,
 	spec?: string,
+	credentials?: CredentialStore,
 ): Promise<{ readonly models: MutableModels; readonly choice: ModelChoice }> {
 	const requested = spec ?? (env[MODEL_VARIABLE] || undefined);
-	const choice = requested === undefined ? detectModel(env) : parseModelSpec(requested);
+	const stored = new Set((await credentials?.list())?.map((entry) => entry.providerId));
+	const choice = requested === undefined ? detectModel(env, stored) : parseModelSpec(requested);
 	if (choice === undefined) {
 		const keys = PROVIDERS.map((entry) => entry.keys[0]).join(", ");
 		throw new ConfigurationError(
-			`No model provider is configured. Set one of ${keys}, or pass --model provider/model-id.`,
+			`No model provider is configured. Run u1 login anthropic or u1 login openai to use a subscription, set one of ${keys}, or pass --model provider/model-id.`,
 		);
 	}
-	const entry = PROVIDERS.find((candidate) => candidate.id === choice.provider);
-	if (entry === undefined) {
-		const supported = PROVIDERS.map((candidate) => candidate.id).join(", ");
-		throw new ConfigurationError(
-			`Provider "${choice.provider}" is not supported. Supported providers: ${supported}.`,
-		);
-	}
-	const models = createModels();
-	models.setProvider(await entry.load());
+	const models = await createModelsFor(choice.provider, credentials);
 	if (models.getModel(choice.provider, choice.modelId) === undefined) {
 		const known = models
 			.getModels(choice.provider)

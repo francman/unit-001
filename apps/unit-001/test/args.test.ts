@@ -50,3 +50,36 @@ describe("parseArguments", () => {
 		expect(() => parseArguments(argv)).toThrow(message);
 	});
 });
+
+describe("parseArguments account commands", () => {
+	it("parses login, logout, and status", () => {
+		expect(parseArguments(["login", "anthropic"])).toEqual({ kind: "login", provider: "anthropic" });
+		expect(parseArguments(["logout", "openai", "--data-dir", "/d"])).toEqual({
+			kind: "logout",
+			provider: "openai",
+			dataDir: "/d",
+		});
+		expect(parseArguments(["status"])).toEqual({ kind: "status" });
+		expect(parseArguments(["status", "--data-dir=/d"])).toEqual({ kind: "status", dataDir: "/d" });
+	});
+
+	it("returns help for a subcommand's --help", () => {
+		expect(parseArguments(["login", "--help"])).toEqual({ kind: "help" });
+	});
+
+	it.each([
+		[["login"], /Usage: u1 login <provider>/],
+		[["logout"], /Usage: u1 logout <provider>/],
+		[["login", "a", "b"], /Unexpected argument: b/],
+		[["status", "extra"], /Unexpected argument: extra/],
+		[["login", "a", "--bogus"], /Unknown option: --bogus/],
+		[["login", "a", "--data-dir"], /needs a value/],
+	])("rejects %j", (argv, message) => {
+		expect(() => parseArguments(argv)).toThrow(UsageError);
+		expect(() => parseArguments(argv)).toThrow(message);
+	});
+
+	it("treats login, logout, and status as commands only in first position", () => {
+		expect(() => parseArguments(["--session", "x", "login"])).toThrow(/Unexpected argument: login/);
+	});
+});

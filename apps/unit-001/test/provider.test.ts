@@ -25,6 +25,13 @@ describe("detectModel", () => {
 		expect(detectModel({ ANTHROPIC_API_KEY: "" })).toBeUndefined();
 	});
 
+	it("counts a stored sign-in as configured, in the same order as keys", () => {
+		expect(detectModel({}, new Set(["openai"]))?.provider).toBe("openai");
+		expect(detectModel({ GEMINI_API_KEY: "k" }, new Set(["openrouter"]))?.provider).toBe("google");
+		expect(detectModel({ OPENAI_API_KEY: "k" }, new Set(["anthropic"]))?.provider).toBe("anthropic");
+		expect(detectModel({}, new Set(["unknown"]))).toBeUndefined();
+	});
+
 	it("picks the first configured provider in order", () => {
 		expect(detectModel({ OPENAI_API_KEY: "k", GEMINI_API_KEY: "k" })?.provider).toBe("openai");
 		expect(detectModel({ OPENAI_API_KEY: "k", ANTHROPIC_OAUTH_TOKEN: "t" })?.provider).toBe("anthropic");
@@ -34,7 +41,20 @@ describe("detectModel", () => {
 
 describe("createConfiguredModels", () => {
 	it("explains how to configure a provider when there is none", async () => {
-		await expect(createConfiguredModels({})).rejects.toThrow(/No model provider is configured.*ANTHROPIC_API_KEY/);
+		await expect(createConfiguredModels({})).rejects.toThrow(
+			/No model provider is configured.*u1 login.*ANTHROPIC_API_KEY/,
+		);
+	});
+
+	it("uses the provider the user signed in to, with no key set", async () => {
+		const credentials = {
+			list: async () => [{ providerId: "openai", type: "oauth" as const }],
+			read: async () => undefined,
+			modify: async () => undefined,
+			delete: async () => {},
+		};
+		const { choice } = await createConfiguredModels({}, undefined, credentials);
+		expect(choice).toEqual({ provider: "openai", modelId: "gpt-5" });
 	});
 
 	it("rejects a provider it cannot start", async () => {

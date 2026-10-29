@@ -5,7 +5,7 @@ A durable agent built on [Pi Durable](../../packages/durable). Its conversation 
 ## Requirements
 
 - Node.js 22.19 or later, on macOS, Linux, or Windows
-- An API key for one model provider
+- A model provider: a Claude or ChatGPT subscription, or an API key
 
 ## Start it
 
@@ -15,9 +15,11 @@ From the repository root:
 npm install
 npm run build
 cd apps/unit-001 && npm link         # once: puts `u1` (and `unit-001`) on your PATH
-export ANTHROPIC_API_KEY=...         # or OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY
+u1 login anthropic                   # sign in with a Claude subscription, or: u1 login openai (ChatGPT)
 u1
 ```
+
+Or skip the sign-in and set an API key instead: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, or `OPENROUTER_API_KEY`.
 
 On Windows PowerShell, set the key with `$env:ANTHROPIC_API_KEY = "..."`.
 
@@ -31,11 +33,19 @@ u1 --model openai/gpt-5   pick a model (provider/model-id)
 
 In the chat, `/help` lists commands, `/exit` or Ctrl+D quits, and Ctrl+C stops the current run (and quits when idle). The agent works in the directory you start it from, with Pi Durable's `read`, `write`, `edit`, and `bash` tools, plus `powershell` on Windows. On Windows the `bash` tool needs a bash installed, such as Git Bash; `powershell` does not.
 
+## Subscriptions
+
+`u1 login anthropic` (Claude Pro or Max) and `u1 login openai` (ChatGPT Plus or Pro) open the provider's own sign-in page in your browser, with a paste-the-code fallback for machines without one. `u1 logout <provider>` removes it and `u1 status` shows how each provider is configured, without printing any secret. Tokens refresh automatically.
+
+Sign-ins are stored in `auth.json` in the data directory, readable only by you (mode 0600 on macOS and Linux; on Windows it inherits your profile directory's access rules). A stored sign-in wins over an API key for the same provider.
+
+Whether a provider lets third-party tools use a subscription is that provider's policy and has changed before; check the current terms of your plan before relying on it.
+
 ## Configuration
 
 | Setting | Meaning |
 |---|---|
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | Detected in this order; the first one set picks the provider and its default model |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | A provider is used when you are signed in to it or its key is set, checked in this order; the first picks the provider and its default model |
 | `UNIT_001_MODEL` or `--model` | `provider/model-id`; the flag wins |
 | `UNIT_001_HOME` or `--data-dir` | Where sessions are stored; the flag wins |
 

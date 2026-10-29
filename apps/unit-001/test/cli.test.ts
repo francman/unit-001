@@ -76,6 +76,26 @@ describe("main", () => {
 		expect(run.err()).toContain("No model provider is configured");
 	});
 
+	it("lists how each provider is configured, without printing secrets", async () => {
+		const run = runtime({ OPENAI_API_KEY: "sk-secret-value" });
+		expect(await main(["status"], run.runtime, signal)).toBe(0);
+		expect(run.out()).toContain("openai      API key from OPENAI_API_KEY");
+		expect(run.out()).toContain("anthropic   not configured");
+		expect(run.out()).not.toContain("secret");
+	});
+
+	it("rejects an unknown provider for login with a usage error", async () => {
+		const run = runtime({});
+		expect(await main(["login", "nowhere"], run.runtime, signal)).toBe(2);
+		expect(run.err()).toContain('Unknown provider "nowhere". Choose one of: anthropic, openai.');
+	});
+
+	it("logout says when there is nothing to remove, and leaves no credentials file", async () => {
+		const run = runtime({});
+		expect(await main(["logout", "anthropic"], run.runtime, signal)).toBe(0);
+		expect(run.err()).toContain("Not signed in to anthropic.");
+	});
+
 	it("exits 1 for an unknown model", async () => {
 		const run = runtime({ ANTHROPIC_API_KEY: "k" });
 		expect(await main(["--model", "anthropic/nope", "-p", "hi"], run.runtime, signal)).toBe(1);
