@@ -24,7 +24,7 @@ const VALUE_FLAGS = new Map<string, "print" | "session" | "model" | "dataDir">([
 	["--data-dir", "dataDir"],
 ]);
 
-export const USAGE = `Usage: unit-001 [options]
+export const USAGE = `Usage: u1 [options]   (also installed as unit-001)
 
 Starts the unit-001 agent. Its conversations persist, so a restarted process resumes unfinished work.
 

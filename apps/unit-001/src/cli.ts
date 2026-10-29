@@ -120,7 +120,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 	} catch (error) {
 		if (signal.aborted) return 130;
 		if (error instanceof UsageError) {
-			runtime.stderr.write(`unit-001: ${error.message}\nRun unit-001 --help for usage.\n`);
+			runtime.stderr.write(`unit-001: ${error.message}\nRun u1 --help for usage.\n`);
 			return 2;
 		}
 		const message = error instanceof Error ? error.message : String(error);
