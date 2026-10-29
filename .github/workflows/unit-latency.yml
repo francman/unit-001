@@ -1,0 +1,60 @@
+name: Unit latency
+
+# Tenet: latency stays minimal on the agent's hot path (recall, prompt assembly, hooks, checkpoint commits).
+# Runs the `bench` script of every unit-001 workspace (apps/unit-*, packages/unit-*). Each bench asserts its own
+# budget (p95, using robust statistics against shared-runner noise) and exits non-zero when it is exceeded, so a
+# regression fails the check. Adding a bench needs no edit here, only a `bench` script in the workspace.
+
+on:
+  push:
+    branches: [main]
+    paths: ["apps/unit-*/**", "packages/unit-*/**", ".github/workflows/unit-latency.yml", ".github/scripts/unit-workspaces.*"]
+  pull_request:
+    branches: [main]
+    paths: ["apps/unit-*/**", "packages/unit-*/**", ".github/workflows/unit-latency.yml", ".github/scripts/unit-workspaces.*"]
+
+concurrency:
+  group: unit-latency-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build upstream packages
+        run: npm run build
+
+      - name: Build unit workspaces
+        run: |
+          for workspace in $(node .github/scripts/unit-workspaces.mjs build); do
+            npm run build --workspace "$workspace"
+          done
+
+      - name: Run latency benchmarks
+        run: |
+          found=0
+          for workspace in $(node .github/scripts/unit-workspaces.mjs bench); do
+            found=1
+            echo "::group::bench $workspace"
+            npm run bench --workspace "$workspace"
+            echo "::endgroup::"
+          done
+          if [ "$found" = 0 ]; then
+            echo "::warning::No unit workspace defines a bench script; no latency budget was checked."
+          fi
