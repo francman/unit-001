@@ -1,0 +1,58 @@
+name: Unit CI
+
+# Builds the workspace and runs the build, typecheck, and test scripts of every unit-001 workspace
+# (apps/unit-*, packages/unit-*). Workspaces are discovered, so adding one needs no edit here.
+# Upstream's CI workflow (ci.yml) keeps checking the whole tree with biome and tsc.
+
+on:
+  push:
+    branches: [main]
+    paths: ["apps/unit-*/**", "packages/unit-*/**", ".github/workflows/unit-ci.yml", ".github/scripts/unit-workspaces.*"]
+  pull_request:
+    branches: [main]
+    paths: ["apps/unit-*/**", "packages/unit-*/**", ".github/workflows/unit-ci.yml", ".github/scripts/unit-workspaces.*"]
+
+concurrency:
+  group: unit-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Test workspace discovery
+        run: node --test .github/scripts/unit-workspaces.test.mjs
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build upstream packages
+        run: npm run build
+
+      - name: Build, typecheck, and test unit workspaces
+        run: |
+          found=0
+          for script in build typecheck test; do
+            for workspace in $(node .github/scripts/unit-workspaces.mjs "$script"); do
+              found=1
+              echo "::group::$script $workspace"
+              npm run "$script" --workspace "$workspace"
+              echo "::endgroup::"
+            done
+          done
+          if [ "$found" = 0 ]; then
+            echo "::warning::No unit workspace defines build, typecheck, or test; nothing was checked."
+          fi
