@@ -2,6 +2,19 @@
 
 A durable agent built on [Pi Durable](../../packages/durable). Its conversation lives in a SQLite file, so a process that stops, crashes, or is killed resumes unfinished work the next time it starts.
 
+## Design goals
+
+- **Always on and mission-driven.** Given a mission and operating boundaries, the agent proactively decides what to do next, executes, verifies results, and adapts without waiting for another user prompt. Missions and unfinished work must survive restarts. It asks for input when a decision exceeds its authority or requires missing information.
+
+The current launcher resumes interrupted runs, but autonomous mission execution and persistent memory remain to be built.
+
+## Design tenets
+
+- **Keep upstream Pi unchanged.** Build on Pi Durable through its public APIs. Unit-specific work belongs in `apps/unit-*` and `packages/unit-*`; never modify upstream files. The upstream guard enforces this, with `package-lock.json` as the sole exception. Raise missing capabilities upstream instead of patching Pi locally.
+- **Keep response latency minimal.** Keep recall, prompt assembly, hooks, and checkpoint commits within measured latency budgets. Run slow work, such as memory extraction and consolidation, in resumable background tasks so it does not delay responses.
+
+The upstream guard is in place; enforced latency budgets remain to be built.
+
 ## Requirements
 
 - Node.js 22.19 or later, on macOS, Linux, or Windows
