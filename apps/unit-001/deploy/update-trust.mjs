@@ -1,6 +1,6 @@
 // Verifies private GitHub release metadata and archives with a pinned, persistent TUF trust chain.
 import { createWriteStream } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -67,6 +67,25 @@ export async function fetchUpdate(options, context = { fetch: globalThis.fetch, 
 		},
 	});
 	await updater.refresh();
+	// A successful check must not forget a trusted rotation or version floor after power loss.
+	// tuf-js writes its cache synchronously but does not flush files or newly created directory entries.
+	for (const name of ["root", "timestamp", "snapshot", "targets"]) {
+		const file = await open(join(metadataDir, `${name}.json`), "r");
+		try {
+			await file.sync();
+		} finally {
+			await file.close();
+		}
+	}
+	for (let directory = resolve(metadataDir); ; directory = dirname(directory)) {
+		const file = await open(directory, "r");
+		try {
+			await file.sync();
+		} finally {
+			await file.close();
+		}
+		if (dirname(directory) === directory) break;
+	}
 	const descriptorInfo = await updater.getTargetInfo("linux-x64/stable.json");
 	if (descriptorInfo === undefined) throw new Error("No signed linux-x64 stable descriptor.");
 	if (!/^[a-f0-9]{64}$/.test(descriptorInfo.hashes.sha256) || descriptorInfo.length > 16_384)
