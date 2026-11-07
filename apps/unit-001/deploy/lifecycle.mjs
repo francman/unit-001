@@ -24,10 +24,9 @@ export async function lifecycle(record, action, context, newName) {
 	if (action === "start") {
 		await writeInstallation({ ...record, desiredState: "running" }, root);
 		try {
-			// reset-failed does not load an inactive unit that systemd has garbage-collected.
-			await systemctl("show", "--property=LoadState", "--value", unit);
-			// An operator retry after fixing configuration must clear a prior crash-loop start limit.
-			await systemctl("reset-failed", unit);
+			const state = await run("systemctl", ["show", "--property=ActiveState", "--value", unit], true);
+			// Failed units retain crash-loop limits; cold inactive units may be unloaded before reset-failed runs.
+			if (state.trim() === "failed") await systemctl("reset-failed", unit);
 			await systemctl("enable", "--now", unit);
 			await context.ready(record);
 		} catch (error) {

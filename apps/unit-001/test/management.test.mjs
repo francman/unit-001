@@ -37,7 +37,7 @@ async function setup() {
 		uid: 0,
 		async run(command, args) {
 			calls.push([command, ...args]);
-			return 0;
+			return args[0] === "show" ? "inactive\n" : 0;
 		},
 		async account() {
 			return { uid: 1001 };
@@ -233,9 +233,8 @@ test("#20 explicit start restores running intent and failed readiness leaves it 
 	const { context, record, root, calls } = await setup();
 	await lifecycle({ ...record, desiredState: "stopped" }, "start", context);
 	assert.equal(readInstallation(id, root).desiredState, "running");
-	assert.deepEqual(calls.slice(0, 3), [
-		["systemctl", "show", "--property=LoadState", "--value", installationPaths(id, root).unit],
-		["systemctl", "reset-failed", installationPaths(id, root).unit],
+	assert.deepEqual(calls.slice(0, 2), [
+		["systemctl", "show", "--property=ActiveState", "--value", installationPaths(id, root).unit],
 		["systemctl", "enable", "--now", installationPaths(id, root).unit],
 	]);
 	await assert.rejects(
@@ -307,6 +306,7 @@ test("#16 explicit start recovers an owned service after its configuration crash
 		...context,
 		async run(command, args) {
 			assert.equal(command, "systemctl");
+			if (args[0] === "show") return "failed\n";
 			if (args[0] === "reset-failed") {
 				assert.deepEqual(args, ["reset-failed", paths.unit]);
 				limited = false;
@@ -319,17 +319,19 @@ test("#16 explicit start recovers an owned service after its configuration crash
 	assert.equal(readInstallation(id, root).desiredState, "running");
 });
 
-test("#16 first start loads a cold installed unit before resetting its failure state", async () => {
+test("#16 first start skips reset for a cold inactive unit that systemd may unload", async () => {
 	const { record, context, root, paths } = await setup();
 	let loaded = false;
 	await lifecycle({ ...record, desiredState: "stopped" }, "start", {
 		...context,
-		async run(_command, args) {
+		async run(_command, args, capture) {
 			if (args[0] === "show") {
-				assert.deepEqual(args, ["show", "--property=LoadState", "--value", paths.unit]);
+				assert.deepEqual(args, ["show", "--property=ActiveState", "--value", paths.unit]);
+				assert.equal(capture, true);
 				loaded = true;
+				return "inactive\n";
 			}
-			if (args[0] === "reset-failed" && !loaded) throw new Error("Unit not loaded");
+			if (args[0] === "reset-failed") throw new Error("Unit not loaded");
 			return 0;
 		},
 	});
@@ -344,6 +346,7 @@ test("#16 reset failure still rejects start and restores stopped intent", async 
 			...context,
 			async run(command, args) {
 				calls.push([command, ...args]);
+				if (args[0] === "show") return "failed\n";
 				if (args[0] === "reset-failed") throw new Error("reset denied");
 				return 0;
 			},
