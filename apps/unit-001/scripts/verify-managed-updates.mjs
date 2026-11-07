@@ -1,12 +1,20 @@
 #!/usr/bin/env node
 // Exercises signed fixture updates and rollback on the explicitly disposable managed-install acceptance host.
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { setTimeout } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { readInstallation } from "../deploy/installation.mjs";
 import { extractUpdateArchive } from "../deploy/update.mjs";
-import { activateUpdate, createUpdateContext, rollbackUpdate } from "../deploy/update-activation.mjs";
+import {
+	activateUpdate,
+	createUpdateContext,
+	readUpdateJournal,
+	rollbackUpdate,
+	updatePaths,
+} from "../deploy/update-activation.mjs";
 import { fetchUpdate } from "../deploy/update-trust.mjs";
 import { writeReleaseArchive, writeReleaseChecksums } from "./build-release.mjs";
 import { generateRepositoryKeys, prepareRepository } from "./update-repository.mjs";
@@ -142,7 +150,97 @@ try {
 	assert.equal(readInstallation(id).releaseVersion, baseline);
 	assert.equal(context.control(readInstallation(id), ["service-status"]).inhibited, false);
 	assert.equal(readFileSync(marker, "utf8"), "created-after-update-commit\n");
-	console.log("Managed signed update and current-state rollback passed (real systemd; no model requests).");
+	// #18: SIGKILL releases the real kernel lock; the next main-unit start must invoke its boot dependencies.
+	const crashCandidate = join(work, "crash-candidate.json");
+	writeFileSync(crashCandidate, JSON.stringify({ releasePath, ...verified }), { mode: 0o600 });
+	const killed = spawnSync(
+		process.execPath,
+		[fileURLToPath(new URL("./verify-update-crash.mjs", import.meta.url)), id, crashCandidate],
+		{ encoding: "utf8", timeout: 60000, maxBuffer: 1048576 },
+	);
+	assert.equal(killed.signal, "SIGKILL", `Crash helper did not reach candidate: ${killed.stderr}`);
+	assert.equal(readUpdateJournal(id).phase, "candidate");
+	assert.equal(readInstallation(id).desiredState, "running");
+	const mainUnit = `unit-001@${id}.service`;
+	context.run("systemctl", ["start", mainUnit]);
+	const deadline = performance.now() + 45000;
+	let recovered = false,
+		failure;
+	do {
+		try {
+			const current = readInstallation(id);
+			const status = context.control(
+				current,
+				["service-status"],
+				Math.min(2000, Math.max(1, deadline - performance.now())),
+			);
+			assert.equal(readUpdateJournal(id).phase, "complete");
+			assert.equal(current.releaseVersion, baseline);
+			assert.equal(current.desiredState, "running");
+			assert.equal(status.installationId, id);
+			assert.equal(status.version, baseline);
+			assert.equal(status.inhibited, false);
+			assert.equal(status.maintenance.state, "open");
+			recovered = true;
+			break;
+		} catch (error) {
+			failure = error;
+		}
+		await setTimeout(100);
+	} while (performance.now() < deadline);
+	if (!recovered) {
+		const paths = updatePaths(id);
+		try {
+			context.run("systemctl", ["status", "--no-pager", mainUnit, paths.prepareUnit, paths.finalizeUnit]);
+		} catch {}
+		throw new Error(`Boot dependency recovery did not finish within 45 seconds: ${failure?.message}`);
+	}
+	assert.equal(readFileSync(marker, "utf8"), "created-after-update-commit\n");
+	assert.equal(packagedStatus().runningVersion, baseline);
+	console.log(
+		"Managed signed update, current-state rollback, and SIGKILL/startup-dependency recovery passed (real systemd; no reboot or model requests).",
+	);
+} catch (error) {
+	console.error(`Native update acceptance failed: ${error.message}`);
+	const paths = updatePaths(id),
+		mainUnit = `unit-001@${id}.service`;
+	try {
+		console.error(`Recovery journal phase: ${readUpdateJournal(id)?.phase ?? "absent"}`);
+	} catch {}
+	for (const [command, args] of [
+		[
+			"systemctl",
+			[
+				"show",
+				"--property=ActiveState,SubState,Result,MainPID,LoadState",
+				mainUnit,
+				paths.prepareUnit,
+				paths.finalizeUnit,
+			],
+		],
+		[
+			"journalctl",
+			[
+				"--no-pager",
+				"--output=short-monotonic",
+				"-n",
+				"80",
+				"-u",
+				mainUnit,
+				"-u",
+				paths.prepareUnit,
+				"-u",
+				paths.finalizeUnit,
+			],
+		],
+	]) {
+		try {
+			context.run(command, args);
+		} catch (diagnosticError) {
+			console.error(`Bounded ${command} diagnostics failed: ${diagnosticError.message}`);
+		}
+	}
+	throw error;
 } finally {
 	rmSync(work, { recursive: true, force: true });
 }

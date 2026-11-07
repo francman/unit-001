@@ -23,6 +23,7 @@ import {
 	generateRepositoryKeys,
 	METADATA_RELEASE,
 	prepareRepository,
+	pruneRepository,
 	publishRepository,
 	renewRepository,
 	rotateRepositoryRoot,
@@ -78,6 +79,11 @@ function fakeGithub() {
 			assert(replace || !entries.has(name));
 			entries.set(name, { id: ++id, name, bytes: readFileSync(path) });
 			operations.push(`${tag}:${name}`);
+		},
+		remove(tag, asset) {
+			assert.equal(releases.get(tag).get(asset.name).id, asset.id);
+			releases.get(tag).delete(asset.name);
+			operations.push(`remove:${tag}:${asset.name}`);
 		},
 	};
 }
@@ -242,6 +248,13 @@ test("rejects unsupported compatibility, dirty source, and stable downgrade", (t
 		() => f.prepare("compatibility", { release: { ...f.release, compatibility: { stateVersion: 2 } } }),
 		/reviewed/,
 	);
+	assert.throws(
+		() =>
+			f.prepare("oversized", {
+				release: { ...f.release, compatibility: { ...f.release.compatibility, extra: "x".repeat(16384) } },
+			}),
+		/descriptor exceeds/,
+	);
 	const first = f.prepare("first");
 	const archive = join(f.directory, "unit-001-0.0.0-linux-x64.tar.gz");
 	copyFileSync(f.archive, archive);
@@ -322,9 +335,19 @@ test("publisher assets interoperate with the actual private-GitHub trust transpo
 		const tag = parsed.pathname.match(/\/releases\/tags\/(.+)$/)?.[1];
 		if (tag !== undefined) {
 			const assets = remote.assets(tag);
-			return new Response(JSON.stringify({ assets: assets?.map(({ id, name }) => ({ id, name })) }), {
+			return new Response(JSON.stringify({ id: tag === METADATA_RELEASE ? 100 : 101 }), {
 				status: assets === null ? 404 : 200,
 			});
+		}
+		if (/\/releases\/(100|101)\/assets$/.test(parsed.pathname)) {
+			const name = parsed.pathname.includes("/100/") ? METADATA_RELEASE : "unit-v0.0.1";
+			const page = Number(parsed.searchParams.get("page"));
+			return Response.json(
+				remote
+					.assets(name)
+					.map(({ id, name }) => ({ id, name }))
+					.slice((page - 1) * 100, page * 100),
+			);
 		}
 		const id = Number(parsed.pathname.split("/").at(-1));
 		for (const assets of remote.releases.values())
@@ -388,4 +411,99 @@ test("retry preparation skips orphaned numbered metadata instead of clobbering i
 	publishRepository(third.out, f.rootBytes, remote);
 	assert(third.files["3.targets.json"]);
 	assert.deepEqual(remote.releases.get(METADATA_RELEASE).get("2.targets.json").bytes, orphan);
+});
+
+// #18: rotation must work for scheduled renewal and remain usable after the first rotated publication.
+test("renewal accepts a cross-signed previous root only when current credentials cannot verify prior metadata", (t) => {
+	const f = fixture(t);
+	const remote = fakeGithub();
+	publishRepository(f.prepare("first").out, f.rootBytes, remote);
+	const keys = join(f.directory, "rotated-online");
+	generateRepositoryKeys(keys);
+	const rootBytes = rotateRepositoryRoot(f.rootBytes, f.keys, keys);
+	const options = { rootBytes, keys, previousRootBytes: f.rootBytes };
+	renewRepository({ ...options, out: join(f.directory, "rotation-renew") }, remote);
+	publishRepository(join(f.directory, "rotation-renew/publication"), rootBytes, remote);
+	renewRepository({ ...options, out: join(f.directory, "normal-renew") }, remote);
+	publishRepository(join(f.directory, "normal-renew/publication"), rootBytes, remote);
+	assert.equal(JSON.parse(remote.releases.get(METADATA_RELEASE).get("timestamp.json").bytes).signed.version, 3);
+	assert(remote.releases.get(METADATA_RELEASE).has("1.root.json"));
+	assert(remote.releases.get(METADATA_RELEASE).has("2.root.json"));
+});
+
+// #18: a client that already fetched a still-valid old timestamp must retain its authenticated dependencies.
+test("retention preserves an old valid timestamp's snapshot, targets, and descriptor for an in-flight client", async (t) => {
+	const f = fixture(t);
+	const remote = fakeGithub();
+	const now = new Date();
+	const firstTime = new Date(now.getTime() - 86400000);
+	const first = f.prepare("old-client", { now: firstTime });
+	publishRepository(first.out, f.rootBytes, remote, firstTime);
+	publishRepository(f.prepare("current-client", { previous: first.out, now }).out, f.rootBytes, remote, now);
+	const files = Object.fromEntries(remote.assets(METADATA_RELEASE).map(({ name, bytes }) => [name, bytes]));
+	files["timestamp.json"] = first.files["timestamp.json"];
+	const updater = await client(t, f, [{ files }]);
+	await updater.refresh();
+	const info = await updater.getTargetInfo("linux-x64/stable.json");
+	assert.deepEqual(JSON.parse(readFileSync(await updater.downloadTarget(info))), first.descriptor);
+});
+
+// #18: pruning is tied to successful freshness publication, never merely to preparing or staging assets.
+test("failed freshness leaves old metadata intact; successful publication prunes aged metadata but preserves unknowns", (t) => {
+	const f = fixture(t);
+	const remote = fakeGithub();
+	const now = new Date();
+	const oldTime = new Date(now.getTime() - 40 * 86400000);
+	const first = f.prepare("aged", { now: oldTime });
+	publishRepository(first.out, f.rootBytes, remote, oldTime);
+	const entries = remote.releases.get(METADATA_RELEASE);
+	entries.set("operator-notes.txt", { id: 9999, name: "operator-notes.txt", bytes: Buffer.from("preserve") });
+	const second = f.prepare("fresh", { previous: first.out, now });
+	const upload = remote.upload.bind(remote);
+	remote.upload = (tag, path, replace) => {
+		if (path.endsWith("/timestamp.json")) throw new Error("freshness interrupted");
+		upload(tag, path, replace);
+	};
+	assert.throws(() => publishRepository(second.out, f.rootBytes, remote, now), /freshness interrupted/);
+	assert(entries.has("1.snapshot.json"));
+	assert(!remote.operations.some((operation) => operation.startsWith("remove:")));
+	remote.upload = upload;
+	publishRepository(second.out, f.rootBytes, remote, now);
+	for (const name of ["1.timestamp.json", "1.snapshot.json", "1.targets.json"]) assert(!entries.has(name));
+	assert(entries.has("operator-notes.txt"));
+	assert(entries.has("1.root.json"));
+	assert(remote.releases.get("unit-v0.0.1").has("unit-001-0.0.1-linux-x64.tar.gz"));
+	entries.set("999.targets.json", { id: 9998, name: "999.targets.json", bytes: Buffer.from("not signed") });
+	const before = [...entries.keys()];
+	assert.throws(() => pruneRepository(f.rootBytes, remote, now));
+	assert.deepEqual([...entries.keys()], before);
+});
+
+// #18: six-hour renewal must not exhaust GitHub's 1,000-assets-per-release limit over the service's lifetime.
+test("authenticated seven-day retention bounds assets across more than 1000 six-hour renewals", (t) => {
+	const f = fixture(t);
+	const remote = fakeGithub();
+	remote.create(METADATA_RELEASE);
+	remote.create("unit-v0.0.1", f.release.source.commit);
+	remote.upload("unit-v0.0.1", f.archive);
+	const start = Date.now() - 1200 * 6 * 3600000;
+	let previous;
+	let now;
+	for (let index = 0; index < 1200; index++) {
+		now = new Date(start + index * 6 * 3600000);
+		const publication = f.prepare(`renewal-${index}`, { previous, now });
+		for (const name of Object.keys(publication.files)) {
+			if (name !== "timestamp.json" && remote.releases.get(METADATA_RELEASE).has(name)) continue;
+			remote.upload(METADATA_RELEASE, join(publication.out, name), name === "timestamp.json");
+		}
+		previous = publication.out;
+		// Even a backlog of twenty successful renewals fits; production prunes after every successful publication.
+		if (index % 20 === 0) pruneRepository(f.rootBytes, remote, now);
+		assert(remote.assets(METADATA_RELEASE).length < 1000);
+	}
+	const result = pruneRepository(f.rootBytes, remote, now);
+	assert(result.retained < 300);
+	assert(remote.releases.get(METADATA_RELEASE).has("1200.timestamp.json"));
+	assert(remote.releases.get(METADATA_RELEASE).has("1.root.json"));
+	assert.equal(remote.releases.get("unit-v0.0.1").size, 1);
 });

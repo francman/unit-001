@@ -73,6 +73,7 @@ export function rotateRepositoryRoot(rootBytes, oldKeys, newKeys, now = new Date
 }
 
 function rootMetadata(rootBytes, now) {
+	if (rootBytes.length > 4 * 1024 * 1024) throw new Error("Approved root exceeds the client metadata limit");
 	const root = Metadata.fromJSON("root", JSON.parse(rootBytes));
 	root.verifyDelegate("root", root);
 	if (!root.signed.consistentSnapshot || root.signed.isExpired(now))
@@ -98,6 +99,20 @@ function priorMetadata(directory, root) {
 
 function fileMetadata(bytes, version) {
 	return new MetaFile({ version, length: bytes.length, hashes: { sha256: digest(bytes) } });
+}
+
+function priorForRoot(directory, root, previousRootBytes) {
+	try {
+		return priorMetadata(directory, root);
+	} catch (error) {
+		if (previousRootBytes === undefined) throw error;
+		const previousRoot = Metadata.fromJSON("root", JSON.parse(previousRootBytes));
+		previousRoot.verifyDelegate("root", previousRoot);
+		if (root.signed.version !== previousRoot.signed.version + 1)
+			throw new Error("Root rotations must advance by exactly one version");
+		previousRoot.verifyDelegate("root", root);
+		return priorMetadata(directory, previousRoot);
+	}
 }
 
 /** Builds fresh signed metadata from reviewed release metadata and immutable archive bytes. */
@@ -126,15 +141,7 @@ export function prepareRepository({
 	)
 		throw new Error("Release compatibility requires an explicitly reviewed supported policy");
 	const root = rootMetadata(rootBytes, now);
-	let previousRoot = root;
-	if (previousRootBytes !== undefined) {
-		previousRoot = Metadata.fromJSON("root", JSON.parse(previousRootBytes));
-		previousRoot.verifyDelegate("root", previousRoot);
-		if (root.signed.version !== previousRoot.signed.version + 1)
-			throw new Error("Root rotations must advance by exactly one version");
-		previousRoot.verifyDelegate("root", root);
-	}
-	const prior = priorMetadata(previous, previousRoot);
+	const prior = priorForRoot(previous, root, previousRootBytes);
 	const floor =
 		previous !== undefined && existsSync(join(previous, "publisher-floor.json"))
 			? JSON.parse(readFileSync(join(previous, "publisher-floor.json")))
@@ -156,6 +163,7 @@ export function prepareRepository({
 		compatibility,
 	};
 	const descriptorBytes = encode(descriptor);
+	if (descriptorBytes.length > 16384) throw new Error("Stable descriptor exceeds the client metadata limit");
 	const targets = new Targets({
 		version: Math.max(prior?.targets.signed.version ?? 0, floor.targets ?? 0) + 1,
 		expires: expires(now, 30),
@@ -200,6 +208,8 @@ export function prepareRepository({
 	const targetsMetadata = signed(targets, [privateKey(keys, "targets")]);
 	root.verifyDelegate("targets", targetsMetadata);
 	const targetsBytes = encode(targetsMetadata.toJSON());
+	if (targetsBytes.length > 4 * 1024 * 1024)
+		throw new Error("Targets exceed the client metadata limit; publication requires a reviewed repository migration");
 	const snapshot = signed(
 		new Snapshot({
 			version: Math.max(prior?.snapshot.signed.version ?? 0, floor.snapshot ?? 0) + 1,
@@ -295,6 +305,10 @@ export function githubPublisher() {
 		upload(tag, path, replace = false) {
 			run(["release", "upload", tag, path, "--repo", UPDATE_REPOSITORY, ...(replace ? ["--clobber"] : [])]);
 		},
+		remove(_tag, asset) {
+			if (!Number.isSafeInteger(asset.id) || asset.id < 1) throw new Error("Invalid asset deletion identifier");
+			run(["api", "--method", "DELETE", `repos/${UPDATE_REPOSITORY}/releases/assets/${asset.id}`]);
+		},
 	};
 }
 
@@ -330,11 +344,14 @@ export function fetchRepository(out, remote = githubPublisher()) {
 }
 
 /** Renews metadata for the exact existing archive; never rebuilds an already published version. */
-export function renewRepository({ out, rootBytes, keys }, remote = githubPublisher()) {
+export function renewRepository(
+	{ out, rootBytes, keys, previousRootBytes, now = new Date() },
+	remote = githubPublisher(),
+) {
 	mkdirSync(out, { mode: 0o700 });
 	const previous = join(out, "previous");
 	fetchRepository(previous, remote);
-	const prior = priorMetadata(previous, rootMetadata(rootBytes, new Date()));
+	const prior = priorForRoot(previous, rootMetadata(rootBytes, now), previousRootBytes);
 	if (prior === undefined) throw new Error("Cannot renew an empty repository");
 	const info = prior.targets.signed.targets["linux-x64/stable.json"];
 	const name = `linux-x64-${info.hashes.sha256}.stable.json`;
@@ -372,19 +389,21 @@ export function renewRepository({ out, rootBytes, keys }, remote = githubPublish
 		rootBytes,
 		keys,
 		previous,
+		previousRootBytes,
+		now,
 		out: join(out, "publication"),
 	});
 }
 
 /** Publishes immutable content first, with timestamp last and a stale-publisher check. */
-export function publishRepository(directory, rootBytes, remote = githubPublisher()) {
+export function publishRepository(directory, rootBytes, remote = githubPublisher(), now = new Date()) {
 	const plan = JSON.parse(readFileSync(join(directory, "publication.json")));
 	if (plan.repository !== UPDATE_REPOSITORY || plan.schemaVersion !== 1) throw new Error("Invalid publication plan");
-	const root = rootMetadata(rootBytes, new Date());
+	const root = rootMetadata(rootBytes, now);
 	const metadata = priorMetadata(directory, root);
 	if (
 		metadata === undefined ||
-		[metadata.timestamp, metadata.snapshot, metadata.targets].some((entry) => entry.signed.isExpired())
+		[metadata.timestamp, metadata.snapshot, metadata.targets].some((entry) => entry.signed.isExpired(now))
 	)
 		throw new Error("Missing or expired publication metadata");
 	const archiveBytes = readFileSync(plan.archive);
@@ -491,6 +510,126 @@ export function publishRepository(directory, rootBytes, remote = githubPublisher
 	for (const name of names) put(METADATA_RELEASE, name, join(directory, name));
 	checkTimestamp();
 	remote.upload(METADATA_RELEASE, join(directory, "timestamp.json"), true);
+	const current = remote.assets(METADATA_RELEASE)?.find((asset) => asset.name === "timestamp.json");
+	if (current === undefined || !remote.read(current).equals(metadata.timestampBytes))
+		throw new Error("Published timestamp readback differs; retention was not run");
+	pruneRepository(rootBytes, remote, now);
+}
+
+const RETENTION_MS = 7 * 86400000;
+
+/** Removes only authenticated expired metadata after seven additional days, preserving live dependency chains. */
+export function pruneRepository(rootBytes, remote = githubPublisher(), now = new Date()) {
+	const root = rootMetadata(rootBytes, now);
+	const inventory = remote.assets(METADATA_RELEASE);
+	if (inventory === null) throw new Error("Cannot prune a missing metadata repository");
+	const assets = new Map(inventory.map((asset) => [asset.name, asset]));
+	if (assets.size !== inventory.length) throw new Error("Duplicate metadata asset names prevent retention");
+	const read = (asset) => {
+		const bytes = remote.read(asset);
+		if (bytes.length > 4 * 1024 * 1024) throw new Error("Retention metadata exceeds its size limit");
+		return bytes;
+	};
+	const roots = [];
+	for (const asset of inventory.filter((entry) => /^[1-9]\d*\.root\.json$/.test(entry.name))) {
+		const bytes = read(asset);
+		const metadata = Metadata.fromJSON("root", JSON.parse(bytes));
+		metadata.verifyDelegate("root", metadata);
+		if (`${metadata.signed.version}.root.json` !== asset.name) throw new Error("Root filename/version mismatch");
+		roots.push({ metadata, bytes });
+	}
+	roots.sort((a, b) => a.metadata.signed.version - b.metadata.signed.version);
+	if (roots.length !== root.signed.version || !roots.at(-1)?.bytes.equals(rootBytes))
+		throw new Error("Retention requires the complete approved root chain");
+	for (let index = 0; index < roots.length; index++) {
+		if (roots[index].metadata.signed.version !== index + 1) throw new Error("Root chain has a gap");
+		if (index > 0) roots[index - 1].metadata.verifyDelegate("root", roots[index].metadata);
+	}
+	const records = new Map();
+	for (const asset of inventory) {
+		const match = asset.name.match(/^([1-9]\d*)\.(timestamp|snapshot|targets)\.json$/);
+		if (match === null) continue;
+		const bytes = read(asset);
+		const metadata = Metadata.fromJSON(match[2], JSON.parse(bytes));
+		if (metadata.signed.version !== Number(match[1]) || !Number.isFinite(Date.parse(metadata.signed.expires)))
+			throw new Error("Retention metadata has an invalid version or expiry");
+		const authorized = roots.some(({ metadata: trusted }) => {
+			try {
+				trusted.verifyDelegate(match[2], metadata);
+				return true;
+			} catch {
+				return false;
+			}
+		});
+		if (!authorized) throw new Error("Unauthenticated numbered metadata prevents retention");
+		records.set(asset.name, { asset, bytes, metadata, kind: match[2] });
+	}
+	const timestampAsset = assets.get("timestamp.json");
+	if (timestampAsset === undefined) throw new Error("Retention requires published freshness metadata");
+	const currentBytes = read(timestampAsset);
+	const current = Metadata.fromJSON("timestamp", JSON.parse(currentBytes));
+	root.verifyDelegate("timestamp", current);
+	if (current.signed.isExpired(now)) throw new Error("Cannot prune with expired freshness metadata");
+	const receipt = records.get(`${current.signed.version}.timestamp.json`);
+	if (receipt === undefined || !receipt.bytes.equals(currentBytes))
+		throw new Error("Current timestamp receipt mismatch");
+	const keep = new Set(["timestamp.json", ...roots.map(({ metadata }) => `${metadata.signed.version}.root.json`)]);
+	const protect = (record) => {
+		if (record === undefined) throw new Error("Retained metadata dependency is missing");
+		if (keep.has(record.asset.name)) return;
+		keep.add(record.asset.name);
+		if (record.kind === "targets") return;
+		const reference =
+			record.kind === "timestamp"
+				? record.metadata.signed.snapshotMeta
+				: record.metadata.signed.meta["targets.json"];
+		const child = records.get(`${reference.version}.${record.kind === "timestamp" ? "snapshot" : "targets"}.json`);
+		if (child === undefined) throw new Error("Retained metadata dependency is missing");
+		reference.verify(child.bytes);
+		protect(child);
+	};
+	const timestamps = [...records.values()].filter((record) => record.kind === "timestamp");
+	const highest = timestamps.reduce(
+		(previous, record) =>
+			previous === undefined || record.metadata.signed.version > previous.metadata.signed.version
+				? record
+				: previous,
+		undefined,
+	);
+	protect(receipt);
+	if (highest !== undefined) protect(highest);
+	for (const record of records.values())
+		if (Date.parse(record.metadata.signed.expires) + RETENTION_MS >= now.getTime()) protect(record);
+	const descriptors = new Map();
+	for (const record of records.values()) {
+		if (record.kind !== "targets") continue;
+		const info = record.metadata.signed.targets["linux-x64/stable.json"];
+		if (info === undefined || !/^[a-f0-9]{64}$/.test(info.hashes.sha256))
+			throw new Error("Retention requires an authenticated stable descriptor");
+		const name = `linux-x64-${info.hashes.sha256}.stable.json`;
+		const asset = assets.get(name);
+		if (asset === undefined) {
+			if (keep.has(record.asset.name)) throw new Error("Retained descriptor is missing");
+			continue;
+		}
+		if (!descriptors.has(name)) {
+			const bytes = read(asset);
+			if (bytes.length !== info.length || digest(bytes) !== info.hashes.sha256)
+				throw new Error("Descriptor hash mismatch during retention");
+			descriptors.set(name, asset);
+		}
+		if (keep.has(record.asset.name)) keep.add(name);
+	}
+	const removals = [...records.values()]
+		.map((record) => record.asset)
+		.concat([...descriptors.values()])
+		.filter((asset) => !keep.has(asset.name));
+	// Recheck freshness after validation: a competing publication must never lose its dependency chain.
+	const latest = remote.assets(METADATA_RELEASE)?.find((asset) => asset.name === "timestamp.json");
+	if (latest === undefined || !remote.read(latest).equals(currentBytes))
+		throw new Error("Freshness changed during retention");
+	for (const asset of removals) remote.remove(METADATA_RELEASE, asset);
+	return { removed: removals.map((asset) => asset.name), retained: inventory.length - removals.length };
 }
 
 if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url) {
@@ -512,7 +651,12 @@ if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])
 		});
 	else if (command === "fetch") fetchRepository(values.out);
 	else if (command === "renew")
-		renewRepository({ out: values.out, rootBytes: readFileSync(values.root), keys: values.keys });
+		renewRepository({
+			out: values.out,
+			rootBytes: readFileSync(values.root),
+			keys: values.keys,
+			...(values["previous-root"] === undefined ? {} : { previousRootBytes: readFileSync(values["previous-root"]) }),
+		});
 	else if (command === "prepare") {
 		const version = basename(values.archive)
 			.replace(/^unit-001-/, "")

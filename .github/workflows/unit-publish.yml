@@ -52,7 +52,7 @@ jobs:
 
   publish:
     needs: bundle
-    if: always() && github.repository == 'francman/unit-001' && github.ref == 'refs/heads/main' && ((inputs.mode == 'publish' && needs.bundle.result == 'success') || inputs.mode == 'renew' || github.event_name == 'schedule')
+    if: always() && github.repository == 'francman/unit-001' && github.ref == 'refs/heads/main' && ((inputs.mode == 'publish' && needs.bundle.result == 'success') || inputs.mode == 'renew' || (github.event_name == 'schedule' && vars.UNIT_UPDATES_ENABLED == 'true'))
     environment: unit-release
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -75,6 +75,7 @@ jobs:
       - name: Load explicit trust root and online signing keys
         env:
           UPDATE_ROOT_JSON: ${{ vars.UNIT_UPDATE_ROOT_JSON }}
+          UPDATE_PREVIOUS_ROOT_JSON: ${{ vars.UNIT_UPDATE_PREVIOUS_ROOT_JSON }}
           TARGETS_KEY: ${{ secrets.UNIT_UPDATE_TARGETS_KEY }}
           SNAPSHOT_KEY: ${{ secrets.UNIT_UPDATE_SNAPSHOT_KEY }}
           TIMESTAMP_KEY: ${{ secrets.UNIT_UPDATE_TIMESTAMP_KEY }}
@@ -95,6 +96,9 @@ jobs:
           if not root:
               raise ValueError("Missing approved bootstrap root")
           (base / "root.json").write_text(root)
+          previous = os.environ.get("UPDATE_PREVIOUS_ROOT_JSON", "")
+          if previous:
+              (base / "previous-root.json").write_text(previous)
       - name: Sign new release against current repository
         if: inputs.mode == 'publish'
         env:
@@ -104,10 +108,14 @@ jobs:
         run: |
           set -euo pipefail
           tool=apps/unit-001/scripts/update-repository.mjs
+          previous_root=()
+          if [[ -f "$RUNNER_TEMP/unit-signing/previous-root.json" ]]; then
+            previous_root=(--previous-root "$RUNNER_TEMP/unit-signing/previous-root.json")
+          fi
           node "$tool" fetch --out "$RUNNER_TEMP/unit-previous"
           node "$tool" prepare --archive "$RUNNER_TEMP/unit-candidate/unit-001-$RELEASE_VERSION-linux-x64.tar.gz" \
             --root "$RUNNER_TEMP/unit-signing/root.json" --keys "$RUNNER_TEMP/unit-signing" \
-            --previous "$RUNNER_TEMP/unit-previous" --out "$RUNNER_TEMP/unit-publication"
+            --previous "$RUNNER_TEMP/unit-previous" --out "$RUNNER_TEMP/unit-publication" "${previous_root[@]}"
           node "$tool" publish --out "$RUNNER_TEMP/unit-publication" --root "$RUNNER_TEMP/unit-signing/root.json"
       - name: Renew authenticated metadata without rebuilding
         if: inputs.mode == 'renew' || github.event_name == 'schedule'
@@ -117,7 +125,11 @@ jobs:
         run: |
           set -euo pipefail
           tool=apps/unit-001/scripts/update-repository.mjs
-          node "$tool" renew --out "$RUNNER_TEMP/unit-renewal" --root "$RUNNER_TEMP/unit-signing/root.json" --keys "$RUNNER_TEMP/unit-signing"
+          previous_root=()
+          if [[ -f "$RUNNER_TEMP/unit-signing/previous-root.json" ]]; then
+            previous_root=(--previous-root "$RUNNER_TEMP/unit-signing/previous-root.json")
+          fi
+          node "$tool" renew --out "$RUNNER_TEMP/unit-renewal" --root "$RUNNER_TEMP/unit-signing/root.json" --keys "$RUNNER_TEMP/unit-signing" "${previous_root[@]}"
           node "$tool" publish --out "$RUNNER_TEMP/unit-renewal/publication" --root "$RUNNER_TEMP/unit-signing/root.json"
       - name: Remove temporary signing keys
         if: always()

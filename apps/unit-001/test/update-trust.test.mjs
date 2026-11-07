@@ -112,11 +112,17 @@ async function fixture() {
 		const parsed = new URL(url);
 		if (parsed.pathname.includes("/releases/tags/")) {
 			const tag = parsed.pathname.split("/").at(-1);
-			return Response.json({
-				assets: [...assets.entries()]
+			return Response.json({ id: tag === "unit-updates-stable" ? 100 : 101 });
+		}
+		if (/\/releases\/(100|101)\/assets$/.test(parsed.pathname)) {
+			const tag = parsed.pathname.includes("/100/") ? "unit-updates-stable" : "unit-v0.0.2";
+			const page = Number(parsed.searchParams.get("page"));
+			return Response.json(
+				[...assets.entries()]
 					.filter(([name]) => name.startsWith(`${tag}/`))
-					.map(([, value]) => ({ id: value.id, name: value.name })),
-			});
+					.map(([, value]) => ({ id: value.id, name: value.name }))
+					.slice((page - 1) * 100, page * 100),
+			);
 		}
 		const body = byId.get(Number(parsed.pathname.split("/").at(-1)));
 		return new Response(body, { status: body === undefined ? 404 : 200 });
@@ -151,6 +157,16 @@ test("verifies the full chain, root-404 termination and immutable archive withou
 	assert.deepEqual(await readFile(candidate.archivePath), f.archive);
 	assert.equal(candidate.compatibility.maintenanceProtocol, 1);
 	assert.ok(f.requests.every((request) => request.headers.Authorization === "Bearer fixture-secret"));
+});
+
+test("paginates beyond 256 assets once per release and still verifies the exact signed targets", async () => {
+	const f = await fixture();
+	for (let index = 0; index < 400; index++) f.put("unit-updates-stable", `unknown-${index}`, Buffer.from("unknown"));
+	f.publish(2, { sourceCommit: "b".repeat(40) });
+	const candidate = await fetchUpdate(f.options, f.context);
+	assert.equal(candidate.sourceCommit, "b".repeat(40));
+	assert.ok(f.requests.some(({ url }) => url.includes("/releases/100/assets?per_page=100&page=5")));
+	assert.equal(f.requests.filter(({ url }) => url.endsWith("/tags/unit-updates-stable")).length, 1);
 });
 
 test("allows policy to skip a verified current or held candidate before archive requests/download", async () => {

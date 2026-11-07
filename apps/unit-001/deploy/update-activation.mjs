@@ -183,7 +183,9 @@ function stateBytes(path, prefix = "") {
 			(total, name) => total + stateBytes(join(path, name), prefix === "" ? name : `${prefix}/${name}`),
 			0,
 		);
-	return info.isFile() ? info.size : 0;
+	if (info.isSymbolicLink()) return Buffer.byteLength(readlinkSync(path));
+	if (!info.isFile()) throw new Error("State contains a special file outside control; automatic update deferred.");
+	return info.size;
 }
 
 /** Reads only protected root-owned journal metadata; its paths never come from application input. */
@@ -560,10 +562,40 @@ function publishApplication(record, version, context) {
 	syncDirectory(dirname(paths.record));
 }
 
+async function waitForStatus(record, context) {
+	const deadline = performance.now() + 30000;
+	let failure;
+	do {
+		try {
+			return await context.control(
+				record,
+				["service-status"],
+				Math.min(2000, Math.max(1, deadline - performance.now())),
+			);
+		} catch (error) {
+			failure = error;
+		}
+		await setTimeout(100);
+	} while (performance.now() < deadline);
+	throw failure;
+}
+
+async function startApplication(record, context, action = "start") {
+	const unit = installationPaths(record.id, context.root).unit;
+	try {
+		// Controlled upgrades must not consume the crash-loop budget of the replacement process.
+		await context.run("systemctl", ["reset-failed", unit]);
+	} catch (error) {
+		const loaded = await context.run("systemctl", ["show", "--property=LoadState", "--value", unit], true);
+		if (loaded.trim() !== "not-found") throw error;
+	}
+	await context.run("systemctl", [action, ...(action === "enable" ? ["--now"] : []), unit]);
+}
+
 async function releaseGate(record, journal, context) {
 	const current = readInstallation(record.id, context.root);
 	if (current.desiredState !== "running") return;
-	const status = await context.control(current, ["service-status"]);
+	const status = await waitForStatus(current, context);
 	if (status.maintenance?.state === "open" && !status.inhibited && journal.phase === "committed") return;
 	if (status.maintenance?.state === "open")
 		await context.control(current, ["maintenance-enter", "--operation-id", journal.operationId, "--timeout-ms", "0"]);
@@ -621,11 +653,20 @@ export async function activateUpdate(record, candidate, context) {
 		if (!closedRepair && status.maintenance?.protocol !== 1)
 			return { status: "incompatible", reason: "Install the maintenance-capable baseline manually." };
 		const paths = updatePaths(record.id, context.root);
-		const filesystem = statfsSync(paths.configDirectory);
-		const available =
-			context.availableBytes?.(paths.configDirectory) ?? Number(filesystem.bavail) * Number(filesystem.bsize);
-		if (available < 2 * stateBytes(installationPaths(record.id, context.root).state))
-			return { status: "deferred", reason: "Insufficient free space for a closed state backup." };
+		const state = installationPaths(record.id, context.root).state;
+		let bytes;
+		try {
+			bytes = stateBytes(state);
+		} catch (error) {
+			return { status: "deferred", reason: error.message };
+		}
+		const required = 2 * bytes + 16 * 1024 * 1024;
+		for (const directory of [paths.configDirectory, dirname(state)]) {
+			const filesystem = statfsSync(directory);
+			const available = context.availableBytes?.(directory) ?? Number(filesystem.bavail) * Number(filesystem.bsize);
+			if (available < required)
+				return { status: "deferred", reason: "Insufficient free space for backup and staged state recovery." };
+		}
 		const destination = stageRelease(candidate, context);
 		if (existsSync(paths.currentCore)) selectLink(paths.recoveryCore, readlinkSync(paths.currentCore));
 		const operationId = randomUUID();
@@ -665,6 +706,7 @@ export async function activateUpdate(record, candidate, context) {
 				const state = installationPaths(record.id, context.root).state;
 				cpSync(state, backup, {
 					recursive: true,
+					verbatimSymlinks: true,
 					filter: (source) => relative(state, source).split("/")[0] !== "control",
 				});
 				chmodSync(backup, 0o700);
@@ -683,7 +725,7 @@ export async function activateUpdate(record, candidate, context) {
 			}
 			const updated = readInstallation(record.id, context.root);
 			await context.run("systemctl", ["daemon-reload"]);
-			await context.run("systemctl", ["start", installationPaths(record.id, context.root).unit]);
+			await startApplication(record, context);
 			await context.ready(updated, operationId);
 			// After this publication no recovery path may restore historical state.
 			saveJournal(record, context, journal, "committed");
@@ -696,7 +738,7 @@ export async function activateUpdate(record, candidate, context) {
 		} catch (error) {
 			if (journal.phase === "committed") throw error;
 			await prepareRecovery(record, journal, context);
-			await context.run("systemctl", ["start", installationPaths(record.id, context.root).unit]);
+			await startApplication(record, context);
 			await finalizeRecovery(record, journal, context);
 			throw error;
 		}
@@ -732,7 +774,7 @@ async function prepareRecovery(record, journal, context) {
 		assertSafePath(previous, context.root);
 		try {
 			rmSync(prepared, { recursive: true, force: true });
-			cpSync(backup, prepared, { recursive: true, preserveTimestamps: true });
+			cpSync(backup, prepared, { recursive: true, preserveTimestamps: true, verbatimSymlinks: true });
 			await context.run("chown", ["--no-dereference", "-R", `${record.account}:${record.account}`, prepared]);
 			syncTree(prepared);
 			syncDirectory(dirname(prepared));
@@ -771,7 +813,7 @@ async function finalizeRecovery(record, journal, context) {
 	}
 	if (journal.liveDeferred) {
 		const current = readInstallation(record.id, context.root);
-		const status = await context.control(current, ["service-status"]);
+		const status = await waitForStatus(current, context);
 		if (status.inhibited) await releaseGate(record, journal, context);
 		else if (status.maintenance?.state === "held")
 			await context.control(current, ["maintenance-release", "--operation-id", journal.operationId]);
@@ -796,11 +838,7 @@ export async function recoverUpdate(record, context, options = { phase: "all" })
 				writeInstallation({ ...readInstallation(record.id, context.root), desiredState: "running" }, context.root);
 			if (phase === "prepare") return { status: "prepared" };
 			if (phase === "all" && readInstallation(record.id, context.root).desiredState === "running")
-				await context.run("systemctl", [
-					options.start === true ? "enable" : "start",
-					...(options.start === true ? ["--now"] : []),
-					installationPaths(record.id, context.root).unit,
-				]);
+				await startApplication(record, context, options.start === true ? "enable" : "start");
 			const result = await finalizeRecovery(record, journal, context);
 			if (options.start === true && result.status === "recovered") await restartUpdateScheduling(record, context);
 			return result;

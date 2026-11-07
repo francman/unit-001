@@ -410,3 +410,115 @@ test("#18 a crash between recovery directory renames can retry from the closed b
 		database.close();
 	}
 });
+
+// #18: A slow old storage owner must not strand boot finalization on its first status probe.
+test("#18 boot finalization retries service status while storage opens", async () => {
+	const fixture = setup("busy");
+	await activateUpdate(fixture.record, fixture.candidate, fixture.context);
+	writeFileSync(
+		updatePaths(id, fixture.root).journal,
+		JSON.stringify({ ...readUpdateJournal(id, fixture.root), phase: "restored", liveDeferred: true }),
+	);
+	await fixture.context.run("systemctl", ["start", fixture.paths.unit]);
+	const control = fixture.context.control;
+	let remaining = 2;
+	fixture.context.control = async (...args) => {
+		if (args[1][0] === "service-status" && remaining-- > 0) throw new Error("storage opening");
+		return control(...args);
+	};
+	assert.equal((await recoverUpdate(fixture.record, fixture.context, { phase: "finalize" })).status, "recovered");
+	assert.ok(remaining < 0);
+});
+
+// #18: Workspace links retain their literal relative target through both backup and recovery.
+test("#18 relative workspace symlinks survive precommit restoration unchanged", async () => {
+	const fixture = setup();
+	mkdirSync(join(fixture.paths.state, "workspace"));
+	symlinkSync("../marker", join(fixture.paths.state, "workspace/link"));
+	fixture.context.fault = (phase) => {
+		if (phase === "candidate") throw new Error("candidate failure");
+	};
+	await assert.rejects(activateUpdate(fixture.record, fixture.candidate, fixture.context), /candidate failure/);
+	assert.equal(readlinkSync(join(fixture.paths.state, "workspace/link")), "../marker");
+	assert.equal(
+		readlinkSync(join(updatePaths(id, fixture.root).configDirectory, "backup/workspace/link")),
+		"../marker",
+	);
+});
+
+// #18: Restore staging can reside on a different filesystem from the protected backup.
+test("#18 low state filesystem space defers even when backup filesystem has room", async () => {
+	const fixture = setup();
+	fixture.context.availableBytes = (path) => (path === dirname(fixture.paths.state) ? 0 : Number.MAX_SAFE_INTEGER);
+	assert.equal((await activateUpdate(fixture.record, fixture.candidate, fixture.context)).status, "deferred");
+	assert.ok(!fixture.calls.some((call) => call[0] === "control" && call[1] === "maintenance-enter"));
+});
+
+// #18: An intentional workspace socket is not silently discarded or discovered after downtime.
+test("#18 special files outside control defer before admission hold or service stop", async () => {
+	const fixture = setup();
+	const short = mkdtempSync("/tmp/unit-special-");
+	roots.push(short);
+	symlinkSync(fixture.paths.state, join(short, "s"));
+	const server = createServer();
+	await new Promise((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(join(short, "s/workspace.sock"), resolve);
+	});
+	try {
+		assert.match((await activateUpdate(fixture.record, fixture.candidate, fixture.context)).reason, /special file/);
+		assert.ok(!fixture.calls.some((call) => call[1] === "maintenance-enter" || call[1] === "stop"));
+	} finally {
+		await new Promise((resolve) => server.close(resolve));
+	}
+});
+
+// #18: Intentional upgrades/recovery do not exhaust the unchanged service crash-loop budget.
+test("#18 update rollback and failed candidate recovery reset intentional start accounting", async () => {
+	const fixture = setup();
+	const run = fixture.context.run;
+	let starts = 5;
+	let resets = 0;
+	fixture.context.run = async (command, args, ...rest) => {
+		if (command === "systemctl" && args[0] === "reset-failed") {
+			starts = 0;
+			resets++;
+		}
+		if (command === "systemctl" && args[0] === "start" && ++starts > 5) throw new Error("start-limit-hit");
+		return run(command, args, ...rest);
+	};
+	await activateUpdate(fixture.record, fixture.candidate, fixture.context);
+	await rollbackUpdate(readInstallation(id, fixture.root), fixture.context);
+	const ready = fixture.context.ready;
+	let fail = true;
+	fixture.context.ready = async (...args) => {
+		if (fail) {
+			fail = false;
+			throw new Error("Injected candidate health failure");
+		}
+		return ready.apply(fixture.context, args);
+	};
+	await assert.rejects(
+		activateUpdate(readInstallation(id, fixture.root), fixture.candidate, fixture.context),
+		/Injected candidate health failure/,
+	);
+	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.2");
+	assert.equal((await fixture.context.control(fixture.record, ["service-status"])).inhibited, false);
+	assert.equal(resets, 4);
+});
+
+// #18: A missing cold unit is safe to load, but other reset failures remain fatal.
+test("#18 updater tolerates only unloaded unit reset failure", async () => {
+	for (const load of ["not-found", "loaded"]) {
+		const fixture = setup();
+		const run = fixture.context.run;
+		fixture.context.run = async (command, args, ...rest) => {
+			if (command === "systemctl" && args[0] === "reset-failed") throw new Error("reset refused");
+			if (command === "systemctl" && args.includes("--property=LoadState")) return load;
+			return run(command, args, ...rest);
+		};
+		if (load === "not-found")
+			assert.equal((await activateUpdate(fixture.record, fixture.candidate, fixture.context)).status, "updated");
+		else await assert.rejects(activateUpdate(fixture.record, fixture.candidate, fixture.context), /reset refused/);
+	}
+});

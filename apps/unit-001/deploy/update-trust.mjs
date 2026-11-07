@@ -227,11 +227,32 @@ class GithubFetcher {
 	}
 	async #release(tag) {
 		if (this.#releases.has(tag)) return this.#releases.get(tag);
-		const response = await this.#request(
-			`https://api.github.com/repos/${this.#repository}/releases/tags/${tag}`,
-			"application/vnd.github+json",
-			30_000,
-		);
+		const deadline = performance.now() + 30_000;
+		const request = async (url) => {
+			const remaining = Math.floor(deadline - performance.now());
+			if (remaining <= 0) throw new Error("GitHub asset inventory timed out.");
+			return this.#json(await this.#request(url, "application/vnd.github+json", remaining));
+		};
+		const release = await request(`https://api.github.com/repos/${this.#repository}/releases/tags/${tag}`);
+		if (!Number.isSafeInteger(release?.id) || release.id < 1) throw new Error("Invalid GitHub release identifier.");
+		const assets = [];
+		// GitHub permits 1,000 assets per release; pagination avoids a lower lifetime limit on this feed.
+		for (let page = 1; page <= 11; page++) {
+			const entries = await request(
+				`https://api.github.com/repos/${this.#repository}/releases/${release.id}/assets?per_page=100&page=${page}`,
+			);
+			if (!Array.isArray(entries) || entries.length > 100 || (page === 11 && entries.length !== 0))
+				throw new Error("Invalid GitHub asset inventory.");
+			assets.push(...entries);
+			if (entries.length < 100) {
+				const inventory = { assets };
+				this.#releases.set(tag, inventory);
+				return inventory;
+			}
+		}
+		throw new Error("GitHub asset inventory exceeds the supported release limit.");
+	}
+	async #json(response) {
 		const reader = response.body.getReader();
 		const chunks = [];
 		let count = 0;
@@ -248,16 +269,11 @@ class GithubFetcher {
 		} finally {
 			await reader.cancel();
 		}
-		let release;
 		try {
-			release = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+			return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 		} catch {
 			throw new Error("Invalid GitHub release response.");
 		}
-		if (!Array.isArray(release.assets) || release.assets.length > 256)
-			throw new Error("Invalid GitHub asset inventory.");
-		this.#releases.set(tag, release);
-		return release;
 	}
 	async #request(url, accept, timeout) {
 		const signal = AbortSignal.timeout(timeout);
