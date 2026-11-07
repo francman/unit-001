@@ -23,6 +23,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { createUpdateContext, installUpdateCore } from "./update-activation.mjs";
 
 /** Validates the stable UUID namespace used by every installation-owned resource. */
 export function validateId(id) {
@@ -107,7 +108,7 @@ export function assertSafePath(path, root = "/") {
 	}
 }
 
-function trustedParents(path, root) {
+export function trustedParents(path, root) {
 	const owner = resolve(root || "/") === "/" ? 0 : process.getuid();
 	let directory = dirname(path);
 	const filesystem = resolve(root || "/");
@@ -119,7 +120,7 @@ function trustedParents(path, root) {
 	}
 }
 
-function trustedFile(path, root) {
+export function trustedFile(path, root) {
 	assertSafePath(path, root);
 	const info = lstatSync(path);
 	const owner = resolve(root || "/") === "/" ? 0 : process.getuid();
@@ -161,6 +162,12 @@ function atomicFile(path, contents, mode, root) {
 	}
 	try {
 		renameSync(temporary, path);
+		const directory = openSync(dirname(path), "r");
+		try {
+			fsyncSync(directory);
+		} finally {
+			closeSync(directory);
+		}
 	} finally {
 		rmSync(temporary, { force: true });
 	}
@@ -507,6 +514,7 @@ async function installRelease(source, root, name, dryRun) {
 		if (!existsSync(paths.environment))
 			atomicFile(paths.environment, "# Optional provider keys and UNIT_001_MODEL.\n", 0o600, root);
 		const plan = mkdtempSync(join(tmpdir(), "unit-001-install-"));
+		installUpdateCore(record, destination, createUpdateContext(root));
 		try {
 			writeFileSync(join(plan, "record.json"), `${JSON.stringify(record, null, "\t")}\n`);
 			writeFileSync(join(plan, "command"), commandContents(record));

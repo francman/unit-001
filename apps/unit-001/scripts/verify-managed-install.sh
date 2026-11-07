@@ -179,6 +179,12 @@ printf 'retained\n' > "$work/marker.fixture"
 install -o "$first_account" -g "$first_account" -m 600 "$work/marker.fixture" "/var/lib/unit-001/agents/$first/workspace/ci-marker"
 cp "/var/lib/unit-001/agents/$first/auth.json" "$work/auth.before"
 cp "/etc/unit-001/agents/$first/environment" "$work/environment.before"
+if [[ ${UNIT_001_DISPOSABLE_CONTAINER:-} != 1 && -f $release/updater/lib/update.mjs ]]; then
+  "$node" "$(dirname -- "${BASH_SOURCE[0]}")/verify-managed-updates.mjs" "$release" "$first"
+  cmp "$work/auth.before" "/var/lib/unit-001/agents/$first/auth.json"
+  cmp "$work/environment.before" "/etc/unit-001/agents/$first/environment"
+  grep -qx retained "/var/lib/unit-001/agents/$first/workspace/ci-marker"
+fi
 /usr/local/bin/unit-ci-renamed uninstall --yes
 "$node" "$work/check.mjs" intent "$first" uninstalled
 [[ ! -e /usr/local/bin/unit-ci-renamed && ! -e /opt/unit-001/agents/$first && ! -e /usr/lib/unit-001/agents/$first && ! -e /etc/systemd/system/unit-001@$first.service ]] || fail 'Uninstall left owned software.'

@@ -36,7 +36,7 @@ jobs:
         run: node apps/unit-001/scripts/build-release.mjs --out .artifacts/unit-001-release
 
       - name: Test release tooling
-        run: node --test apps/unit-001/test/release.test.mjs apps/unit-001/test/management.test.mjs apps/unit-001/test/activation.test.mjs
+        run: node --test apps/unit-001/test/*.test.mjs
 
       - name: Smoke test outside the checkout
         shell: bash

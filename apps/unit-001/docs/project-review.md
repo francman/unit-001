@@ -2,6 +2,8 @@
 
 Reviewed 7 November 2026 by Codex and Claude Code against `a147caae7` (PR #24), with the operator guidance and activity corrections accompanying this review.
 
+Update foundation now takes priority over the mission sequence below. The operator requires a dependable path to deploy and recover changes before autonomous execution. The authenticated updater implementation and its operational prerequisites are documented in [continuous updates](updates.md); the findings below describe the earlier reviewed commit.
+
 ## One-minute assessment
 
 The project has a credible durable coding-service foundation: named installations, restart recovery, private owner controls, and a usable rich terminal. It is ready for continued engineering and a controlled **submitted-work** VPS pilot after real authentication and managed-terminal checks. It is **not yet an autonomous mission agent**. Mission and memory documents exist, but neither execution loop nor memory behavior is connected to production.

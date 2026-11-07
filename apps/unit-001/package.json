@@ -1,6 +1,6 @@
 {
 	"name": "unit-001",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"description": "unit-001: a durable agent built on Pi Durable",
 	"private": true,
 	"type": "module",
@@ -41,7 +41,9 @@
 		"@earendil-works/chord": "1.4.0",
 		"@earendil-works/pi-ai": "1.4.0",
 		"@earendil-works/pi-durable": "1.4.0",
-		"@earendil-works/pi-tui": "1.4.0"
+		"@earendil-works/pi-tui": "1.4.0",
+		"@tufjs/models": "4.1.1",
+		"tuf-js": "5.0.1"
 	},
 	"devDependencies": {
 		"shx": "0.3.4",

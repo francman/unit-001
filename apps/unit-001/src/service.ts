@@ -5,6 +5,12 @@ import { dirname, join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
 import { ConfigurationError, UsageError } from "./errors.ts";
+import {
+	authorizeManagedMaintenance,
+	type MaintenanceResult,
+	type MaintenanceState,
+	validateOperationId,
+} from "./maintenance.ts";
 import { validateSessionName } from "./paths.ts";
 import { parseServiceEvent, type ServiceView, serviceView } from "./service-view.ts";
 
@@ -14,7 +20,12 @@ export type ServiceRequest =
 	| { readonly type: "send"; readonly prompt: string; readonly requestId?: string }
 	| { readonly type: "status" | "cancel" };
 
+export type MaintenanceRequest =
+	| { readonly type: "maintenance-enter"; readonly operationId: string; readonly timeoutMs: number }
+	| { readonly type: "maintenance-release"; readonly operationId: string };
+
 export type ServiceResponse =
+	| MaintenanceResult
 	| { readonly type: "reply"; readonly reply: Reply }
 	| {
 			readonly type: "status";
@@ -23,6 +34,8 @@ export type ServiceResponse =
 			readonly name: string;
 			readonly installationId: string | null;
 			readonly busy: boolean;
+			readonly inhibited: boolean;
+			readonly maintenance: MaintenanceState;
 	  }
 	| { readonly type: "cancelled" }
 	| { readonly type: "error"; readonly message: string };
@@ -214,7 +227,11 @@ export function watchService(path: string, listener: (view: ServiceView) => void
 }
 
 /** Sends one bounded local request; only the service owner accesses SQLite. */
-export function requestService(path: string, request: ServiceRequest, signal: AbortSignal): Promise<ServiceResponse> {
+export function requestService(
+	path: string,
+	request: ServiceRequest | MaintenanceRequest,
+	signal: AbortSignal,
+): Promise<ServiceResponse> {
 	const wire = `${JSON.stringify(request)}\n`;
 	if (Buffer.byteLength(wire) > MAX_REQUEST_BYTES) throw new UsageError("Service request exceeds 64 KiB.");
 	signal.throwIfAborted();
@@ -282,6 +299,21 @@ async function handleRequest(
 		await agent.abort(BACKGROUND_CONTEXT);
 		return { type: "cancelled" };
 	}
+	if (value.type === "maintenance-enter" || value.type === "maintenance-release") {
+		const operationId = "operationId" in value ? value.operationId : undefined;
+		validateOperationId(operationId);
+		if (installationId !== null)
+			await authorizeManagedMaintenance(
+				installationId,
+				version,
+				operationId,
+				value.type === "maintenance-release" ? "release" : "enter",
+			);
+		if (value.type === "maintenance-release") return agent.releaseMaintenance(operationId, BACKGROUND_CONTEXT);
+		if (!("timeoutMs" in value) || typeof value.timeoutMs !== "number")
+			throw new UsageError("Invalid maintenance timeout.");
+		return agent.enterMaintenance(operationId, value.timeoutMs, BACKGROUND_CONTEXT);
+	}
 	if (value.type !== "send" || !("prompt" in value) || typeof value.prompt !== "string" || value.prompt.trim() === "")
 		throw new UsageError("Invalid service prompt.");
 	const requestId = "requestId" in value ? value.requestId : undefined;
@@ -307,6 +339,29 @@ function parseResponse(wire: string): ServiceResponse {
 	const value: unknown = JSON.parse(wire);
 	// A failed or different local service must not be mistaken for a valid reply.
 	if (typeof value === "object" && value !== null && "type" in value) {
+		if (
+			value.type === "maintenance" &&
+			"protocol" in value &&
+			value.protocol === 1 &&
+			"state" in value &&
+			"operationId" in value
+		) {
+			if (value.state === "open" && value.operationId === null)
+				return { type: "maintenance", protocol: 1, state: "open", operationId: null };
+			if (
+				value.state === "held" &&
+				typeof value.operationId === "string" &&
+				"result" in value &&
+				(value.result === "drained" || value.result === "deferred")
+			)
+				return {
+					type: "maintenance",
+					protocol: 1,
+					state: "held",
+					operationId: value.operationId,
+					result: value.result,
+				};
+		}
 		if (value.type === "cancelled") return { type: "cancelled" };
 		if (
 			value.type === "status" &&
@@ -319,7 +374,18 @@ function parseResponse(wire: string): ServiceResponse {
 			"installationId" in value &&
 			(value.installationId === null || typeof value.installationId === "string") &&
 			"busy" in value &&
-			typeof value.busy === "boolean"
+			typeof value.busy === "boolean" &&
+			"inhibited" in value &&
+			typeof value.inhibited === "boolean" &&
+			"maintenance" in value &&
+			typeof value.maintenance === "object" &&
+			value.maintenance !== null &&
+			"protocol" in value.maintenance &&
+			value.maintenance.protocol === 1 &&
+			"state" in value.maintenance &&
+			"operationId" in value.maintenance &&
+			((value.maintenance.state === "open" && value.maintenance.operationId === null) ||
+				(value.maintenance.state === "held" && typeof value.maintenance.operationId === "string"))
 		)
 			return {
 				type: "status",
@@ -328,6 +394,11 @@ function parseResponse(wire: string): ServiceResponse {
 				name: value.name,
 				installationId: value.installationId,
 				busy: value.busy,
+				inhibited: value.inhibited,
+				maintenance:
+					value.maintenance.state === "open"
+						? { protocol: 1, state: "open", operationId: null }
+						: { protocol: 1, state: "held", operationId: String(value.maintenance.operationId) },
 			};
 		if (value.type === "error" && "message" in value && typeof value.message === "string")
 			return { type: "error", message: value.message };

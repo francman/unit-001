@@ -37,6 +37,8 @@ sudo -n agent stop --yes        # no action or sudo prompt; fails if unauthorize
 
 `kill` immediately terminates the owned service and its tools. `uninstall` removes the installation's software while preserving its data and account. Both ask for confirmation and accept `--yes`. Stopped agents remain stopped until an explicit `start`; confirmation never silently succeeds without a terminal. See [operations](docs/operations.md) for rename, removal, and recovery.
 
+Continuous updates use a separate privileged updater with signed releases, bounded work draining and interrupted-activation recovery. Updates start disabled; trust and publication credentials must be configured before enabling them. Read the [one-minute update overview](docs/updates.md). This deployment foundation precedes autonomous mission execution.
+
 `attach` opens a full-screen terminal with Markdown conversation, live tool status, model/usage metadata, and a multiline composer. Enter sends; Ctrl+J inserts a newline. `/exit` or an SSH disconnect leaves work running; `/cancel` cancels shared work. Use `attach --plain` for basic terminals and `send` for pipes. Foreground chat remains separate. See [terminal behavior and comparison](docs/terminal.md) for controls, bounded history, cost estimates, and remaining gaps.
 
 ## Subscriptions

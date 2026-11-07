@@ -12,6 +12,14 @@ import {
 	writeAgentCommand,
 	writeInstallation,
 } from "./installation.mjs";
+import {
+	assertUpdateCoreOwned,
+	assertUpdateSchedulingOwned,
+	readUpdateJournal,
+	removeUpdateCore,
+	removeUpdateScheduling,
+	restartUpdateScheduling,
+} from "./update-activation.mjs";
 
 /** Changes only the selected installation's known units, wrapper and root-owned software. */
 export async function lifecycle(record, action, context, newName) {
@@ -22,6 +30,11 @@ export async function lifecycle(record, action, context, newName) {
 		throw new Error("This installation is uninstalled; install it again first.");
 	const systemctl = (...args) => run("systemctl", args);
 	if (action === "start") {
+		const journal = readUpdateJournal(record.id, root);
+		if (journal && journal.phase !== "complete")
+			throw new Error(
+				`Run sudo ${record.name} update recover --start to recover the pending update and explicitly start this agent.`,
+			);
 		await writeInstallation({ ...record, desiredState: "running" }, root);
 		try {
 			const state = await run("systemctl", ["show", "--property=ActiveState", "--value", unit], true);
@@ -29,6 +42,7 @@ export async function lifecycle(record, action, context, newName) {
 			if (state.trim() === "failed") await systemctl("reset-failed", unit);
 			await systemctl("enable", "--now", unit);
 			await context.ready(record);
+			await restartUpdateScheduling(record, context);
 		} catch (error) {
 			await writeInstallation({ ...record, desiredState: "stopped" }, root);
 			await systemctl("disable", "--now", unit);
@@ -101,7 +115,7 @@ export async function lifecycle(record, action, context, newName) {
 						.replaceAll("@ACCOUNT@", record.account);
 		if (text !== template) throw new Error("Refusing to remove an unowned service unit.");
 	}
-	const helpers = ["agent-command.mjs", "lifecycle.mjs", "installation.mjs"];
+	const helpers = ["agent-command.mjs", "lifecycle.mjs", "installation.mjs", "update-activation.mjs"];
 	for (const file of helpers) {
 		const target = join(paths.management, file);
 		assertSafePath(target, root);
@@ -113,11 +127,16 @@ export async function lifecycle(record, action, context, newName) {
 			throw new Error(`Preserving unexpected management helper: ${target}`);
 	}
 	// Complete ownership checks before removing any path used to retry this command.
+	assertUpdateCoreOwned(record, root);
+	assertUpdateSchedulingOwned(record, root);
 	await removeOwnedAgentCommand(record, root);
 	if (link !== undefined) await rm(paths.current);
 	if (text !== undefined) await rm(paths.unitFile);
 	await systemctl("daemon-reload");
 	for (const file of helpers) await rm(join(paths.management, file), { force: true });
+	removeUpdateCore(record, root);
+	removeUpdateScheduling(record, root);
+	await systemctl("daemon-reload");
 	for (const directory of [paths.management, paths.agentRoot]) {
 		const entries = await readdir(directory).catch((error) => {
 			if (error.code !== "ENOENT") throw error;

@@ -37,6 +37,7 @@ async function release(version: string) {
 	};
 	for (const name of [
 		"installation.mjs",
+		"update-activation.mjs",
 		"agent-command.mjs",
 		"lifecycle.mjs",
 		"activate.sh",

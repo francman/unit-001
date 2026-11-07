@@ -11,9 +11,11 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
@@ -137,7 +139,8 @@ function installDependencies(app, sourceManifest) {
 	const packages = packDependencies(app);
 	const specifiers = Object.fromEntries(packages.map(({ manifest, file }) => [manifest.name, `file:${file}`]));
 	for (const name of Object.keys(sourceManifest.dependencies)) {
-		if (specifiers[name] === undefined) throw new Error(`Release packaging has no checkout artifact for ${name}`);
+		if (name.startsWith("@earendil-works/") && specifiers[name] === undefined)
+			throw new Error(`Release packaging has no checkout artifact for ${name}`);
 	}
 	const manifest = {
 		name: sourceManifest.name,
@@ -146,7 +149,7 @@ function installDependencies(app, sourceManifest) {
 		type: "module",
 		engines: sourceManifest.engines,
 		dependencies: Object.fromEntries(
-			Object.keys(sourceManifest.dependencies).map((name) => [name, specifiers[name]]),
+			Object.entries(sourceManifest.dependencies).map(([name, version]) => [name, specifiers[name] ?? version]),
 		),
 		overrides: specifiers,
 	};
@@ -206,8 +209,9 @@ export function writeReleaseLauncher(stage) {
 }
 
 /** Builds the archive without publishing, installing a service, or changing upstream sources. */
-export function buildRelease(out) {
+export function buildRelease(out, options = {}) {
 	const sourceManifest = JSON.parse(readFileSync(join(repository, "apps/unit-001/package.json"), "utf8"));
+	if (options.version !== undefined) sourceManifest.version = options.version;
 	if (!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(sourceManifest.version)) throw new Error("Invalid release version");
 	const output = resolve(out);
 	const releaseName = `unit-001-${sourceManifest.version}-linux-x64`;
@@ -230,6 +234,7 @@ export function buildRelease(out) {
 		const dependencies = installDependencies(app, sourceManifest);
 		copyNodeRuntime(stage, scratch);
 		cpSync(join(repository, "apps/unit-001/deploy"), join(stage, "deploy"), { recursive: true });
+		writeUpdaterCore(stage);
 		mkdirSync(join(stage, "docs"));
 		for (const name of [
 			"deployment.md",
@@ -239,6 +244,7 @@ export function buildRelease(out) {
 			"terminal-design.md",
 			"terminal-assessment-omp.md",
 			"terminal-assessment-others.md",
+			"updates.md",
 		]) {
 			cpSync(join(repository, "apps/unit-001/docs", name), join(stage, "docs", name));
 		}
@@ -253,7 +259,7 @@ export function buildRelease(out) {
 		const modelManifest = readFileSync(join(repository, "packages/ai/src/providers/data/.manifest.json"));
 		writeFileSync(
 			join(stage, "release.json"),
-			`${JSON.stringify({ version: sourceManifest.version, platform: "linux-x64", node: NODE_RELEASE, source: { commit: source, dirty }, modelDataManifestSha256: createHash("sha256").update(modelManifest).digest("hex"), dependencies }, null, "\t")}\n`,
+			`${JSON.stringify({ version: sourceManifest.version, platform: "linux-x64", node: NODE_RELEASE, source: { commit: source, dirty }, compatibility: JSON.parse(readFileSync(join(stage, "deploy/release-compatibility.json"), "utf8")), modelDataManifestSha256: createHash("sha256").update(modelManifest).digest("hex"), dependencies }, null, "\t")}\n`,
 		);
 		writeReleaseChecksums(stage);
 		execFileSync(process.execPath, [join(app, "dist/bin.js"), "--help"], { cwd: scratch, stdio: "inherit" });
@@ -272,16 +278,50 @@ export function buildRelease(out) {
 	}
 }
 
+/** Builds an independent management runtime so a broken application cannot disable its updater. */
+export function writeUpdaterCore(stage) {
+	const updater = join(stage, "updater");
+	mkdirSync(join(updater, "node_modules"), { recursive: true });
+	cpSync(join(stage, "runtime"), join(updater, "runtime"), { recursive: true });
+	cpSync(join(stage, "deploy"), join(updater, "lib"), { recursive: true });
+	writeFileSync(join(updater, "package.json"), '{"private":true,"type":"module"}\n');
+	const appModules = realpathSync(join(stage, "app/node_modules"));
+	const copied = new Set();
+	const copyDependency = (name, from) => {
+		const require = createRequire(join(from, "package.json"));
+		let directory = dirname(require.resolve(name));
+		while (
+			!existsSync(join(directory, "package.json")) ||
+			JSON.parse(readFileSync(join(directory, "package.json"), "utf8")).name !== name
+		) {
+			const parent = dirname(directory);
+			if (parent === directory) throw new Error(`Cannot locate updater dependency ${name}`);
+			directory = parent;
+		}
+		if (!directory.startsWith(`${appModules}/`))
+			throw new Error(`Updater dependency escapes packaged application: ${name}`);
+		if (copied.has(directory)) return;
+		copied.add(directory);
+		const destination = join(updater, "node_modules", directory.slice(appModules.length + 1));
+		mkdirSync(dirname(destination), { recursive: true });
+		cpSync(directory, destination, { recursive: true });
+		const manifest = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
+		for (const dependency of Object.keys(manifest.dependencies ?? {})) copyDependency(dependency, directory);
+	};
+	for (const dependency of ["tuf-js", "@tufjs/models"]) copyDependency(dependency, join(stage, "app"));
+}
+
 if (process.argv[1] !== undefined && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
 	const { values } = parseArgs({
 		options: {
 			out: { type: "string", default: join(repository, ".artifacts/unit-001-release") },
+			version: { type: "string" },
 			help: { type: "boolean", default: false },
 		},
 	});
 	if (values.help)
 		console.log(
-			"Usage: node apps/unit-001/scripts/build-release.mjs [--out <directory>]\nBuild prerequisites: Node/npm, curl, tar, installed checkout dependencies, and network access.\nHydrates Pi model data, builds app and Pi dependencies, then emits a Linux x64 archive with Node and a locked production install.",
+			"Usage: node apps/unit-001/scripts/build-release.mjs [--out <directory>] [--version <fixture-version>]\nBuild prerequisites: Node/npm, curl, tar, installed checkout dependencies, and network access.\nHydrates Pi model data, builds app and Pi dependencies, then emits a Linux x64 archive with Node and a locked production install. Production publication requires the source manifest version.",
 		);
-	else buildRelease(values.out);
+	else buildRelease(values.out, { version: values.version });
 }

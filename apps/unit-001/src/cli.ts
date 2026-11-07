@@ -15,7 +15,13 @@ import { describeStatus, runLogin, runLogout, subscriptionFor } from "./login.ts
 import { credentialsFile, dataDirectory, sessionFile } from "./paths.ts";
 import { createConfiguredModels, createModelsFor } from "./provider.ts";
 import { runPrint, runRepl, type Terminal } from "./repl.ts";
-import { requestService, runService, type ServiceRequest, serviceEndpoint } from "./service.ts";
+import {
+	type MaintenanceRequest,
+	requestService,
+	runService,
+	type ServiceRequest,
+	serviceEndpoint,
+} from "./service.ts";
 import { runRichAttach } from "./terminal-ui.ts";
 
 /** What the CLI reads from its process, so tests can run it against fakes. */
@@ -153,6 +159,7 @@ async function run(
 				model: choice,
 				cwd: runtime.cwd,
 				platform: runtime.platform,
+				startup: { kind: options.inhibited ? "inhibited" : "active" },
 				onReport: (report) => terminal.err(describeReport(report)),
 			},
 			BACKGROUND_CONTEXT,
@@ -177,7 +184,10 @@ async function run(
 }
 
 async function control(
-	command: Extract<Command, { kind: "send" | "service-status" | "cancel" | "attach" }>,
+	command: Extract<
+		Command,
+		{ kind: "send" | "service-status" | "cancel" | "attach" | "maintenance-enter" | "maintenance-release" }
+	>,
 	runtime: Runtime,
 	signal: AbortSignal,
 ): Promise<number> {
@@ -199,14 +209,18 @@ async function control(
 			colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
 		});
 	}
-	const request: ServiceRequest =
-		command.kind === "send"
-			? {
-					type: "send",
-					prompt: command.prompt,
-					...(command.requestId === undefined ? {} : { requestId: command.requestId }),
-				}
-			: { type: command.kind === "cancel" ? "cancel" : "status" };
+	const request: ServiceRequest | MaintenanceRequest =
+		command.kind === "maintenance-enter"
+			? { type: command.kind, operationId: command.operationId, timeoutMs: command.timeoutMs }
+			: command.kind === "maintenance-release"
+				? { type: command.kind, operationId: command.operationId }
+				: command.kind === "send"
+					? {
+							type: "send",
+							prompt: command.prompt,
+							...(command.requestId === undefined ? {} : { requestId: command.requestId }),
+						}
+					: { type: command.kind === "cancel" ? "cancel" : "status" };
 	const response = await requestService(endpoint, request, signal);
 	if (response.type === "error") {
 		runtime.stderr.write(`${response.message}\n`);
@@ -256,7 +270,9 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 			command.kind === "send" ||
 			command.kind === "service-status" ||
 			command.kind === "cancel" ||
-			command.kind === "attach"
+			command.kind === "attach" ||
+			command.kind === "maintenance-enter" ||
+			command.kind === "maintenance-release"
 		)
 			code = await control(command, runtime, signal);
 		else code = await account(command, runtime, signal);

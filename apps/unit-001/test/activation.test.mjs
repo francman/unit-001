@@ -46,7 +46,7 @@ case "$1" in
 esac
 `,
 			};
-			for (const module of ["installation.mjs", "agent-command.mjs", "lifecycle.mjs"])
+			for (const module of ["installation.mjs", "agent-command.mjs", "lifecycle.mjs", "update-activation.mjs"])
 				files[join(release, "deploy", module)] = `new ${module}`;
 			for (const [path, text] of Object.entries(files)) {
 				await mkdir(dirname(path), { recursive: true });
