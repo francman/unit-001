@@ -23,7 +23,7 @@
 		"typecheck": "tsc -p tsconfig.json",
 		"release:build": "node scripts/build-release.mjs",
 		"test:release": "node --test test/release.test.mjs",
-		"test:management": "node --test test/management.test.mjs",
+		"test:management": "node --test test/management.test.mjs test/activation.test.mjs",
 		"bench": "tsc -p bench/tsconfig.json && node --conditions=source --experimental-strip-types bench/checkpoint-commit.bench.ts && node --conditions=source --experimental-strip-types bench/request-preparation.bench.ts",
 		"test": "vitest --run",
 		"start": "node dist/bin.js"

@@ -85,6 +85,10 @@ Uninstall disables the selected agent and any installed update/recovery scheduli
 
 Administrative operations share a process-released management lock. They use recorded installation ownership, never guessed PIDs, broad `pkill`, or deletion of the source checkout.
 
+A failed first installation retains a stopped record so retrying the verified installer with the same `--name` reuses its UUID, account, and state. The command may be unavailable until activation succeeds; preserve the record and retry installation.
+
+The management lock now lives under protected `/run/unit-001`. Older releases use a different lock path. Complete upgrades of all named installations before running their administrative commands concurrently; an old helper cannot coordinate with the new lock.
+
 Before upgrading, stop the agent and back up its state directory while SQLite is closed. Verify and install the bundle under the same name, preserving identity. Keep a compatible previous release and state backup until verified. A running-service upgrade checks expected identity, version, and systemd PID within 30 seconds; failed readiness stops the candidate before restoring the previous release.
 
 Rollback requires code that understands the stored documents and task checkpoints. Otherwise restore a matching closed-state backup. Never copy live SQLite without a SQLite-aware backup method or run two owners against one session.

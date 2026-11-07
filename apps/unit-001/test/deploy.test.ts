@@ -140,6 +140,38 @@ describe.skipIf(process.platform === "win32")("named Linux installation", () => 
 		expect(install(second, ["--root", root, "--name", "bob"]).status).toBe(0);
 	});
 
+	it("retains the first installation reservation after activation rollback and reuses its state on retry", async () => {
+		// #23: a failed first activation must not orphan an account/state identity and allocate another on retry.
+		const root = join(temporary, "image");
+		const directory = await release("0.0.1");
+		const commands = join(temporary, "commands");
+		const marker = join(temporary, "activation-failed");
+		await mkdir(commands);
+		await writeFile(
+			join(commands, "ln"),
+			'#!/bin/sh\nif [ ! -f "$UNIT_FIRST_FAILURE" ]; then : > "$UNIT_FIRST_FAILURE"; exit 42; fi\nexec /bin/ln "$@"\n',
+		);
+		await chmod(join(commands, "ln"), 0o755);
+		const env = { ...process.env, PATH: `${commands}:${process.env.PATH}`, UNIT_FIRST_FAILURE: marker };
+		const failed = install(directory, ["--root", root, "--name", "bob"], env);
+		expect(failed.status, failed.stderr).toBe(1);
+		expect(failed.stderr).toContain("activation failed");
+		const reserved = (await records(root))[0];
+		expect(reserved.name).toBe("bob");
+		expect(reserved.desiredState).toBe("stopped");
+		await expect(stat(join(root, "usr/local/bin/bob"))).rejects.toMatchObject({ code: "ENOENT" });
+		const state = join(root, "var/lib/unit-001/agents", reserved.id);
+		await writeFile(join(state, "auth.json"), "retained credentials");
+		await writeFile(join(state, "workspace/file.txt"), "retained work");
+		const retried = install(directory, ["--root", root, "--name", "bob"], env);
+		expect(retried.status, retried.stderr).toBe(0);
+		expect(await records(root)).toEqual([reserved]);
+		expect(await readdir(join(root, "var/lib/unit-001/agents"))).toEqual([reserved.id]);
+		expect(await readFile(join(state, "auth.json"), "utf8")).toBe("retained credentials");
+		expect(await readFile(join(state, "workspace/file.txt"), "utf8")).toBe("retained work");
+		expect(await readFile(join(root, "usr/local/bin/bob"), "utf8")).toContain(reserved.id);
+	});
+
 	it.each(["../bob", "Bob", "--bob", "a b", "bob;sh", "x".repeat(33)])(
 		"rejects invalid name %s without creating an image",
 		async (name) => {

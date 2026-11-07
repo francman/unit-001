@@ -96,6 +96,9 @@ atomic_link "../../releases/$version" "$prefix/current"
 if [[ "$service_action" == manage ]]; then
   systemctl daemon-reload
   if [[ "$desired_state" == running ]]; then
+    # Failed units retain start limits; inactive units can disappear before reset-failed.
+    active_state=$(systemctl show --property=ActiveState --value "$unit_name")
+    if [[ "$active_state" == failed ]]; then systemctl reset-failed "$unit_name"; fi
     systemctl enable "$unit_name"
     candidate_started=true
     systemctl start "$unit_name"

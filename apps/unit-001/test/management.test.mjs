@@ -2,13 +2,19 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, test } from "node:test";
 import { configuredEnvironment, confirmAction, dispatchAgent } from "../deploy/agent-command.mjs";
-import { installationPaths, readInstallation, writeAgentCommand, writeInstallation } from "../deploy/installation.mjs";
+import {
+	installationPaths,
+	readInstallation,
+	withManagementLock,
+	writeAgentCommand,
+	writeInstallation,
+} from "../deploy/installation.mjs";
 import { lifecycle, recoverRename } from "../deploy/lifecycle.mjs";
 
 const roots = [];
@@ -58,6 +64,45 @@ async function setup() {
 	};
 	return { root, record, paths, calls, context };
 }
+
+test("#23 management lock uses a protected directory instead of an attacker-precreated /run/lock file", async () => {
+	const { root, paths } = await setup();
+	await mkdir(join(root, "run/lock"), { recursive: true, mode: 0o1777 });
+	await chmod(join(root, "run/lock"), 0o1777);
+	const old = join(root, "run/lock/unit-001-management.lock");
+	await writeFile(old, "untrusted blocker", { mode: 0o666 });
+	await withManagementLock(async () => {
+		assert.equal(paths.lock, join(root, "run/unit-001/management.lock"));
+		const directory = await stat(join(root, "run/unit-001"));
+		assert.equal(directory.mode & 0o022, 0);
+		assert.equal(directory.uid, process.getuid());
+		await assert.rejects(
+			withManagementLock(async () => assert.fail("Contender acquired the lock"), root),
+			/Another install, update, or lifecycle operation is running/,
+		);
+	}, root);
+	await withManagementLock(async () => {}, root);
+	assert.equal(await readFile(old, "utf8"), "untrusted blocker");
+});
+
+test("#23 management locking rejects writable or symlinked directories before creating a lock", async () => {
+	for (const unsafe of ["writable", "symlink"]) {
+		const { root } = await setup();
+		await mkdir(join(root, "run"));
+		const outside = join(root, "outside");
+		await mkdir(outside);
+		if (unsafe === "symlink") await symlink(outside, join(root, "run/unit-001"));
+		else {
+			await mkdir(join(root, "run/unit-001"));
+			await chmod(join(root, "run/unit-001"), 0o777);
+		}
+		await assert.rejects(
+			withManagementLock(async () => assert.fail("Unsafe lock acquired"), root),
+			/Unsafe installation path|Untrusted installation directory/,
+		);
+		await assert.rejects(stat(join(outside, "management.lock")), { code: "ENOENT" });
+	}
+});
 
 test("#19 root app commands drop privileges and bind identity before opening data", async () => {
 	const { context, calls } = await setup();

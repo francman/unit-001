@@ -65,7 +65,7 @@ export function installationPaths(id, root = "/") {
 		updaterService: `unit-001-update@${id}.service`,
 		updaterTimer: `unit-001-update@${id}.timer`,
 		updaterRecovery: `unit-001-update-recover@${id}.service`,
-		lock: join(filesystem, "run/lock/unit-001-management.lock"),
+		lock: join(filesystem, "run/unit-001/management.lock"),
 		wrapper: (name) => join(filesystem, "usr/local/bin", validateName(name)),
 	};
 }
@@ -254,9 +254,13 @@ export function removeOwnedAgentCommand(record, root = "/") {
 
 /** Serializes install/update/lifecycle operations with a kernel-released lock outside removable installations. */
 export async function withManagementLock(callback, root = "/") {
-	const path = join(resolve(root || "/"), "run/lock/unit-001-management.lock");
+	const path = join(resolve(root || "/"), "run/unit-001/management.lock");
 	assertSafePath(path, root);
-	mkdirSync(dirname(path), { recursive: true, mode: 0o755 });
+	// /run/lock is world-writable on Ubuntu; only the administrator may create this directory or lock.
+	mkdirSync(dirname(dirname(path)), { recursive: true, mode: 0o755 });
+	trustedParents(dirname(path), root);
+	mkdirSync(dirname(path), { mode: 0o700, recursive: true });
+	trustedParents(path, root);
 	const fd = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
 	const lock = fstatSync(fd);
 	if (
@@ -269,7 +273,12 @@ export async function withManagementLock(callback, root = "/") {
 	}
 	if (process.platform === "linux") {
 		try {
-			execFileSync("flock", ["--exclusive", "--nonblock", "3"], { stdio: ["ignore", "pipe", "pipe", fd] });
+			try {
+				execFileSync("flock", ["--exclusive", "--nonblock", "3"], { stdio: ["ignore", "pipe", "pipe", fd] });
+			} catch (error) {
+				if (error.status === 1) throw new Error("Another install, update, or lifecycle operation is running.");
+				throw error;
+			}
 			return await callback(fd);
 		} finally {
 			closeSync(fd);
@@ -393,7 +402,7 @@ async function installRelease(source, root, name, dryRun) {
 		"usr/lib/unit-001/agents",
 		"usr/local/bin",
 		"etc/systemd/system",
-		"run/lock",
+		"run/unit-001",
 	];
 	const targetDirectories = [
 		...directories.map((path) => join(root, path)),
@@ -462,6 +471,8 @@ async function installRelease(source, root, name, dryRun) {
 				rmSync(staged, { recursive: true, force: true });
 			}
 		}
+		// Reserve identity before creating an account or private state. Activation rollback keeps this stopped record.
+		if (latest === undefined) writeInstallation(record, root);
 		if (root === "/") {
 			if (!account)
 				execFileSync(
