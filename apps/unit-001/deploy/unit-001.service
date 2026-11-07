@@ -1,0 +1,31 @@
+# Runs the headless agent under its dedicated account with persistent local state.
+[Unit]
+Description=unit-001 durable agent @ID@
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@ACCOUNT@
+Group=@ACCOUNT@
+WorkingDirectory=/var/lib/unit-001/agents/@ID@/workspace
+Environment=HOME=/var/lib/unit-001/agents/@ID@
+EnvironmentFile=-/etc/unit-001/agents/@ID@/environment
+ExecStart=/opt/unit-001/agents/@ID@/current/runtime/bin/node /usr/lib/unit-001/agents/@ID@/agent-command.mjs @ID@ --service
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/unit-001/agents/@ID@
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

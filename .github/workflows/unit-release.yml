@@ -1,0 +1,83 @@
+name: Unit release bundle
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/unit-001/**"
+      - ".github/workflows/unit-release.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install build dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build release bundle
+        run: node apps/unit-001/scripts/build-release.mjs --out .artifacts/unit-001-release
+
+      - name: Test release tooling
+        run: node --test apps/unit-001/test/release.test.mjs apps/unit-001/test/management.test.mjs
+
+      - name: Smoke test outside the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .artifacts/unit-001-release
+          sha256sum --check *.sha256
+          archives=(unit-001-*-linux-x64.tar.gz)
+          test "${#archives[@]}" -eq 1
+          mkdir "$RUNNER_TEMP/unit-release-smoke"
+          tar -xzf "${archives[0]}" -C "$RUNNER_TEMP/unit-release-smoke"
+          cd "$RUNNER_TEMP/unit-release-smoke"
+          bundles=(unit-001-*-linux-x64)
+          cd "${bundles[0]}"
+          ./runtime/bin/node --version
+          ./bin/agent --help
+          ./bin/agent --version
+          test ! -e ./bin/u1
+          UNIT_001_HOME="$RUNNER_TEMP/unit-release-state" ./bin/agent status
+          ./install.sh --dry-run
+          ./install.sh --root "$RUNNER_TEMP/unit-release-image"
+          ./install.sh --root "$RUNNER_TEMP/unit-release-image" --name bob
+          test -f "$RUNNER_TEMP/unit-release-image/usr/local/bin/agent"
+          test -f "$RUNNER_TEMP/unit-release-image/usr/local/bin/bob"
+          test ! -e "$RUNNER_TEMP/unit-release-image/usr/local/bin/u1"
+          records=("$RUNNER_TEMP/unit-release-image/etc/unit-001/agents/"*/installation.json)
+          test "${#records[@]}" -eq 2
+
+      - name: Verify live named services on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundles=("$RUNNER_TEMP/unit-release-smoke/"unit-001-*-linux-x64)
+          test "${#bundles[@]}" -eq 1
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH \
+            env UNIT_001_DISPOSABLE_CI=1 \
+            bash apps/unit-001/scripts/verify-managed-install.sh "${bundles[0]}"
+
+      - name: Upload unpublished bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-001-linux-x64
+          path: .artifacts/unit-001-release/*
+          if-no-files-found: error

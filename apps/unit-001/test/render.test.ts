@@ -1,11 +1,44 @@
 import type { LiveState } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "vitest";
-import { DeltaPrinter, liveText, ToolAnnouncer } from "../src/render.ts";
+import { DeltaPrinter, liveText, sanitizeTerminalText, ToolAnnouncer } from "../src/render.ts";
 
 function collect() {
 	const chunks: string[] = [];
 	return { write: (text: string) => void chunks.push(text), output: () => chunks.join("") };
 }
+
+describe("sanitizeTerminalText", () => {
+	// #21: untrusted transcript and tool content must not issue terminal commands.
+	it("removes styling, cursor commands, hyperlinks, clipboard commands and string controls", () => {
+		expect(
+			sanitizeTerminalText(
+				"\x1b[31mred\x1b[0m\x1b[2J \x1b]8;;https://example.test\x07link\x1b]8;;\x1b\\ \x1b]52;c;secret\x07ok\x1bPpayload\x1b\\",
+			),
+		).toBe("red link ok");
+	});
+
+	it("keeps Unicode, tab and newline while dropping C0/C1 and DEL controls", () => {
+		expect(sanitizeTerminalText("héllo\t世界\n\r\b\x00\x07\x7f\x85\x9b31mend")).toBe("héllo\t世界\nend");
+		expect(sanitizeTerminalText("\x1b世界\x1b\n\x1b\t")).toBe("世界\n\t");
+	});
+
+	it("withholds split escape tails in cumulative snapshots without leaking sequence payloads", () => {
+		const sink = collect();
+		const printer = new DeltaPrinter(sink.write);
+		for (const partial of [
+			"Hello\x1b",
+			"Hello\x1b]52;",
+			"Hello\x1b]52;c;secret",
+			"Hello\x1b]52;c;secret\x07 world",
+		]) {
+			printer.update(sanitizeTerminalText(partial));
+		}
+		printer.finish(sanitizeTerminalText("Hello\x1b]52;c;secret\x07 world"));
+		expect(sink.output()).toBe("Hello world\n");
+		expect(sanitizeTerminalText("safe\x1b[31")).toBe("safe");
+		expect(sanitizeTerminalText("safe\x1b(")).toBe("safe");
+	});
+});
 
 describe("DeltaPrinter", () => {
 	it("prints only what each partial adds", () => {

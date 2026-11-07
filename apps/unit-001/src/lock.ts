@@ -1,46 +1,42 @@
-import { mkdir, open, readFile, unlink } from "node:fs/promises";
+// Holds session ownership through a separate SQLite transaction released automatically on process death.
+import { mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { ConfigurationError } from "./errors.ts";
 
-function isAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		// EPERM means the process exists but belongs to someone else.
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
-
-/**
- * Takes the exclusive right to run a session. Pi Durable has no cross-process locking, so two agents on one storage
- * could corrupt it. The lock is a file holding the owner's pid; a lock whose process is gone is taken over.
- * Returns the function that releases it.
- */
+/** Takes exclusive session ownership until release or process death, without deleting a competing owner's lock. */
 export async function acquireSessionLock(path: string): Promise<() => Promise<void>> {
 	await mkdir(dirname(path), { recursive: true });
-	for (let attempt = 0; attempt < 3; attempt++) {
-		try {
-			const handle = await open(path, "wx");
-			try {
-				await handle.writeFile(`${process.pid}\n`);
-			} finally {
-				await handle.close();
+	const file = await open(path, "a", 0o600);
+	await file.close();
+	const database = new DatabaseSync(path, { timeout: 0 });
+	try {
+		// Keeping this transaction open holds an OS-backed lock; the lock file itself is never removed.
+		database.exec("BEGIN EXCLUSIVE");
+	} catch (error) {
+		database.close();
+		if (error instanceof Error && "errcode" in error && typeof error.errcode === "number") {
+			if ((error.errcode & 0xff) === 5 || (error.errcode & 0xff) === 6) {
+				throw new ConfigurationError(
+					"This session is already running. Use attach for a running service, --session to open another, or stop its owner first.",
+				);
 			}
-			return async () => {
-				await unlink(path).catch(() => {});
-			};
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			if ((error.errcode & 0xff) === 26) {
+				throw new ConfigurationError(
+					`The session lock at ${path} uses the old PID-file format or is not a SQLite database. Stop all unit-001 processes for this session before removing that lock file.`,
+				);
+			}
 		}
-		const owner = Number.parseInt(await readFile(path, "utf8").catch(() => ""), 10);
-		if (Number.isInteger(owner) && owner > 0 && isAlive(owner)) {
-			throw new ConfigurationError(
-				`This session is already running (process ${owner}). Use --session to open another, or delete ${path} if no unit-001 is running.`,
-			);
-		}
-		// The owner is gone, or the file is unreadable: a stale lock.
-		await unlink(path).catch(() => {});
+		throw error;
 	}
-	throw new ConfigurationError(`Could not lock the session at ${path}.`);
+	let released = false;
+	return async () => {
+		if (released) return;
+		released = true;
+		try {
+			database.exec("ROLLBACK");
+		} finally {
+			database.close();
+		}
+	};
 }

@@ -13,10 +13,6 @@
 			"default": "./dist/index.js"
 		}
 	},
-	"bin": {
-		"u1": "./dist/bin.js",
-		"unit-001": "./dist/bin.js"
-	},
 	"files": [
 		"dist",
 		"README.md"
@@ -25,6 +21,10 @@
 		"clean": "shx rm -rf dist",
 		"build": "tsc -p tsconfig.build.json",
 		"typecheck": "tsc -p tsconfig.json",
+		"release:build": "node scripts/build-release.mjs",
+		"test:release": "node --test test/release.test.mjs",
+		"test:management": "node --test test/management.test.mjs",
+		"bench": "tsc -p bench/tsconfig.json && node --conditions=source --experimental-strip-types bench/checkpoint-commit.bench.ts && node --conditions=source --experimental-strip-types bench/request-preparation.bench.ts",
 		"test": "vitest --run",
 		"start": "node dist/bin.js"
 	},
@@ -40,7 +40,8 @@
 	"dependencies": {
 		"@earendil-works/chord": "1.4.0",
 		"@earendil-works/pi-ai": "1.4.0",
-		"@earendil-works/pi-durable": "1.4.0"
+		"@earendil-works/pi-durable": "1.4.0",
+		"@earendil-works/pi-tui": "1.4.0"
 	},
 	"devDependencies": {
 		"shx": "0.3.4",

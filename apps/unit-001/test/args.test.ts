@@ -68,8 +68,8 @@ describe("parseArguments account commands", () => {
 	});
 
 	it.each([
-		[["login"], /Usage: u1 login <provider>/],
-		[["logout"], /Usage: u1 logout <provider>/],
+		[["login"], /Usage: agent login <provider>/],
+		[["logout"], /Usage: agent logout <provider>/],
 		[["login", "a", "b"], /Unexpected argument: b/],
 		[["status", "extra"], /Unexpected argument: extra/],
 		[["login", "a", "--bogus"], /Unknown option: --bogus/],
@@ -81,5 +81,65 @@ describe("parseArguments account commands", () => {
 
 	it("treats login, logout, and status as commands only in first position", () => {
 		expect(() => parseArguments(["--session", "x", "login"])).toThrow(/Unexpected argument: login/);
+	});
+});
+
+describe("parseArguments service commands", () => {
+	it.each(["- explain this failure", "--help", "--session=literal"])(
+		"keeps %s as a literal prompt after --",
+		(prompt) => {
+			expect(parseArguments(["send", "--session", "work", "--request-id", "retry", "--", prompt])).toEqual({
+				kind: "send",
+				prompt,
+				requestId: "retry",
+				options: { session: "work" },
+			});
+		},
+	);
+
+	it("parses the headless owner and local controls", () => {
+		// #22: plain attachment remains available without changing service ownership or automation.
+		expect(parseArguments(["attach", "--plain", "--session", "work"])).toEqual({
+			kind: "attach", options: { session: "work", plain: true },
+		});
+		// #21: attaching is a socket client and cannot select a new owner model.
+		expect(parseArguments(["attach", "--session", "work", "--data-dir=/d"])).toEqual({
+			kind: "attach",
+			options: { session: "work", dataDir: "/d" },
+		});
+		expect(parseArguments(["serve", "--session", "work", "--data-dir=/d", "--model", "openai/gpt-5"])).toEqual({
+			kind: "serve",
+			options: { session: "work", dataDir: "/d", model: "openai/gpt-5" },
+		});
+		expect(parseArguments(["send", "hello", "--request-id", "r1", "--session=work"])).toEqual({
+			kind: "send",
+			prompt: "hello",
+			requestId: "r1",
+			options: { session: "work" },
+		});
+		expect(parseArguments(["service-status"])).toEqual({ kind: "service-status", options: { session: "default" } });
+		expect(parseArguments(["cancel", "--data-dir", "/d"])).toEqual({
+			kind: "cancel",
+			options: { session: "default", dataDir: "/d" },
+		});
+	});
+
+	it.each([
+		["serve", "-p", "hello"],
+		["send"],
+		["send", "hello", "extra"],
+		["service-status", "--model", "x"],
+		["attach", "--model", "x"],
+		["attach", "stray"],
+		["attach", "--plain", "--plain"],
+		["send", "hello", "--plain"],
+		["cancel", "--session"],
+		["serve", "--session=a", "--session=b"],
+		["send", "--"],
+		["send", "--", "hello", "extra"],
+		["send", "hello", "--", "extra"],
+		["send", "--", ""],
+	])("rejects invalid service arguments %j", (...argv) => {
+		expect(() => parseArguments(argv)).toThrow(UsageError);
 	});
 });

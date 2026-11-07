@@ -25,15 +25,16 @@ export async function runLogin(
 	terminal: Terminal,
 	signal: AbortSignal,
 	platform: NodeJS.Platform = process.platform,
+	programName = "agent",
 ): Promise<number> {
 	const subscription = subscriptionFor(name);
 	const { interaction, close } = createLoginInteraction(terminal, signal, platform);
 	try {
-		await models.login(subscription.provider, "oauth", interaction, { agentName: "unit-001" });
+		await models.login(subscription.provider, "oauth", interaction, { agentName: programName });
 	} finally {
 		close();
 	}
-	terminal.err(`Signed in with ${subscription.label}. Run u1 to start.\n`);
+	terminal.err(`Signed in with ${subscription.label}. Run ${programName} to start.\n`);
 	return 0;
 }
 

@@ -11,26 +11,32 @@ export interface Terminal {
 	readonly err: (text: string) => void;
 }
 
-const HELP = "Commands: /help shows this, /exit (or Ctrl+D) quits. Ctrl+C stops the current run.";
+const HELP =
+	"Commands: /help shows this, /status shows activity, /exit (or Ctrl+D) quits. Ctrl+C stops the current run.";
 
 /** Runs one prompt, streaming the answer to `terminal.out` and tool use to `terminal.err`. */
 async function turn(agent: Agent, prompt: string, terminal: Terminal, signal: AbortSignal): Promise<Reply> {
 	const { context, cancel } = withCancel(BACKGROUND_CONTEXT);
-	signal.addEventListener("abort", () => cancel(), { once: true });
+	const onAbort = () => cancel();
+	signal.addEventListener("abort", onAbort, { once: true });
+	if (signal.aborted) onAbort();
 	const printer = new DeltaPrinter(terminal.out);
 	const tools = new ToolAnnouncer();
-	const stop = await agent.watch((live) => {
-		for (const name of tools.next(live)) terminal.err(`[${name}]\n`);
-		printer.update(liveText(live));
-	}, BACKGROUND_CONTEXT);
 	try {
-		const reply = await agent.ask(prompt, context);
-		await stop();
+		const stop = await agent.watch((live) => {
+			for (const name of tools.next(live)) terminal.err(`[${name}]\n`);
+			printer.update(liveText(live));
+		}, BACKGROUND_CONTEXT);
+		let reply: Reply;
+		try {
+			reply = await agent.ask(prompt, context);
+		} finally {
+			await stop();
+		}
 		if (reply.status === "answered") printer.finish(reply.text);
 		return reply;
-	} catch (error) {
-		await stop();
-		throw error;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -43,21 +49,27 @@ function report(reply: Reply, terminal: Terminal): void {
 /** Runs one prompt and prints only its answer, for scripts and pipes. Returns the exit code. */
 export async function runPrint(agent: Agent, prompt: string, terminal: Terminal, signal: AbortSignal): Promise<number> {
 	const { context, cancel } = withCancel(BACKGROUND_CONTEXT);
-	signal.addEventListener("abort", () => cancel(), { once: true });
+	const onAbort = () => cancel();
+	signal.addEventListener("abort", onAbort, { once: true });
+	if (signal.aborted) onAbort();
 	const tools = new ToolAnnouncer();
-	const stop = await agent.watch((live) => {
-		for (const name of tools.next(live)) terminal.err(`[${name}]\n`);
-	}, BACKGROUND_CONTEXT);
 	try {
-		const reply = await agent.ask(prompt, context);
-		if (reply.status === "answered") {
-			terminal.out(reply.text.endsWith("\n") ? reply.text : `${reply.text}\n`);
-			return 0;
+		const stop = await agent.watch((live) => {
+			for (const name of tools.next(live)) terminal.err(`[${name}]\n`);
+		}, BACKGROUND_CONTEXT);
+		try {
+			const reply = await agent.ask(prompt, context);
+			if (reply.status === "answered") {
+				terminal.out(reply.text.endsWith("\n") ? reply.text : `${reply.text}\n`);
+				return 0;
+			}
+			report(reply, terminal);
+			return 1;
+		} finally {
+			await stop();
 		}
-		report(reply, terminal);
-		return 1;
 	} finally {
-		await stop();
+		signal.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -66,16 +78,14 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 	const interactive = terminal.output !== undefined;
 	const readline = createInterface({ input: terminal.input, output: terminal.output, terminal: interactive });
 	let current: AbortController | undefined;
+	let stopping: Promise<void> | undefined;
 	let closing = false;
 
-	signal.addEventListener(
-		"abort",
-		() => {
-			current?.abort();
-			readline.close();
-		},
-		{ once: true },
-	);
+	const onAbort = () => {
+		current?.abort();
+		readline.close();
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
 	readline.on("SIGINT", () => {
 		if (current === undefined) {
 			closing = true;
@@ -84,41 +94,61 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 		}
 		terminal.err("\n^C stopping the run\n");
 		current.abort();
-		void agent.abort(BACKGROUND_CONTEXT).catch(() => {});
+		stopping ??= agent.abort(BACKGROUND_CONTEXT).catch(() => {});
 	});
 
-	if (interactive) terminal.err(`unit-001 ready. ${HELP}\n`);
-	if (agent.interrupted) {
-		terminal.err("Resuming the run that was interrupted.\n");
-		const printer = new DeltaPrinter(terminal.out);
-		const stop = await agent.watch((live) => printer.update(liveText(live)), BACKGROUND_CONTEXT);
-		try {
-			printer.finish((await agent.idle(BACKGROUND_CONTEXT)) ?? "");
-		} finally {
-			await stop();
-		}
-	}
-
-	readline.setPrompt("> ");
-	if (interactive) readline.prompt();
-	for await (const line of readline) {
-		const text = line.trim();
-		if (text === "/exit" || text === "/quit") break;
-		if (text === "/help") terminal.err(`${HELP}\n`);
-		else if (text.startsWith("/")) terminal.err(`Unknown command ${text.split(/\s/, 1)[0]}. ${HELP}\n`);
-		else if (text !== "") {
+	try {
+		if (signal.aborted) return 0;
+		if (interactive) terminal.err(`${agent.name} ready. ${HELP}\n`);
+		if (agent.interrupted) {
 			current = new AbortController();
+			const recovering = current;
+			const { context, cancel } = withCancel(BACKGROUND_CONTEXT);
+			const onRecoveryAbort = () => cancel();
+			recovering.signal.addEventListener("abort", onRecoveryAbort, { once: true });
+			terminal.err("Resuming the run that was interrupted.\n");
+			const printer = new DeltaPrinter(terminal.out);
+			const stop = await agent.watch((live) => printer.update(liveText(live)), BACKGROUND_CONTEXT);
 			try {
-				report(await turn(agent, text, terminal, current.signal), terminal);
+				printer.finish((await agent.idle(context)) ?? "");
 			} catch (error) {
-				terminal.err(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+				if (!current.signal.aborted) throw error;
 			} finally {
+				recovering.signal.removeEventListener("abort", onRecoveryAbort);
+				await stop();
+				await stopping;
+				stopping = undefined;
 				current = undefined;
 			}
 		}
-		if (closing) break;
+
+		readline.setPrompt("> ");
 		if (interactive) readline.prompt();
+		for await (const line of readline) {
+			const text = line.trim();
+			if (text === "/exit" || text === "/quit") break;
+			if (text === "/help") terminal.err(`${HELP}\n`);
+			else if (text === "/status")
+				terminal.err(`${agent.name}: ${(await agent.status(BACKGROUND_CONTEXT)).busy ? "busy" : "idle"}\n`);
+			else if (text.startsWith("/")) terminal.err(`Unknown command ${text.split(/\s/, 1)[0]}. ${HELP}\n`);
+			else if (text !== "") {
+				current = new AbortController();
+				try {
+					report(await turn(agent, text, terminal, current.signal), terminal);
+				} catch (error) {
+					terminal.err(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+				} finally {
+					await stopping;
+					stopping = undefined;
+					current = undefined;
+				}
+			}
+			if (closing) break;
+			if (interactive) readline.prompt();
+		}
+		return 0;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		readline.close();
 	}
-	readline.close();
-	return 0;
 }

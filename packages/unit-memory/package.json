@@ -1,0 +1,33 @@
+{
+	"name": "unit-memory",
+	"version": "0.0.1",
+	"private": true,
+	"license": "MIT",
+	"description": "Durable memory documents for unit-001",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"source": "./src/index.ts",
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		}
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"typecheck": "tsc -p tsconfig.json",
+		"test": "vitest --run"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"dependencies": {
+		"@earendil-works/pi-durable": "1.4.0"
+	},
+	"devDependencies": {
+		"@earendil-works/chord": "1.4.0",
+		"vitest": "4.1.12"
+	}
+}

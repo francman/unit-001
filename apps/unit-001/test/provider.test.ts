@@ -42,7 +42,7 @@ describe("detectModel", () => {
 describe("createConfiguredModels", () => {
 	it("explains how to configure a provider when there is none", async () => {
 		await expect(createConfiguredModels({})).rejects.toThrow(
-			/No model provider is configured.*u1 login.*ANTHROPIC_API_KEY/,
+			/No model provider is configured.*login subcommand.*ANTHROPIC_API_KEY/,
 		);
 	});
 
