@@ -108,7 +108,16 @@ async function account(
 	const { provider } = subscriptionFor(command.provider);
 	if (command.kind === "logout") return runLogout(credentials, command.provider, terminal);
 	const models = await createModelsFor(provider, credentials);
-	return runLogin(models, command.provider, terminal, signal, runtime.platform, runtime.managed?.name ?? "agent");
+	return runLogin(
+		models,
+		command.provider,
+		terminal,
+		signal,
+		runtime.platform,
+		runtime.managed === undefined
+			? { kind: "foreground", name: "agent" }
+			: { kind: "managed", name: runtime.managed.name },
+	);
 }
 
 async function run(

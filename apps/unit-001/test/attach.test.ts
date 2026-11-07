@@ -148,6 +148,10 @@ describe.skipIf(process.platform === "win32")("service terminal", () => {
 		io.input.write("/status\n/help\n/exit\n");
 		expect(await running).toBe(0);
 		expect(io.err()).toContain("bob: ready");
+		// #25: plain help must expose shared cancellation, not suggest it only affects this client.
+		expect(io.err().match(/shared session, including other operators' queued inputs/g)).toHaveLength(2);
+		expect(io.err()).toContain("cancels while busy or submitting; otherwise it detaches");
+		expect(io.err()).toContain("Detaching leaves admitted work running");
 		expect(service.requests).toEqual([{ type: "watch" }]);
 	});
 

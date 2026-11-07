@@ -68,6 +68,7 @@ function run(command, args, capture = false, applicationEnvironment = {}) {
 							PATH: "/usr/sbin:/usr/bin:/sbin:/bin",
 							LANG: process.env.LANG ?? "C.UTF-8",
 							TERM: process.env.TERM ?? "dumb",
+							...(process.env.NO_COLOR === undefined ? {} : { NO_COLOR: "1" }),
 							...applicationEnvironment,
 						}
 					: process.env,

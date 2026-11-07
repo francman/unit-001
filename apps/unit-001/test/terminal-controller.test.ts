@@ -216,8 +216,12 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 	);
 
 	it("handles help/status/unknown commands locally and bounds notices", async () => {
+		// #25: local help must explain that cancellation affects other operators while detaching preserves work.
 		const owner = await server();
 		const { controller } = await connect(owner);
+		controller.submit("/help");
+		expect(controller.state.notices.at(-1)).toContain("shared session, including other operators' queued inputs");
+		expect(controller.state.notices.at(-1)).toContain("Detaching leaves admitted work running");
 		expect(controller.submit("/unknown")).toEqual({ status: "rejected" });
 		for (let count = 0; count < 20; count++) expect(controller.submit("/help")).toEqual({ status: "command" });
 		controller.submit("/status");

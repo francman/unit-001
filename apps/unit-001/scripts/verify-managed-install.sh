@@ -136,6 +136,11 @@ grep -q 'installation account' "$work/wrong-account"
 status agent "$first"
 status unit-ci-bob "$second"
 
+# #25: The real managed dispatcher must preserve rich terminal behavior and NO_COLOR across runuser.
+python3 "$(dirname -- "${BASH_SOURCE[0]}")/verify-managed-terminal.py"
+status agent "$first"
+status unit-ci-bob "$second"
+
 # #20: nonterminal input and a blank terminal answer must both default to No.
 if timeout 10 /usr/local/bin/agent stop </dev/null > "$work/refusal" 2>&1; then fail 'Nonterminal stop succeeded without consent.'; fi
 grep -q 'Action cancelled' "$work/refusal"

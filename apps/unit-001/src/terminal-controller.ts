@@ -1,6 +1,7 @@
 // Controls an attached terminal through the single storage owner's bounded local protocol.
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
+import { ATTACH_HELP } from "./attach-help.ts";
 import { requestService, type ServiceView, watchService } from "./service.ts";
 
 /** Latest bounded service view and client state; presentation must sanitize all untrusted strings. */
@@ -36,7 +37,7 @@ export function createTerminalController(
 	return new OwnerTerminalController(endpoint, onChange, signal);
 }
 
-const HELP = "/help /status /cancel /exit /detach. Detaching does not cancel admitted work.";
+const HELP = `${ATTACH_HELP}\nDefault rich controls: PageUp/PageDown scroll; Ctrl+Shift+F searches the displayed transcript when forwarded by the terminal; Enter/Shift+Enter moves between matches; Esc closes search.\nUsage covers conversation-model estimates, excluding tool/subagent costs and subscription billing.`;
 const MAX_INPUT_BYTES = 16_384;
 
 class OwnerTerminalController implements TerminalController {
