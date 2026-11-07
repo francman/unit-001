@@ -6,7 +6,8 @@ Run `sudo agent attach` over SSH, or `sudo bob attach` for an installation named
 
 Attach opens a full-screen terminal interface with a name/session/model header, a scrolling Markdown conversation, tool status cards, and a fixed composer. Live updates leave the draft and cursor intact. Output follows the conversation until you scroll away to inspect earlier text.
 
-- **Enter** submits; **Ctrl+J** or **Shift+Enter** inserts a newline. The footer shows the configured shortcuts.
+- **Enter** submits; **Ctrl+J** or **Shift+Enter** inserts a newline. The footer shows the active shortcuts.
+- **PageUp/PageDown** scroll; **Ctrl+Shift+F** searches the displayed transcript when the terminal forwards that key combination distinctly. In search, **Enter/Shift+Enter** moves between matches and **Esc** closes search. These are default bindings; this does not search older or other sessions' history.
 - `/status` shows identity, session, PID, version and activity; `/help` lists commands.
 - `/cancel`, or **Ctrl+C** while working/submitting, cancels shared work. Cancellation can also withdraw queued inputs from other attached operators.
 - `/exit`, `/detach`, **Ctrl+D**, EOF or a lost SSH connection detaches without cancelling admitted work. Idle **Ctrl+C** also detaches. Unsent drafts are not saved after exit.
@@ -27,6 +28,8 @@ Use `sudo agent attach --plain` for the basic line interface. It is also selecte
 
 Attach requires an interactive terminal in either mode. Use `send` for scripts and pipes; its final-answer stdout contract is unchanged.
 
+Set `NO_COLOR` in the attaching process for monochrome rich output; for a named installation, use `sudo NO_COLOR=1 agent attach` where your sudo policy permits it.
+
 ## Remaining gaps
 
-The [design](terminal-design.md), [omp assessment](terminal-assessment-omp.md) and [other terminal assessments](terminal-assessment-others.md) explain the direction. Persistent drafts, searchable sessions/history, in-interface model/session switching, expanded tool output/diffs and complete transcript export remain later work. Foreground source chat remains a separate owner, with `/status` and corrected recovery cancellation.
+The [design](terminal-design.md), [omp assessment](terminal-assessment-omp.md) and [other terminal assessments](terminal-assessment-others.md) explain the direction. Persistent drafts, cross-session/older-history search, in-interface model/session switching, expanded tool output/diffs and complete transcript export remain later work. The CLI does not yet load a user keybinding file; override support currently exists only through the TUI's programmatic API. Foreground source chat remains a separate owner, with `/status` and corrected recovery cancellation.

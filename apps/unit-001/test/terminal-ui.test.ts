@@ -96,6 +96,23 @@ function launch() {
 }
 
 describe("rich service terminal", () => {
+	it("shows owner activity while a submission awaits its final reply", () => {
+		// #25: awaiting the final send reply must not hide authoritative running or cancelling activity.
+		const app = launch();
+		try {
+			app.update(base, { sending: true });
+			expect(app.screen()[0]).toContain("SENDING");
+			app.update({ ...base, busy: true }, { sending: true });
+			expect(app.screen()[0]).toContain("WORKING");
+			expect(app.screen()[0]).not.toContain("SENDING");
+			app.update({ ...base, busy: true }, { sending: true, cancelling: true });
+			expect(app.screen()[0]).toContain("CANCELLING");
+			app.update();
+			expect(app.screen()[0]).toContain("READY");
+		} finally {
+			app.tui.stop();
+		}
+	});
 	it.each(["edit", "submit"] as const)(
 		"dismisses an oversized-paste warning after a valid %s without losing the preserved draft",
 		(action) => {

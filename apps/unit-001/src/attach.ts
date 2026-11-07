@@ -2,12 +2,11 @@
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
+import { ATTACH_HELP as HELP } from "./attach-help.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import type { Terminal } from "./repl.ts";
 import { requestService, type ServiceView, watchService } from "./service.ts";
 
-const HELP =
-	"/help /status /cancel /exit /detach. Ctrl+C cancels busy work; otherwise detaches. Detaching leaves service work running.";
 const MAX_INPUT_BYTES = 16_384;
 
 /** Runs a service terminal client; exit, EOF, signals, or connection loss never abort admitted service work. */

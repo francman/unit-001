@@ -10,6 +10,10 @@ export const SUBSCRIPTIONS: Readonly<Record<string, { readonly provider: string;
 	openai: { provider: "openai", label: "ChatGPT Plus or Pro" },
 };
 
+export type LoginLaunch =
+	| { readonly kind: "foreground"; readonly name: string }
+	| { readonly kind: "managed"; readonly name: string };
+
 export function subscriptionFor(name: string): { readonly provider: string; readonly label: string } {
 	const subscription = Object.hasOwn(SUBSCRIPTIONS, name) ? SUBSCRIPTIONS[name] : undefined;
 	if (subscription === undefined) {
@@ -25,16 +29,20 @@ export async function runLogin(
 	terminal: Terminal,
 	signal: AbortSignal,
 	platform: NodeJS.Platform = process.platform,
-	programName = "agent",
+	launch: LoginLaunch = { kind: "foreground", name: "agent" },
 ): Promise<number> {
 	const subscription = subscriptionFor(name);
 	const { interaction, close } = createLoginInteraction(terminal, signal, platform);
 	try {
-		await models.login(subscription.provider, "oauth", interaction, { agentName: programName });
+		await models.login(subscription.provider, "oauth", interaction, { agentName: launch.name });
 	} finally {
 		close();
 	}
-	terminal.err(`Signed in with ${subscription.label}. Run ${programName} to start.\n`);
+	const next =
+		launch.kind === "managed"
+			? `Use sudo ${launch.name} attach if already running; otherwise run sudo ${launch.name} start, then sudo ${launch.name} attach.`
+			: "For foreground chat, run this launcher again without login arguments.";
+	terminal.err(`Signed in with ${subscription.label}. ${next}\n`);
 	return 0;
 }
 

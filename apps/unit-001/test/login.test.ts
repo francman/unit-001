@@ -62,13 +62,40 @@ describe("runLogin", () => {
 		};
 		const io = terminal();
 		expect(
-			await runLogin(models as never, "anthropic", io.terminal, new AbortController().signal, "linux", "bob"),
+			await runLogin(models as never, "anthropic", io.terminal, new AbortController().signal, "linux", {
+				kind: "foreground",
+				name: "bob",
+			}),
 		).toBe(0);
 		expect(calls).toHaveLength(1);
 		expect(calls[0]).toMatchObject({ provider: "anthropic", type: "oauth", agentName: "bob" });
-		expect(io.err()).toContain("Run bob to start.");
+		expect(io.err()).toContain("For foreground chat, run this launcher again without login arguments.");
+		expect(io.err()).not.toContain("sudo");
 		expect(io.err()).toContain("Welcome");
 		expect(io.err()).toContain("Signed in with Claude Pro or Max");
+	});
+
+	// #25: Managed login must direct operators to the service rather than a competing foreground owner.
+	it.each(["agent", "bob"])("directs managed %s login to its service and attached interface", async (name) => {
+		const io = terminal();
+		const models = { login: async () => oauth };
+		expect(
+			await runLogin(models as never, "openai", io.terminal, new AbortController().signal, "linux", {
+				kind: "managed",
+				name,
+			}),
+		).toBe(0);
+		expect(io.err()).toContain(
+			`Use sudo ${name} attach if already running; otherwise run sudo ${name} start, then sudo ${name} attach.`,
+		);
+		expect(io.err()).not.toContain(`Run ${name} to start.`);
+	});
+
+	it("retains foreground guidance for a source login", async () => {
+		const io = terminal();
+		await runLogin({ login: async () => oauth } as never, "openai", io.terminal, new AbortController().signal);
+		expect(io.err()).toContain("For foreground chat, run this launcher again without login arguments.");
+		expect(io.err()).not.toContain("sudo");
 	});
 
 	it("does not report success when the login fails", async () => {

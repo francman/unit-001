@@ -226,10 +226,10 @@ export class RichAttachView extends VStack {
 				? this.#state.connection
 				: this.#state.cancelling
 					? "cancelling"
-					: this.#state.sending
-						? "sending"
-						: view?.busy
-							? "working"
+					: view?.busy
+						? "working"
+						: this.#state.sending
+							? "sending"
 							: "ready";
 		const model =
 			view?.model == null ? "model unknown" : `${label(view.model.provider)}/${label(view.model.modelId)}`;
