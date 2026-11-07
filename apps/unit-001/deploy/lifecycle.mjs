@@ -42,11 +42,17 @@ export async function lifecycle(record, action, context, newName) {
 			if (state.trim() === "failed") await systemctl("reset-failed", unit);
 			await systemctl("enable", "--now", unit);
 			await context.ready(record);
-			await restartUpdateScheduling(record, context);
 		} catch (error) {
 			await writeInstallation({ ...record, desiredState: "stopped" }, root);
 			await systemctl("disable", "--now", unit);
 			throw error;
+		}
+		try {
+			await restartUpdateScheduling(record, context);
+		} catch (error) {
+			const warning = `Agent is running, but automatic update scheduling failed: ${error.message}. Inspect sudo ${record.name} update status.`;
+			if (context.warn) context.warn(warning);
+			else process.stderr.write(`${warning}\n`);
 		}
 		return;
 	}

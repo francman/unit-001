@@ -11,19 +11,17 @@ npm ci --ignore-scripts
 node apps/unit-001/scripts/build-release.mjs --out .artifacts/unit-001-release
 ```
 
-The builder hydrates Pi model data, compiles the app and required Pi packages, installs locked production dependencies without lifecycle scripts, and bundles a pinned Node 24 runtime. It verifies Node's checksum and hashes the complete payload. The Unit release bundle workflow uploads an unpublished artifact. The separate publication workflow signs releases; neither workflow enables a host's update timer. See [continuous updates](updates.md) for trust bootstrap, commands and key custody.
+The builder hydrates Pi model data, compiles the app and required Pi packages, installs locked production dependencies without lifecycle scripts, and bundles a pinned Node 24 runtime. It verifies Node's checksum and hashes the complete payload. This development build stays unconfigured. Public production builds also pass `--update-root /secure/root.json`; the separate publication workflow supplies that approved public metadata automatically. The installer then configures public updates without asking users for keys or credentials. See [continuous updates](updates.md) for maintainer setup and recovery.
 
-Obtain the archive and checksum through a trusted release channel. For the current app version:
+Download the public Linux archive from the [stable download channel](distribution.md). For the current app version:
 
 ```bash
-sha256sum --check unit-001-0.0.2-linux-x64.tar.gz.sha256
-tar -xzf unit-001-0.0.2-linux-x64.tar.gz
-cd unit-001-0.0.2-linux-x64
-./install.sh --dry-run
+tar -xzf unit-001-linux-x64.tar.gz
+cd unit-001-0.0.3-linux-x64
 sudo ./install.sh
 ```
 
-Use your release's filenames if its version differs. The checksum detects corruption; the trusted channel establishes which release you intended to install. `--root DIRECTORY` stages an image without creating host accounts or managing host services. Symlinked destination ancestors are rejected.
+Use your release's extracted directory if its version differs. The installer verifies its complete file inventory. The trusted public download channel establishes which installer you initially receive; the bundled public root authenticates future updates. `--dry-run` verifies without installing. `--root DIRECTORY` stages an image without creating host accounts or managing host services. Symlinked destination ancestors are rejected.
 
 ## Choose a name and configure a provider
 
@@ -95,4 +93,4 @@ Rollback requires code that understands the stored documents and task checkpoint
 
 ## Scope
 
-Named installations, submitted work, lifecycle controls and the independent update infrastructure are implemented. Live continuous delivery requires the signing environment and host trust described in [updates](updates.md). Autonomous mission decisions and memory remain separate work in #14–#17 and #3–#9. Old singleton installations are not automatically migrated. Source execution has no managed-system administrative behavior.
+Named installations, submitted work, lifecycle controls and the independent update infrastructure are implemented. Maintainers must complete initial publication before public downloads are live. Published bundles configure host trust automatically. Autonomous mission decisions and memory remain separate work in #14–#17 and #3–#9. Old singleton installations are not automatically migrated. Source execution has no managed-system administrative behavior.

@@ -2,14 +2,16 @@
 // Signs and publishes the unit-owned TUF repository; never updates a running installation.
 import { execFileSync } from "node:child_process";
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { Key, Metadata, MetaFile, Root, Signature, Snapshot, TargetFile, Targets, Timestamp } from "@tufjs/models";
 
-export const UPDATE_REPOSITORY = "francman/unit-001";
+export const UPDATE_REPOSITORY = "francman/unit-001-releases";
 export const METADATA_RELEASE = "unit-updates-stable";
+export const DOWNLOAD_ASSET = "unit-001-linux-x64.tar.gz";
+export const DOWNLOAD_URL = `https://github.com/${UPDATE_REPOSITORY}/releases/latest/download/${DOWNLOAD_ASSET}`;
 const roles = ["root", "targets", "snapshot", "timestamp"];
 const digest = (data) => createHash("sha256").update(data).digest("hex");
 const encode = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
@@ -123,6 +125,7 @@ export function prepareRepository({
 	keys,
 	previous,
 	previousRootBytes,
+	expectedSourceCommit = release.source?.commit,
 	out,
 	now = new Date(),
 }) {
@@ -133,6 +136,8 @@ export function prepareRepository({
 		release.source.dirty !== false
 	)
 		throw new Error("Publishing requires a clean Linux x64 release with an exact stable version and source commit");
+	if (!/^[a-f0-9]{40}$/.test(expectedSourceCommit) || release.source.commit !== expectedSourceCommit)
+		throw new Error("Archive source commit does not match the trusted build checkout");
 	const compatibility = release.compatibility;
 	if (
 		compatibility?.stateVersion !== 1 ||
@@ -239,11 +244,13 @@ export function prepareRepository({
 		"timestamp.json": encode(timestamp.toJSON()),
 	};
 	for (const [name, bytes] of Object.entries(files)) writeFileSync(join(out, name), bytes, { flag: "wx" });
+	copyFileSync(archive, join(out, DOWNLOAD_ASSET));
 	writeFileSync(
 		join(out, "publication.json"),
 		encode({
 			schemaVersion: 1,
 			repository: UPDATE_REPOSITORY,
+			sourceCommit: expectedSourceCommit,
 			archive: resolve(archive),
 			releaseTag,
 			assetName,
@@ -255,11 +262,17 @@ export function prepareRepository({
 	return { descriptor, files };
 }
 
-/** Uses only the fixed private GitHub repository, without embedding credentials in URLs. */
+/** Publishes only to the public release repository; its credential never reaches downloaded bundles. */
 export function githubPublisher() {
 	const run = (args, options = {}) => execFileSync("gh", args, { maxBuffer: 1024 * 1024 * 1024, ...options });
+	let publicRepository = false;
 	return {
 		assets(tag) {
+			if (!publicRepository) {
+				const repository = JSON.parse(run(["api", `repos/${UPDATE_REPOSITORY}`]));
+				if (repository.private !== false) throw new Error("The distribution repository must be public");
+				publicRepository = true;
+			}
 			try {
 				const release = JSON.parse(run(["api", `repos/${UPDATE_REPOSITORY}/releases/tags/${tag}`]));
 				return JSON.parse(
@@ -283,12 +296,7 @@ export function githubPublisher() {
 				"Accept: application/octet-stream",
 			]);
 		},
-		commit(tag) {
-			return run(["api", `repos/${UPDATE_REPOSITORY}/commits/${tag}`, "--jq", ".sha"])
-				.toString()
-				.trim();
-		},
-		create(tag, commit) {
+		create(tag) {
 			run([
 				"release",
 				"create",
@@ -298,9 +306,12 @@ export function githubPublisher() {
 				"--title",
 				tag,
 				"--notes",
-				"Authenticated unit-001 release assets.",
-				...(commit === undefined ? [] : ["--target", commit]),
+				`Download: ${DOWNLOAD_URL}\n\nUbuntu 24.04 LTS, Linux x64. Extract the download and run sudo ./install.sh.`,
+				"--latest=false",
 			]);
+		},
+		markLatest(tag) {
+			run(["release", "edit", tag, "--repo", UPDATE_REPOSITORY, "--latest"]);
 		},
 		upload(tag, path, replace = false) {
 			run(["release", "upload", tag, path, "--repo", UPDATE_REPOSITORY, ...(replace ? ["--clobber"] : [])]);
@@ -413,6 +424,8 @@ export function publishRepository(directory, rootBytes, remote = githubPublisher
 	if (descriptorFile.length !== descriptorBytes.length || digest(descriptorBytes) !== descriptorFile.hashes.sha256)
 		throw new Error("Descriptor hash mismatch");
 	const descriptor = JSON.parse(descriptorBytes);
+	if (plan.sourceCommit !== descriptor.sourceCommit)
+		throw new Error("Signed descriptor source commit differs from the trusted publication plan");
 	const archiveFile = metadata.targets.signed.targets[descriptor.archiveTarget];
 	if (
 		basename(plan.archive) !== plan.assetName ||
@@ -424,6 +437,8 @@ export function publishRepository(directory, rootBytes, remote = githubPublisher
 		archiveFile.hashes.sha256 !== digest(archiveBytes)
 	)
 		throw new Error("Archive publication plan mismatch");
+	if (!readFileSync(join(directory, DOWNLOAD_ASSET)).equals(archiveBytes))
+		throw new Error("Direct download alias differs from the signed archive");
 	const rootName = `${root.signed.version}.root.json`;
 	if (!readFileSync(join(directory, rootName)).equals(rootBytes))
 		throw new Error("Staged root differs from approved root");
@@ -485,11 +500,10 @@ export function publishRepository(directory, rootBytes, remote = githubPublisher
 	const put = (tag, name, path) => {
 		let assets = remote.assets(tag);
 		if (assets === null) {
-			remote.create(tag, tag === plan.releaseTag ? descriptor.sourceCommit : undefined);
+			// Public tags anchor the release-only repository, never private source git objects.
+			remote.create(tag);
 			assets = [];
 		}
-		if (tag === plan.releaseTag && remote.commit(tag) !== descriptor.sourceCommit)
-			throw new Error("Release tag does not identify the built source commit");
 		const existing = assets.find((asset) => asset.name === name);
 		if (existing !== undefined) {
 			if (!remote.read(existing).equals(readFileSync(path)))
@@ -499,6 +513,7 @@ export function publishRepository(directory, rootBytes, remote = githubPublisher
 		remote.upload(tag, path);
 	};
 	put(plan.releaseTag, plan.assetName, plan.archive);
+	put(plan.releaseTag, DOWNLOAD_ASSET, join(directory, DOWNLOAD_ASSET));
 	if (initial === null) remote.create(METADATA_RELEASE);
 	const names = [
 		rootName,
@@ -513,6 +528,7 @@ export function publishRepository(directory, rootBytes, remote = githubPublisher
 	const current = remote.assets(METADATA_RELEASE)?.find((asset) => asset.name === "timestamp.json");
 	if (current === undefined || !remote.read(current).equals(metadata.timestampBytes))
 		throw new Error("Published timestamp readback differs; retention was not run");
+	remote.markLatest(plan.releaseTag);
 	pruneRepository(rootBytes, remote, now);
 }
 
@@ -637,7 +653,7 @@ if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])
 	const { values } = parseArgs({
 		args: process.argv.slice(3),
 		options: Object.fromEntries(
-			["out", "root", "keys", "new-keys", "previous", "previous-root", "archive"].map((name) => [
+			["out", "root", "keys", "new-keys", "previous", "previous-root", "archive", "source-commit"].map((name) => [
 				name,
 				{ type: "string" },
 			]),
@@ -658,6 +674,8 @@ if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])
 			...(values["previous-root"] === undefined ? {} : { previousRootBytes: readFileSync(values["previous-root"]) }),
 		});
 	else if (command === "prepare") {
+		if (!/^[a-f0-9]{40}$/.test(values["source-commit"] ?? ""))
+			throw new Error("Prepare requires --source-commit from the trusted build checkout");
 		const version = basename(values.archive)
 			.replace(/^unit-001-/, "")
 			.replace(/-linux-x64\.tar\.gz$/, "");
@@ -666,15 +684,32 @@ if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])
 				encoding: "utf8",
 			}),
 		);
+		const rootBytes = readFileSync(values.root);
+		const bootstrap = execFileSync(
+			"tar",
+			["-xOf", values.archive, `unit-001-${version}-linux-x64/deploy/update-root.json`],
+			{ maxBuffer: 4 * 1024 * 1024 },
+		);
+		const feed = JSON.parse(
+			execFileSync("tar", ["-xOf", values.archive, `unit-001-${version}-linux-x64/deploy/update-feed.json`], {
+				maxBuffer: 8192,
+			}),
+		);
+		if (
+			!bootstrap.equals(rootBytes) ||
+			JSON.stringify(feed) !== JSON.stringify({ schemaVersion: 1, repository: UPDATE_REPOSITORY, channel: "stable" })
+		)
+			throw new Error("Public release must bundle the approved verification root and fixed public update feed");
 		prepareRepository({
 			...values,
 			release,
-			rootBytes: readFileSync(values.root),
+			expectedSourceCommit: values["source-commit"],
+			rootBytes,
 			...(values["previous-root"] === undefined ? {} : { previousRootBytes: readFileSync(values["previous-root"]) }),
 		});
 	} else if (command === "publish") publishRepository(values.out, readFileSync(values.root));
 	else
 		throw new Error(
-			"Usage: update-repository.mjs keygen|rotate-root|fetch|prepare|renew|publish --out PATH [--root FILE --keys DIR --new-keys DIR --previous DIR --previous-root FILE --archive FILE]",
+			"Usage: update-repository.mjs keygen|rotate-root|fetch|prepare|renew|publish --out PATH [--root FILE --keys DIR --new-keys DIR --previous DIR --previous-root FILE --archive FILE --source-commit SHA]",
 		);
 }

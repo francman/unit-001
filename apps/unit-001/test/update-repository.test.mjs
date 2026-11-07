@@ -1,5 +1,6 @@
 // Exercises signed publisher output through the real TUF client and a fake GitHub asset store.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import {
 	copyFileSync,
@@ -16,9 +17,12 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { Updater } from "tuf-js";
 import { fetchUpdate } from "../deploy/update-trust.mjs";
 import {
+	DOWNLOAD_ASSET,
+	DOWNLOAD_URL,
 	fetchRepository,
 	generateRepositoryKeys,
 	METADATA_RELEASE,
@@ -27,6 +31,7 @@ import {
 	publishRepository,
 	renewRepository,
 	rotateRepositoryRoot,
+	UPDATE_REPOSITORY,
 } from "../scripts/update-repository.mjs";
 
 function fixture(t) {
@@ -53,7 +58,6 @@ function fixture(t) {
 function fakeGithub() {
 	const releases = new Map();
 	const operations = [];
-	const commits = new Map();
 	let id = 0;
 	return {
 		releases,
@@ -64,14 +68,16 @@ function fakeGithub() {
 		read(asset) {
 			return asset.bytes;
 		},
-		create(tag, commit) {
+		create(tag, ...argumentsAfterTag) {
+			assert.equal(argumentsAfterTag.length, 0, "Public release creation must never receive private source SHAs");
 			assert(!releases.has(tag));
 			releases.set(tag, new Map());
-			commits.set(tag, commit);
 			operations.push(`create:${tag}`);
 		},
-		commit(tag) {
-			return commits.get(tag);
+		markLatest(tag) {
+			assert.equal(tag.startsWith("unit-v"), true);
+			assert(releases.get(tag).has(DOWNLOAD_ASSET));
+			operations.push(`latest:${tag}`);
 		},
 		upload(tag, path, replace = false) {
 			const name = path.split("/").at(-1);
@@ -195,7 +201,10 @@ test("publishes archive and immutable metadata before freshness; repeat is idemp
 	const first = f.prepare("first");
 	const remote = fakeGithub();
 	publishRepository(first.out, f.rootBytes, remote);
-	assert.equal(remote.operations.at(-1), `${METADATA_RELEASE}:timestamp.json`);
+	assert.equal(remote.operations.at(-1), "latest:unit-v0.0.1");
+	assert(
+		remote.operations.indexOf(`${METADATA_RELEASE}:timestamp.json`) < remote.operations.indexOf("latest:unit-v0.0.1"),
+	);
 	assert(
 		remote.operations.indexOf("unit-v0.0.1:unit-001-0.0.1-linux-x64.tar.gz") <
 			remote.operations.indexOf(`${METADATA_RELEASE}:timestamp.json`),
@@ -206,6 +215,74 @@ test("publishes archive and immutable metadata before freshness; repeat is idemp
 	const second = f.prepare("second", { previous });
 	publishRepository(second.out, f.rootBytes, remote);
 	assert.equal(JSON.parse(remote.releases.get(METADATA_RELEASE).get("timestamp.json").bytes).signed.version, 2);
+});
+
+// #18: users receive one stable URL; promotion must wait for the signed release to be complete.
+test("stable download is the exact signed archive and never becomes latest before freshness", (t) => {
+	const f = fixture(t);
+	assert.equal(UPDATE_REPOSITORY, "francman/unit-001-releases");
+	assert.equal(
+		DOWNLOAD_URL,
+		"https://github.com/francman/unit-001-releases/releases/latest/download/unit-001-linux-x64.tar.gz",
+	);
+	const first = f.prepare("direct-download");
+	assert.deepEqual(readFileSync(join(first.out, DOWNLOAD_ASSET)), readFileSync(f.archive));
+	const remote = fakeGithub();
+	const upload = remote.upload.bind(remote);
+	remote.upload = (tag, path, replace) => {
+		if (path.endsWith(`/${DOWNLOAD_ASSET}`)) throw new Error("download alias interrupted");
+		upload(tag, path, replace);
+	};
+	assert.throws(() => publishRepository(first.out, f.rootBytes, remote), /alias interrupted/);
+	assert(!remote.operations.some((entry) => entry.startsWith("latest:")));
+	assert.equal(remote.assets(METADATA_RELEASE), null);
+	remote.upload = upload;
+	publishRepository(first.out, f.rootBytes, remote);
+	assert.deepEqual(remote.releases.get("unit-v0.0.1").get(DOWNLOAD_ASSET).bytes, readFileSync(f.archive));
+	assert(
+		remote.operations.indexOf(`unit-v0.0.1:${DOWNLOAD_ASSET}`) <
+			remote.operations.indexOf(`${METADATA_RELEASE}:timestamp.json`),
+	);
+	assert(
+		remote.operations.indexOf(`${METADATA_RELEASE}:timestamp.json`) < remote.operations.indexOf("latest:unit-v0.0.1"),
+	);
+	writeFileSync(join(first.out, DOWNLOAD_ASSET), "substituted alias");
+	assert.throws(() => publishRepository(first.out, f.rootBytes, remote), /alias differs/);
+	assert.throws(() => f.prepare("wrong-source", { expectedSourceCommit: "b".repeat(40) }), /trusted build checkout/);
+});
+
+// #18: public releases bundle trust automatically and remain bound to the private trusted build without leaking git objects.
+test("production prepare requires the trusted checkout and exact bundled public bootstrap", (t) => {
+	const f = fixture(t);
+	const name = "unit-001-0.0.1-linux-x64";
+	const payload = join(f.directory, "payload");
+	const deploy = join(payload, name, "deploy");
+	mkdirSync(deploy, { recursive: true });
+	writeFileSync(join(payload, name, "release.json"), JSON.stringify(f.release));
+	writeFileSync(join(deploy, "update-root.json"), f.rootBytes);
+	writeFileSync(
+		join(deploy, "update-feed.json"),
+		JSON.stringify({ schemaVersion: 1, repository: UPDATE_REPOSITORY, channel: "stable" }),
+	);
+	const archive = () =>
+		execFileSync("tar", ["-czf", f.archive, "-C", payload, name], { env: { ...process.env, COPYFILE_DISABLE: "1" } });
+	archive();
+	const tool = fileURLToPath(new URL("../scripts/update-repository.mjs", import.meta.url));
+	const args = [tool, "prepare", "--archive", f.archive, "--root", join(f.keys, "root.json"), "--keys", f.keys];
+	const run = (out, extra = []) =>
+		execFileSync(process.execPath, [...args, "--out", join(f.directory, out), ...extra], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+	assert.throws(() => run("missing-source"), /requires --source-commit/);
+	assert.throws(() => run("wrong-checkout", ["--source-commit", "b".repeat(40)]), /trusted build checkout/);
+	run("valid-public", ["--source-commit", f.release.source.commit]);
+	const plan = JSON.parse(readFileSync(join(f.directory, "valid-public/publication.json")));
+	assert.equal(plan.sourceCommit, f.release.source.commit);
+	assert.equal(plan.repository, UPDATE_REPOSITORY);
+	writeFileSync(join(deploy, "update-root.json"), Buffer.from("different approved root"));
+	archive();
+	assert.throws(() => run("wrong-root", ["--source-commit", f.release.source.commit]), /approved verification root/);
 });
 
 test("stale publisher and changed immutable release cannot advance timestamp", (t) => {
@@ -283,7 +360,7 @@ test("scheduled renewal reuses authenticated immutable archive bytes", (t) => {
 	);
 });
 
-test("publication validates root rotation chain and release source tag before freshness", (t) => {
+test("publication validates root rotation chain and signed private-source provenance before freshness", (t) => {
 	const f = fixture(t);
 	const remote = fakeGithub();
 	const first = f.prepare("first");
@@ -300,7 +377,9 @@ test("publication validates root rotation chain and release source tag before fr
 	publishRepository(second.out, rootBytes, remote);
 	assert(remote.releases.get(METADATA_RELEASE).has("2.root.json"));
 	const timestampBefore = remote.releases.get(METADATA_RELEASE).get("timestamp.json").bytes;
-	remote.commit = () => "b".repeat(40);
+	const planPath = join(second.out, "publication.json");
+	const plan = JSON.parse(readFileSync(planPath));
+	writeFileSync(planPath, JSON.stringify({ ...plan, sourceCommit: "b".repeat(40) }));
 	assert.throws(() => publishRepository(second.out, rootBytes, remote), /source commit/);
 	assert.deepEqual(remote.releases.get(METADATA_RELEASE).get("timestamp.json").bytes, timestampBefore);
 });
@@ -308,7 +387,7 @@ test("publication validates root rotation chain and release source tag before fr
 test("changed existing remote archive is not clobbered and no timestamp is published", (t) => {
 	const f = fixture(t);
 	const remote = fakeGithub();
-	remote.create("unit-v0.0.1", f.release.source.commit);
+	remote.create("unit-v0.0.1");
 	remote.releases.get("unit-v0.0.1").set("unit-001-0.0.1-linux-x64.tar.gz", {
 		name: "unit-001-0.0.1-linux-x64.tar.gz",
 		bytes: Buffer.from("foreign bytes"),
@@ -320,42 +399,25 @@ test("changed existing remote archive is not clobbered and no timestamp is publi
 	assert.equal(remote.assets(METADATA_RELEASE), null);
 });
 
-test("publisher assets interoperate with the actual private-GitHub trust transport", async (t) => {
+test("publisher assets interoperate with public downloads without accounts, tokens, or GitHub API", async (t) => {
 	const f = fixture(t);
 	const remote = fakeGithub();
 	publishRepository(f.prepare("first").out, f.rootBytes, remote);
 	const base = join(f.directory, "transport");
 	mkdirSync(base, { mode: 0o700 });
 	const bootstrapRoot = join(base, "bootstrap.json");
-	const tokenFile = join(base, "token");
 	writeFileSync(bootstrapRoot, f.rootBytes, { mode: 0o600 });
-	writeFileSync(tokenFile, "fixture-token", { mode: 0o600 });
-	const fetch = async (url) => {
+	const fetch = async (url, options) => {
 		const parsed = new URL(url);
-		const tag = parsed.pathname.match(/\/releases\/tags\/(.+)$/)?.[1];
-		if (tag !== undefined) {
-			const assets = remote.assets(tag);
-			return new Response(JSON.stringify({ id: tag === METADATA_RELEASE ? 100 : 101 }), {
-				status: assets === null ? 404 : 200,
-			});
-		}
-		if (/\/releases\/(100|101)\/assets$/.test(parsed.pathname)) {
-			const name = parsed.pathname.includes("/100/") ? METADATA_RELEASE : "unit-v0.0.1";
-			const page = Number(parsed.searchParams.get("page"));
-			return Response.json(
-				remote
-					.assets(name)
-					.map(({ id, name }) => ({ id, name }))
-					.slice((page - 1) * 100, page * 100),
-			);
-		}
-		const id = Number(parsed.pathname.split("/").at(-1));
-		for (const assets of remote.releases.values())
-			for (const asset of assets.values()) if (asset.id === id) return new Response(asset.bytes);
-		return new Response("missing", { status: 404 });
+		assert.equal(parsed.origin, "https://github.com");
+		assert.equal(options.headers.Authorization, undefined);
+		const match = parsed.pathname.match(/^\/francman\/unit-001-releases\/releases\/download\/([^/]+)\/([^/]+)$/);
+		assert(match, "Public clients must use exact direct download URLs");
+		const asset = remote.releases.get(match[1])?.get(match[2]);
+		return asset === undefined ? new Response("missing", { status: 404 }) : new Response(asset.bytes);
 	};
 	const result = await fetchUpdate(
-		{ metadataDir: join(base, "metadata"), downloadDir: join(base, "downloads"), bootstrapRoot, tokenFile },
+		{ metadataDir: join(base, "metadata"), downloadDir: join(base, "downloads"), bootstrapRoot },
 		{ fetch, ownerUid: process.getuid(), platform: "linux", arch: "x64" },
 	);
 	assert.equal(result.version, "0.0.1");
@@ -484,7 +546,7 @@ test("authenticated seven-day retention bounds assets across more than 1000 six-
 	const f = fixture(t);
 	const remote = fakeGithub();
 	remote.create(METADATA_RELEASE);
-	remote.create("unit-v0.0.1", f.release.source.commit);
+	remote.create("unit-v0.0.1");
 	remote.upload("unit-v0.0.1", f.archive);
 	const start = Date.now() - 1200 * 6 * 3600000;
 	let previous;

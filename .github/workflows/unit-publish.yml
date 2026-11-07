@@ -40,10 +40,21 @@ jobs:
         run: |
           node --input-type=module -e 'import {readFileSync} from "node:fs"; const v=process.env.RELEASE_VERSION; const p=JSON.parse(readFileSync("apps/unit-001/package.json")); if(!/^\d+\.\d+\.\d+$/.test(v) || v!==p.version) throw new Error("Input version must match app manifest exactly")'
       - run: npm ci --ignore-scripts
+      - name: Prepare bundled public verification root
+        env:
+          UPDATE_ROOT_JSON: ${{ vars.UNIT_UPDATE_ROOT_JSON }}
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          root = os.environ["UPDATE_ROOT_JSON"]
+          if not root:
+              raise ValueError("Missing approved public bootstrap root repository variable")
+          (Path(os.environ["RUNNER_TEMP"]) / "unit-bootstrap-root.json").write_text(root)
       - name: Test publisher and build immutable candidate
         run: |
           node --test apps/unit-001/test/update-repository.test.mjs
-          node apps/unit-001/scripts/build-release.mjs --out .artifacts/unit-publish
+          node apps/unit-001/scripts/build-release.mjs --out .artifacts/unit-publish --update-root "$RUNNER_TEMP/unit-bootstrap-root.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unit-publish-candidate
@@ -56,8 +67,6 @@ jobs:
     environment: unit-release
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -102,11 +111,12 @@ jobs:
       - name: Sign new release against current repository
         if: inputs.mode == 'publish'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UNIT_RELEASE_TOKEN }}
           RELEASE_VERSION: ${{ inputs.version }}
         shell: bash
         run: |
           set -euo pipefail
+          test -n "$GH_TOKEN" || { echo 'Missing maintainer-only UNIT_RELEASE_TOKEN for the public release repository' >&2; exit 1; }
           tool=apps/unit-001/scripts/update-repository.mjs
           previous_root=()
           if [[ -f "$RUNNER_TEMP/unit-signing/previous-root.json" ]]; then
@@ -115,15 +125,17 @@ jobs:
           node "$tool" fetch --out "$RUNNER_TEMP/unit-previous"
           node "$tool" prepare --archive "$RUNNER_TEMP/unit-candidate/unit-001-$RELEASE_VERSION-linux-x64.tar.gz" \
             --root "$RUNNER_TEMP/unit-signing/root.json" --keys "$RUNNER_TEMP/unit-signing" \
-            --previous "$RUNNER_TEMP/unit-previous" --out "$RUNNER_TEMP/unit-publication" "${previous_root[@]}"
+            --previous "$RUNNER_TEMP/unit-previous" --out "$RUNNER_TEMP/unit-publication" \
+            --source-commit "$GITHUB_SHA" "${previous_root[@]}"
           node "$tool" publish --out "$RUNNER_TEMP/unit-publication" --root "$RUNNER_TEMP/unit-signing/root.json"
       - name: Renew authenticated metadata without rebuilding
         if: inputs.mode == 'renew' || github.event_name == 'schedule'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UNIT_RELEASE_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
+          test -n "$GH_TOKEN" || { echo 'Missing maintainer-only UNIT_RELEASE_TOKEN for the public release repository' >&2; exit 1; }
           tool=apps/unit-001/scripts/update-repository.mjs
           previous_root=()
           if [[ -f "$RUNNER_TEMP/unit-signing/previous-root.json" ]]; then

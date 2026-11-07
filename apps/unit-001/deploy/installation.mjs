@@ -23,7 +23,14 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { createUpdateContext, installUpdateCore } from "./update-activation.mjs";
+import {
+	assertUpdateSchedulingOwned,
+	createUpdateContext,
+	installUpdateCore,
+	restartUpdateScheduling,
+	updatePaths,
+	updateScheduling,
+} from "./update-activation.mjs";
 
 /** Validates the stable UUID namespace used by every installation-owned resource. */
 export function validateId(id) {
@@ -177,6 +184,101 @@ function atomicFile(path, contents, mode, root) {
 export function writeInstallation(record, root = "/") {
 	validateRecord(record);
 	atomicFile(installationPaths(record.id, root).record, `${JSON.stringify(record, null, "\t")}\n`, 0o644, root);
+}
+
+/** Reads bounded release bootstrap metadata without requiring administrator ownership or changing the host. */
+export function readReleaseUpdateBootstrap(release) {
+	try {
+		const directory = lstatSync(join(release, "deploy"));
+		if (!directory.isDirectory() || directory.isSymbolicLink())
+			throw new Error("Bundled update bootstrap must not traverse a symlink.");
+	} catch (error) {
+		if (error.code === "ENOENT") return null;
+		throw error;
+	}
+	const sourceRoot = join(release, "deploy/update-root.json");
+	const sourceFeed = join(release, "deploy/update-feed.json");
+	let present = false;
+	for (const [path, limit] of [
+		[sourceRoot, 4 * 1024 * 1024],
+		[sourceFeed, 8192],
+	]) {
+		let info;
+		try {
+			info = lstatSync(path);
+		} catch (error) {
+			if (error.code !== "ENOENT") throw error;
+		}
+		if (info === undefined) continue;
+		present = true;
+		if (!info.isFile() || info.isSymbolicLink() || info.size > limit)
+			throw new Error("Bundled update bootstrap must contain bounded regular files.");
+	}
+	if (!present) return null;
+	const bytes = readFileSync(sourceRoot);
+	const metadata = JSON.parse(bytes);
+	const feed = JSON.parse(readFileSync(sourceFeed));
+	// Preflight checks shape and expiry before privileged setup; the builder verifies approved root signatures.
+	if (
+		metadata.signed?._type !== "root" ||
+		metadata.signed.consistent_snapshot !== true ||
+		!Number.isSafeInteger(metadata.signed.version) ||
+		metadata.signed.version < 1 ||
+		!Number.isFinite(Date.parse(metadata.signed.expires)) ||
+		Date.parse(metadata.signed.expires) <= Date.now() ||
+		feed.schemaVersion !== 1 ||
+		feed.repository !== "francman/unit-001-releases" ||
+		feed.channel !== "stable" ||
+		Object.keys(feed).some((key) => !["schemaVersion", "repository", "channel"].includes(key))
+	)
+		throw new Error("Unsupported bundled public update trust.");
+	return { rootBytes: bytes, feed };
+}
+
+/** Seeds bundled public trust once; existing operator trust and update policy always remain authoritative. */
+export function bootstrapReleaseUpdates(record, release, root = "/") {
+	const bootstrap = readReleaseUpdateBootstrap(release);
+	if (bootstrap === null) return false;
+	// Bootstrap trusts only the protected release whose complete inventory the installer already verified.
+	for (const path of ["update-root.json", "update-feed.json"]) trustedFile(join(release, "deploy", path), root);
+	const { rootBytes: bytes, feed } = bootstrap;
+	const paths = updatePaths(record.id, root);
+	const receipt = join(paths.configDirectory, "bootstrap.json");
+	for (const path of [paths.config, paths.trustRoot, receipt]) {
+		assertSafePath(path, root);
+		if (existsSync(path)) trustedFile(path, root);
+	}
+	if (existsSync(paths.config)) return false;
+	const expectedReceipt = `${JSON.stringify({ schemaVersion: 1, rootSha256: createHash("sha256").update(bytes).digest("hex"), repository: feed.repository, channel: feed.channel })}\n`;
+	if (existsSync(paths.trustRoot) && (!existsSync(receipt) || readFileSync(receipt, "utf8") !== expectedReceipt))
+		return false;
+	if (existsSync(paths.trustRoot) && !readFileSync(paths.trustRoot).equals(bytes))
+		throw new Error("Bundled trust does not match the interrupted public bootstrap.");
+	assertUpdateSchedulingOwned(record, root);
+	mkdirSync(paths.configDirectory, { recursive: true, mode: 0o755 });
+	trustedParents(join(paths.configDirectory, ".check"), root);
+	const schedule = updateScheduling(record, root);
+	for (const [path, contents] of [
+		[schedule.servicePath, schedule.serviceContents],
+		[schedule.timerPath, schedule.timerContents],
+	])
+		atomicFile(path, contents, 0o644, root);
+	atomicFile(receipt, expectedReceipt, 0o600, root);
+	atomicFile(paths.trustRoot, bytes, 0o644, root);
+	atomicFile(
+		paths.config,
+		`${JSON.stringify({ schemaVersion: 1, id: record.id, enabled: true, pin: null, repository: feed.repository, channel: feed.channel })}\n`,
+		0o600,
+		root,
+	);
+	rmSync(receipt);
+	const directory = openSync(paths.configDirectory, "r");
+	try {
+		fsyncSync(directory);
+	} finally {
+		closeSync(directory);
+	}
+	return true;
 }
 
 function commandContents(record) {
@@ -388,6 +490,7 @@ export function removeUnusedRelease(record, root = "/") {
 
 async function installRelease(source, root, name, dryRun) {
 	root = resolve(root || "/");
+	readReleaseUpdateBootstrap(source);
 	validateName(name);
 	const version = readFileSync(join(source, "VERSION"), "utf8").trim();
 	const old = listInstallations(root).find((record) => record.name === name);
@@ -515,6 +618,7 @@ async function installRelease(source, root, name, dryRun) {
 			atomicFile(paths.environment, "# Optional provider keys and UNIT_001_MODEL.\n", 0o600, root);
 		const plan = mkdtempSync(join(tmpdir(), "unit-001-install-"));
 		installUpdateCore(record, destination, createUpdateContext(root));
+		const updatesConfigured = bootstrapReleaseUpdates(record, destination, root);
 		try {
 			writeFileSync(join(plan, "record.json"), `${JSON.stringify(record, null, "\t")}\n`);
 			writeFileSync(join(plan, "command"), commandContents(record));
@@ -542,20 +646,37 @@ async function installRelease(source, root, name, dryRun) {
 		} finally {
 			rmSync(plan, { recursive: true, force: true });
 		}
+		if (root === "/" && record.desiredState === "running") {
+			try {
+				await restartUpdateScheduling(record, createUpdateContext(root));
+			} catch (error) {
+				process.stderr.write(
+					`Agent is running, but automatic update scheduling failed: ${error.message}. Inspect sudo ${name} update status.\n`,
+				);
+			}
+		}
 		console.log(
 			`Installed ${name} (${id}). Provider environment: ${paths.environment}. Configure credentials with sudo ${name} login, then run sudo ${name} start.`,
 		);
+		if (updatesConfigured)
+			console.log(`Signed public updates are configured automatically and run while ${name} is started.`);
 	}, root);
 }
 
-if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+if (process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url) {
 	const [command, source, root, name, dryRun] = process.argv.slice(2);
-	if (command !== "install" || !source || root === undefined || !name)
-		throw new Error("Invalid installer invocation.");
-	if (resolve(root || "/") === "/") {
-		if (process.getuid() !== 0 || process.platform !== "linux")
-			throw new Error("Live named installation requires Linux root privileges.");
-		process.env.PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+	if (command === "preflight") {
+		if (!source || process.argv.length !== 4) throw new Error("Invalid bootstrap preflight invocation.");
+		readReleaseUpdateBootstrap(realpathSync(source));
+		console.log("Public update trust verified.");
+	} else {
+		if (command !== "install" || !source || root === undefined || !name)
+			throw new Error("Invalid installer invocation.");
+		if (resolve(root || "/") === "/") {
+			if (process.getuid() !== 0 || process.platform !== "linux")
+				throw new Error("Live named installation requires Linux root privileges.");
+			process.env.PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/bin";
+		}
+		await installRelease(realpathSync(source), root, name, dryRun === "true");
 	}
-	await installRelease(realpathSync(source), root, name, dryRun === "true");
 }

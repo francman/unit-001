@@ -19,6 +19,7 @@ import { createRequire } from "node:module";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import { Metadata } from "@tufjs/models";
 
 export const NODE_RELEASE = {
 	version: "24.22.2",
@@ -208,6 +209,38 @@ export function writeReleaseLauncher(stage) {
 	);
 }
 
+/** Bundles only explicitly approved public trust for credential-free release installation. */
+export function writeUpdateBootstrap(stage, rootFile) {
+	if (rootFile === undefined) return;
+	const info = lstatSync(rootFile);
+	if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 * 1024)
+		throw new Error("Update root must be a bounded regular public metadata file");
+	const bytes = readFileSync(rootFile);
+	if (/-----BEGIN [^-]*PRIVATE KEY-----/.test(bytes.toString("utf8")))
+		throw new Error("Private signing keys must never be bundled");
+	const value = JSON.parse(bytes);
+	for (const key of Object.values(value.signed?.keys ?? {})) {
+		if (
+			key.keytype !== "ed25519" ||
+			key.scheme !== "ed25519" ||
+			Object.keys(key.keyval ?? {}).length !== 1 ||
+			!/^[a-f0-9]{64}$/.test(key.keyval?.public)
+		)
+			throw new Error("Update root must contain public Ed25519 keys only");
+	}
+	const metadata = Metadata.fromJSON("root", value);
+	metadata.verifyDelegate("root", metadata);
+	if (!metadata.signed.consistentSnapshot || metadata.signed.isExpired())
+		throw new Error("Update root must be unexpired with consistent snapshots");
+	mkdirSync(join(stage, "deploy"), { recursive: true });
+	writeFileSync(join(stage, "deploy/update-root.json"), bytes, { flag: "wx", mode: 0o644 });
+	writeFileSync(
+		join(stage, "deploy/update-feed.json"),
+		`${JSON.stringify({ schemaVersion: 1, repository: "francman/unit-001-releases", channel: "stable" })}\n`,
+		{ flag: "wx", mode: 0o644 },
+	);
+}
+
 /** Builds the archive without publishing, installing a service, or changing upstream sources. */
 export function buildRelease(out, options = {}) {
 	const sourceManifest = JSON.parse(readFileSync(join(repository, "apps/unit-001/package.json"), "utf8"));
@@ -234,6 +267,7 @@ export function buildRelease(out, options = {}) {
 		const dependencies = installDependencies(app, sourceManifest);
 		copyNodeRuntime(stage, scratch);
 		cpSync(join(repository, "apps/unit-001/deploy"), join(stage, "deploy"), { recursive: true });
+		writeUpdateBootstrap(stage, options.updateRoot);
 		writeUpdaterCore(stage);
 		mkdirSync(join(stage, "docs"));
 		for (const name of [
@@ -245,6 +279,7 @@ export function buildRelease(out, options = {}) {
 			"terminal-assessment-omp.md",
 			"terminal-assessment-others.md",
 			"updates.md",
+			"distribution.md",
 		]) {
 			cpSync(join(repository, "apps/unit-001/docs", name), join(stage, "docs", name));
 		}
@@ -316,12 +351,13 @@ if (process.argv[1] !== undefined && pathToFileURL(resolve(process.argv[1])).hre
 		options: {
 			out: { type: "string", default: join(repository, ".artifacts/unit-001-release") },
 			version: { type: "string" },
+			"update-root": { type: "string" },
 			help: { type: "boolean", default: false },
 		},
 	});
 	if (values.help)
 		console.log(
-			"Usage: node apps/unit-001/scripts/build-release.mjs [--out <directory>] [--version <fixture-version>]\nBuild prerequisites: Node/npm, curl, tar, installed checkout dependencies, and network access.\nHydrates Pi model data, builds app and Pi dependencies, then emits a Linux x64 archive with Node and a locked production install. Production publication requires the source manifest version.",
+			"Usage: node apps/unit-001/scripts/build-release.mjs [--out <directory>] [--version <fixture-version>] [--update-root <public-root.json>]\nBuild prerequisites: Node/npm, curl, tar, installed checkout dependencies, and network access.\nHydrates Pi model data, builds app and Pi dependencies, then emits a Linux x64 archive with Node and a locked production install. Public production releases require an approved public update root and the source manifest version.",
 		);
-	else buildRelease(values.out, { version: values.version });
+	else buildRelease(values.out, { version: values.version, updateRoot: values["update-root"] });
 }

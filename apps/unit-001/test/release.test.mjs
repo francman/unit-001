@@ -15,7 +15,9 @@ import {
 	writeReleaseArchive,
 	writeReleaseChecksums,
 	writeReleaseLauncher,
+	writeUpdateBootstrap,
 } from "../scripts/build-release.mjs";
+import { generateRepositoryKeys } from "../scripts/update-repository.mjs";
 
 const temporary = [];
 afterEach(() => {
@@ -122,4 +124,49 @@ test("rejects external dependency drift while allowing packed local checkout pac
 			),
 		/Unreviewed release dependency/,
 	);
+});
+
+test("#18 production bootstrap bundles public trust and a credential-free feed inside the release inventory", () => {
+	const directory = mkdtempSync(join(tmpdir(), "unit-release-"));
+	temporary.push(directory);
+	const stage = join(directory, "release"),
+		keys = join(directory, "keys");
+	mkdirSync(stage);
+	const root = generateRepositoryKeys(keys);
+	writeUpdateBootstrap(stage, join(keys, "root.json"));
+	assert.deepEqual(releaseFiles(stage), ["deploy/update-feed.json", "deploy/update-root.json"]);
+	assert.deepEqual(readFileSync(join(stage, "deploy/update-root.json")), root);
+	assert.deepEqual(JSON.parse(readFileSync(join(stage, "deploy/update-feed.json"))), {
+		schemaVersion: 1,
+		repository: "francman/unit-001-releases",
+		channel: "stable",
+	});
+	writeReleaseChecksums(stage);
+	assert.match(readFileSync(join(stage, "SHA256SUMS"), "utf8"), /\.\/deploy\/update-root\.json/);
+	assert(!releaseFiles(stage).some((name) => name.endsWith(".pem")));
+});
+
+test("#18 release bootstrap rejects private keys, expired trust, and tampered signatures; ordinary CI stays unconfigured", () => {
+	const directory = mkdtempSync(join(tmpdir(), "unit-release-"));
+	temporary.push(directory);
+	const stage = join(directory, "release"),
+		keys = join(directory, "keys");
+	mkdirSync(stage);
+	writeUpdateBootstrap(stage);
+	assert.deepEqual(releaseFiles(stage), []);
+	generateRepositoryKeys(keys);
+	assert.throws(() => writeUpdateBootstrap(stage, join(keys, "root.pem")), /Private signing keys/);
+	const value = JSON.parse(readFileSync(join(keys, "root.json")));
+	Object.values(value.signed.keys)[0].keyval.private = "must-not-ship";
+	const unsafe = join(directory, "unsafe.json");
+	writeFileSync(unsafe, JSON.stringify(value));
+	assert.throws(() => writeUpdateBootstrap(stage, unsafe), /public Ed25519/);
+	delete Object.values(value.signed.keys)[0].keyval.private;
+	value.signed.version++;
+	writeFileSync(unsafe, JSON.stringify(value));
+	assert.throws(() => writeUpdateBootstrap(stage, unsafe));
+	const expired = join(directory, "expired");
+	generateRepositoryKeys(expired, new Date("2020-01-01T00:00:00Z"));
+	assert.throws(() => writeUpdateBootstrap(stage, join(expired, "root.json")), /unexpired/);
+	assert.deepEqual(releaseFiles(stage), []);
 });
