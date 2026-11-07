@@ -206,7 +206,13 @@ async function software(record, root, paths) {
 	await mkdir(paths.agentRoot, { recursive: true });
 	await mkdir(join(root, "etc/systemd/system"), { recursive: true });
 	const files = new Map([["VERSION", `${record.releaseVersion}\n`]]);
-	for (const file of ["agent-command.mjs", "lifecycle.mjs", "installation.mjs", "unit-001.service"]) {
+	for (const file of [
+		"agent-command.mjs",
+		"lifecycle.mjs",
+		"installation.mjs",
+		"update-activation.mjs",
+		"unit-001.service",
+	]) {
 		const text = await readFile(new URL(`../deploy/${file}`, import.meta.url), "utf8");
 		files.set(`deploy/${file}`, text);
 		if (file !== "unit-001.service") await writeFile(join(paths.management, file), text);

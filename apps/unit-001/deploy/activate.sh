@@ -86,7 +86,7 @@ if [[ "$service_action" == manage && "$was_running" == true ]]; then systemctl s
 activation_started=true
 mkdir -p -- "$management"
 chmod 755 "$management"
-for module in installation.mjs agent-command.mjs lifecycle.mjs; do
+for module in installation.mjs agent-command.mjs lifecycle.mjs update-activation.mjs; do
   publish_file "$release/deploy/$module" "$management/$module" 644
 done
 publish_file "$plan/record.json" "$record" 644

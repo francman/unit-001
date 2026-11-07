@@ -85,6 +85,31 @@ describe("parseArguments account commands", () => {
 });
 
 describe("parseArguments service commands", () => {
+	it("parses inhibited startup and bounded maintenance controls", () => {
+		// #18: Inhibition belongs to service startup, never a client-side admission override.
+		expect(parseArguments(["serve", "--inhibited"])).toEqual({
+			kind: "serve",
+			options: { session: "default", inhibited: true },
+		});
+		expect(parseArguments(["maintenance-enter", "--operation-id", "upgrade", "--timeout-ms", "0"])).toEqual({
+			kind: "maintenance-enter",
+			operationId: "upgrade",
+			timeoutMs: 0,
+			options: { session: "default" },
+		});
+		expect(parseArguments(["maintenance-release", "--operation-id", "upgrade", "--session", "work"])).toEqual({
+			kind: "maintenance-release",
+			operationId: "upgrade",
+			options: { session: "work" },
+		});
+		for (const args of [
+			["send", "x", "--inhibited"],
+			["maintenance-enter"],
+			["maintenance-enter", "--operation-id", "x", "--timeout-ms", "30001"],
+			["maintenance-release", "--operation-id", "x", "--timeout-ms", "0"],
+		])
+			expect(() => parseArguments(args)).toThrow(UsageError);
+	});
 	it.each(["- explain this failure", "--help", "--session=literal"])(
 		"keeps %s as a literal prompt after --",
 		(prompt) => {
@@ -100,7 +125,8 @@ describe("parseArguments service commands", () => {
 	it("parses the headless owner and local controls", () => {
 		// #22: plain attachment remains available without changing service ownership or automation.
 		expect(parseArguments(["attach", "--plain", "--session", "work"])).toEqual({
-			kind: "attach", options: { session: "work", plain: true },
+			kind: "attach",
+			options: { session: "work", plain: true },
 		});
 		// #21: attaching is a socket client and cannot select a new owner model.
 		expect(parseArguments(["attach", "--session", "work", "--data-dir=/d"])).toEqual({

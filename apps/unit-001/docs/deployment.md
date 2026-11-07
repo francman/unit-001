@@ -11,6 +11,6 @@ For Amazon Lightsail, use the [VPS setup guide](lightsail.md) and run the bundle
 
 Each agent has its own stable ID, account, service, sessions, credentials, and workspace. Renaming preserves that identity. Stop/kill remains effective until an explicit start. Uninstall preserves data, configuration, and account ownership, and leaves another agent's software untouched.
 
-Persistent hosting and submitted work are implemented. Autonomous mission decisions, memory, and automatic updates remain roadmap work.
+Persistent hosting and submitted work are implemented. The [independent updater](updates.md) adds authenticated releases and recovery; configure signing and host trust before enabling its timer. Autonomous mission decisions and memory remain roadmap work.
 
 See [operations](operations.md) for configuration, rename, upgrades, and recovery.

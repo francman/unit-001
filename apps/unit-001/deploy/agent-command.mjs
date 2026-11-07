@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { parseEnv } from "node:util";
 import { assertSafePath, installationPaths, readInstallation, withManagementLock } from "./installation.mjs";
 import { lifecycle, recoverRename } from "./lifecycle.mjs";
+import { readUpdateJournal, updatePaths } from "./update-activation.mjs";
 
 const ACTIONS = new Set(["start", "stop", "kill", "uninstall", "rename"]);
 
@@ -17,6 +18,13 @@ export async function dispatchAgent(id, expectedName, args, context) {
 	if (!service && expectedName !== record.name)
 		throw new Error("This agent command was renamed; use its current name.");
 	const action = args[0];
+	if (!service && ["maintenance-enter", "maintenance-release"].includes(action))
+		throw new Error("Managed maintenance controls belong to the independent updater.");
+	if (!service && action === "update") {
+		if (context.uid !== 0) throw new Error("Update commands require root; this command does not elevate itself.");
+		const core = updatePaths(id, context.root).currentCore;
+		return context.run(join(core, "runtime/bin/node"), [join(core, "lib/update.mjs"), "--id", id, ...args.slice(1)]);
+	}
 	if (!service && ACTIONS.has(action)) {
 		if (context.uid !== 0)
 			throw new Error(`Run sudo ${record.name} ${action}; this command does not elevate itself.`);
@@ -47,7 +55,14 @@ export async function dispatchAgent(id, expectedName, args, context) {
 	const release = await context.release(paths.current);
 	const node = join(release, "runtime/bin/node");
 	const app = join(release, "app/dist/named.js");
-	const appArgs = [app, id, record.name, `/var/lib/unit-001/agents/${id}`, ...(service ? ["serve"] : args)];
+	const journal = service ? readUpdateJournal(id, context.root) : null;
+	const appArgs = [
+		app,
+		id,
+		record.name,
+		`/var/lib/unit-001/agents/${id}`,
+		...(service ? ["serve", ...(journal && journal.phase !== "complete" ? ["--inhibited"] : [])] : args),
+	];
 	// runuser establishes the recorded account before Node opens config, credentials, sockets or state.
 	return context.uid === 0
 		? context.run(

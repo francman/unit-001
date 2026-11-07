@@ -11,14 +11,14 @@ npm ci --ignore-scripts
 node apps/unit-001/scripts/build-release.mjs --out .artifacts/unit-001-release
 ```
 
-The builder hydrates Pi model data, compiles the app and required Pi packages, installs locked production dependencies without lifecycle scripts, and bundles a pinned Node 24 runtime. It verifies Node's checksum and hashes the complete payload. The Unit release bundle workflow uploads an unpublished artifact; it does not publish a release or enable auto-updates.
+The builder hydrates Pi model data, compiles the app and required Pi packages, installs locked production dependencies without lifecycle scripts, and bundles a pinned Node 24 runtime. It verifies Node's checksum and hashes the complete payload. The Unit release bundle workflow uploads an unpublished artifact. The separate publication workflow signs releases; neither workflow enables a host's update timer. See [continuous updates](updates.md) for trust bootstrap, commands and key custody.
 
 Obtain the archive and checksum through a trusted release channel. For the current app version:
 
 ```bash
-sha256sum --check unit-001-0.0.1-linux-x64.tar.gz.sha256
-tar -xzf unit-001-0.0.1-linux-x64.tar.gz
-cd unit-001-0.0.1-linux-x64
+sha256sum --check unit-001-0.0.2-linux-x64.tar.gz.sha256
+tar -xzf unit-001-0.0.2-linux-x64.tar.gz
+cd unit-001-0.0.2-linux-x64
 ./install.sh --dry-run
 sudo ./install.sh
 ```
@@ -95,4 +95,4 @@ Rollback requires code that understands the stored documents and task checkpoint
 
 ## Scope
 
-Named installations, submitted work, and lifecycle controls are implemented. Autonomous mission decisions, memory, and authenticated automatic updates remain separate work in #14–#18 and #3–#9. Old singleton installations are not automatically migrated. Source execution has no managed-system administrative behavior.
+Named installations, submitted work, lifecycle controls and the independent update infrastructure are implemented. Live continuous delivery requires the signing environment and host trust described in [updates](updates.md). Autonomous mission decisions and memory remain separate work in #14–#17 and #3–#9. Old singleton installations are not automatically migrated. Source execution has no managed-system administrative behavior.

@@ -50,6 +50,45 @@ function runtime(env: Record<string, string>, stdin = ""): { runtime: Runtime; o
 const signal = new AbortController().signal;
 
 describe("main", () => {
+	it.skipIf(process.platform === "win32")(
+		"serves inhibited inspection and maintenance controls without executing work",
+		async () => {
+			// #18: Candidate readiness cannot enable persisted work or accept new prompts.
+			const owner = runtime({ OPENAI_API_KEY: "dummy-never-dispatched" });
+			const controller = new AbortController();
+			const running = main(["serve", "--inhibited"], owner.runtime, controller.signal);
+			try {
+				await expect.poll(owner.err).toContain("service ready");
+				const status = runtime({});
+				expect(await main(["service-status"], status.runtime, signal)).toBe(0);
+				expect(JSON.parse(status.out())).toMatchObject({
+					inhibited: true,
+					maintenance: { protocol: 1, state: "open" },
+				});
+				const sending = runtime({});
+				expect(await main(["send", "blocked"], sending.runtime, signal)).toBe(1);
+				expect(sending.err()).toContain("inhibited");
+				const cancel = runtime({});
+				expect(await main(["cancel"], cancel.runtime, signal)).toBe(1);
+				expect(cancel.err()).toContain("inhibited");
+				const enter = runtime({});
+				expect(
+					await main(
+						["maintenance-enter", "--operation-id", "update", "--timeout-ms", "0"],
+						enter.runtime,
+						signal,
+					),
+				).toBe(0);
+				expect(JSON.parse(enter.out())).toMatchObject({ state: "held", result: "drained" });
+				const release = runtime({});
+				expect(await main(["maintenance-release", "--operation-id", "update"], release.runtime, signal)).toBe(0);
+				expect(JSON.parse(release.out())).toMatchObject({ state: "open" });
+			} finally {
+				controller.abort();
+				expect(await running).toBe(0);
+			}
+		},
+	);
 	it("prints help and exits 0", async () => {
 		const run = runtime({});
 		expect(await main(["--help"], run.runtime, signal)).toBe(0);
@@ -92,8 +131,8 @@ describe("main", () => {
 								name: "bob",
 								installationId: "test-id",
 								entries: [],
-						model: null,
-						usage: null,
+								model: null,
+								usage: null,
 								busy: false,
 								text: "",
 								textTruncated: false,

@@ -1,0 +1,136 @@
+name: Publish authenticated unit release
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [publish, renew]
+        default: publish
+        description: Publish a new immutable bundle or renew existing metadata
+      version:
+        type: string
+        description: Exact app version required for publish (unused by renew)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-update-publication
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    if: github.repository == 'francman/unit-001' && github.ref == 'refs/heads/main' && inputs.mode == 'publish'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Validate exact version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          node --input-type=module -e 'import {readFileSync} from "node:fs"; const v=process.env.RELEASE_VERSION; const p=JSON.parse(readFileSync("apps/unit-001/package.json")); if(!/^\d+\.\d+\.\d+$/.test(v) || v!==p.version) throw new Error("Input version must match app manifest exactly")'
+      - run: npm ci --ignore-scripts
+      - name: Test publisher and build immutable candidate
+        run: |
+          node --test apps/unit-001/test/update-repository.test.mjs
+          node apps/unit-001/scripts/build-release.mjs --out .artifacts/unit-publish
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-publish-candidate
+          path: .artifacts/unit-publish/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: bundle
+    if: always() && github.repository == 'francman/unit-001' && github.ref == 'refs/heads/main' && ((inputs.mode == 'publish' && needs.bundle.result == 'success') || inputs.mode == 'renew' || (github.event_name == 'schedule' && vars.UNIT_UPDATES_ENABLED == 'true'))
+    environment: unit-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - if: inputs.mode == 'publish'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: unit-publish-candidate
+          path: ${{ runner.temp }}/unit-candidate
+      - name: Load explicit trust root and online signing keys
+        env:
+          UPDATE_ROOT_JSON: ${{ vars.UNIT_UPDATE_ROOT_JSON }}
+          UPDATE_PREVIOUS_ROOT_JSON: ${{ vars.UNIT_UPDATE_PREVIOUS_ROOT_JSON }}
+          TARGETS_KEY: ${{ secrets.UNIT_UPDATE_TARGETS_KEY }}
+          SNAPSHOT_KEY: ${{ secrets.UNIT_UPDATE_SNAPSHOT_KEY }}
+          TIMESTAMP_KEY: ${{ secrets.UNIT_UPDATE_TIMESTAMP_KEY }}
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          base = Path(os.environ["RUNNER_TEMP"]) / "unit-signing"
+          base.mkdir(mode=0o700)
+          for role in ("targets", "snapshot", "timestamp"):
+              value = os.environ[role.upper() + "_KEY"]
+              if not value:
+                  raise ValueError("Missing explicit online signing key")
+              fd = os.open(base / (role + ".pem"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, "w") as file:
+                  file.write(value)
+          root = os.environ["UPDATE_ROOT_JSON"]
+          if not root:
+              raise ValueError("Missing approved bootstrap root")
+          (base / "root.json").write_text(root)
+          previous = os.environ.get("UPDATE_PREVIOUS_ROOT_JSON", "")
+          if previous:
+              (base / "previous-root.json").write_text(previous)
+      - name: Sign new release against current repository
+        if: inputs.mode == 'publish'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool=apps/unit-001/scripts/update-repository.mjs
+          previous_root=()
+          if [[ -f "$RUNNER_TEMP/unit-signing/previous-root.json" ]]; then
+            previous_root=(--previous-root "$RUNNER_TEMP/unit-signing/previous-root.json")
+          fi
+          node "$tool" fetch --out "$RUNNER_TEMP/unit-previous"
+          node "$tool" prepare --archive "$RUNNER_TEMP/unit-candidate/unit-001-$RELEASE_VERSION-linux-x64.tar.gz" \
+            --root "$RUNNER_TEMP/unit-signing/root.json" --keys "$RUNNER_TEMP/unit-signing" \
+            --previous "$RUNNER_TEMP/unit-previous" --out "$RUNNER_TEMP/unit-publication" "${previous_root[@]}"
+          node "$tool" publish --out "$RUNNER_TEMP/unit-publication" --root "$RUNNER_TEMP/unit-signing/root.json"
+      - name: Renew authenticated metadata without rebuilding
+        if: inputs.mode == 'renew' || github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool=apps/unit-001/scripts/update-repository.mjs
+          previous_root=()
+          if [[ -f "$RUNNER_TEMP/unit-signing/previous-root.json" ]]; then
+            previous_root=(--previous-root "$RUNNER_TEMP/unit-signing/previous-root.json")
+          fi
+          node "$tool" renew --out "$RUNNER_TEMP/unit-renewal" --root "$RUNNER_TEMP/unit-signing/root.json" --keys "$RUNNER_TEMP/unit-signing" "${previous_root[@]}"
+          node "$tool" publish --out "$RUNNER_TEMP/unit-renewal/publication" --root "$RUNNER_TEMP/unit-signing/root.json"
+      - name: Remove temporary signing keys
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/unit-signing"

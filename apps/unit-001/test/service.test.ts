@@ -84,6 +84,33 @@ const signal = () => new AbortController().signal;
 const reply = (text: string) => fauxAssistantMessage([fauxText(text)]);
 
 describe.skipIf(process.platform === "win32")("headless local service", () => {
+	it("exposes durable maintenance controls while rejecting new admissions", async () => {
+		// #18: Only the owner changes the session gate; clients never open a second SQLite writer.
+		const service = await launch([reply("Allowed")]);
+		expect(
+			await requestService(
+				service.path,
+				{ type: "maintenance-enter", operationId: "update", timeoutMs: 0 },
+				signal(),
+			),
+		).toEqual({ type: "maintenance", protocol: 1, state: "held", operationId: "update", result: "drained" });
+		expect(await requestService(service.path, { type: "send", prompt: "Blocked" }, signal())).toMatchObject({
+			type: "error",
+		});
+		expect(await requestService(service.path, { type: "status" }, signal())).toMatchObject({
+			maintenance: { state: "held", operationId: "update" },
+		});
+		expect(
+			await requestService(service.path, { type: "maintenance-release", operationId: "wrong" }, signal()),
+		).toMatchObject({ type: "error" });
+		expect(
+			await requestService(service.path, { type: "maintenance-release", operationId: "update" }, signal()),
+		).toEqual({ type: "maintenance", protocol: 1, state: "open", operationId: null });
+		expect(await requestService(service.path, { type: "send", prompt: "Allowed" }, signal())).toMatchObject({
+			type: "reply",
+		});
+		expect(service.faux.state.callCount).toBe(1);
+	});
 	it("keeps the second watcher alive through queued prompts and a tool round after the first detaches", async () => {
 		// #21: structural snapshots retain committed answers even when intermediate updates fold.
 		let resume!: () => void;
@@ -282,6 +309,8 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 			name: "agent",
 			installationId: null,
 			busy: false,
+			inhibited: false,
+			maintenance: { protocol: 1, state: "open", operationId: null },
 		});
 		expect(
 			await requestService(service.path, { type: "send", prompt: "Capital of France?", requestId: "q1" }, signal()),

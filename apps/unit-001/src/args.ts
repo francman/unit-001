@@ -9,6 +9,7 @@ export interface RunOptions {
 	/** `provider/model-id`; without it the model comes from `UNIT_001_MODEL` or the configured provider. */
 	readonly model?: string;
 	readonly dataDir?: string;
+	readonly inhibited?: boolean;
 }
 
 export interface ServiceOptions {
@@ -21,6 +22,13 @@ export interface AttachOptions extends ServiceOptions {
 }
 
 export type Command =
+	| {
+			readonly kind: "maintenance-enter";
+			readonly operationId: string;
+			readonly timeoutMs: number;
+			readonly options: ServiceOptions;
+	  }
+	| { readonly kind: "maintenance-release"; readonly operationId: string; readonly options: ServiceOptions }
 	| { readonly kind: "help" }
 	| { readonly kind: "version" }
 	| { readonly kind: "login"; readonly provider: string; readonly dataDir?: string }
@@ -100,8 +108,14 @@ function parseServiceCommand(
 	const values: { session?: string; dataDir?: string; model?: string; requestId?: string } = {};
 	let prompt: string | undefined;
 	let plain = false;
+	let inhibited = false;
 	for (let index = 0; index < rest.length; index++) {
 		const argument = rest[index];
+		if (kind === "serve" && argument === "--inhibited") {
+			if (inhibited) throw new UsageError("Option --inhibited was given more than once.");
+			inhibited = true;
+			continue;
+		}
 		if (kind === "attach" && argument === "--plain") {
 			if (plain) throw new UsageError("Option --plain was given more than once.");
 			plain = true;
@@ -142,7 +156,14 @@ function parseServiceCommand(
 		...(values.dataDir === undefined ? {} : { dataDir: values.dataDir }),
 	};
 	if (kind === "serve")
-		return { kind, options: { ...options, ...(values.model === undefined ? {} : { model: values.model }) } };
+		return {
+			kind,
+			options: {
+				...options,
+				...(values.model === undefined ? {} : { model: values.model }),
+				...(inhibited ? { inhibited: true } : {}),
+			},
+		};
 	if (kind === "send") {
 		if (prompt === undefined || prompt.trim() === "") throw new UsageError("Usage: agent send <prompt> [options]");
 		return { kind, options, prompt, ...(values.requestId === undefined ? {} : { requestId: values.requestId }) };
@@ -153,6 +174,33 @@ function parseServiceCommand(
 /** Parses the command line, without the node and script entries. Throws `UsageError` on anything unrecognized. */
 export function parseArguments(argv: readonly string[]): Command {
 	const first = argv[0];
+	if (first === "maintenance-enter" || first === "maintenance-release") {
+		const values = new Map<string, string>();
+		for (let index = 1; index < argv.length; index++) {
+			const flag = argv[index];
+			if (
+				!["--operation-id", "--timeout-ms", "--session", "--data-dir"].includes(flag) ||
+				(flag === "--timeout-ms" && first === "maintenance-release")
+			)
+				throw new UsageError(`Unknown maintenance option: ${flag}`);
+			const value = argv[++index];
+			if (value === undefined || value === "" || values.has(flag))
+				throw new UsageError(`Option ${flag} needs one value.`);
+			values.set(flag, value);
+		}
+		const operationId = values.get("--operation-id");
+		if (operationId === undefined || operationId.length > 200)
+			throw new UsageError("Maintenance requires --operation-id (1 to 200 characters).");
+		const options = {
+			session: values.get("--session") ?? DEFAULT_SESSION,
+			...(values.has("--data-dir") ? { dataDir: values.get("--data-dir") } : {}),
+		};
+		if (first === "maintenance-release") return { kind: first, operationId, options };
+		const timeoutMs = Number(values.get("--timeout-ms") ?? "30000");
+		if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 30000)
+			throw new UsageError("Maintenance timeout must be 0 to 30000 ms.");
+		return { kind: first, operationId, timeoutMs, options };
+	}
 	if (first === "login" || first === "logout" || first === "status") return parseAccountCommand(first, argv.slice(1));
 	if (first === "serve" || first === "send" || first === "service-status" || first === "cancel" || first === "attach")
 		return parseServiceCommand(first, argv.slice(1));
