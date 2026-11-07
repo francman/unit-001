@@ -2,11 +2,11 @@
 // Exercises signed fixture updates and rollback on the explicitly disposable managed-install acceptance host.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { readInstallation } from "../deploy/installation.mjs";
+import { installationPaths, listInstallations, readInstallation } from "../deploy/installation.mjs";
 import { extractUpdateArchive } from "../deploy/update.mjs";
 import {
 	activateUpdate,
@@ -16,7 +16,7 @@ import {
 	updatePaths,
 } from "../deploy/update-activation.mjs";
 import { fetchUpdate } from "../deploy/update-trust.mjs";
-import { writeReleaseArchive, writeReleaseChecksums } from "./build-release.mjs";
+import { writeReleaseArchive, writeReleaseChecksums, writeUpdateBootstrap } from "./build-release.mjs";
 import { generateRepositoryKeys, prepareRepository } from "./update-repository.mjs";
 
 if (
@@ -38,6 +38,8 @@ mkdirSync("/var/cache/unit-001", { recursive: true, mode: 0o755 });
 const work = mkdtempSync("/var/cache/unit-001/update-acceptance-");
 const context = createUpdateContext();
 try {
+	const keys = join(work, "keys");
+	const rootBytes = generateRepositoryKeys(keys);
 	const parts = baseline.split(".").map(Number);
 	const version = `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
 	const name = `unit-001-${version}-linux-x64`;
@@ -52,60 +54,82 @@ try {
 	// This fixture signs copied payload bytes; it is never published as a production release.
 	release.source.dirty = false;
 	writeFileSync(join(candidate, "release.json"), JSON.stringify(release));
+	writeUpdateBootstrap(candidate, join(keys, "root.json"));
 	writeReleaseChecksums(candidate);
 	const archive = join(work, `${name}.tar.gz`);
 	writeReleaseArchive(work, name, archive);
-	const rootBytes = generateRepositoryKeys(join(work, "keys"));
 	const { files } = prepareRepository({
 		archive,
 		release,
 		rootBytes,
-		keys: join(work, "keys"),
+		keys,
 		out: join(work, "metadata"),
 	});
-	const assets = new Map();
-	let nextId = 1;
-	const inventory = (entries) =>
-		entries.map(([assetName, bytes]) => {
-			const asset = { id: nextId++, name: assetName };
-			assets.set(asset.id, bytes);
-			return asset;
-		});
-	const metadata = inventory(Object.entries(files));
-	const archives = inventory([[`${name}.tar.gz`, readFileSync(archive)]]);
-	writeFileSync(join(work, "root.json"), rootBytes);
-	writeFileSync(join(work, "token"), "fixture-only", { mode: 0o600 });
+	const assets = new Map(
+		Object.entries(files).map(([assetName, bytes]) => [`unit-updates-stable/${assetName}`, bytes]),
+	);
+	assets.set(`unit-v${version}/${name}.tar.gz`, readFileSync(archive));
+	const requests = [];
 	chmodSync(work, 0o700);
 	const verified = await fetchUpdate(
 		{
 			metadataDir: join(work, "cache"),
-			bootstrapRoot: join(work, "root.json"),
-			tokenFile: join(work, "token"),
+			bootstrapRoot: join(candidate, "deploy/update-root.json"),
 			downloadDir: join(work, "downloads"),
 		},
 		{
 			ownerUid: 0,
-			async fetch(url) {
+			async fetch(url, init) {
+				requests.push({ url, headers: init.headers });
 				const route = new URL(url);
-				if (route.pathname.endsWith("/releases/tags/unit-updates-stable"))
-					return Response.json({ id: 100, assets: metadata });
-				if (route.pathname.endsWith(`/releases/tags/unit-v${version}`))
-					return Response.json({ id: 101, assets: archives });
-				const listing = route.pathname.match(/\/releases\/(100|101)\/assets$/);
-				if (listing !== null) {
-					const inventory = listing[1] === "100" ? metadata : archives;
-					const page = Number(route.searchParams.get("page") ?? "1");
-					return Response.json(inventory.slice((page - 1) * 100, page * 100));
-				}
-				const asset = assets.get(Number(route.pathname.split("/").at(-1)));
+				assert.equal(route.origin, "https://github.com");
+				assert.equal(init.headers.Authorization, undefined);
+				const match = route.pathname.match(/^\/francman\/unit-001-releases\/releases\/download\/([^/]+)\/([^/]+)$/);
+				assert.notEqual(match, null);
+				const asset = assets.get(`${match[1]}/${match[2]}`);
 				return asset === undefined ? new Response("missing", { status: 404 }) : new Response(asset);
 			},
 		},
 	);
 	assert.equal(verified.version, version);
+	assert.ok(requests.length > 0);
+	assert.ok(
+		requests.every(({ url, headers }) => !url.includes("api.github.com") && headers.Authorization === undefined),
+	);
 	const extraction = join(work, "extracted");
 	mkdirSync(extraction, { mode: 0o700 });
 	const releasePath = await extractUpdateArchive(verified.archivePath, extraction, version);
+	// #18: the actual downloaded installer seeds public trust without changing host accounts or services.
+	const image = join(work, "public-image");
+	execFileSync("bash", [join(releasePath, "install.sh"), "--root", image, "--name", "public-ci"], {
+		env: {
+			...process.env,
+			PATH: `${releasePath}/runtime/bin:${process.env.PATH ?? "/usr/sbin:/usr/bin:/sbin:/bin"}`,
+		},
+		stdio: "inherit",
+		timeout: 180000,
+	});
+	const installed = listInstallations(image);
+	assert.equal(installed.length, 1);
+	const staged = installed[0];
+	assert.equal(staged.name, "public-ci");
+	assert.equal(staged.desiredState, "stopped");
+	const stagedUpdate = updatePaths(staged.id, image);
+	assert.deepEqual(JSON.parse(readFileSync(stagedUpdate.config)), {
+		schemaVersion: 1,
+		id: staged.id,
+		enabled: true,
+		pin: null,
+		repository: "francman/unit-001-releases",
+		channel: "stable",
+	});
+	assert.deepEqual(readFileSync(stagedUpdate.trustRoot), rootBytes);
+	assert.equal(existsSync(stagedUpdate.token), false);
+	const stagedInstallation = installationPaths(staged.id, image);
+	for (const unit of [stagedInstallation.updaterService, stagedInstallation.updaterTimer])
+		assert.equal(existsSync(join(image, "etc/systemd/system", unit)), true);
+	assert.equal(existsSync(`/etc/systemd/system/${stagedInstallation.unit}`), false);
+	assert.equal(spawnSync("getent", ["passwd", staged.account], { timeout: 10000 }).status, 2);
 	assert.deepEqual(await activateUpdate(record, { releasePath, ...verified }, context), {
 		status: "updated",
 		version,
@@ -198,7 +222,7 @@ try {
 	assert.equal(readFileSync(marker, "utf8"), "created-after-update-commit\n");
 	assert.equal(packagedStatus().runningVersion, baseline);
 	console.log(
-		"Managed signed update, current-state rollback, and SIGKILL/startup-dependency recovery passed (real systemd; no reboot or model requests).",
+		"Managed public download/bootstrap, signed update, current-state rollback, and SIGKILL/startup-dependency recovery passed (real systemd; no GitHub credentials, reboot or model requests).",
 	);
 } catch (error) {
 	console.error(`Native update acceptance failed: ${error.message}`);

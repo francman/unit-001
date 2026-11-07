@@ -23,7 +23,7 @@ beforeEach(async () => {
 });
 afterEach(() => rm(temporary, { recursive: true, force: true }));
 
-async function release(version: string) {
+async function release(version: string, bootstrap?: { root: string; feed: string }) {
 	const directory = join(temporary, `release-${version}`);
 	const node = process.execPath.replaceAll("'", "'\\''");
 	const files: { [path: string]: string } = {
@@ -35,6 +35,10 @@ async function release(version: string) {
 		"bin/agent": "#!/bin/sh\nexit 98\n",
 		"install.sh": await readFile(join(deployment, "install.sh"), "utf8"),
 	};
+	if (bootstrap !== undefined) {
+		files["deploy/update-root.json"] = bootstrap.root;
+		files["deploy/update-feed.json"] = bootstrap.feed;
+	}
 	for (const name of [
 		"installation.mjs",
 		"update-activation.mjs",
@@ -49,6 +53,7 @@ async function release(version: string) {
 		await mkdir(dirname(join(directory, path)), { recursive: true });
 		await writeFile(join(directory, path), content);
 	}
+	if (bootstrap !== undefined) await chmod(join(directory, "runtime/bin/node"), 0o755);
 	await writeFile(
 		join(directory, "SHA256SUMS"),
 		Object.entries(files)
@@ -79,6 +84,45 @@ describe.skipIf(process.platform === "win32")("named Linux installation", () => 
 		expect(result.status, result.stderr).toBe(0);
 		expect(result.stdout).toContain("Plan: install command agent");
 	});
+
+	it.each(["invalid", "expired", "oversized"])(
+		"rejects %s public bootstrap before dry-run or image mutations",
+		async (mode) => {
+			// #18: invalid bundled trust must fail before identity reservations, accounts, or updater cores exist.
+			const rootMetadata = {
+				signed: {
+					_type: "root",
+					consistent_snapshot: true,
+					version: 1,
+					expires: mode === "expired" ? "2000-01-01T00:00:00Z" : "2099-01-01T00:00:00Z",
+				},
+			};
+			const directory = await release("0.0.3", {
+				root:
+					mode === "oversized"
+						? " ".repeat(4 * 1024 * 1024 + 1)
+						: mode === "invalid"
+							? "{not-json"
+							: JSON.stringify(rootMetadata),
+				feed: JSON.stringify({ schemaVersion: 1, repository: "francman/unit-001-releases", channel: "stable" }),
+			});
+			const root = join(temporary, "image");
+			for (const args of [["--dry-run"], ["--root", root]]) {
+				const result = install(directory, args);
+				expect(result.status).not.toBe(0);
+				expect(result.stdout).not.toContain("Plan: install command");
+				await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+			}
+			// Calling the Node installer directly must also preflight before its management lock creates an image.
+			const direct = spawnSync(
+				process.execPath,
+				[join(directory, "deploy/installation.mjs"), "install", directory, root, "agent", "false"],
+				{ encoding: "utf8", timeout: 15000 },
+			);
+			expect(direct.status).not.toBe(0);
+			await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+		},
+	);
 
 	it("installs default agent and custom bob with separate identities and one shared immutable release", async () => {
 		// #19: command identity and state ownership must never be shared merely because release bytes are shared.

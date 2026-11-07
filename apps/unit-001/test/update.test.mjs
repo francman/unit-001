@@ -120,6 +120,27 @@ test("configuration protects credentials, defaults disabled, and status never ex
 	assert.equal((await f.run(["status"])).configuration, "invalid");
 });
 
+test("#18 public configuration checks updates without any token file or user credentials", async (t) => {
+	const f = fixture(t);
+	await f.run(["configure", "--root-file", join(f.keys, "root.json")]);
+	assert.equal(existsSync(f.paths.token), false);
+	const status = await f.run(["status"]);
+	assert.equal(status.configured, true);
+	assert.equal(status.policy.repository, "francman/unit-001-releases");
+	let fetched = false;
+	const result = await f.run(["check"], {
+		fetchCandidate: async (options, context) => {
+			assert.equal(options.repository, "francman/unit-001-releases");
+			assert.equal(Object.hasOwn(options, "tokenFile"), false);
+			fetched = true;
+			context.acceptCandidate({ version: "0.0.2", compatibility });
+			return null;
+		},
+	});
+	assert.equal(fetched, true);
+	assert.equal(result.status, "available");
+});
+
 test("configure refuses writable inputs, token symlinks, and replacement bootstrap roots", async (t) => {
 	const f = fixture(t);
 	chmodSync(f.token, 0o666);

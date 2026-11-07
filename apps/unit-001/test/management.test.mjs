@@ -9,6 +9,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, test } from "node:test";
 import { configuredEnvironment, confirmAction, dispatchAgent } from "../deploy/agent-command.mjs";
 import {
+	bootstrapReleaseUpdates,
 	installationPaths,
 	readInstallation,
 	withManagementLock,
@@ -16,6 +17,9 @@ import {
 	writeInstallation,
 } from "../deploy/installation.mjs";
 import { lifecycle, recoverRename } from "../deploy/lifecycle.mjs";
+import { updatePaths, updateScheduling } from "../deploy/update-activation.mjs";
+import { writeReleaseChecksums, writeUpdateBootstrap } from "../scripts/build-release.mjs";
+import { generateRepositoryKeys } from "../scripts/update-repository.mjs";
 
 const roots = [];
 afterEach(async () => {
@@ -410,4 +414,136 @@ test("#16 reset failure still rejects start and restores stopped intent", async 
 		false,
 	);
 	assert.deepEqual(calls.at(-1), ["systemctl", "disable", "--now", paths.unit]);
+});
+
+test("#18 signed public installation configures updates automatically and starts its timer only with explicit agent start", async () => {
+	const { record, root, paths, context, calls } = await setup();
+	const release = await software(record, root, paths);
+	const keys = join(root, "fixture-keys");
+	generateRepositoryKeys(keys);
+	writeUpdateBootstrap(release, join(keys, "root.json"));
+	writeReleaseChecksums(release);
+	await writeInstallation({ ...record, desiredState: "stopped" }, root);
+	assert.equal(bootstrapReleaseUpdates(record, release, root), true);
+	const update = updatePaths(id, root),
+		schedule = updateScheduling(record, root);
+	assert.deepEqual(JSON.parse(await readFile(update.config)), {
+		schemaVersion: 1,
+		id,
+		enabled: true,
+		pin: null,
+		repository: "francman/unit-001-releases",
+		channel: "stable",
+	});
+	assert.equal((await stat(update.trustRoot)).mode & 0o022, 0);
+	await assert.rejects(stat(update.token), { code: "ENOENT" });
+	assert.equal(await readFile(schedule.timerPath, "utf8"), schedule.timerContents);
+	assert.deepEqual(calls, []);
+	await lifecycle({ ...record, desiredState: "stopped" }, "start", context);
+	assert(calls.some((call) => call[0] === "systemctl" && call[1] === "enable" && call.includes(schedule.timerName)));
+});
+
+test("#18 failed update scheduling warns without stopping the healthy agent or reverting running intent", async () => {
+	const { record, root, paths, context, calls } = await setup();
+	const release = await software(record, root, paths),
+		keys = join(root, "fixture-keys");
+	generateRepositoryKeys(keys);
+	writeUpdateBootstrap(release, join(keys, "root.json"));
+	bootstrapReleaseUpdates(record, release, root);
+	await writeInstallation({ ...record, desiredState: "stopped" }, root);
+	const schedule = updateScheduling(record, root),
+		warnings = [];
+	let ready = false;
+	await lifecycle({ ...record, desiredState: "stopped" }, "start", {
+		...context,
+		async run(command, args) {
+			calls.push([command, ...args]);
+			if (args[0] === "show") return "inactive\n";
+			if (args[0] === "enable" && args.includes(schedule.timerName)) throw new Error("timer permission failed");
+			return 0;
+		},
+		async ready() {
+			ready = true;
+		},
+		warn(message) {
+			warnings.push(message);
+		},
+	});
+	assert.equal(ready, true);
+	assert.equal(readInstallation(id, root).desiredState, "running");
+	assert.equal(
+		calls.some((call) => call[1] === "disable" && call.includes(paths.unit)),
+		false,
+	);
+	assert.match(warnings[0], /Agent is running.*timer permission failed/);
+	assert.match(warnings[0], /sudo agent update status/);
+});
+
+test("#18 installing another public release never overwrites an existing private feed, pin, disabled policy or trust", async () => {
+	const { record, root, paths } = await setup();
+	const release = await software(record, root, paths);
+	const keys = join(root, "fixture-keys");
+	generateRepositoryKeys(keys);
+	writeUpdateBootstrap(release, join(keys, "root.json"));
+	const update = updatePaths(id, root);
+	await mkdir(update.configDirectory, { recursive: true });
+	const policy = JSON.stringify({
+		schemaVersion: 1,
+		id,
+		enabled: false,
+		pin: "0.0.1",
+		repository: "francman/unit-001",
+		channel: "stable",
+	});
+	await writeFile(update.config, policy, { mode: 0o600 });
+	await writeFile(update.trustRoot, "previous-operator-trust", { mode: 0o600 });
+	assert.equal(bootstrapReleaseUpdates(record, release, root), false);
+	assert.equal(await readFile(update.config, "utf8"), policy);
+	assert.equal(await readFile(update.trustRoot, "utf8"), "previous-operator-trust");
+});
+
+test("#18 unsigned development bundles do not silently enable updates", async () => {
+	const { record, root, paths } = await setup();
+	const release = await software(record, root, paths);
+	assert.equal(bootstrapReleaseUpdates(record, release, root), false);
+	await assert.rejects(stat(updatePaths(id, root).config), { code: "ENOENT" });
+});
+
+test("#18 an interrupted bundled bootstrap finishes without changing its trusted root", async () => {
+	const { record, root, paths } = await setup();
+	const release = await software(record, root, paths),
+		keys = join(root, "fixture-keys");
+	const bytes = generateRepositoryKeys(keys);
+	writeUpdateBootstrap(release, join(keys, "root.json"));
+	const update = updatePaths(id, root);
+	await mkdir(update.configDirectory, { recursive: true });
+	await writeFile(update.trustRoot, bytes, { mode: 0o644 });
+	await writeFile(
+		join(update.configDirectory, "bootstrap.json"),
+		`${JSON.stringify({
+			schemaVersion: 1,
+			rootSha256: createHash("sha256").update(bytes).digest("hex"),
+			repository: "francman/unit-001-releases",
+			channel: "stable",
+		})}\n`,
+		{ mode: 0o600 },
+	);
+	assert.equal(bootstrapReleaseUpdates(record, release, root), true);
+	assert.equal(JSON.parse(await readFile(update.config)).enabled, true);
+	assert.deepEqual(await readFile(update.trustRoot), bytes);
+	await assert.rejects(stat(join(update.configDirectory, "bootstrap.json")), { code: "ENOENT" });
+});
+
+test("#18 partial operator trust without an installer receipt is preserved", async () => {
+	const { record, root, paths } = await setup();
+	const release = await software(record, root, paths),
+		keys = join(root, "fixture-keys");
+	generateRepositoryKeys(keys);
+	writeUpdateBootstrap(release, join(keys, "root.json"));
+	const update = updatePaths(id, root);
+	await mkdir(update.configDirectory, { recursive: true });
+	await writeFile(update.trustRoot, "operator-managed-root", { mode: 0o600 });
+	assert.equal(bootstrapReleaseUpdates(record, release, root), false);
+	assert.equal(await readFile(update.trustRoot, "utf8"), "operator-managed-root");
+	await assert.rejects(stat(update.config), { code: "ENOENT" });
 });

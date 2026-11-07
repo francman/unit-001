@@ -45,8 +45,10 @@ import {
 import { fetchUpdate } from "./update-trust.mjs";
 
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+const PUBLIC_REPOSITORY = "francman/unit-001-releases";
+const PRIVATE_REPOSITORY = "francman/unit-001";
 const HELP =
-	"Usage: update [apply|check|auto|status|configure|enable|disable|pin VERSION|unpin|rollback|recover] --id UUID\nconfigure --root-file FILE --token-file FILE copies explicit trust/credentials; automatic updates start disabled.\nrecover [--start] --phase prepare|finalize|all; --help requires no configuration or network.\n";
+	"Usage: update [apply|check|auto|status|configure|enable|disable|pin VERSION|unpin|rollback|recover] --id UUID\nPublic releases configure trust automatically; configure --root-file FILE is available for administrator setup.\nOptional --token-file FILE selects the private development feed.\nrecover [--start] --phase prepare|finalize|all; --help requires no configuration or network.\n";
 
 /** Runs operator/timer commands with injectable host boundaries and no model calls. */
 export async function runUpdate(args, context = createUpdateContext()) {
@@ -106,7 +108,7 @@ export async function runUpdate(args, context = createUpdateContext()) {
 		let policy = null;
 		try {
 			policy = readConfig(record.id, root);
-			if (configuration === "valid") requireConfigured(paths, root);
+			if (configuration === "valid") requireConfigured(paths, root, policy);
 		} catch {
 			configuration = "invalid";
 		}
@@ -141,17 +143,19 @@ export async function runUpdate(args, context = createUpdateContext()) {
 			if (current.desiredState === "uninstalled") throw new Error("This agent is uninstalled.");
 			const config = readConfig(record.id, root);
 			if (command === "configure") {
-				if (values["root-file"] === undefined || values["token-file"] === undefined)
-					throw new Error("Configure requires --root-file and --token-file.");
+				if (values["root-file"] === undefined) throw new Error("Configure requires --root-file.");
 				const trust = inputFile(values["root-file"], 4 * 1024 * 1024);
 				const metadata = Metadata.fromJSON("root", JSON.parse(trust));
 				metadata.verifyDelegate("root", metadata);
 				if (!metadata.signed.consistentSnapshot || metadata.signed.isExpired())
 					throw new Error("Bootstrap root is expired or lacks consistent snapshots.");
-				const tokenPath = values["token-file"];
-				if ((lstatSync(tokenPath).mode & 0o077) !== 0) throw new Error("Token source file must be private.");
-				const token = inputFile(tokenPath, 8192).toString().trim();
-				if (!/^[A-Za-z0-9_\-.]+$/.test(token)) throw new Error("Invalid repository download token.");
+				let token;
+				if (values["token-file"] !== undefined) {
+					const tokenPath = values["token-file"];
+					if ((lstatSync(tokenPath).mode & 0o077) !== 0) throw new Error("Token source file must be private.");
+					token = inputFile(tokenPath, 8192).toString().trim();
+					if (!/^[A-Za-z0-9_\-.]+$/.test(token)) throw new Error("Invalid repository download token.");
+				}
 				if (existsSync(paths.trustRoot)) {
 					trustedFile(paths.trustRoot, root);
 					if (!readFileSync(paths.trustRoot).equals(trust))
@@ -159,8 +163,9 @@ export async function runUpdate(args, context = createUpdateContext()) {
 				}
 				protectedDirectory(paths.configDirectory, root, 0o755);
 				atomicWrite(paths.trustRoot, trust, root);
-				atomicWrite(paths.token, `${token}\n`, root);
-			} else if (command !== "disable") requireConfigured(paths, root);
+				if (token !== undefined) atomicWrite(paths.token, `${token}\n`, root);
+				config.repository = token === undefined ? PUBLIC_REPOSITORY : PRIVATE_REPOSITORY;
+			} else if (command !== "disable") requireConfigured(paths, root, config);
 			if (command === "enable") config.enabled = true;
 			if (command === "disable") config.enabled = false;
 			if (command === "pin") config.pin = positionals[1];
@@ -199,7 +204,7 @@ export async function runUpdate(args, context = createUpdateContext()) {
 	if (command === "auto" && !policy.enabled) return { status: "disabled" };
 	if (command !== "check" && record.desiredState !== "running")
 		return { status: "deferred", reason: "Operator intent is stopped." };
-	if (command !== "rollback") requireConfigured(paths, root);
+	if (command !== "rollback") requireConfigured(paths, root, policy);
 	protectedDirectory(paths.cache, root);
 	const lockPath = join(paths.cache, "updater.lock");
 	assertSafePath(lockPath, root);
@@ -225,7 +230,8 @@ export async function runUpdate(args, context = createUpdateContext()) {
 			{
 				metadataDir: join(paths.cache, "metadata"),
 				bootstrapRoot: paths.trustRoot,
-				tokenFile: paths.token,
+				repository: policy.repository,
+				...(policy.repository === PRIVATE_REPOSITORY ? { tokenFile: paths.token } : {}),
 				downloadDir: join(paths.cache, "downloads"),
 			},
 			{
@@ -352,7 +358,7 @@ function readConfig(id, root) {
 		id,
 		enabled: false,
 		pin: null,
-		repository: "francman/unit-001",
+		repository: PUBLIC_REPOSITORY,
 		channel: "stable",
 	};
 	const path = updatePaths(id, root).config;
@@ -368,7 +374,7 @@ function readConfig(id, root) {
 		value.id !== id ||
 		typeof value.enabled !== "boolean" ||
 		(value.pin !== null && !VERSION.test(value.pin)) ||
-		value.repository !== defaults.repository ||
+		![PUBLIC_REPOSITORY, PRIVATE_REPOSITORY].includes(value.repository) ||
 		value.channel !== "stable" ||
 		Object.keys(value).some((key) => !Object.hasOwn(defaults, key))
 	)
@@ -376,9 +382,12 @@ function readConfig(id, root) {
 	return value;
 }
 
-function requireConfigured(paths, root) {
-	for (const file of [paths.config, paths.trustRoot, paths.token]) trustedFile(file, root);
-	if ((lstatSync(paths.token).mode & 0o077) !== 0) throw new Error("Download credential is not private.");
+function requireConfigured(paths, root, policy) {
+	for (const file of [paths.config, paths.trustRoot]) trustedFile(file, root);
+	if (policy.repository === PRIVATE_REPOSITORY) {
+		trustedFile(paths.token, root);
+		if ((lstatSync(paths.token).mode & 0o077) !== 0) throw new Error("Download credential is not private.");
+	}
 }
 
 function readLastCheck(paths, root, filename = "last-check.json") {

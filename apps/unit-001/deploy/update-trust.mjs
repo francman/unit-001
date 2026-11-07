@@ -1,4 +1,4 @@
-// Verifies private GitHub release metadata and archives with a pinned, persistent TUF trust chain.
+// Verifies public or explicitly authenticated GitHub releases with a pinned, persistent TUF trust chain.
 import { createWriteStream } from "node:fs";
 import { copyFile, lstat, mkdir, mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -19,18 +19,23 @@ export async function fetchUpdate(options, context = { fetch: globalThis.fetch, 
 	if ((context.platform ?? process.platform) !== "linux" || (context.arch ?? process.arch) !== "x64")
 		throw new Error("Authenticated updates currently require Linux x64.");
 	const { metadataDir, bootstrapRoot, tokenFile, downloadDir } = options;
-	const repository = options.repository ?? "francman/unit-001";
+	const repository =
+		options.repository ?? (tokenFile === undefined ? "francman/unit-001-releases" : "francman/unit-001");
 	const metadataTag = options.metadataTag ?? "unit-updates-stable";
 	if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(repository))
 		throw new Error("Invalid update repository.");
 	if (metadataTag !== "unit-updates-stable") throw new Error("Unsupported metadata channel.");
-	for (const file of [bootstrapRoot, tokenFile]) await ownedPath(file, "file", context.ownerUid);
-	const tokenStat = await lstat(tokenFile);
-	if ((tokenStat.mode & 0o077) !== 0 || tokenStat.size > 8192)
-		throw new Error("Update token must be private and bounded.");
+	await ownedPath(bootstrapRoot, "file", context.ownerUid);
 	if ((await lstat(bootstrapRoot)).size > MAX_METADATA) throw new Error("Bootstrap root is too large.");
-	const token = (await readFile(tokenFile, "utf8")).trim();
-	if (!/^[A-Za-z0-9_\-.]+$/.test(token)) throw new Error("Invalid update token.");
+	let token = null;
+	if (tokenFile !== undefined) {
+		await ownedPath(tokenFile, "file", context.ownerUid);
+		const tokenStat = await lstat(tokenFile);
+		if ((tokenStat.mode & 0o077) !== 0 || tokenStat.size > 8192)
+			throw new Error("Update token must be private and bounded.");
+		token = (await readFile(tokenFile, "utf8")).trim();
+		if (!/^[A-Za-z0-9_\-.]+$/.test(token)) throw new Error("Invalid update token.");
+	}
 	for (const directory of [metadataDir, downloadDir]) {
 		await ownedPath(dirname(directory), "directory", context.ownerUid);
 		await mkdir(directory, { recursive: false, mode: 0o700 }).catch((error) => {
@@ -211,12 +216,16 @@ class GithubFetcher {
 			target = { tag: this.#metadataTag, asset, limit: MAX_METADATA };
 		} else target = this.#targets.get(route.pathname.slice("/targets/".length));
 		if (target === undefined) throw new Error("Unsigned artifact location.");
-		const release = await this.#release(target.tag);
-		const asset = release.assets.find((entry) => entry.name === target.asset);
-		if (asset === undefined) throw new DownloadHTTPError("Update asset unavailable.", 404);
-		if (!Number.isSafeInteger(asset.id) || asset.id < 1) throw new Error("Invalid GitHub asset identifier.");
+		let location = `https://github.com/${this.#repository}/releases/download/${target.tag}/${target.asset}`;
+		if (this.#token !== null) {
+			const release = await this.#release(target.tag);
+			const asset = release.assets.find((entry) => entry.name === target.asset);
+			if (asset === undefined) throw new DownloadHTTPError("Update asset unavailable.", 404);
+			if (!Number.isSafeInteger(asset.id) || asset.id < 1) throw new Error("Invalid GitHub asset identifier.");
+			location = `https://api.github.com/repos/${this.#repository}/releases/assets/${asset.id}`;
+		}
 		const response = await this.#request(
-			`https://api.github.com/repos/${this.#repository}/releases/assets/${asset.id}`,
+			location,
 			"application/octet-stream",
 			target.limit === MAX_ARCHIVE ? 15 * 60_000 : 30_000,
 		);
@@ -296,11 +305,23 @@ class GithubFetcher {
 	}
 	async #request(url, accept, timeout) {
 		const signal = AbortSignal.timeout(timeout);
+		const requested = new URL(url);
 		let authenticated = true;
 		for (let redirects = 0; redirects < 5; redirects++) {
 			const parsed = new URL(url);
-			const api = parsed.origin === "https://api.github.com";
-			if (!api && (parsed.protocol !== "https:" || !REDIRECT_HOSTS.has(parsed.hostname)))
+			const api = this.#token !== null && parsed.origin === "https://api.github.com";
+			const publicRelease =
+				this.#token === null &&
+				parsed.origin === "https://github.com" &&
+				parsed.pathname.startsWith(`/${this.#repository}/releases/download/`) &&
+				parsed.pathname === requested.pathname &&
+				parsed.search === "" &&
+				parsed.hash === "";
+			if (
+				!api &&
+				!publicRelease &&
+				(parsed.protocol !== "https:" || parsed.port !== "" || !REDIRECT_HOSTS.has(parsed.hostname))
+			)
 				throw new Error("Untrusted update download redirect.");
 			if (parsed.username || parsed.password) throw new Error("Credential-bearing update URL rejected.");
 			let response;

@@ -80,6 +80,13 @@ done
 version=$(cat -- "$release/VERSION")
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$ ]] || fail 'VERSION must be a safe semantic version.'
 printf 'Verified unit-001 %s.\n' "$version"
+if [[ -f "$release/deploy/update-root.json" || -f "$release/deploy/update-feed.json" ]]; then
+  preflight_node="$release/runtime/bin/node"
+  if [[ -n "$root" || $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
+    preflight_node=$(command -v node) || fail 'Public update trust verification on another OS requires a host Node.js runtime.'
+  fi
+  "$preflight_node" "$release/deploy/installation.mjs" preflight "$release"
+fi
 if [[ "$dry_run" == true ]]; then
   printf 'Plan: install command %s with isolated identity and state; no host changes.\n' "$name"
   exit 0

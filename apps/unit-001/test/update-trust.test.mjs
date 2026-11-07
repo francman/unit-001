@@ -16,7 +16,7 @@ afterEach(async () => {
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const encoded = (metadata) => Buffer.from(JSON.stringify(metadata.toJSON()));
 
-async function fixture() {
+async function fixture(access = "private") {
 	const directory = await mkdtemp(join(await realpath(tmpdir()), "unit-trust-"));
 	directories.push(directory);
 	const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -110,6 +110,11 @@ async function fixture() {
 	const fetch = async (url, init) => {
 		requests.push({ url, headers: init.headers });
 		const parsed = new URL(url);
+		if (parsed.origin === "https://github.com") {
+			const route = parsed.pathname.match(/^\/francman\/unit-001-releases\/releases\/download\/([^/]+)\/([^/]+)$/);
+			const body = route === null ? undefined : assets.get(`${route[1]}/${route[2]}`)?.body;
+			return new Response(body, { status: body === undefined ? 404 : 200 });
+		}
 		if (parsed.pathname.includes("/releases/tags/")) {
 			const tag = parsed.pathname.split("/").at(-1);
 			return Response.json({ id: tag === "unit-updates-stable" ? 100 : 101 });
@@ -130,7 +135,7 @@ async function fixture() {
 	const options = {
 		metadataDir: join(directory, "metadata"),
 		bootstrapRoot,
-		tokenFile,
+		...(access === "private" ? { tokenFile } : {}),
 		downloadDir: join(directory, "downloads"),
 	};
 	return {
@@ -149,6 +154,89 @@ async function fixture() {
 		descriptor,
 	};
 }
+
+test("public downloads verify the full chain without a token file, account, or API request", async () => {
+	const f = await fixture("public");
+	await rm(join(f.directory, "token"));
+	const candidate = await fetchUpdate(f.options, f.context);
+	assert.equal(candidate.version, "0.0.2");
+	assert.deepEqual(await readFile(candidate.archivePath), f.archive);
+	assert.ok(
+		f.requests.every(
+			({ url, headers }) =>
+				url.startsWith("https://github.com/francman/unit-001-releases/releases/download/") &&
+				headers.Authorization === undefined,
+		),
+	);
+	assert.ok(f.requests.some(({ url }) => url.endsWith("/2.root.json")));
+});
+
+test("public CDN redirects stay credential-free and reject API or unrelated download hosts", async () => {
+	const f = await fixture("public");
+	const original = f.context.fetch;
+	const requests = [];
+	f.context.fetch = async (url, init) => {
+		requests.push({ url, headers: init.headers });
+		if (url.startsWith("https://release-assets.githubusercontent.com/")) return new Response(f.archive);
+		if (url.endsWith(".tar.gz"))
+			return new Response(null, {
+				status: 302,
+				headers: { location: "https://release-assets.githubusercontent.com/archive?signature=opaque" },
+			});
+		return original(url, init);
+	};
+	await fetchUpdate(f.options, f.context);
+	assert.ok(requests.every(({ headers }) => headers.Authorization === undefined));
+	for (const location of [
+		"https://api.github.com/repos/francman/unit-001-releases/releases/assets/1",
+		"https://attacker.example/archive",
+		"https://github.com/attacker/repository/releases/download/tag/asset",
+		"https://github.com/francman/unit-001-releases/releases/download/other/asset",
+		"https://github.com/francman/unit-001-releases/releases/download/unit-v0.0.2/unit-001-0.0.2-linux-x64.tar.gz?token=secret",
+		"https://release-assets.githubusercontent.com:444/archive",
+		"https://user:secret@release-assets.githubusercontent.com/archive",
+	]) {
+		f.context.fetch = async (url, init) =>
+			url.endsWith(".tar.gz") ? new Response(null, { status: 302, headers: { location } }) : original(url, init);
+		await assert.rejects(fetchUpdate(f.options, f.context), /Untrusted.*redirect|Credential-bearing/);
+	}
+});
+
+test("public signed metadata tampering and archive substitution fail closed", async () => {
+	const f = await fixture("public");
+	const archive = f.assets.get("unit-v0.0.2/unit-001-0.0.2-linux-x64.tar.gz");
+	archive.body = Buffer.from("substituted archive");
+	await assert.rejects(fetchUpdate(f.options, f.context), /length|hash/);
+	const item = f.assets.get("unit-updates-stable/timestamp.json");
+	const value = JSON.parse(item.body);
+	value.signatures[0].sig = "00".repeat(64);
+	item.body = Buffer.from(JSON.stringify(value));
+	await assert.rejects(fetchUpdate(f.options, f.context), /signed by 0\/1 keys/i);
+});
+
+test("public checks rotate trusted roots, avoid held archives, and reject metadata replay", async () => {
+	const f = await fixture("public");
+	const old = f.assets.get("unit-updates-stable/timestamp.json").body;
+	f.root.version = 2;
+	f.put("unit-updates-stable", "2.root.json", f.signed(f.root));
+	f.publish(2);
+	let offered;
+	assert.equal(
+		await fetchUpdate(f.options, {
+			...f.context,
+			acceptCandidate(descriptor) {
+				offered = descriptor;
+				return false;
+			},
+		}),
+		null,
+	);
+	assert.equal(offered.version, "0.0.2");
+	assert.equal(JSON.parse(await readFile(join(f.options.metadataDir, "root.json"), "utf8")).signed.version, 2);
+	assert.ok(f.requests.every(({ url }) => !url.includes("/unit-v0.0.2/")));
+	f.put("unit-updates-stable", "timestamp.json", old);
+	await assert.rejects(fetchUpdate(f.options, f.context), /less than|version/i);
+});
 
 test("verifies the full chain, root-404 termination and immutable archive without executing it", async () => {
 	const f = await fixture();
