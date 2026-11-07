@@ -2,6 +2,45 @@ import type { LiveState } from "@earendil-works/pi-durable";
 
 type AssistantContent = { readonly type: string; readonly text?: string };
 
+/** Sanitizes a complete terminal text field/snapshot, including incomplete escape tails; never pass isolated deltas. */
+export function sanitizeTerminalText(text: string): string {
+	let output = "";
+	for (let index = 0; index < text.length; index++) {
+		let code = text.charCodeAt(index);
+		if (code === 0x1b) {
+			if (++index === text.length) break;
+			code = text.charCodeAt(index);
+			if (code === 0x5b) code = 0x9b;
+			else if (code === 0x5d || code === 0x50 || code === 0x58 || code === 0x5e || code === 0x5f) code = 0x9d;
+			else {
+				while (index < text.length && text.charCodeAt(index) >= 0x20 && text.charCodeAt(index) <= 0x2f) index++;
+				if (index < text.length && !(text.charCodeAt(index) >= 0x30 && text.charCodeAt(index) <= 0x7e)) index--;
+				continue;
+			}
+		}
+		if (code === 0x9b) {
+			while (++index < text.length) {
+				const next = text.charCodeAt(index);
+				if (next >= 0x40 && next <= 0x7e) break;
+			}
+			continue;
+		}
+		if (code === 0x90 || code === 0x98 || code === 0x9d || code === 0x9e || code === 0x9f) {
+			while (++index < text.length) {
+				const next = text.charCodeAt(index);
+				if (next === 0x07 || next === 0x9c) break;
+				if (next === 0x1b && text[index + 1] === "\\") {
+					index++;
+					break;
+				}
+			}
+			continue;
+		}
+		if (code === 0x09 || code === 0x0a || (code >= 0x20 && !(code >= 0x7f && code <= 0x9f))) output += text[index];
+	}
+	return output;
+}
+
 /** The text of the answer being generated, from the newest committed partial of a live conversation. */
 export function liveText(live: LiveState | undefined): string {
 	const content = live?.generation?.message?.content as readonly AssistantContent[] | undefined;

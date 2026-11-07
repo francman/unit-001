@@ -96,7 +96,7 @@ export async function createConfiguredModels(
 	if (choice === undefined) {
 		const keys = PROVIDERS.map((entry) => entry.keys[0]).join(", ");
 		throw new ConfigurationError(
-			`No model provider is configured. Run u1 login anthropic or u1 login openai to use a subscription, set one of ${keys}, or pass --model provider/model-id.`,
+			`No model provider is configured. Sign in using the installed command’s login subcommand to use a subscription, set one of ${keys}, or pass --model provider/model-id.`,
 		);
 	}
 	const models = await createModelsFor(choice.provider, credentials);

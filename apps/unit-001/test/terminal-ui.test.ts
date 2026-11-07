@@ -1,0 +1,325 @@
+// #21: Rich attached terminals retain drafts while the public TUI renderer updates bounded owner views.
+import { mkdtemp, rm } from "node:fs/promises";
+import { createServer, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	getCapabilities,
+	getKeybindings,
+	KeybindingsManager,
+	setCapabilities,
+	setKeybindings,
+	stripTerminalSequences,
+	type Terminal,
+	TUI_KEYBINDINGS,
+	TuiAltScreen,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
+import { describe, expect, it, vi } from "vitest";
+import type { ServiceView } from "../src/service.ts";
+import type { TerminalInputResult, TerminalState } from "../src/terminal-controller.ts";
+import { DEFAULT_APP_KEYBINDINGS, RichAttachView, runRichAttach } from "../src/terminal-ui.ts";
+
+class FakeTerminal implements Terminal {
+	columns = 80;
+	rows = 24;
+	kittyProtocolActive = false;
+	input: (data: string) => void = () => {};
+	resize: () => void = () => {};
+	stopped = false;
+	events: string[] = [];
+	start(input: (data: string) => void, resize: () => void): void {
+		this.input = input;
+		this.resize = resize;
+	}
+	stop(): void {
+		this.stopped = true;
+		this.events.push("stop");
+	}
+	async drainInput(): Promise<void> {
+		this.events.push("drain");
+	}
+	write(): void {}
+	moveBy(): void {}
+	hideCursor(): void {}
+	showCursor(): void {}
+	clearLine(): void {}
+	clearFromCursor(): void {}
+	clearScreen(): void {}
+	setTitle(): void {}
+	setProgress(): void {}
+	setProgramStatus(): void {}
+}
+
+const base: ServiceView = {
+	pid: 42,
+	version: "1.0.0",
+	name: "bob",
+	installationId: null,
+	model: { provider: "faux", modelId: "faux-1" },
+	usage: null,
+	entries: [
+		{ id: 1, role: "user", text: "Explain this", truncated: false },
+		{
+			id: 2,
+			role: "assistant",
+			text: "## Result\n\nUse **bold** and `code`.\n\n```ts\nconst ready = true;\n```",
+			truncated: false,
+		},
+	],
+	busy: false,
+	text: "",
+	textTruncated: false,
+	tools: [],
+	historyTruncated: false,
+};
+
+function launch() {
+	const terminal = new FakeTerminal();
+	const tui = new TuiAltScreen(terminal, true, undefined, { mouse: false, copyOnSelect: false });
+	const actions = {
+		submit: vi.fn((_text: string): TerminalInputResult => ({ status: "submitted", requestId: "r1" })),
+		cancel: vi.fn(),
+		detach: vi.fn(),
+	};
+	const view = new RichAttachView(tui, "default", actions, { colorMode: "monochrome" });
+	tui.setLayoutRoot(view);
+	tui.setFocus(view.editor);
+	tui.addInputListener((data) => view.handleGlobalInput(data));
+	tui.start();
+	const update = (value: ServiceView = base, change: Partial<TerminalState> = {}) => {
+		view.update({ connection: "attached", view: value, sending: false, cancelling: false, notices: [], ...change });
+		tui.renderNow(true);
+	};
+	const screen = () => tui.getScreenLines().map(stripTerminalSequences);
+	return { terminal, tui, view, actions, update, screen };
+}
+
+describe("rich service terminal", () => {
+	it("bounds completed and fragmented pastes and typed drafts while preserving existing input", () => {
+		const app = launch();
+		try {
+			app.update();
+			app.view.editor.setText("existing draft");
+			app.terminal.input(`\x1b[200~${"x".repeat(17000)}\x1b[201~`);
+			expect(app.view.editor.getExpandedText()).toBe("existing draft");
+			app.terminal.input(`\x1b[200~${"x".repeat(9000)}`);
+			app.terminal.input(`${"x".repeat(9000)}\x1b[201~`);
+			expect(app.view.editor.getExpandedText()).toBe("existing draft");
+			app.terminal.input("x".repeat(9000));
+			const bounded = app.view.editor.getExpandedText();
+			app.terminal.input("x".repeat(9000));
+			expect(app.view.editor.getExpandedText()).toBe(bounded);
+			expect(app.actions.submit).not.toHaveBeenCalled();
+		} finally {
+			app.tui.stop();
+		}
+	});
+	it.skipIf(process.platform === "win32").each(["signal", "disconnect"] as const)(
+		"restores the terminal after runner %s without cancelling the owner",
+		async (kind) => {
+			const directory = await mkdtemp(join(tmpdir(), "u1-rich-"));
+			const endpoint = join(directory, "default.sock");
+			const requests: unknown[] = [];
+			let client: Socket | undefined;
+			const server = createServer((socket) => {
+				client = socket;
+				socket.on("error", () => {});
+				socket.once("data", (data) => {
+					requests.push(JSON.parse(String(data).trim()));
+					socket.write(`${JSON.stringify({ type: "view", view: base })}\n`);
+				});
+			});
+			await new Promise<void>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(endpoint, resolve);
+			});
+			const terminal = new FakeTerminal();
+			const controller = new AbortController();
+			const running = runRichAttach(endpoint, terminal, controller.signal, { colorMode: "monochrome" });
+			try {
+				await expect.poll(() => requests.length).toBe(1);
+				if (kind === "signal") controller.abort();
+				else client?.destroy();
+				expect(await running).toBe(kind === "signal" ? 0 : 1);
+				expect(terminal.events).toEqual(["drain", "stop"]);
+				expect(requests).toEqual([{ type: "watch" }]);
+			} finally {
+				controller.abort();
+				await running;
+				client?.destroy();
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+				await rm(directory, { recursive: true, force: true });
+			}
+		},
+	);
+	it("ignores Kitty action releases after cancellation makes the view idle", () => {
+		const app = launch();
+		try {
+			app.update({ ...base, busy: true });
+			app.terminal.input("\x03");
+			expect(app.actions.cancel).toHaveBeenCalledOnce();
+			app.update(base);
+			app.terminal.input("\x1b[99;5:3u");
+			app.terminal.input("\x1b[100;5:3u");
+			expect(app.actions.cancel).toHaveBeenCalledOnce();
+			expect(app.actions.detach).not.toHaveBeenCalled();
+		} finally {
+			app.tui.stop();
+		}
+	});
+	it("keeps usage visible after notices and removes active Markdown link targets", () => {
+		const previous = getCapabilities();
+		setCapabilities({ ...previous, hyperlinks: true });
+		const app = launch();
+		try {
+			app.update(
+				{
+					...base,
+					entries: [
+						{
+							id: 1,
+							role: "assistant",
+							text: "[Open](javascript:alert(1))\n\n[site](https://example.com)",
+							truncated: false,
+						},
+					],
+				},
+				{ notices: ["Provider error details remain readable here."] },
+			);
+			const text = app.tui.getScreenLines().join("\n");
+			expect(text).not.toMatch(/\x1b\]8;;(?:javascript:|https:)/);
+			expect(app.screen().join("\n")).toContain("Provider error details");
+			expect(app.screen().at(-2)).toContain("cost unknown");
+			expect(text).not.toMatch(/\x1b\[(?:3[0-9]|9[0-7])m/);
+		} finally {
+			app.tui.stop();
+			setCapabilities(previous);
+		}
+	});
+	it("expands multiline bracketed pastes without submitting until Enter", () => {
+		const app = launch();
+		try {
+			app.update();
+			const paste = Array.from({ length: 12 }, (_, index) => `line ${index}`).join("\n");
+			app.terminal.input(`\x1b[200~${paste}\x1b[201~`);
+			expect(app.view.editor.getExpandedText()).toBe(paste);
+			expect(app.actions.submit).not.toHaveBeenCalled();
+			app.terminal.input("\r");
+			expect(app.actions.submit).toHaveBeenCalledWith(paste);
+		} finally {
+			app.tui.stop();
+		}
+	});
+	it("uses inherited key overrides in actions, editor behavior, and footer hints", () => {
+		const previous = getKeybindings();
+		setKeybindings(
+			new KeybindingsManager(
+				{ ...TUI_KEYBINDINGS, ...DEFAULT_APP_KEYBINDINGS },
+				{
+					"unit.attach.cancel": "ctrl+x",
+					"unit.attach.detach": "ctrl+q",
+					"tui.input.submit": "ctrl+s",
+					"tui.input.newLine": "alt+enter",
+				},
+			),
+		);
+		const app = launch();
+		try {
+			app.update({ ...base, busy: true });
+			app.terminal.input("\x18");
+			expect(app.actions.cancel).toHaveBeenCalledOnce();
+			expect(app.screen().at(-1)).toContain("Ctrl+X");
+			expect(app.screen().at(-1)).toContain("Alt+Enter");
+			app.view.editor.setText("draft");
+			app.terminal.input("\x13");
+			expect(app.actions.submit).toHaveBeenCalledWith("draft");
+		} finally {
+			app.tui.stop();
+			setKeybindings(previous);
+		}
+	});
+	it("renders a fixed identity/model header, Markdown conversation, tools, and action footer", () => {
+		const app = launch();
+		try {
+			app.update({ ...base, tools: [{ callId: "read-1", name: "read", status: "running" }] });
+			const screen = app.screen();
+			expect(screen).toHaveLength(24);
+			expect(screen[0]).toContain("bob  /  default");
+			expect(screen[1]).toContain("faux/faux-1");
+			expect(screen.join("\n")).toContain("const ready = true;");
+			expect(screen.join("\n")).toContain("read");
+			expect(screen.at(-1)).toContain("Enter send");
+			expect(screen.at(-2)).toContain("cost unknown");
+		} finally {
+			app.tui.stop();
+		}
+	});
+	it("retains a multiline draft and cursor through live updates and a narrow resize", () => {
+		const app = launch();
+		try {
+			app.update();
+			app.view.editor.setText("first line\nsecond line");
+			app.terminal.input("\x1b[D");
+			const cursor = app.view.editor.getCursor();
+			app.update({ ...base, busy: true, text: "Live **answer** arriving\n" });
+			app.terminal.columns = 40;
+			app.terminal.rows = 12;
+			app.terminal.resize();
+			app.tui.renderNow(true);
+			expect(app.view.editor.getText()).toBe("first line\nsecond line");
+			expect(app.view.editor.getCursor()).toEqual(cursor);
+			expect(app.screen()).toHaveLength(12);
+			expect(app.screen().every((line) => visibleWidth(line) <= 40)).toBe(true);
+			expect(app.screen()[0]).toContain("bob");
+			expect(app.screen().at(-1)).toContain("cancel");
+			expect(app.screen().at(-1)).toContain("detach");
+		} finally {
+			app.tui.stop();
+		}
+	});
+	it("uses controller actions and restores rejected drafts instead of losing input", () => {
+		const app = launch();
+		try {
+			app.update({ ...base, busy: true });
+			app.terminal.input("\x03");
+			expect(app.actions.cancel).toHaveBeenCalledOnce();
+			app.terminal.input("\x04");
+			expect(app.actions.detach).toHaveBeenCalledOnce();
+			app.actions.submit.mockReturnValue({ status: "rejected" });
+			app.view.editor.setText("keep my draft");
+			app.terminal.input("\r");
+			expect(app.view.editor.getText()).toBe("keep my draft");
+		} finally {
+			app.tui.stop();
+		}
+	});
+	it("sanitizes remote fields before styling and labels bounded text and cost estimates", () => {
+		const app = launch();
+		try {
+			app.update({
+				...base,
+				name: "bob\x1b]52;unsafe\x07",
+				entries: [{ id: 3, role: "assistant", text: "safe\x1b[2J result", truncated: true }],
+				usage: {
+					scope: "conversation-models",
+					input: 10,
+					output: 20,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 30,
+					cost: { kind: "estimate", usd: 0.001 },
+				},
+			});
+			const text = app.screen().join("\n");
+			expect(text).toContain("safe result");
+			expect(text).toContain("Text truncated");
+			expect(text).toContain("30 conversation tokens");
+			expect(text).toContain("estimated");
+			expect(text).not.toContain("unsafe");
+			expect(text).not.toMatch(/[\x00\x1b\x7f-\x9f]/);
+		} finally {
+			app.tui.stop();
+		}
+	});
+});

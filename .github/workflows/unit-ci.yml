@@ -57,7 +57,7 @@ jobs:
       # Only what unit-001 imports, in dependency order; upstream's own CI builds and tests the rest.
       - name: Build upstream packages
         run: |
-          for package in telemetry chord codemode ai durable; do
+          for package in telemetry chord tui codemode ai durable; do
             npm run build --workspace "packages/$package"
           done
 

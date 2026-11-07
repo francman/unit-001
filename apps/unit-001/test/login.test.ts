@@ -61,9 +61,12 @@ describe("runLogin", () => {
 			},
 		};
 		const io = terminal();
-		expect(await runLogin(models as never, "anthropic", io.terminal, new AbortController().signal, "linux")).toBe(0);
+		expect(
+			await runLogin(models as never, "anthropic", io.terminal, new AbortController().signal, "linux", "bob"),
+		).toBe(0);
 		expect(calls).toHaveLength(1);
-		expect(calls[0]).toMatchObject({ provider: "anthropic", type: "oauth", agentName: "unit-001" });
+		expect(calls[0]).toMatchObject({ provider: "anthropic", type: "oauth", agentName: "bob" });
+		expect(io.err()).toContain("Run bob to start.");
 		expect(io.err()).toContain("Welcome");
 		expect(io.err()).toContain("Signed in with Claude Pro or Max");
 	});

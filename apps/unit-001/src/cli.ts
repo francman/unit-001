@@ -4,8 +4,10 @@ import { resolve } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Report } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { ProcessTerminal } from "@earendil-works/pi-tui";
 import { Agent } from "./agent.ts";
-import { type Command, parseArguments, type RunOptions, USAGE } from "./args.ts";
+import { type Command, parseArguments, USAGE } from "./args.ts";
+import { runAttach } from "./attach.ts";
 import { FileCredentialStore } from "./credentials.ts";
 import { ConfigurationError, UsageError } from "./errors.ts";
 import { acquireSessionLock } from "./lock.ts";
@@ -13,9 +15,18 @@ import { describeStatus, runLogin, runLogout, subscriptionFor } from "./login.ts
 import { credentialsFile, dataDirectory, sessionFile } from "./paths.ts";
 import { createConfiguredModels, createModelsFor } from "./provider.ts";
 import { runPrint, runRepl, type Terminal } from "./repl.ts";
+import { requestService, runService, type ServiceRequest, serviceEndpoint } from "./service.ts";
+import { runRichAttach } from "./terminal-ui.ts";
 
 /** What the CLI reads from its process, so tests can run it against fakes. */
+export interface ManagedIdentity {
+	readonly id: string;
+	readonly name: string;
+	readonly state: string;
+}
+
 export interface Runtime {
+	readonly managed?: ManagedIdentity;
 	readonly env: Readonly<Record<string, string | undefined>>;
 	readonly platform: NodeJS.Platform;
 	readonly home: string;
@@ -59,6 +70,11 @@ function describeReport(report: Report): string {
 }
 
 function resolveDirectory(dataDir: string | undefined, runtime: Runtime): string {
+	if (runtime.managed !== undefined) {
+		if (dataDir !== undefined && resolve(runtime.cwd, dataDir) !== runtime.managed.state)
+			throw new ConfigurationError("A named installation cannot change its data directory.");
+		return runtime.managed.state;
+	}
 	return dataDir === undefined
 		? dataDirectory({ platform: runtime.platform, env: runtime.env, home: runtime.home })
 		: resolve(runtime.cwd, dataDir);
@@ -92,19 +108,26 @@ async function account(
 	const { provider } = subscriptionFor(command.provider);
 	if (command.kind === "logout") return runLogout(credentials, command.provider, terminal);
 	const models = await createModelsFor(provider, credentials);
-	return runLogin(models, command.provider, terminal, signal, runtime.platform);
+	return runLogin(models, command.provider, terminal, signal, runtime.platform, runtime.managed?.name ?? "agent");
 }
 
-async function run(options: RunOptions, runtime: Runtime, signal: AbortSignal): Promise<number> {
+async function run(
+	command: Extract<Command, { kind: "run" | "serve" }>,
+	runtime: Runtime,
+	signal: AbortSignal,
+): Promise<number> {
+	const options = command.options;
 	const directory = resolveDirectory(options.dataDir, runtime);
 	const file = sessionFile(directory, options.session, runtime.platform);
+	const endpoint =
+		command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
 	const { models, choice } = await createConfiguredModels(
 		runtime.env,
 		options.model,
 		credentialStore(directory, runtime),
 	);
 
-	let prompt = options.print;
+	let prompt = command.kind === "run" ? command.options.print : undefined;
 	if (prompt === "-") prompt = (await readAll(runtime.stdin)).trim();
 	if (prompt === "") throw new UsageError("The prompt is empty.");
 
@@ -116,6 +139,7 @@ async function run(options: RunOptions, runtime: Runtime, signal: AbortSignal): 
 		agent = await Agent.open(
 			{
 				storage: await openNodeSqliteStorage(file),
+				name: runtime.managed?.name ?? "agent",
 				models,
 				model: choice,
 				cwd: runtime.cwd,
@@ -125,42 +149,121 @@ async function run(options: RunOptions, runtime: Runtime, signal: AbortSignal): 
 			BACKGROUND_CONTEXT,
 		);
 		const opened = agent;
+		if (endpoint !== undefined) {
+			await runService(opened, endpoint, await version(), terminal.err, signal, runtime.managed?.id ?? null);
+			return 0;
+		}
 		signal.addEventListener("abort", () => void opened.abort(BACKGROUND_CONTEXT).catch(() => {}), { once: true });
 		return prompt === undefined
 			? await runRepl(agent, terminal, signal)
 			: await runPrint(agent, prompt, terminal, signal);
 	} finally {
-		await agent?.close(BACKGROUND_CONTEXT).catch(() => {});
-		await release();
+		try {
+			if (command.kind === "serve") await agent?.close(BACKGROUND_CONTEXT);
+			else await agent?.close(BACKGROUND_CONTEXT).catch(() => {});
+		} finally {
+			await release();
+		}
 	}
+}
+
+async function control(
+	command: Extract<Command, { kind: "send" | "service-status" | "cancel" | "attach" }>,
+	runtime: Runtime,
+	signal: AbortSignal,
+): Promise<number> {
+	if (command.kind === "attach" && !runtime.interactive)
+		throw new UsageError(
+			`Interactive attach requires a terminal. Use ${runtime.managed?.name ?? "agent"} send for scripts and pipes.`,
+		);
+	const endpoint = serviceEndpoint(
+		resolveDirectory(command.options.dataDir, runtime),
+		command.options.session,
+		runtime.platform,
+	);
+	if (command.kind === "attach") {
+		if (command.options.plain || runtime.env.TERM === undefined || runtime.env.TERM === "dumb")
+			return runAttach(endpoint, terminalFor(runtime), signal);
+		const terminal = new ProcessTerminal();
+		if (terminal.columns < 40 || terminal.rows < 12) return runAttach(endpoint, terminalFor(runtime), signal);
+		return runRichAttach(endpoint, terminal, signal, {
+			colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+		});
+	}
+	const request: ServiceRequest =
+		command.kind === "send"
+			? {
+					type: "send",
+					prompt: command.prompt,
+					...(command.requestId === undefined ? {} : { requestId: command.requestId }),
+				}
+			: { type: command.kind === "cancel" ? "cancel" : "status" };
+	const response = await requestService(endpoint, request, signal);
+	if (response.type === "error") {
+		runtime.stderr.write(`${response.message}\n`);
+		return 1;
+	}
+	if (response.type === "reply") {
+		if (response.reply.status === "failed") {
+			runtime.stderr.write(
+				`unanswered: ${response.reply.reason}${response.reply.detail === undefined ? "" : ` (${response.reply.detail})`}\n`,
+			);
+			return 1;
+		}
+		runtime.stdout.write(response.reply.text.endsWith("\n") ? response.reply.text : `${response.reply.text}\n`);
+	} else {
+		runtime.stdout.write(`${JSON.stringify(response)}\n`);
+	}
+	return 0;
 }
 
 /**
  * Runs the CLI and returns its exit code: 0 on success, 1 on a failed run or a configuration problem, 2 on a usage
- * error, and 130 when stopped by a signal.
+ * error, and 130 when interrupted. Service shutdown returns 0 and preserves unfinished work.
  */
 export async function main(argv: readonly string[], runtime: Runtime, signal: AbortSignal): Promise<number> {
+	let serving = false;
 	try {
+		if (["start", "stop", "kill", "uninstall", "rename"].includes(argv[0] ?? ""))
+			throw new ConfigurationError("Lifecycle commands require an installed named agent command.");
 		const command = parseArguments(argv);
+		serving = command.kind === "serve";
+		if (signal.aborted) return serving ? 0 : 130;
 		if (command.kind === "help") {
-			runtime.stdout.write(`${USAGE}\n`);
+			runtime.stdout.write(`${USAGE.replaceAll(/\bagent\b/g, runtime.managed?.name ?? "agent")}\n`);
+			if (runtime.managed !== undefined)
+				runtime.stdout.write(
+					`\nInstalled lifecycle: sudo ${runtime.managed.name} start|stop|kill|uninstall|rename <name>\nActions ask for confirmation; use --yes for automation (sudo authorization still applies).\n`,
+				);
 			return 0;
 		}
 		if (command.kind === "version") {
 			runtime.stdout.write(`${await version()}\n`);
 			return 0;
 		}
-		const code =
-			command.kind === "run" ? await run(command.options, runtime, signal) : await account(command, runtime, signal);
-		return signal.aborted ? 130 : code;
+		let code: number;
+		if (command.kind === "run" || command.kind === "serve") code = await run(command, runtime, signal);
+		else if (
+			command.kind === "send" ||
+			command.kind === "service-status" ||
+			command.kind === "cancel" ||
+			command.kind === "attach"
+		)
+			code = await control(command, runtime, signal);
+		else code = await account(command, runtime, signal);
+		return signal.aborted && !serving ? 130 : code;
 	} catch (error) {
-		if (signal.aborted) return 130;
+		if (signal.aborted && !serving) return 130;
 		if (error instanceof UsageError) {
-			runtime.stderr.write(`unit-001: ${error.message}\nRun u1 --help for usage.\n`);
+			runtime.stderr.write(
+				`${runtime.managed?.name ?? "agent"}: ${error.message.replaceAll("Usage: agent", `Usage: ${runtime.managed?.name ?? "agent"}`)}\nRun ${runtime.managed?.name ?? "agent"} --help for usage.\n`,
+			);
 			return 2;
 		}
 		const message = error instanceof Error ? error.message : String(error);
-		runtime.stderr.write(error instanceof ConfigurationError ? `${message}\n` : `unit-001: ${message}\n`);
+		runtime.stderr.write(
+			error instanceof ConfigurationError ? `${message}\n` : `${runtime.managed?.name ?? "agent"}: ${message}\n`,
+		);
 		return 1;
 	}
 }
