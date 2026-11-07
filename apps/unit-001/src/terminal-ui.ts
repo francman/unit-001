@@ -121,6 +121,7 @@ export class RichAttachView extends VStack {
 			const draft = this.editor.getExpandedText();
 			if (Buffer.byteLength(draft) <= MAX_DRAFT_BYTES) {
 				this.#draft = draft;
+				this.clearInputNotice();
 				return;
 			}
 			this.#restoringDraft = true;
@@ -134,7 +135,10 @@ export class RichAttachView extends VStack {
 		this.editor.onSubmit = (text) => {
 			const result = this.#actions.submit(text);
 			if (result.status === "rejected") this.editor.setText(text);
-			else if (result.status === "submitted") this.editor.addToHistory(text);
+			else if (result.status === "submitted") {
+				this.clearInputNotice();
+				this.editor.addToHistory(text);
+			}
 			this.#tui.requestRender();
 		};
 		this.scroll = new ScrollView(this.transcript, { follow: "end", primary: true, scrollbar: "auto" });
@@ -203,6 +207,13 @@ export class RichAttachView extends VStack {
 
 	private rejectInput(): void {
 		this.#inputNotice = "Input exceeds 16 KiB; existing draft preserved.";
+		this.updateTranscript(this.#state.view);
+		this.#tui.requestRender();
+	}
+
+	private clearInputNotice(): void {
+		if (this.#inputNotice === "") return;
+		this.#inputNotice = "";
 		this.updateTranscript(this.#state.view);
 		this.#tui.requestRender();
 	}

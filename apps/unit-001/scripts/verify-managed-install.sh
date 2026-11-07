@@ -107,6 +107,9 @@ stopped() {
 bash "$release/install.sh"
 first=$("$node" "$work/check.mjs" find agent)
 owned+=("$first")
+# #23: unrelated accounts cannot occupy the management lock's protected parent.
+[[ $(stat -c %U /run/unit-001) == root && $((8#$(stat -c %a /run/unit-001) & 0022)) == 0 ]] || fail 'Management lock directory is not protected.'
+if runuser -u nobody -- test -w /run/unit-001; then fail 'An unrelated account can write the management lock directory.'; fi
 bash "$release/install.sh" --name unit-ci-bob
 second=$("$node" "$work/check.mjs" find unit-ci-bob)
 owned+=("$second")

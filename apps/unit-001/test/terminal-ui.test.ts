@@ -96,6 +96,35 @@ function launch() {
 }
 
 describe("rich service terminal", () => {
+	it.each(["edit", "submit"] as const)(
+		"dismisses an oversized-paste warning after a valid %s without losing the preserved draft",
+		(action) => {
+			// #23: input warnings survive owner updates but stop describing a problem after valid input succeeds.
+			const app = launch();
+			try {
+				app.update();
+				app.view.editor.setText("preserved draft");
+				app.terminal.input(`\x1b[200~${"x".repeat(17000)}\x1b[201~`);
+				app.tui.renderNow(true);
+				expect(app.screen().join("\n")).toContain("Input exceeds 16 KiB");
+				expect(app.view.editor.getExpandedText()).toBe("preserved draft");
+				app.update({ ...base, busy: true, text: "Owner progress\n" });
+				expect(app.screen().join("\n")).toContain("Input exceeds 16 KiB");
+				if (action === "edit") {
+					app.terminal.input(" revised");
+					expect(app.view.editor.getExpandedText()).toBe("preserved draft revised");
+				} else {
+					app.terminal.input("\r");
+					expect(app.actions.submit).toHaveBeenCalledWith("preserved draft");
+					expect(app.view.editor.getExpandedText()).toBe("");
+				}
+				app.tui.renderNow(true);
+				expect(app.screen().join("\n")).not.toContain("Input exceeds 16 KiB");
+			} finally {
+				app.tui.stop();
+			}
+		},
+	);
 	it("bounds completed and fragmented pastes and typed drafts while preserving existing input", () => {
 		const app = launch();
 		try {
