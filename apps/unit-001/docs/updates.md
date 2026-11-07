@@ -24,6 +24,8 @@ Use the installed name, such as `bob`, instead of `agent`. The repository is fix
 
 The updater retains its own Node runtime, dependencies and previous recovery core. If the application launcher or runtime is broken, use `sudo /usr/local/sbin/unit-001-update UUID status` or `recover`. Obtain the UUID from the installation record under `/etc/unit-001/agents`. Recovery units run before and after application startup to repair interrupted activation.
 
+If the selected updater itself fails, invoke the retained recovery core directly: `sudo /usr/lib/unit-001/updaters/UUID/recovery/runtime/bin/node /usr/lib/unit-001/updaters/UUID/recovery/lib/update.mjs --id UUID recover`. Use `rollback` there to return compatible code to the previous version. New updater releases must preserve the retained core's ability to read the activation journal.
+
 If an operator stopped the agent during an interrupted update, recovery preserves that intent. Use `sudo agent update recover --start` when explicitly ready to recover and resume it.
 
 ## Compatibility and rollback
@@ -44,10 +46,12 @@ The [publication workflow](../../../.github/workflows/unit-publish.yml) builds f
 
 Create keys explicitly with `node apps/unit-001/scripts/update-repository.mjs keygen --out /secure/unit-update-keys`; keep the root private key offline. Configure the `unit-release` environment with `UNIT_UPDATE_ROOT_JSON` and separate `UNIT_UPDATE_TARGETS_KEY`, `UNIT_UPDATE_SNAPSHOT_KEY`, and `UNIT_UPDATE_TIMESTAMP_KEY` secrets. These are publication credentials, separate from each host's read-only token. Root rotation requires signatures from both the old and new root authorities.
 
-Only trusted release maintainers should control that environment: its online keys authorize software that the privileged updater will execute. During root rotation, also supply the approved old root as `UNIT_UPDATE_PREVIOUS_ROOT_JSON`, update the root and online keys together, then publish or renew. Verification tries current trust first, so subsequent renewals work while the previous-root variable remains set.
+Only trusted release maintainers should control that environment: its online keys authorize software that the privileged updater will execute. During root rotation, also supply the approved old root as `UNIT_UPDATE_PREVIOUS_ROOT_JSON`, update the root and online keys together, then publish or renew. Rotate one root version at a time and clear the previous-root variable after successful publication. Verification tries current trust first, so subsequent renewals also work while that variable remains set.
 
 The workflow renews metadata every six hours without rebuilding application code. Timestamp metadata expires after 48 hours; environment approval rules must permit timely renewal. Expired or unavailable metadata fails closed and leaves the installed agent running. Publish through the serialized workflow: GitHub release assets do not provide atomic compare-and-swap publication. Numbered receipts preserve recovery from interrupted timestamp replacement.
 
 After the initial successful publication, set repository variable `UNIT_UPDATES_ENABLED=true` to activate scheduled renewal. It defaults off. Retention runs only after freshness is published and read back: signed metadata remains until expiry plus seven days, with retained dependency chains and every root preserved. Unknown assets remain for operator inspection. This avoids exhausting GitHub's [1,000 assets per release](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) during ordinary renewal. Archive history is retained; reaching the client's 4 MiB targets-metadata limit requires a reviewed repository migration.
+
+Investigate failed publication jobs. A failure during retention can occur after the new timestamp is already live; inspect the reported step before retrying. Unexpected numbered metadata stops cleanup rather than authorizing deletion, so remove such assets only after operator review.
 
 Production keys, the protected environment and the initial signed feed must be configured before continuous delivery is live. Merging the code does not provision those secrets or enable a host timer. See the [application comparison](update-assessment.md) for the design evidence.

@@ -48,6 +48,7 @@ function release(root, version, stateCompatibility = compatibility) {
 		"install.sh": "install",
 		"updater/runtime/bin/node": "independent node",
 		"updater/lib/update.mjs": "independent core",
+		"updater/lib/update-activation.mjs": "activation core",
 	};
 	for (const name of ["installation.mjs", "lifecycle.mjs", "agent-command.mjs", "update-activation.mjs"])
 		files[`deploy/${name}`] = readFileSync(fileURLToPath(new URL(`../deploy/${name}`, import.meta.url)), "utf8");
@@ -521,4 +522,42 @@ test("#18 updater tolerates only unloaded unit reset failure", async () => {
 			assert.equal((await activateUpdate(fixture.record, fixture.candidate, fixture.context)).status, "updated");
 		else await assert.rejects(activateUpdate(fixture.record, fixture.candidate, fixture.context), /reset refused/);
 	}
+});
+
+// #18: A working retained core must not entrust recovery to the broken selected updater.
+test("#18 retained executing core owns recovery across failed repair and successful rollback", async () => {
+	const fixture = setup();
+	await activateUpdate(fixture.record, fixture.candidate, fixture.context);
+	const paths = updatePaths(id, fixture.root);
+	fixture.context.executingModule = join(paths.cores, "0.0.2/lib/update-activation.mjs");
+	const ready = fixture.context.ready;
+	let fail = true;
+	fixture.context.ready = async (...args) => {
+		if (fail) {
+			fail = false;
+			throw new Error("repair health failure");
+		}
+		return ready.apply(fixture.context, args);
+	};
+	const repair = { releasePath: release(fixture.root, "0.0.4"), version: "0.0.4", compatibility };
+	await assert.rejects(
+		activateUpdate(readInstallation(id, fixture.root), repair, fixture.context),
+		/repair health failure/,
+	);
+	assert.equal(readlinkSync(paths.currentCore), "cores/0.0.2");
+	assert.equal(readlinkSync(paths.recoveryCore), "cores/0.0.2");
+	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.3");
+	assert.equal(
+		(
+			await activateUpdate(
+				readInstallation(id, fixture.root),
+				{ releasePath: join(fixture.root, "opt/unit-001/releases/0.0.2"), version: "0.0.2", compatibility },
+				fixture.context,
+			)
+		).status,
+		"updated",
+	);
+	assert.equal(readlinkSync(paths.currentCore), "cores/0.0.2");
+	assert.equal(readlinkSync(paths.recoveryCore), "cores/0.0.2");
+	assert.deepEqual(readdirSync(paths.cores), ["0.0.2"]);
 });

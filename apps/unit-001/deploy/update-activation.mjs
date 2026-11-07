@@ -14,6 +14,7 @@ import {
 	readdirSync,
 	readFileSync,
 	readlinkSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	statfsSync,
@@ -23,6 +24,7 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import {
 	assertSafePath,
 	installationPaths,
@@ -405,6 +407,7 @@ export function createUpdateContext(root = "/") {
 		})?.trim();
 	return {
 		root,
+		executingModule: fileURLToPath(import.meta.url),
 		run,
 		control(record, args, timeoutMs = args[0] === "maintenance-enter" ? 35000 : 2000) {
 			const paths = installationPaths(record.id, root);
@@ -519,6 +522,20 @@ function pruneCores(record, context) {
 	} catch (error) {
 		return [`Updater cores were preserved: ${error.message}`];
 	}
+}
+
+function executingCore(paths, context) {
+	if (context.executingModule) {
+		const module = realpathSync(context.executingModule);
+		const local = relative(realpathSync(paths.cores), module);
+		const match = /^(\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?)\/lib\/update-activation\.mjs$/.exec(local);
+		if (match) {
+			trustedFile(join(paths.cores, local), context.root);
+			trustedFile(join(paths.cores, match[1], "runtime/bin/node"), context.root);
+			return `cores/${match[1]}`;
+		}
+	}
+	return existsSync(paths.currentCore) ? readlinkSync(paths.currentCore) : null;
 }
 
 function stageRelease(candidate, context) {
@@ -668,7 +685,8 @@ export async function activateUpdate(record, candidate, context) {
 				return { status: "deferred", reason: "Insufficient free space for backup and staged state recovery." };
 		}
 		const destination = stageRelease(candidate, context);
-		if (existsSync(paths.currentCore)) selectLink(paths.recoveryCore, readlinkSync(paths.currentCore));
+		const previousCore = executingCore(paths, context);
+		if (previousCore) selectLink(paths.recoveryCore, previousCore);
 		const operationId = randomUUID();
 		const journal = {
 			schemaVersion: 1,
@@ -678,7 +696,7 @@ export async function activateUpdate(record, candidate, context) {
 			candidateVersion: candidate.version,
 			compatibility: candidate.compatibility,
 			phase: "holding",
-			previousCore: existsSync(paths.currentCore) ? readlinkSync(paths.currentCore) : null,
+			previousCore,
 		};
 		saveJournal(record, context, journal, "holding");
 		try {
