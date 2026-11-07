@@ -14,6 +14,10 @@ fi
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 ]] || fail 'Requires Ubuntu 24.04.'
 [[ $(ps -p 1 -o comm=) == systemd ]] || fail 'Requires a real systemd host.'
+# GitHub images expose a writable /opt for tool caches; this disposable host must meet the installer's trust boundary.
+[[ -d /opt && ! -L /opt ]] || fail 'Expected a real /opt directory.'
+chown root:root /opt
+chmod go-w /opt
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH

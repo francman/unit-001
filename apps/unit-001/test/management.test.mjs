@@ -233,7 +233,8 @@ test("#20 explicit start restores running intent and failed readiness leaves it 
 	const { context, record, root, calls } = await setup();
 	await lifecycle({ ...record, desiredState: "stopped" }, "start", context);
 	assert.equal(readInstallation(id, root).desiredState, "running");
-	assert.deepEqual(calls.slice(0, 2), [
+	assert.deepEqual(calls.slice(0, 3), [
+		["systemctl", "show", "--property=LoadState", "--value", installationPaths(id, root).unit],
 		["systemctl", "reset-failed", installationPaths(id, root).unit],
 		["systemctl", "enable", "--now", installationPaths(id, root).unit],
 	]);
@@ -316,4 +317,43 @@ test("#16 explicit start recovers an owned service after its configuration crash
 	});
 	assert.equal(limited, false);
 	assert.equal(readInstallation(id, root).desiredState, "running");
+});
+
+test("#16 first start loads a cold installed unit before resetting its failure state", async () => {
+	const { record, context, root, paths } = await setup();
+	let loaded = false;
+	await lifecycle({ ...record, desiredState: "stopped" }, "start", {
+		...context,
+		async run(_command, args) {
+			if (args[0] === "show") {
+				assert.deepEqual(args, ["show", "--property=LoadState", "--value", paths.unit]);
+				loaded = true;
+			}
+			if (args[0] === "reset-failed" && !loaded) throw new Error("Unit not loaded");
+			return 0;
+		},
+	});
+	assert.equal(loaded, true);
+	assert.equal(readInstallation(id, root).desiredState, "running");
+});
+
+test("#16 reset failure still rejects start and restores stopped intent", async () => {
+	const { record, context, root, paths, calls } = await setup();
+	await assert.rejects(
+		lifecycle(record, "start", {
+			...context,
+			async run(command, args) {
+				calls.push([command, ...args]);
+				if (args[0] === "reset-failed") throw new Error("reset denied");
+				return 0;
+			},
+		}),
+		/reset denied/,
+	);
+	assert.equal(readInstallation(id, root).desiredState, "stopped");
+	assert.equal(
+		calls.some((call) => call[1] === "enable"),
+		false,
+	);
+	assert.deepEqual(calls.at(-1), ["systemctl", "disable", "--now", paths.unit]);
 });
