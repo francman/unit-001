@@ -29,6 +29,10 @@ The default command is `agent`. `sudo ./install.sh --name bob` chooses `bob`. Na
 
 Each installation gets a UUID and dedicated unprivileged account. Its root-owned record is under `/etc/unit-001/agents/<id>`; private sessions, credentials, and workspace are under `/var/lib/unit-001/agents/<id>`. Its selected release pointer is under `/opt/unit-001/agents/<id>`. Release files can be shared while data and process ownership remain separate.
 
+Run `sudo agent setup` for guided provider selection, subscription login or hidden API key entry, and model selection. The chosen model is saved in the agent-owned `settings.json`. Command-line `--model` and the administrator's `UNIT_001_MODEL` override it. No paid request is made during setup. Successful setup offers to start a stopped service; changing a running service requires a stop and start. Cancellation never starts the service. Release `0.0.3` uses the individual commands below; guided setup arrives in the next release.
+
+Finish or cancel setup before issuing another installation, update, stop or kill command. Setup holds the management lock while credentials and settings change, so those operations report busy. An interrupted update must be recovered before setup can begin.
+
 The installer reports the ID and configuration path. Complete sign-in before starting:
 
 ```bash
