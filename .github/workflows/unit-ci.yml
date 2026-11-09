@@ -48,6 +48,18 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
+      - name: Install real terminal test tool
+        if: runner.os != 'Windows'
+        run: |
+          if command -v tmux >/dev/null; then
+            tmux -V
+          elif [ "$RUNNER_OS" = macOS ]; then
+            brew install tmux
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends tmux
+          fi
+
       - name: Test workspace discovery
         run: node --test .github/scripts/unit-workspaces.test.mjs
 

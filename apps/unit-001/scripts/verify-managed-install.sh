@@ -137,6 +137,7 @@ status agent "$first"
 status unit-ci-bob "$second"
 
 # #25: The real managed dispatcher must preserve rich terminal behavior and NO_COLOR across runuser.
+python3 "$(dirname -- "${BASH_SOURCE[0]}")/../test/managed-terminal.test.py"
 python3 "$(dirname -- "${BASH_SOURCE[0]}")/verify-managed-terminal.py"
 status agent "$first"
 status unit-ci-bob "$second"

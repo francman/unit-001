@@ -24,7 +24,7 @@ import {
 } from "./service.ts";
 import { readDefaultModel, saveDefaultModel } from "./settings.ts";
 import { runSetup } from "./setup.ts";
-import { runRichAttach } from "./terminal-ui.ts";
+import { runRichAttach, runRichForeground } from "./terminal-ui.ts";
 
 /** What the CLI reads from its process, so tests can run it against fakes. */
 export interface ManagedIdentity {
@@ -95,6 +95,12 @@ function terminalFor(runtime: Runtime): Terminal {
 		out: (text) => void runtime.stdout.write(text),
 		err: (text) => void runtime.stderr.write(text),
 	};
+}
+
+function richTerminalFor(runtime: Runtime): ProcessTerminal | undefined {
+	if (!runtime.interactive || runtime.env.TERM === undefined || runtime.env.TERM === "dumb") return undefined;
+	const terminal = new ProcessTerminal();
+	return terminal.columns < 40 || terminal.rows < 12 ? undefined : terminal;
 }
 
 function credentialStore(directory: string, runtime: Runtime): FileCredentialStore {
@@ -207,9 +213,13 @@ async function run(
 			return 0;
 		}
 		signal.addEventListener("abort", () => void opened.abort(BACKGROUND_CONTEXT).catch(() => {}), { once: true });
-		return prompt === undefined
+		if (prompt !== undefined) return await runPrint(agent, prompt, terminal, signal);
+		const rich = richTerminalFor(runtime);
+		return rich === undefined
 			? await runRepl(agent, terminal, signal)
-			: await runPrint(agent, prompt, terminal, signal);
+			: await runRichForeground(agent, options.session, await version(), rich, signal, {
+					colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+				});
 	} finally {
 		try {
 			if (command.kind === "serve") await agent?.close(BACKGROUND_CONTEXT);
@@ -238,12 +248,16 @@ async function control(
 		runtime.platform,
 	);
 	if (command.kind === "attach") {
-		if (command.options.plain || runtime.env.TERM === undefined || runtime.env.TERM === "dumb")
-			return runAttach(endpoint, terminalFor(runtime), signal);
-		const terminal = new ProcessTerminal();
-		if (terminal.columns < 40 || terminal.rows < 12) return runAttach(endpoint, terminalFor(runtime), signal);
+		const terminal = command.options.plain ? undefined : richTerminalFor(runtime);
+		if (terminal === undefined) return runAttach(endpoint, terminalFor(runtime), signal);
 		return runRichAttach(endpoint, terminal, signal, {
 			colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+			...(runtime.managed === undefined
+				? {}
+				: {
+						name: runtime.managed.name,
+						unavailableHint: `Configure: sudo ${runtime.managed.name} setup\nStart: sudo ${runtime.managed.name} start\nOpen: sudo ${runtime.managed.name}`,
+					}),
 		});
 	}
 	const request: ServiceRequest | MaintenanceRequest =
@@ -283,11 +297,13 @@ async function control(
  */
 export async function main(argv: readonly string[], runtime: Runtime, signal: AbortSignal): Promise<number> {
 	let serving = false;
+	let foreground = false;
 	try {
 		if (["start", "stop", "kill", "uninstall", "rename"].includes(argv[0] ?? ""))
 			throw new ConfigurationError("Lifecycle commands require an installed named agent command.");
 		const command = parseArguments(argv);
 		serving = command.kind === "serve";
+		foreground = command.kind === "run" && command.options.print === undefined && runtime.interactive;
 		if (signal.aborted) return serving ? 0 : 130;
 		if (command.kind === "help") {
 			runtime.stdout.write(`${USAGE.replaceAll(/\bagent\b/g, runtime.managed?.name ?? "agent")}\n`);
@@ -303,7 +319,17 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		}
 		let code: number;
 		if (command.kind === "setup") code = await setup(command, runtime, signal);
-		else if (command.kind === "run" || command.kind === "serve") code = await run(command, runtime, signal);
+		else if (command.kind === "run" && argv.length === 0 && runtime.managed !== undefined && runtime.interactive) {
+			// The normal installed entry is a client; explicit foreground flags retain their existing owner semantics.
+			try {
+				code = await control({ kind: "attach", options: { session: command.options.session } }, runtime, signal);
+			} catch (error) {
+				if (!(error instanceof ConfigurationError)) throw error;
+				throw new ConfigurationError(
+					`Cannot connect to ${runtime.managed.name}. Run sudo ${runtime.managed.name} setup or sudo ${runtime.managed.name} start, then try again.`,
+				);
+			}
+		} else if (command.kind === "run" || command.kind === "serve") code = await run(command, runtime, signal);
 		else if (
 			command.kind === "send" ||
 			command.kind === "service-status" ||
@@ -327,6 +353,10 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		runtime.stderr.write(
 			error instanceof ConfigurationError ? `${message}\n` : `${runtime.managed?.name ?? "agent"}: ${message}\n`,
 		);
+		if (foreground && error instanceof ConfigurationError)
+			runtime.stderr.write(
+				`Run ${runtime.managed === undefined ? "" : "sudo "}${runtime.managed?.name ?? "agent"} setup to review provider and model settings.\n`,
+			);
 		return 1;
 	}
 }

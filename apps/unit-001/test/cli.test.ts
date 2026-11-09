@@ -5,10 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { main, type Runtime } from "../src/cli.ts";
 import { serviceEndpoint } from "../src/service.ts";
 import { saveDefaultModel } from "../src/settings.ts";
+import { SetupUI } from "../src/setup-ui.ts";
+import * as terminalUI from "../src/terminal-ui.ts";
 
 let home: string;
 beforeEach(async () => {
@@ -63,7 +66,9 @@ describe("main", () => {
 		await writeFile(join(home, "data", "settings.json"), "broken");
 		const run = runtime({ OPENAI_API_KEY: "dummy-never-dispatched" });
 		const input = new PassThrough();
-		const answers = ["openai", "keep", "gpt-5", "yes"];
+		const answers = ["openai", "keep", "gpt-5", "save"];
+		// #36: exercise CLI persistence independently from terminal input/visual acceptance.
+		const choose = vi.spyOn(SetupUI.prototype, "choose").mockImplementation(async () => answers.shift() ?? "save");
 		const output = new Writable({
 			write(_chunk, _encoding, callback) {
 				callback();
@@ -71,9 +76,7 @@ describe("main", () => {
 		});
 		const error = new Writable({
 			write(chunk, _encoding, callback) {
-				const text = chunk.toString();
-				if (text === "Choose: " || text.startsWith("Model [") || text === "Save configuration? [Y/n]: ")
-					setImmediate(() => input.write(`${answers.shift()}\n`));
+				void chunk;
 				callback();
 			},
 		});
@@ -91,6 +94,7 @@ describe("main", () => {
 			});
 			expect((await readdir(join(home, "data"))).sort()).toEqual(["settings.json"]);
 		} finally {
+			choose.mockRestore();
 			input.destroy();
 		}
 	});
@@ -384,6 +388,72 @@ describe("built binary", () => {
 });
 
 describe("named runtime", () => {
+	it.skipIf(process.platform === "win32")(
+		"opens the owner client for bare interactive entry without reading credentials or SQLite",
+		async () => {
+			// #36: launching the installed application must not create a second storage owner.
+			const state = join(home, "named");
+			await mkdir(join(state, "control"), { recursive: true });
+			await writeFile(join(state, "auth.json"), "invalid; default client must not read this");
+			await writeFile(join(state, "settings.json"), "invalid; default client must not read this");
+			const input = new PassThrough();
+			const run = runtime({});
+			const requests: unknown[] = [];
+			const server = createServer((socket) =>
+				socket.once("data", (wire) => {
+					requests.push(JSON.parse(String(wire)));
+					socket.write(
+						`${JSON.stringify({
+							type: "view",
+							view: {
+								pid: 1,
+								version: "0.0.4",
+								name: "bob",
+								installationId: "test",
+								entries: [],
+								model: null,
+								usage: null,
+								busy: false,
+								text: "",
+								textTruncated: false,
+								tools: [],
+								historyTruncated: false,
+							},
+						})}\n`,
+					);
+				}),
+			);
+			await new Promise<void>((resolve) => server.listen(serviceEndpoint(state, "default", process.platform), resolve));
+			try {
+				const running = main(
+					[],
+					{ ...run.runtime, stdin: input, interactive: true, managed: { id: "test", name: "bob", state } },
+					signal,
+				);
+				await expect.poll(run.err).toContain("Attached to bob");
+				input.end("/exit\n");
+				expect(await running).toBe(0);
+				expect(requests).toEqual([{ type: "watch" }]);
+				expect((await readdir(state)).sort()).toEqual(["auth.json", "control", "settings.json"]);
+			} finally {
+				input.destroy();
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+			}
+		},
+	);
+
+	it("preserves explicit foreground model and session options instead of discarding them", async () => {
+		const run = runtime({});
+		const managed = { id: "test", name: "bob", state: join(home, "bob") };
+		expect(
+			await main(["--model", "openai/does-not-exist"], { ...run.runtime, interactive: true, managed }, signal),
+		).toBe(1);
+		expect(run.err()).toContain("not in the openai catalog");
+		const selected = runtime({});
+		expect(await main(["--session", "work"], { ...selected.runtime, interactive: true, managed }, signal)).toBe(1);
+		expect(selected.err()).toContain("No model provider is configured");
+		expect(selected.err()).not.toContain("Cannot connect to bob");
+	});
 	it("uses the installed name in help and rejects conflicting state paths", async () => {
 		// #19: named commands bind runtime identity and state rather than the caller environment.
 		const run = runtime({});
@@ -399,5 +469,31 @@ describe("named runtime", () => {
 		const run = runtime({});
 		expect(await main(["uninstall", "--yes"], run.runtime, signal)).toBe(1);
 		expect(run.err()).toContain("require an installed named agent");
+	});
+});
+
+describe("modern default foreground entry", () => {
+	it("uses the rich view with its already-open owner on a capable terminal", async () => {
+		// #36: the default source experience is the same terminal application, not raw readline.
+		const run = runtime({ OPENAI_API_KEY: "dummy-never-dispatched", TERM: "xterm-256color" });
+		const rich = vi.spyOn(terminalUI, "runRichForeground").mockImplementation(async (agent, session) => {
+			expect(session).toBe("default");
+			expect((await agent.status(BACKGROUND_CONTEXT)).busy).toBe(false);
+			return 0;
+		});
+		try {
+			expect(await main([], { ...run.runtime, interactive: true }, signal)).toBe(0);
+			expect(rich).toHaveBeenCalledOnce();
+			expect(await readdir(join(home, "data", "sessions"))).toContain("default.sqlite");
+		} finally {
+			rich.mockRestore();
+		}
+	});
+
+	it("points an unconfigured foreground user to guided setup", async () => {
+		const run = runtime({});
+		expect(await main([], { ...run.runtime, interactive: true }, signal)).toBe(1);
+		expect(run.err()).toContain("Run agent setup");
+		expect(await readdir(home)).toEqual([]);
 	});
 });

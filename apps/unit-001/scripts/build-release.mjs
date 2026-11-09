@@ -241,6 +241,25 @@ export function writeUpdateBootstrap(stage, rootFile) {
 	);
 }
 
+/** Copies the operator documentation, including the setup guide linked by the terminal design. */
+export function writeReleaseDocumentation(stage) {
+	mkdirSync(join(stage, "docs"));
+	for (const name of [
+		"deployment.md",
+		"operations.md",
+		"lightsail.md",
+		"terminal.md",
+		"terminal-design.md",
+		"terminal-assessment-omp.md",
+		"terminal-assessment-others.md",
+		"setup-experience.md",
+		"updates.md",
+		"distribution.md",
+	]) {
+		cpSync(join(repository, "apps/unit-001/docs", name), join(stage, "docs", name));
+	}
+}
+
 /** Builds the archive without publishing, installing a service, or changing upstream sources. */
 export function buildRelease(out, options = {}) {
 	const sourceManifest = JSON.parse(readFileSync(join(repository, "apps/unit-001/package.json"), "utf8"));
@@ -269,20 +288,7 @@ export function buildRelease(out, options = {}) {
 		cpSync(join(repository, "apps/unit-001/deploy"), join(stage, "deploy"), { recursive: true });
 		writeUpdateBootstrap(stage, options.updateRoot);
 		writeUpdaterCore(stage);
-		mkdirSync(join(stage, "docs"));
-		for (const name of [
-			"deployment.md",
-			"operations.md",
-			"lightsail.md",
-			"terminal.md",
-			"terminal-design.md",
-			"terminal-assessment-omp.md",
-			"terminal-assessment-others.md",
-			"updates.md",
-			"distribution.md",
-		]) {
-			cpSync(join(repository, "apps/unit-001/docs", name), join(stage, "docs", name));
-		}
+		writeReleaseDocumentation(stage);
 		cpSync(join(stage, "deploy/install.sh"), join(stage, "install.sh"));
 		chmodSync(join(stage, "install.sh"), 0o755);
 		cpSync(join(repository, "apps/unit-001/scripts/check-vps.sh"), join(stage, "check-vps.sh"));

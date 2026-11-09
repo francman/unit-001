@@ -17,7 +17,7 @@ Download the public Linux archive from the [stable download channel](distributio
 
 ```bash
 tar -xzf unit-001-linux-x64.tar.gz
-cd unit-001-0.0.4-linux-x64
+cd unit-001-0.0.5-linux-x64
 sudo ./install.sh
 ```
 

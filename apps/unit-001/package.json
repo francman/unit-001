@@ -1,6 +1,6 @@
 {
 	"name": "unit-001",
-	"version": "0.0.4",
+	"version": "0.0.5",
 	"description": "unit-001: a durable agent built on Pi Durable",
 	"private": true,
 	"type": "module",

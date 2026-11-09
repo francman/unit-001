@@ -20,9 +20,15 @@ import {
 	VStack,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import type { Agent } from "./agent.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import type { ServiceView } from "./service.ts";
-import { createTerminalController, type TerminalController, type TerminalState } from "./terminal-controller.ts";
+import {
+	createForegroundTerminalController,
+	createTerminalController,
+	type TerminalController,
+	type TerminalState,
+} from "./terminal-controller.ts";
 
 declare module "@earendil-works/pi-tui" {
 	interface Keybindings {
@@ -38,6 +44,9 @@ export const DEFAULT_APP_KEYBINDINGS = {
 
 export interface RichAttachOptions {
 	readonly colorMode?: "color" | "monochrome";
+	readonly ownership?: "attached" | "foreground";
+	readonly unavailableHint?: string;
+	readonly name?: string;
 }
 
 type Actions = Pick<TerminalController, "submit" | "cancel" | "detach">;
@@ -53,22 +62,70 @@ export async function runRichAttach(
 	signal: AbortSignal,
 	options: RichAttachOptions = {},
 ): Promise<number> {
+	return runRichConversation(
+		basename(endpoint, ".sock"),
+		terminal,
+		signal,
+		(onChange) => createTerminalController(endpoint, onChange, signal),
+		options,
+	);
+}
+
+/** Renders the existing foreground owner without opening another database or creating a service. */
+export async function runRichForeground(
+	agent: Agent,
+	session: string,
+	version: string,
+	terminal: Terminal,
+	signal: AbortSignal,
+	options: RichAttachOptions = {},
+): Promise<number> {
+	return runRichConversation(
+		session,
+		terminal,
+		signal,
+		(onChange) => createForegroundTerminalController(agent, session, version, onChange, signal),
+		{ ...options, ownership: "foreground" },
+	);
+}
+
+async function runRichConversation(
+	session: string,
+	terminal: Terminal,
+	signal: AbortSignal,
+	connect: (onChange: (state: TerminalState) => void) => TerminalController,
+	options: RichAttachOptions,
+): Promise<number> {
 	if (signal.aborted) return 0;
 	const tui = new TuiAltScreen(terminal, true, undefined, { mouse: false, copyOnSelect: false });
 	let controller: TerminalController;
+	let closeUnavailable: (() => void) | undefined;
 	const actions: Actions = {
 		submit: (text) => controller.submit(text),
 		cancel: () => controller.cancel(),
-		detach: () => controller.detach(),
+		detach: () => (closeUnavailable === undefined ? controller.detach() : closeUnavailable()),
 	};
-	const view = new RichAttachView(tui, basename(endpoint, ".sock"), actions, options);
+	const view = new RichAttachView(tui, session, actions, options);
 	tui.setLayoutRoot(view);
 	tui.setFocus(view.editor);
 	tui.addInputListener((data) => view.handleGlobalInput(data));
-	controller = createTerminalController(endpoint, (state) => view.update(state), signal);
+	controller = connect((state) => view.update(state));
+	let result: number;
 	try {
 		tui.start();
-		return await controller.closed;
+		result = await controller.closed;
+		if (result !== 0 && !signal.aborted) {
+			const closed = Promise.withResolvers<void>();
+			closeUnavailable = closed.resolve;
+			const abort = () => closed.resolve();
+			signal.addEventListener("abort", abort, { once: true });
+			try {
+				if (signal.aborted) abort();
+				await closed.promise;
+			} finally {
+				signal.removeEventListener("abort", abort);
+			}
+		}
 	} finally {
 		controller.detach();
 		try {
@@ -77,6 +134,7 @@ export async function runRichAttach(
 			tui.stop();
 		}
 	}
+	return result;
 }
 
 /** Retains editor state while differential rendering updates the conversation and metadata around it. */
@@ -88,6 +146,9 @@ export class RichAttachView extends VStack {
 	readonly #session: string;
 	readonly #actions: Actions;
 	readonly #theme: ReturnType<typeof createTheme>;
+	readonly #ownership: "attached" | "foreground";
+	readonly #unavailableHint: string;
+	readonly #name: string;
 	readonly #header: StatusLines;
 	readonly #footer: StatusLines;
 	readonly #messages = new Map<number, { text: string; role: string; truncated: boolean; card: Component }>();
@@ -112,10 +173,20 @@ export class RichAttachView extends VStack {
 		this.#session = label(session);
 		this.#actions = actions;
 		this.#theme = createTheme(options.colorMode !== "monochrome");
+		this.#ownership = options.ownership ?? "attached";
+		this.#name = label(options.name ?? "agent");
+		this.#unavailableHint =
+			options.unavailableHint ??
+			(this.#ownership === "foreground"
+				? "Reopen this foreground session to inspect saved work."
+				: "Check the service and reopen this terminal.\nUse /status after reconnecting to inspect saved work.");
 		this.#header = new StatusLines((width) => this.header(width));
 		this.#footer = new StatusLines((width) => this.footer(width));
 		this.#live = new PassiveMarkdown("", 1, 0, this.#theme.markdown);
-		this.editor = new Editor(tui, this.#theme.editor, { paddingX: 1 });
+		this.editor = new ComposerEditor(tui, this.#theme.editor, () => {
+			const name = label(this.#state.view?.name ?? "agent");
+			return `${this.editor.getText() === "" ? `Ask ${name}` : "Message"} · ${this.keyHint("tui.input.newLine")} newline`;
+		});
 		this.editor.onChange = () => {
 			if (this.#restoringDraft) return;
 			const draft = this.editor.getExpandedText();
@@ -144,15 +215,25 @@ export class RichAttachView extends VStack {
 		this.scroll = new ScrollView(this.transcript, { follow: "end", primary: true, scrollbar: "auto" });
 		this.addChild(this.#header, { basis: 2, minSize: 1, shrink: 0 });
 		this.addChild(this.scroll, { basis: 0, grow: 1, minSize: 1 });
-		this.addChild(this.editor, { basis: "auto", minSize: 3, maxSize: 8, shrink: 1 });
+		this.addChild(this.editor, {
+			basis: "auto",
+			minSize: 3,
+			maxSize: 8,
+			shrink: 1,
+			visible: () => this.#state.connection !== "failed",
+		});
 		this.addChild(this.#footer, { basis: 2, minSize: 1, shrink: 0 });
 		this.update(this.#state);
 	}
 
 	/** Applies a bounded owner snapshot without changing the draft or cursor. */
 	update(state: TerminalState): void {
-		const changed = state.view !== this.#state.view || state.notices !== this.#state.notices;
+		const changed =
+			state.view !== this.#state.view ||
+			state.notices !== this.#state.notices ||
+			state.connection !== this.#state.connection;
 		this.#state = state;
+		if (state.connection === "failed") this.#tui.setFocus(null);
 		if (changed || this.transcript.children.length === 0) this.updateTranscript(state.view);
 		this.#tui.requestRender();
 	}
@@ -165,10 +246,12 @@ export class RichAttachView extends VStack {
 			return { consume: true };
 		}
 		if (this.#keys.matches(data, "unit.attach.cancel")) {
-			if (this.#state.view?.busy || this.#state.sending) this.#actions.cancel();
+			if (this.#state.connection === "attached" && (this.#state.view?.busy || this.#state.sending))
+				this.#actions.cancel();
 			else this.#actions.detach();
 			return { consume: true };
 		}
+		if (this.#state.connection === "failed") return { consume: true };
 		if (this.#paste !== undefined || data.startsWith(PASTE_START)) {
 			if (this.#paste === undefined) {
 				this.#paste = "";
@@ -220,7 +303,7 @@ export class RichAttachView extends VStack {
 
 	private header(width: number): string[] {
 		const view = this.#state.view;
-		const name = view === undefined ? "agent" : label(view.name);
+		const name = view === undefined ? this.#name : label(view.name);
 		const activity =
 			this.#state.connection !== "attached"
 				? this.#state.connection
@@ -231,32 +314,58 @@ export class RichAttachView extends VStack {
 						: this.#state.sending
 							? "sending"
 							: "ready";
-		const model =
-			view?.model == null ? "model unknown" : `${label(view.model.provider)}/${label(view.model.modelId)}`;
-		const title = truncateToWidth(`${name}  /  ${this.#session}`, Math.max(1, width - activity.length - 2));
+		const model = view?.model == null ? "model unknown" : `${label(view.model.provider)}/${label(view.model.modelId)}`;
+		const brand = width >= 64 ? "unit-001  ·  " : "";
+		const title = truncateToWidth(`${brand}${name}  /  ${this.#session}`, Math.max(1, width - activity.length - 2));
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(title) - activity.length));
+		const activityStyle =
+			activity === "failed"
+				? this.#theme.error
+				: activity === "working" || activity === "sending" || activity === "cancelling"
+					? this.#theme.warning
+					: activity === "ready"
+						? this.#theme.success
+						: this.#theme.muted;
+		const ownership = width >= 80 ? `  ·  ${this.#ownership === "foreground" ? "foreground" : "attached"}` : "";
+		const version = view === undefined ? "" : `  ·  v${label(view.version)}${ownership}`;
 		return [
-			this.#theme.accent(title) + gap + this.#theme.muted(activity.toUpperCase()),
-			this.#theme.muted(`${model}${view === undefined ? "" : `  ·  PID ${view.pid}  ·  v${label(view.version)}`}`),
+			this.#theme.accent(title) + gap + activityStyle(activity.toUpperCase()),
+			`${truncateToWidth(model, Math.max(1, width - visibleWidth(version)))}${this.#theme.muted(version)}`,
 		];
 	}
 
 	private footer(width: number): string[] {
+		if (this.#state.connection === "failed")
+			return [
+				this.#theme.muted("Run the command above, then reopen."),
+				this.#theme.muted(`${this.keyHint("unit.attach.cancel")} exit · ${this.keyHint("unit.attach.detach")} exit`),
+			];
 		const usage = this.#state.view?.usage;
+		const close = this.#ownership === "foreground" ? "exit" : "detach";
+		if (width < 64) {
+			const tokens =
+				usage == null
+					? "tokens ?"
+					: `${usage.totalTokens.toLocaleString("en-US", { notation: "compact", maximumFractionDigits: 1 })} tok`;
+			const cost =
+				usage == null || usage.cost.kind === "unknown" ? "cost unknown" : `~$${usage.cost.usd.toFixed(4)} est`;
+			const cancel =
+				this.#state.connection === "attached" && (this.#state.view?.busy || this.#state.sending) ? "cancel" : "exit";
+			return [
+				this.#theme.muted(`${this.keyHint("tui.input.submit")} send · ${tokens} · ${cost}`),
+				this.#theme.muted(
+					`${this.keyHint("unit.attach.cancel")} ${cancel} · ${this.keyHint("unit.attach.detach")} ${close} · /help`,
+				),
+			];
+		}
 		const cost =
-			usage == null || usage.cost.kind === "unknown"
-				? "cost unknown"
-				: `~$${usage.cost.usd.toFixed(4)} ${width < 64 ? "est" : "estimated"}`;
+			usage == null || usage.cost.kind === "unknown" ? "cost unknown" : `~$${usage.cost.usd.toFixed(4)} estimated`;
 		const tokens =
-			usage == null
-				? "tokens unknown"
-				: `${usage.totalTokens.toLocaleString("en-US")} ${width < 64 ? "tokens" : "conversation tokens"}`;
+			usage == null ? "tokens unknown" : `${usage.totalTokens.toLocaleString("en-US")} conversation tokens`;
 		return [
 			this.#theme.muted(`${tokens}  ·  ${cost}`),
 			this.#theme.muted(
-				width < 64
-					? `${this.keyHint("unit.attach.cancel")} cancel · ${this.keyHint("unit.attach.detach")} detach · /help`
-					: `${this.keyHint("tui.input.submit")} send · ${this.keyHint("tui.input.newLine")} newline · ${this.keyHint("unit.attach.cancel")} cancel/exit · ${this.keyHint("unit.attach.detach")} detach · /help`,
+				`${this.keyHint("tui.input.submit")} send · ${this.keyHint("tui.input.newLine")} newline · ${this.keyHint("unit.attach.cancel")} cancel/exit · ${this.keyHint("unit.attach.detach")} ${close} · /help`,
 			),
 		];
 	}
@@ -273,6 +382,11 @@ export class RichAttachView extends VStack {
 
 	private updateTranscript(view: ServiceView | undefined): void {
 		this.transcript.clear();
+		if (this.#state.connection === "failed") {
+			this.transcript.addChild(new Text(this.#theme.error("Agent unavailable"), 1, 0));
+			this.transcript.addChild(new Text(sanitizeTerminalText(this.#unavailableHint), 1, 0));
+			return;
+		}
 		const retained = new Set<number>();
 		if (view === undefined)
 			this.transcript.addChild(new Text(this.#theme.muted("Connecting to the running agent…"), 1, 1));
@@ -291,9 +405,7 @@ export class RichAttachView extends VStack {
 					const card = new Container();
 					card.addChild(
 						new Text(
-							entry.role === "user"
-								? this.#theme.user("YOU")
-								: this.#theme.accent(label(view.name).toUpperCase()),
+							entry.role === "user" ? this.#theme.user("YOU") : this.#theme.accent(label(view.name).toUpperCase()),
 							1,
 							0,
 						),
@@ -309,8 +421,7 @@ export class RichAttachView extends VStack {
 			}
 			const last = view.entries.at(-1);
 			const committed =
-				last?.role === "assistant" &&
-				(last.text === view.text || (last.truncated && view.text.startsWith(last.text)));
+				last?.role === "assistant" && (last.text === view.text || (last.truncated && view.text.startsWith(last.text)));
 			const live = committed ? "" : sanitizeTerminalText(view.text);
 			if (live !== this.#liveText) {
 				this.#live.setText(live);
@@ -319,20 +430,59 @@ export class RichAttachView extends VStack {
 			if (live !== "") {
 				this.transcript.addChild(new Text(this.#theme.accent(`${label(view.name).toUpperCase()}  ·  LIVE`), 1, 0));
 				this.transcript.addChild(this.#live);
-				if (view.textTruncated)
-					this.transcript.addChild(new Text(this.#theme.warning("[Live text truncated]"), 1, 0));
+				if (view.textTruncated) this.transcript.addChild(new Text(this.#theme.warning("[Live text truncated]"), 1, 0));
 			}
-			for (const tool of view.tools)
-				this.transcript.addChild(new ToolCard(label(tool.name), tool.status, this.#theme));
+			for (const tool of view.tools) this.transcript.addChild(new ToolCard(label(tool.name), tool.status, this.#theme));
 			if (view.entries.length === 0 && live === "")
-				this.transcript.addChild(
-					new Text(this.#theme.muted("Conversation ready. Send a task or a question below."), 1, 1),
-				);
+				this.transcript.addChild(new WelcomePanel(this.#theme, this.#ownership));
 		}
 		for (const id of this.#messages.keys()) if (!retained.has(id)) this.#messages.delete(id);
-		for (const notice of this.#state.notices.slice(-3))
-			this.transcript.addChild(new Text(this.#theme.muted(sanitizeTerminalText(notice)), 1, 0));
+		for (const notice of this.#state.notices.slice(-3)) {
+			const error = notice.kind === "error";
+			const style = error ? this.#theme.error : this.#theme.muted;
+			// Retry IDs matter after an uncertain failure, not on every successful submission.
+			const text = notice.text.startsWith("Submitting request ") ? "Request submitted." : notice.text;
+			this.transcript.addChild(new Text(style(`${error ? "Error" : "Notice"} · ${sanitizeTerminalText(text)}`), 1, 0));
+		}
 		if (this.#inputNotice !== "") this.transcript.addChild(new Text(this.#theme.warning(this.#inputNotice), 1, 0));
+	}
+}
+
+// Give an empty conversation a clear purpose without spending rows on a splash screen.
+class WelcomePanel implements Component {
+	readonly #theme: ReturnType<typeof createTheme>;
+	readonly #ownership: "attached" | "foreground";
+	constructor(theme: ReturnType<typeof createTheme>, ownership: "attached" | "foreground") {
+		this.#theme = theme;
+		this.#ownership = ownership;
+	}
+	render(width: number): string[] {
+		const title = width < 64 ? " Durable agent workspace" : "  unit-001  /  Durable agent workspace";
+		return [
+			this.#theme.accent(truncateToWidth(title, width)),
+			this.#theme.muted(truncateToWidth(" Ask a question or describe a task below.", width)),
+			this.#theme.muted(
+				truncateToWidth(
+					`/help commands · /status ${this.#ownership === "foreground" ? "session" : "agent"} details`,
+					width,
+				),
+			),
+		];
+	}
+	invalidate(): void {}
+}
+
+// The context lives in the existing border, preserving the editor's cursor and multiline scroll indicators.
+class ComposerEditor extends Editor {
+	readonly #caption: () => string;
+	constructor(tui: TuiAltScreen, theme: EditorTheme, caption: () => string) {
+		super(tui, theme, { paddingX: 1 });
+		this.#caption = caption;
+	}
+	protected override renderTopBorder(width: number, hiddenLineCount: number): string {
+		if (hiddenLineCount > 0 || width < 4) return super.renderTopBorder(width, hiddenLineCount);
+		const caption = truncateToWidth(` ${this.#caption()} `, width - 2);
+		return this.borderColor(`─${caption}${"─".repeat(Math.max(0, width - visibleWidth(caption) - 1))}`);
 	}
 }
 
@@ -379,10 +529,7 @@ class ToolCard implements Component {
 					: this.#status === "done"
 						? this.#theme.muted
 						: this.#theme.warning;
-		return [
-			style(truncateToWidth(` ┌ ${this.#name}`, width)),
-			this.#theme.muted(truncateToWidth(` └ ${this.#status}`, width)),
-		];
+		return [style(truncateToWidth(` [${this.#status}] ${this.#name}`, width))];
 	}
 	invalidate(): void {}
 }
@@ -393,7 +540,8 @@ function label(text: string): string {
 
 function createTheme(color: boolean) {
 	const ansi = (code: string) => (text: string) => (color ? `\x1b[${code}m${text}\x1b[0m` : text);
-	const accent = ansi("1;36");
+	// Important text inherits the terminal's contrasting foreground on light and dark palettes.
+	const accent = ansi("1;39");
 	const muted = ansi("90");
 	const user = ansi("1;34");
 	const success = ansi("32");
@@ -405,7 +553,7 @@ function createTheme(color: boolean) {
 		linkUrl: muted,
 		code: warning,
 		codeBlock: (text) => text,
-		codeBlockBorder: muted,
+		codeBlockBorder: (text) => muted(`──${text.length > 3 ? ` ${text.slice(3)}` : ""}`),
 		quote: muted,
 		quoteBorder: muted,
 		hr: muted,

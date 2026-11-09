@@ -24,7 +24,7 @@ function openBrowser(platform: NodeJS.Platform, url: string): void {
 }
 
 export interface LoginInteraction {
-	readonly interaction: AuthInteraction;
+	readonly interaction: AuthInteraction & { readonly signal: AbortSignal };
 	/** Releases the terminal; call when the login ends. */
 	close(): void;
 }
@@ -40,19 +40,27 @@ export function createLoginInteraction(
 ): LoginInteraction {
 	const interactive = terminal.output !== undefined;
 	const readline = createInterface({ input: terminal.input, output: terminal.output, terminal: interactive });
+	const cancelled = new AbortController();
+	const interactionSignal = AbortSignal.any([signal, cancelled.signal]);
+	const cancel = () => {
+		cancelled.abort(new Error("Sign-in cancelled."));
+		readline.close();
+	};
+	readline.on("SIGINT", cancel);
+	if (interactive) readline.on("close", cancel);
 	// Lines are buffered by the iterator, so an answer typed or piped before its question is asked is not lost.
 	const lines = readline[Symbol.asyncIterator]();
 
 	const show = (text: string) => terminal.err(`${text}\n`);
 
 	const ask = async (question: string, abort: AbortSignal): Promise<string> => {
+		abort.throwIfAborted();
 		if (interactive) {
 			readline.setPrompt(question);
 			readline.prompt();
 		} else {
 			terminal.err(question);
 		}
-		abort.throwIfAborted();
 		let onAbort: (() => void) | undefined;
 		const aborted = new Promise<never>((_resolve, reject) => {
 			onAbort = () => reject(abort.reason);
@@ -93,18 +101,16 @@ export function createLoginInteraction(
 				"Entering a secret here is not supported. Set the provider's API key environment variable instead.",
 			);
 		}
-		const abort = request.signal === undefined ? signal : AbortSignal.any([signal, request.signal]);
+		const abort =
+			request.signal === undefined ? interactionSignal : AbortSignal.any([interactionSignal, request.signal]);
 		if (request.type === "select") {
 			show(request.message);
 			request.options.forEach((option, index) => {
-				show(
-					`  ${index + 1}. ${option.label}${option.description === undefined ? "" : ` (${option.description})`}`,
-				);
+				show(`  ${index + 1}. ${option.label}${option.description === undefined ? "" : ` (${option.description})`}`);
 			});
 			for (;;) {
 				const answer = await ask("Choose: ", abort);
-				const chosen =
-					request.options[Number.parseInt(answer, 10) - 1] ?? request.options.find((o) => o.id === answer);
+				const chosen = request.options[Number.parseInt(answer, 10) - 1] ?? request.options.find((o) => o.id === answer);
 				if (chosen !== undefined) return chosen.id;
 				show("Enter the number of one of the choices.");
 			}
@@ -112,5 +118,12 @@ export function createLoginInteraction(
 		return ask(`${request.message} `, abort);
 	};
 
-	return { interaction: { signal, prompt, notify }, close: () => readline.close() };
+	return {
+		interaction: { signal: interactionSignal, prompt, notify },
+		close: () => {
+			readline.removeListener("SIGINT", cancel);
+			readline.removeListener("close", cancel);
+			readline.close();
+		},
+	};
 }

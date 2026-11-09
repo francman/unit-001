@@ -14,6 +14,7 @@ import {
 	verifyNodeDownload,
 	writeReleaseArchive,
 	writeReleaseChecksums,
+	writeReleaseDocumentation,
 	writeReleaseLauncher,
 	writeUpdateBootstrap,
 } from "../scripts/build-release.mjs";
@@ -22,6 +23,18 @@ import { generateRepositoryKeys } from "../scripts/update-repository.mjs";
 const temporary = [];
 afterEach(() => {
 	for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+test("#36 bundled terminal design resolves its setup guide inside the signed documentation inventory", () => {
+	const directory = mkdtempSync(join(tmpdir(), "unit-release-docs-"));
+	temporary.push(directory);
+	writeReleaseDocumentation(directory);
+	const design = readFileSync(join(directory, "docs/terminal-design.md"), "utf8");
+	assert.match(design, /\]\(setup-experience\.md\)/);
+	const setup = readFileSync(join(directory, "docs/setup-experience.md"));
+	assert.deepEqual(setup, readFileSync(new URL("../docs/setup-experience.md", import.meta.url)));
+	writeReleaseChecksums(directory);
+	assert.match(readFileSync(join(directory, "SHA256SUMS"), "utf8"), /\.\/docs\/setup-experience\.md/);
 });
 
 test("#16 Linux archives exclude macOS extended attributes and AppleDouble companions", () => {
