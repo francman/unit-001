@@ -15,7 +15,7 @@ sudo agent update status
 sudo agent update check
 sudo agent update disable
 sudo agent update enable
-sudo agent update pin 0.0.3
+sudo agent update pin 0.0.4
 sudo agent update unpin
 sudo agent update
 sudo agent update rollback
