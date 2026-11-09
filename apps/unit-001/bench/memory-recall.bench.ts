@@ -10,10 +10,10 @@ import { forgetMemory, MemoryDoc, MemoryRecall, memoryEvidence, rememberMemory }
 import { benchmark, reportEnvironment } from "./benchmark.ts";
 
 reportEnvironment();
-for (const [count, coldBudget, warmBudget, commitBudget] of [
-	[100, 2, 1, 2],
-	[1000, 20, 2, 5],
-	[10000, 200, 10, 20],
+for (const [count, coldBudget, warmBudget, forgetBudget, commitBudget] of [
+	[100, 4, 1, 2, 2],
+	[1000, 20, 2, 20, 5],
+	[10000, 300, 10, 200, 20],
 ]) {
 	const state = MemoryDoc.definition.initial!();
 	for (let index = 0; index < count; index++) {
@@ -43,7 +43,7 @@ for (const [count, coldBudget, warmBudget, commitBudget] of [
 		return performance.now() - start;
 	});
 	let sequence = 0;
-	await benchmark(`memory/${count}/forget-reconcile`, coldBudget, async () => {
+	await benchmark(`memory/${count}/forget-reconcile`, forgetBudget, async () => {
 		const id = `memory:seed:${sequence}`;
 		const start = performance.now();
 		forgetMemory(state, { writeKey: `forget:${sequence++}`, id });
