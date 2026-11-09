@@ -54,6 +54,11 @@ test("#36 bundled terminal design resolves its setup guide inside the signed doc
 	// #6–#9: bundled memory documentation must resolve its verification and capacity links.
 	const memory = readFileSync(join(directory, "docs/memory.md"), "utf8");
 	assert.match(memory, /\]\(memory\/verification\.md\)/);
+	assert.match(memory, /\]\(memory\/reference-practices\.md\)/);
+	assert.deepEqual(
+		readFileSync(join(directory, "docs/memory/reference-practices.md")),
+		readFileSync(new URL("../docs/memory/reference-practices.md", import.meta.url)),
+	);
 	assert.match(readFileSync(join(directory, "docs/memory/verification.md"), "utf8"), /\]\(\.\.\/latency\.md\)/);
 	assert.deepEqual(
 		readFileSync(join(directory, "docs/latency.md")),

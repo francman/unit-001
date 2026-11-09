@@ -18,3 +18,5 @@ Relevant memories automatically accompany requests as untrusted evidence. Human 
 Forgetting removes recall evidence and invalidates derived summaries. Immutable conversation history remains. Memory cannot grant execution authority or establish current process facts. `/status` and the model's `unit_status` tool report the actual owner process and observation time. Autonomous mission scheduling remains separate work.
 
 See [recovery verification and capacity limits](memory/verification.md).
+
+See [practices taken from OMP, OpenClaw and Hermes](memory/reference-practices.md) for implemented patterns and proposed follow-ups.
