@@ -1,4 +1,4 @@
-// Runs application commands under the installation account with a fixed identity and state directory.
+// Runs the installation owner or its normal-user operator client with a fixed identity.
 import { dirname } from "node:path";
 import { main, processRuntime } from "./cli.ts";
 
@@ -14,10 +14,16 @@ if (
 	process.stderr.write("Invalid named agent identity or account; use the installed agent command.\n");
 	process.exitCode = 1;
 } else {
-	process.chdir(`${state}/workspace`);
+	const operator = args[0] === "--operator";
+	if (operator) args.shift();
+	else process.chdir(`${state}/workspace`);
 	// Tools use the bundled runtime even when the host has no Node installation.
 	process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH ?? "/usr/sbin:/usr/bin:/sbin:/bin"}`;
 	const controller = new AbortController();
 	for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => controller.abort());
-	process.exitCode = await main(args, { ...processRuntime(), managed: { id, name, state } }, controller.signal);
+	process.exitCode = await main(
+		args,
+		{ ...processRuntime(), managed: { id, name, state, ...(operator ? { access: "operator" as const } : {}) } },
+		controller.signal,
+	);
 }

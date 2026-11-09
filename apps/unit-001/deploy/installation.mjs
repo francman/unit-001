@@ -660,6 +660,17 @@ async function installRelease(source, root, name, dryRun) {
 		);
 		if (updatesConfigured)
 			console.log(`Signed public updates are configured automatically and run while ${name} is started.`);
+		if (root === "/" && latest === undefined && process.env.SUDO_UID !== undefined && process.env.SUDO_UID !== "0") {
+			const uid = process.env.SUDO_UID;
+			if (!/^[1-9][0-9]*$/.test(uid)) throw new Error("Invalid installing operator UID.");
+			const fields = execFileSync("getent", ["passwd", uid], { encoding: "utf8" }).trim().split(":");
+			if (fields[2] !== uid || fields[0] !== process.env.SUDO_USER)
+				throw new Error("Installing operator does not match its OS account.");
+			execFileSync("usermod", ["--append", "--groups", record.account, fields[0]], { stdio: "inherit" });
+			console.log(
+				`Operator access granted to ${fields[0]}. Reconnect SSH or log out and back in to refresh groups.`,
+			);
+		}
 	}, root);
 }
 

@@ -1,5 +1,5 @@
-// Hosts one headless agent and its owner-only local control socket.
-import { chmod, mkdir, unlink } from "node:fs/promises";
+// Hosts one agent with private administrator and authorized-operator control sockets.
+import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -57,6 +57,15 @@ export function serviceEndpoint(directory: string, session: string, platform: No
 	return path;
 }
 
+/** Resolves the installation's operator socket outside its private state directory. */
+export function operatorEndpoint(id: string, session: string): string {
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id))
+		throw new ConfigurationError("Invalid operator installation identity.");
+	const path = join(`/run/unit-001-${id}`, `${validateSessionName(session)}.sock`);
+	if (Buffer.byteLength(path) > 103) throw new ConfigurationError("The operator socket path is too long.");
+	return path;
+}
+
 /** Serves until shutdown or storage failure; disconnecting clients never cancels admitted work. */
 export async function runService(
 	agent: Agent,
@@ -65,6 +74,7 @@ export async function runService(
 	log: (text: string) => void,
 	signal: AbortSignal,
 	installationId: string | null = null,
+	operatorPath?: string,
 ): Promise<void> {
 	if (signal.aborted) return;
 	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -74,54 +84,62 @@ export async function runService(
 		if (error.code !== "ENOENT") throw error;
 	});
 	const clients = new Set<Socket>();
-	const server = createServer((socket) => {
-		clients.add(socket);
-		socket.once("close", () => clients.delete(socket));
-		socket.on("error", () => {});
-		socket.setEncoding("utf8");
-		socket.setTimeout(5_000, () => socket.destroy());
-		let buffer = "";
-		let handled = false;
-		socket.on("data", (chunk: string) => {
-			if (handled) return;
-			buffer += chunk;
-			if (Buffer.byteLength(buffer) > MAX_REQUEST_BYTES) {
+	const createListener = (access: "administrator" | "operator") =>
+		createServer((socket) => {
+			clients.add(socket);
+			socket.once("close", () => clients.delete(socket));
+			socket.on("error", () => {});
+			socket.setEncoding("utf8");
+			socket.setTimeout(5_000, () => socket.destroy());
+			let buffer = "";
+			let handled = false;
+			socket.on("data", (chunk: string) => {
+				if (handled) return;
+				buffer += chunk;
+				if (Buffer.byteLength(buffer) > MAX_REQUEST_BYTES) {
+					handled = true;
+					writeResponse(socket, { type: "error", message: "Service request exceeds 64 KiB." });
+					return;
+				}
+				const newline = buffer.indexOf("\n");
+				if (newline === -1) return;
 				handled = true;
-				writeResponse(socket, { type: "error", message: "Service request exceeds 64 KiB." });
-				return;
-			}
-			const newline = buffer.indexOf("\n");
-			if (newline === -1) return;
-			handled = true;
-			socket.setTimeout(0);
-			socket.pause();
-			let value: unknown;
-			try {
-				value = JSON.parse(buffer.slice(0, newline));
-			} catch (error) {
-				writeResponse(socket, { type: "error", message: error instanceof Error ? error.message : String(error) });
-				return;
-			}
-			if (typeof value === "object" && value !== null && "type" in value && value.type === "watch") {
-				socket.resume();
-				void streamViews(agent, socket, version, installationId).catch(() => socket.destroy());
-				return;
-			}
-			void handleRequest(agent, version, installationId, value).then(
-				(response) => writeResponse(socket, response),
-				(error: unknown) =>
+				socket.setTimeout(0);
+				socket.pause();
+				let value: unknown;
+				try {
+					value = JSON.parse(buffer.slice(0, newline));
+				} catch (error) {
 					writeResponse(socket, {
 						type: "error",
 						message: error instanceof Error ? error.message : String(error),
-					}),
-			);
+					});
+					return;
+				}
+				if (typeof value === "object" && value !== null && "type" in value && value.type === "watch") {
+					socket.resume();
+					void streamViews(agent, socket, version, installationId).catch(() => socket.destroy());
+					return;
+				}
+				void handleRequest(agent, version, installationId, value, access).then(
+					(response) => writeResponse(socket, response),
+					(error: unknown) =>
+						writeResponse(socket, {
+							type: "error",
+							message: error instanceof Error ? error.message : String(error),
+						}),
+				);
+			});
 		});
-	});
+	const server = createListener("administrator");
+	const operatorServer = operatorPath === undefined ? undefined : createListener("operator");
+	let operatorPrepared = false;
 	let onShutdown: () => void = () => {};
 	const stopped = new Promise<void>((resolve, reject) => {
 		onShutdown = resolve;
 		signal.addEventListener("abort", onShutdown, { once: true });
 		server.on("error", reject);
+		operatorServer?.on("error", reject);
 		void agent.closed.then((end) =>
 			reject(end.kind === "failed" ? end.error : new Error("Agent closed unexpectedly.")),
 		);
@@ -129,6 +147,33 @@ export async function runService(
 	// A startup failure can precede awaiting stopped; keep its rejection observed during listen/chmod.
 	void stopped.catch(() => {});
 	try {
+		if (operatorServer !== undefined && operatorPath !== undefined) {
+			// systemd provisions this installation-owned directory; operators cannot replace its socket.
+			const directory = await lstat(dirname(operatorPath));
+			if (
+				!directory.isDirectory() ||
+				directory.isSymbolicLink() ||
+				directory.uid !== process.getuid?.() ||
+				directory.gid !== process.getgid?.() ||
+				(directory.mode & 0o777) !== 0o750
+			)
+				throw new ConfigurationError(
+					"Operator runtime directory must belong to the service account with mode 0750.",
+				);
+			await unlink(operatorPath).catch((error: NodeJS.ErrnoException) => {
+				if (error.code !== "ENOENT") throw error;
+			});
+			operatorPrepared = true;
+			await new Promise<void>((resolve, reject) => {
+				operatorServer.once("error", reject);
+				operatorServer.listen(operatorPath, () => {
+					operatorServer.off("error", reject);
+					resolve();
+				});
+			});
+			await chmod(operatorPath, 0o660);
+		}
+		// The updater's private readiness probe must not succeed before operator access is prepared.
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
 			server.listen(path, () => {
@@ -146,11 +191,20 @@ export async function runService(
 			if (server.listening) server.close(() => resolve());
 			else resolve();
 		});
+		const operatorClosed = new Promise<void>((resolve) => {
+			if (operatorServer?.listening) operatorServer.close(() => resolve());
+			else resolve();
+		});
 		for (const socket of clients) socket.destroy();
 		await closed;
+		await operatorClosed;
 		await unlink(path).catch((error: NodeJS.ErrnoException) => {
 			if (error.code !== "ENOENT") throw error;
 		});
+		if (operatorPrepared && operatorPath !== undefined)
+			await unlink(operatorPath).catch((error: NodeJS.ErrnoException) => {
+				if (error.code !== "ENOENT") throw error;
+			});
 	}
 }
 
@@ -287,10 +341,19 @@ async function handleRequest(
 	version: string,
 	installationId: string | null,
 	value: unknown,
+	access: "administrator" | "operator",
 ): Promise<ServiceResponse> {
 	// Local wire input is untrusted even when the socket is restricted to its owner.
 	if (typeof value !== "object" || value === null || !("type" in value))
 		throw new UsageError("Invalid service request.");
+	if (
+		access === "operator" &&
+		value.type !== "status" &&
+		value.type !== "send" &&
+		value.type !== "cancel" &&
+		value.type !== "memory"
+	)
+		throw new UsageError("This operation requires the administrator endpoint.");
 	if (value.type === "status")
 		return {
 			type: "status",

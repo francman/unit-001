@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,6 +38,7 @@ afterEach(async () => {
 async function launch(
 	responses: Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0],
 	identity?: { id: string; name: string },
+	operatorDirectory?: string,
 ) {
 	const faux = fauxProvider();
 	faux.setResponses(responses);
@@ -57,11 +58,24 @@ async function launch(
 	);
 	const controller = new AbortController();
 	const path = serviceEndpoint(directory, "default", process.platform);
+	const operatorPath = operatorDirectory === undefined ? undefined : join(operatorDirectory, "default.sock");
+	if (operatorDirectory !== undefined) {
+		await mkdir(operatorDirectory, { mode: 0o750 });
+		await chmod(operatorDirectory, 0o750);
+	}
 	let ready!: () => void;
 	const listening = new Promise<void>((resolve) => {
 		ready = resolve;
 	});
-	const running = runService(agent, path, "fixture-version", ready, controller.signal, identity?.id ?? null);
+	const running = runService(
+		agent,
+		path,
+		"fixture-version",
+		ready,
+		controller.signal,
+		identity?.id ?? null,
+		operatorPath,
+	);
 	void running.catch(() => {});
 	const close = async () => {
 		controller.abort();
@@ -77,13 +91,115 @@ async function launch(
 	};
 	cleanup.push(close);
 	await Promise.race([listening, running]);
-	return { agent, faux, storage, path, controller, running, close };
+	return { agent, faux, storage, path, operatorPath, controller, running, close };
 }
 
 const signal = () => new AbortController().signal;
 const reply = (text: string) => fauxAssistantMessage([fauxText(text)]);
 
 describe.skipIf(process.platform === "win32")("headless local service", () => {
+	it.each(["mode", "symlink"])(
+		"#33 rejects an invalid operator runtime directory (%s) without unlinking existing contents",
+		async (kind) => {
+			const service = await launch([]);
+			const actual = join(directory, "actual-runtime");
+			const runtime = join(directory, "invalid-runtime");
+			await mkdir(actual, { mode: kind === "mode" ? 0o700 : 0o750 });
+			await chmod(actual, kind === "mode" ? 0o700 : 0o750);
+			if (kind === "symlink") await symlink(actual, runtime);
+			const operatorPath = join(kind === "mode" ? actual : runtime, "default.sock");
+			await writeFile(join(actual, "default.sock"), "preserve this preexisting file");
+			const privatePath = join(directory, "rejected-private", "default.sock");
+			await expect(
+				runService(
+					service.agent,
+					privatePath,
+					"fixture-version",
+					() => {
+						throw new Error("An invalid endpoint cannot be ready");
+					},
+					signal(),
+					null,
+					operatorPath,
+				),
+			).rejects.toThrow("mode 0750");
+			expect(await readFile(join(actual, "default.sock"), "utf8")).toBe("preserve this preexisting file");
+			await expect(stat(privatePath)).rejects.toMatchObject({ code: "ENOENT" });
+		},
+	);
+	it("#33 allows routine operator memory commands while keeping maintenance private", async () => {
+		const service = await launch([], undefined, join(directory, "operator"));
+		const operatorPath = service.operatorPath!;
+		expect((await stat(operatorPath)).mode & 0o777).toBe(0o660);
+		expect((await stat(service.path)).mode & 0o777).toBe(0o600);
+		expect((await stat(join(directory, "control"))).mode & 0o777).toBe(0o700);
+		expect(await requestService(operatorPath, { type: "status" }, signal())).toMatchObject({
+			name: "agent",
+			busy: false,
+		});
+		await requestService(
+			operatorPath,
+			{ type: "memory", request: { operation: "remember", content: "violet approval", requestId: "admin" } },
+			signal(),
+		);
+		expect(
+			await requestService(
+				operatorPath,
+				{ type: "memory", request: { operation: "recall", query: "violet" } },
+				signal(),
+			),
+		).toMatchObject({ result: { records: [{ content: "violet approval" }] } });
+		for (const request of [
+			{ type: "maintenance-enter", operationId: "operator-denied", timeoutMs: 0 },
+			{ type: "maintenance-release", operationId: "operator-denied" },
+		] as const)
+			expect(await requestService(operatorPath, request, signal())).toMatchObject({
+				type: "error",
+				message: "This operation requires the administrator endpoint.",
+			});
+		expect(
+			await requestService(operatorPath, { type: "memory", request: { operation: "stats" } }, signal()),
+		).toMatchObject({ result: { working: 1 } });
+		expect(await requestService(service.path, { type: "status" }, signal())).toMatchObject({
+			maintenance: { state: "open" },
+		});
+		expect(
+			await requestService(operatorPath, { type: "memory", request: { operation: "sleep" } }, signal()),
+		).toMatchObject({ type: "memory", result: { operation: "sleep" } });
+		expect(
+			await requestService(
+				operatorPath,
+				{
+					type: "memory",
+					request: { operation: "forget", id: "memory:operator:admin", requestId: "operator", confirmed: true },
+				},
+				signal(),
+			),
+		).toMatchObject({ type: "memory", result: { operation: "forget", removed: true } });
+		expect(service.faux.state.callCount).toBe(0);
+	});
+	it("#33 retains coding tools for trusted operator chat", async () => {
+		const service = await launch(
+			[
+				fauxAssistantMessage(
+					fauxToolCall("write", { path: "operator-proof.txt", content: "operator coding tools retained" }),
+					{ stopReason: "toolUse" },
+				),
+				reply("operator faux reply"),
+			],
+			undefined,
+			join(directory, "operator"),
+		);
+		expect(
+			await requestService(
+				service.operatorPath!,
+				{ type: "send", prompt: "Write the operator proof", requestId: "operator-chat" },
+				signal(),
+			),
+		).toMatchObject({ type: "reply", reply: { status: "answered", text: "operator faux reply" } });
+		expect(await readFile(join(directory, "operator-proof.txt"), "utf8")).toBe("operator coding tools retained");
+		expect(await requestService(service.operatorPath!, { type: "cancel" }, signal())).toEqual({ type: "cancelled" });
+	});
 	it("#8 inspects and changes memory through the existing owner without another SQLite writer or model call", async () => {
 		const service = await launch([]);
 		const remembered = await requestService(

@@ -103,6 +103,11 @@ stopped() {
   [[ $(systemctl show --property=MainPID --value "unit-001@$id.service") == 0 ]] || fail 'Stopped service still owns a process.'
 }
 
+# #33: The real published owner must migrate through signed activation before testing fresh installs.
+if [[ ${UNIT_001_DISPOSABLE_CONTAINER:-} != 1 ]]; then
+  "$node" "$(dirname -- "${BASH_SOURCE[0]}")/verify-operator-migration.mjs" "$release"
+fi
+
 # #19: default/custom commands must own independent accounts, state and services.
 bash "$release/install.sh"
 first=$("$node" "$work/check.mjs" find agent)
@@ -135,6 +140,9 @@ grep -q 'installation account' "$work/wrong-account"
 /usr/local/bin/unit-ci-bob start --yes
 status agent "$first"
 status unit-ci-bob "$second"
+
+# #33: Fresh nonroot operators run routine commands and memory edits without direct private state access.
+python3 "$(dirname -- "${BASH_SOURCE[0]}")/verify-operator-access.py" "$release" "$first" "$second"
 
 # #25: The real managed dispatcher must preserve rich terminal behavior and NO_COLOR across runuser.
 python3 "$(dirname -- "${BASH_SOURCE[0]}")/../test/managed-terminal.test.py"

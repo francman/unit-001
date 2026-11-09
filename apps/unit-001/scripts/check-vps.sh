@@ -29,7 +29,7 @@ fi
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 missing=false
-for command in bash sha256sum find sort cmp mktemp cp chmod mv ln readlink dirname mkdir rm rmdir cat uname id getent useradd chown flock systemctl runuser timeout tar df awk; do
+for command in bash sha256sum find sort cmp mktemp cp chmod mv ln readlink dirname mkdir rm rmdir cat uname id getent useradd usermod gpasswd chown flock systemctl runuser timeout tar df awk; do
   if ! command -v "$command" >/dev/null; then
     printf 'FAIL: missing prerequisite: %s\n' "$command" >&2
     missing=true

@@ -2,7 +2,17 @@
 // Exercises signed fixture updates and rollback on the explicitly disposable managed-install acceptance host.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	cpSync,
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -30,7 +40,9 @@ if (
 )
 	throw new Error("Requires explicit disposable GitHub-hosted Ubuntu/systemd acceptance authorization.");
 
-const [sourceArgument, id] = process.argv.slice(2);
+const [sourceArgument, id, mode] = process.argv.slice(2);
+assert.ok(mode === undefined || mode === "--expect-operator", "Unknown update acceptance option");
+const expectOperator = mode === "--expect-operator";
 const source = resolve(sourceArgument);
 const record = readInstallation(id);
 const baseline = record.releaseVersion;
@@ -42,6 +54,26 @@ try {
 	const rootBytes = generateRepositoryKeys(keys);
 	const parts = baseline.split(".").map(Number);
 	const version = `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
+	const activationContext = {
+		...context,
+		async ready(current, operationId) {
+			await context.ready(current, operationId);
+			if (expectOperator && current.releaseVersion === version) {
+				// #33: candidate readiness must include the operator endpoint, not just its private updater socket.
+				const directory = lstatSync(`/run/unit-001-${id}`);
+				const socket = lstatSync(`/run/unit-001-${id}/default.sock`);
+				const account = execFileSync("getent", ["passwd", current.account], { encoding: "utf8" }).trim().split(":");
+				assert.ok(directory.isDirectory() && !directory.isSymbolicLink());
+				assert.equal(directory.uid, Number(account[2]));
+				assert.equal(directory.gid, Number(account[3]));
+				assert.equal(directory.mode & 0o777, 0o750);
+				assert.ok(socket.isSocket());
+				assert.equal(socket.uid, Number(account[2]));
+				assert.equal(socket.gid, Number(account[3]));
+				assert.equal(socket.mode & 0o777, 0o660);
+			}
+		},
+	};
 	const name = `unit-001-${version}-linux-x64`;
 	const candidate = join(work, name);
 	cpSync(source, candidate, { recursive: true });
@@ -130,7 +162,7 @@ try {
 		assert.equal(existsSync(join(image, "etc/systemd/system", unit)), true);
 	assert.equal(existsSync(`/etc/systemd/system/${stagedInstallation.unit}`), false);
 	assert.equal(spawnSync("getent", ["passwd", staged.account], { timeout: 10000 }).status, 2);
-	assert.deepEqual(await activateUpdate(record, { releasePath, ...verified }, context), {
+	assert.deepEqual(await activateUpdate(record, { releasePath, ...verified }, activationContext), {
 		status: "updated",
 		version,
 	});
@@ -153,7 +185,10 @@ try {
 		stdio: ["pipe", "ignore", "inherit"],
 		timeout: 10000,
 	});
-	assert.deepEqual(await rollbackUpdate(readInstallation(id), context), { status: "updated", version: baseline });
+	assert.deepEqual(await rollbackUpdate(readInstallation(id), activationContext), {
+		status: "updated",
+		version: baseline,
+	});
 	assert.equal(context.control(readInstallation(id), ["service-status"]).version, baseline);
 	assert.equal(packagedStatus().runningVersion, baseline);
 	assert.equal(readFileSync(marker, "utf8"), "created-after-update-commit\n");
@@ -162,9 +197,9 @@ try {
 			readInstallation(id),
 			{ releasePath, ...verified },
 			{
-				...context,
+				...activationContext,
 				async ready(current, operationId) {
-					await context.ready(current, operationId);
+					await activationContext.ready(current, operationId);
 					if (current.releaseVersion === version) throw new Error("Injected candidate health failure");
 				},
 			},

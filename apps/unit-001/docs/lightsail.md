@@ -21,14 +21,13 @@ After publication, download directly on the server. No GitHub account, download 
 curl --fail --location --output unit-001-linux-x64.tar.gz \
   https://github.com/francman/unit-001-releases/releases/latest/download/unit-001-linux-x64.tar.gz
 tar -xzf unit-001-linux-x64.tar.gz
-cd unit-001-0.0.5-linux-x64
+cd unit-001-0.0.7-linux-x64
 bash ./check-vps.sh
 sudo ./install.sh --name bob
 sudo bob setup
-sudo bob service-status
 ```
 
-Use the extracted release directory if its version differs. The installer verifies its payload; bundled public trust configures automatic updates, which begin when the service starts. Setup guides provider sign-in or API key entry, model selection, and optional service start. The protected provider environment remains available as described in [operations](operations.md).
+Use the extracted release directory if its version differs. The installer verifies its payload; bundled public trust configures automatic updates, which begin when the service starts. Setup guides provider sign-in or API key entry, model selection, and optional service start. Reconnect SSH to refresh the new operator group, then run `bob service-status` or `bob` without sudo. Existing installations need `sudo bob operator add ubuntu` once before reconnecting. See [operator access](operations.md#operator-access-and-sudo) for the privilege boundary and protected provider environment.
 
 For acceptance on the approved host, record the UUID printed by installation; substitute it for `UUID`:
 
@@ -42,4 +41,4 @@ sudo bob start
 sudo reboot
 ```
 
-After reconnecting, run `sudo bob service-status` and inspect logs again. Backups contain credentials; keep them protected and copy them securely off-host. Only back up closed SQLite state. See [operations](operations.md) for upgrades, isolation, and recovery.
+After reconnecting, run `bob service-status` and inspect logs again. Backups contain credentials; keep them protected and copy them securely off-host. Only back up closed SQLite state. See [operations](operations.md) for upgrades, isolation, and recovery.

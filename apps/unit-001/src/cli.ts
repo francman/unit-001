@@ -20,6 +20,7 @@ import { sanitizeTerminalText } from "./render.ts";
 import { runPrint, runRepl, type Terminal } from "./repl.ts";
 import {
 	type MaintenanceRequest,
+	operatorEndpoint,
 	requestService,
 	runService,
 	type ServiceRequest,
@@ -34,6 +35,7 @@ export interface ManagedIdentity {
 	readonly id: string;
 	readonly name: string;
 	readonly state: string;
+	readonly access?: "operator";
 }
 
 export interface Runtime {
@@ -213,7 +215,15 @@ async function run(
 		);
 		const opened = agent;
 		if (endpoint !== undefined) {
-			await runService(opened, endpoint, await version(), terminal.err, signal, runtime.managed?.id ?? null);
+			await runService(
+				opened,
+				endpoint,
+				await version(),
+				terminal.err,
+				signal,
+				runtime.managed?.id ?? null,
+				runtime.managed === undefined ? undefined : operatorEndpoint(runtime.managed.id, options.session),
+			);
 			return 0;
 		}
 		signal.addEventListener("abort", () => void opened.abort(BACKGROUND_CONTEXT).catch(() => {}), { once: true });
@@ -246,11 +256,14 @@ async function control(
 		throw new UsageError(
 			`Interactive attach requires a terminal. Use ${runtime.managed?.name ?? "agent"} send for scripts and pipes.`,
 		);
-	const endpoint = serviceEndpoint(
-		resolveDirectory(command.options.dataDir, runtime),
-		command.options.session,
-		runtime.platform,
-	);
+	const endpoint =
+		runtime.managed?.access === "operator"
+			? operatorEndpoint(runtime.managed.id, command.options.session)
+			: serviceEndpoint(
+					resolveDirectory(command.options.dataDir, runtime),
+					command.options.session,
+					runtime.platform,
+				);
 	if (command.kind === "attach") {
 		const terminal = command.options.plain ? undefined : richTerminalFor(runtime);
 		if (terminal === undefined) return runAttach(endpoint, terminalFor(runtime), signal);
@@ -260,7 +273,7 @@ async function control(
 				? {}
 				: {
 						name: runtime.managed.name,
-						unavailableHint: `Configure: sudo ${runtime.managed.name} setup\nStart: sudo ${runtime.managed.name} start\nOpen: sudo ${runtime.managed.name}`,
+						unavailableHint: `Configure: sudo ${runtime.managed.name} setup\nStart: sudo ${runtime.managed.name} start\nOpen: ${runtime.managed.access === "operator" ? "" : "sudo "}${runtime.managed.name}`,
 					}),
 		});
 	}
@@ -346,16 +359,42 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		foreground = command.kind === "run" && command.options.print === undefined && runtime.interactive;
 		if (signal.aborted) return serving ? 0 : 130;
 		if (command.kind === "help") {
-			runtime.stdout.write(`${USAGE.replaceAll(/\bagent\b/g, runtime.managed?.name ?? "agent")}\n`);
+			const usage =
+				runtime.managed?.access === "operator"
+					? USAGE.replace("show how each provider is configured", "inspect the running service")
+					: USAGE;
+			runtime.stdout.write(`${usage.replaceAll(/\bagent\b/g, runtime.managed?.name ?? "agent")}\n`);
 			if (runtime.managed !== undefined)
 				runtime.stdout.write(
 					`\nInstalled lifecycle: sudo ${runtime.managed.name} start|stop|kill|uninstall|rename <name>\nActions ask for confirmation; use --yes for automation (sudo authorization still applies).\n`,
+				);
+			if (runtime.managed?.access === "operator")
+				runtime.stdout.write(
+					`Authorized operator clients use the running owner's socket. Setup, sign-in and access changes require sudo.\nUse sudo ${runtime.managed.name} status for the provider-configuration summary.\n`,
 				);
 			return 0;
 		}
 		if (command.kind === "version") {
 			runtime.stdout.write(`${await version()}\n`);
 			return 0;
+		}
+		if (runtime.managed?.access === "operator") {
+			if (command.kind === "status") {
+				if (command.dataDir !== undefined)
+					throw new UsageError("Operator clients cannot change their data directory.");
+				return control({ kind: "service-status", options: { session: "default" } }, runtime, signal);
+			}
+			if (
+				command.kind !== "attach" &&
+				command.kind !== "send" &&
+				command.kind !== "cancel" &&
+				command.kind !== "service-status" &&
+				command.kind !== "memory" &&
+				!(command.kind === "run" && argv.length === 0 && runtime.interactive)
+			)
+				throw new ConfigurationError("This operation requires the administrator command.");
+			if (command.kind !== "run" && command.options.dataDir !== undefined)
+				throw new UsageError("Operator clients cannot change their data directory.");
 		}
 		let code: number;
 		if (command.kind === "setup") code = await setup(command, runtime, signal);

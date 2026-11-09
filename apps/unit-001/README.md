@@ -28,12 +28,14 @@ Use the [one-minute deployment guide](docs/deployment.md). The default command i
 
 ```bash
 sudo agent setup                 # provider, sign-in or API key, model, optional service start
-sudo agent attach                   # interactive client of the running service
-sudo agent send "Inspect the working repository"
-sudo agent service-status
+agent attach                    # authorized operator client of the running owner
+agent send "Inspect the working repository"
+agent status
 sudo agent stop                 # asks for confirmation
 sudo -n agent stop --yes        # no action or sudo prompt; fails if unauthorized
 ```
+
+A new sudo installation grants its caller operator access; reconnect SSH to refresh groups. Existing installations need `sudo agent operator add USER` once. Normal commands and memory edits need no sudo; configuration, credentials, access, identity, lifecycle and updates remain privileged. Operators retain Bob's coding-tool file authority; see [access and its limits](docs/operations.md#operator-access-and-sudo).
 
 `kill` immediately terminates the owned service and its tools. `uninstall` removes the installation's software while preserving its data and account. Both ask for confirmation and accept `--yes`. Stopped agents remain stopped until an explicit `start`; confirmation never silently succeeds without a terminal. See [operations](docs/operations.md) for rename, removal, and recovery.
 
@@ -41,13 +43,13 @@ Public releases require no GitHub account, download token, or manual verificatio
 
 `attach` opens a full-screen terminal with Markdown conversation, live tool status, model/usage metadata, and a multiline composer. Enter sends; Ctrl+J inserts a newline. `/exit` or an SSH disconnect leaves work running; `/cancel` cancels shared work. Use `attach --plain` for basic terminals and `send` for pipes. Foreground chat remains separate. See [terminal behavior and comparison](docs/terminal.md) for controls, bounded history, cost estimates, and remaining gaps.
 
-Use `/memory` in chat or `sudo agent memory stats` to inspect structured memory. `recall`, `remember`, confirmed `forget`, and `sleep` operate through the running owner without a model request. Memory survives restarts within one session; separate sessions and installations stay isolated. See the [one-minute memory guide](docs/memory.md).
+Use `/memory` in the terminal interface or `agent memory stats` to inspect structured memory. `recall`, `remember`, confirmed `forget`, and `sleep` operate through the running owner without a model request. Memory survives restarts within one session; separate sessions and installations stay isolated. See the [one-minute memory guide](docs/memory.md).
 
 ## Subscriptions
 
 In release `0.0.4` and later, `sudo agent setup` guides provider selection, subscription sign-in or hidden API key entry, and default-model selection. It preserves existing credentials unless you choose replacement. The installed command offers to start a stopped service after setup succeeds; a running service needs a stop and start to apply changed settings. Setup requires an interactive terminal and makes no paid model request. Source use supports `setup` without service management.
 
-`sudo agent login anthropic` (Claude Pro or Max) and `sudo agent login openai` (ChatGPT Plus or Pro) open the provider's sign-in flow, with a paste-the-code fallback for machines without a browser. `logout <provider>` removes the sign-in and `status` reports provider configuration without printing secrets. Application commands run as the named agent's account, including when invoked through `sudo`, so credentials retain the correct ownership. Tokens refresh automatically.
+`sudo agent login anthropic` (Claude Pro or Max) and `sudo agent login openai` (ChatGPT Plus or Pro) open the provider's sign-in flow, with a paste-the-code fallback for machines without a browser. `sudo agent logout <provider>` removes a sign-in; `sudo agent status` reports provider configuration without secrets. Normal `agent status` reports the running owner. Authentication commands drop to the agent account; operator clients keep the caller's UID. Tokens refresh automatically in the owner.
 
 Sign-ins are stored in `auth.json` in the data directory, readable only by the agent account (mode 0600 on macOS and Linux; on Windows it inherits your profile directory's access rules). A stored sign-in wins over an API key for the same provider.
 
