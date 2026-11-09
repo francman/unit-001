@@ -2,15 +2,15 @@
 
 Users should download one Linux bundle, extract it, and run `sudo ./install.sh`. The bundle includes Node, application dependencies, public verification keys, and the update-feed address. No GitHub account, download token, signing key, npm install, or manual update configuration is required.
 
-The distribution target is a separate public repository, `francman/unit-001-releases`. The package includes runnable JavaScript and source maps. Git history and repository access remain private. Its stable download URL will be:
+The distribution target is a separate public repository, `francman/unit-001-releases`. The package includes runnable JavaScript and source maps. Git history and repository access remain private. Its stable download URL is:
 
 ```text
 https://github.com/francman/unit-001-releases/releases/latest/download/unit-001-linux-x64.tar.gz
 ```
 
-That URL becomes live after the initial signed release is published. A URL in this document does not mean a release has already been published.
+Check [release availability](https://github.com/francman/unit-001-releases/releases) before downloading. Installation examples target release `0.0.4`; use the extracted directory for your downloaded version.
 
-The initial supported target is Ubuntu Server 24.04 LTS on x86-64. After installation, sign in to the chosen model provider and run `sudo agent start`. Public-release updates are already configured and begin with that normal start. `sudo agent update disable` turns them off; existing preferences survive upgrades.
+The initial supported target is Ubuntu Server 24.04 LTS on x86-64. After installation, run `sudo agent setup` to choose a provider, sign in or enter an API key, select a model, and optionally start the service. Guided setup is available in release `0.0.4` and later. Public-release updates are already configured and begin when the service starts. `sudo agent update disable` turns them off; existing preferences survive upgrades.
 
 Signing is a maintainer responsibility. Private signing keys stay outside downloads. The offline root authorizes release keys, and the installer carries only public verification data. Users receive authenticated key rotations through the existing update mechanism.
 

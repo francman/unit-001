@@ -1,6 +1,7 @@
 // Dispatches a literal installation UUID through its root-owned record; app commands never run as root.
 import { spawn } from "node:child_process";
 import { lstat, readFile, realpath } from "node:fs/promises";
+import { constants } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
@@ -18,6 +19,23 @@ export async function dispatchAgent(id, expectedName, args, context) {
 	if (!service && expectedName !== record.name)
 		throw new Error("This agent command was renamed; use its current name.");
 	const action = args[0];
+	if (!service && action === "setup") {
+		if (context.uid !== 0)
+			throw new Error(`Run sudo ${record.name} setup; this command does not elevate itself.`);
+		if (args.length !== 1) throw new Error("Invalid setup arguments.");
+		if (context.interactive !== true) throw new Error("Setup requires an interactive terminal.");
+		// Update rollback can restore account state, so configuration writes must share its full transaction lock.
+		return withManagementLock(async () => {
+			const current = await readInstallation(id, context.root);
+			if (current.name !== expectedName)
+				throw new Error("The installation name changed; retry its current command.");
+			const journal = readUpdateJournal(id, context.root);
+			if (journal && journal.phase !== "complete")
+				throw new Error(`Run sudo ${current.name} update recover before setup; an update is incomplete.`);
+			await recoverRename(current, context.root);
+			return dispatchApplication(current, expectedName, args, context);
+		}, context.root);
+	}
 	if (!service && ["maintenance-enter", "maintenance-release"].includes(action))
 		throw new Error("Managed maintenance controls belong to the independent updater.");
 	if (!service && action === "update") {
@@ -42,6 +60,13 @@ export async function dispatchAgent(id, expectedName, args, context) {
 		}, context.root);
 		return 0;
 	}
+	return dispatchApplication(record, expectedName, args, context);
+}
+
+async function dispatchApplication(record, expectedName, args, context) {
+	const id = record.id;
+	const service = expectedName === "--service";
+	const action = args[0];
 	if (record.desiredState === "uninstalled") throw new Error("This agent is uninstalled.");
 	const account = await context.account(record.account);
 	if (
@@ -63,41 +88,98 @@ export async function dispatchAgent(id, expectedName, args, context) {
 		`/var/lib/unit-001/agents/${id}`,
 		...(service ? ["serve", ...(journal && journal.phase !== "complete" ? ["--inhibited"] : [])] : args),
 	];
+	const environment = context.uid === 0 ? await context.applicationEnvironment(paths.environment) : {};
 	// runuser establishes the recorded account before Node opens config, credentials, sockets or state.
-	return context.uid === 0
-		? context.run(
+	let result;
+	try {
+		result = context.uid === 0
+			? await context.run(
 				"runuser",
 				["-u", record.account, "--", node, ...appArgs],
 				false,
-				await context.applicationEnvironment(paths.environment),
+				environment,
+				...(action === "setup" ? [{ forwardSignals: true }] : []),
 			)
-		: context.execApp(node, appArgs);
+			: await context.execApp(node, appArgs);
+	} catch (error) {
+		if (action === "setup" && Number.isInteger(error.exitCode) && error.exitCode > 0) return error.exitCode;
+		throw error;
+	}
+	if (action !== "setup" || result !== 0) return result;
+	if (await context.unitRunning(paths.unit)) {
+		context.notice(`Settings are saved. To apply changes, stop and start ${record.name}.\n`);
+		return 0;
+	}
+	const override = environment.UNIT_001_MODEL;
+	const prompt = override
+		? `Start ${record.name} now using UNIT_001_MODEL (overrides the saved setup model)? [y/N] `
+		: `Start ${record.name} now? [y/N] `;
+	if (!(await context.confirm(prompt))) return 0;
+	await lifecycle(record, "start", context);
+	return 0;
 }
 
-function run(command, args, capture = false, applicationEnvironment = {}) {
+/** Runs a child with protected environment; setup waits for signalled children before releasing its lock. */
+export function run(command, args, capture = false, applicationEnvironment = {}, options = {}) {
 	return new Promise((resolve, reject) => {
-		const child = spawn(command, args, {
-			env:
-				process.geteuid?.() === 0
-					? {
-							PATH: "/usr/sbin:/usr/bin:/sbin:/bin",
-							LANG: process.env.LANG ?? "C.UTF-8",
-							TERM: process.env.TERM ?? "dumb",
-							...(process.env.NO_COLOR === undefined ? {} : { NO_COLOR: "1" }),
-							...applicationEnvironment,
-						}
-					: process.env,
-			stdio: capture ? ["ignore", "pipe", "inherit"] : "inherit",
-		});
+		let child;
+		let interrupted;
+		const forward = (signal) => {
+			interrupted ??= signal;
+			child?.kill(signal);
+		};
+		const onInterrupt = () => forward("SIGINT");
+		const onTerminate = () => forward("SIGTERM");
+		const onHangup = () => forward("SIGHUP");
+		const cleanup = () => {
+			if (!options.forwardSignals) return;
+			process.removeListener("SIGINT", onInterrupt);
+			process.removeListener("SIGTERM", onTerminate);
+			process.removeListener("SIGHUP", onHangup);
+		};
+		if (options.forwardSignals) {
+			process.on("SIGINT", onInterrupt);
+			process.on("SIGTERM", onTerminate);
+			process.on("SIGHUP", onHangup);
+		}
+		try {
+			child = spawn(command, args, {
+				env:
+					process.geteuid?.() === 0
+						? {
+								PATH: "/usr/sbin:/usr/bin:/sbin:/bin",
+								LANG: process.env.LANG ?? "C.UTF-8",
+								TERM: process.env.TERM ?? "dumb",
+								...(process.env.NO_COLOR === undefined ? {} : { NO_COLOR: "1" }),
+								...applicationEnvironment,
+							}
+						: process.env,
+				stdio: capture ? ["ignore", "pipe", "inherit"] : "inherit",
+			});
+		} catch (error) {
+			cleanup();
+			reject(error);
+			return;
+		}
 		let output = "";
 		if (capture)
 			child.stdout.setEncoding("utf8").on("data", (chunk) => {
 				output += chunk;
 			});
-		child.once("error", reject);
-		child.once("exit", (code, signal) =>
-			code === 0 ? resolve(capture ? output : 0) : reject(new Error(`${command} failed (${signal ?? code}).`)),
-		);
+		child.once("error", (error) => {
+			cleanup();
+			reject(error);
+		});
+		child.once(options.forwardSignals ? "close" : "exit", (code, signal) => {
+			cleanup();
+			if (code === 0 && interrupted === undefined) resolve(capture ? output : 0);
+			else
+				reject(
+					Object.assign(new Error(`${command} failed (${interrupted ?? signal ?? code}).`), {
+						exitCode: interrupted === undefined ? code ?? 128 + (constants.signals[signal] ?? 1) : 128 + constants.signals[interrupted],
+					}),
+				);
+		});
 	});
 }
 
@@ -147,6 +229,7 @@ export async function configuredEnvironment(path, root = "/") {
 const context = {
 	root: "/",
 	uid: process.geteuid?.(),
+	interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
 	run,
 	applicationEnvironment: configuredEnvironment,
 	execApp(node, args) {
@@ -182,6 +265,7 @@ const context = {
 		return output.trim() !== "not-found";
 	},
 	confirm: (prompt) => confirmAction(prompt, process.stdin, process.stdout),
+	notice: (message) => process.stdout.write(message),
 };
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

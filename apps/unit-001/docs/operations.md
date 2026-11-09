@@ -17,7 +17,7 @@ Download the public Linux archive from the [stable download channel](distributio
 
 ```bash
 tar -xzf unit-001-linux-x64.tar.gz
-cd unit-001-0.0.3-linux-x64
+cd unit-001-0.0.4-linux-x64
 sudo ./install.sh
 ```
 
@@ -28,6 +28,10 @@ Use your release's extracted directory if its version differs. The installer ver
 The default command is `agent`. `sudo ./install.sh --name bob` chooses `bob`. Names must be safe command names without collisions; the installer never silently substitutes a name or overwrites another command. No `u1` alias is installed.
 
 Each installation gets a UUID and dedicated unprivileged account. Its root-owned record is under `/etc/unit-001/agents/<id>`; private sessions, credentials, and workspace are under `/var/lib/unit-001/agents/<id>`. Its selected release pointer is under `/opt/unit-001/agents/<id>`. Release files can be shared while data and process ownership remain separate.
+
+Run `sudo agent setup` for guided provider selection, subscription login or hidden API key entry, and model selection. The chosen model is saved in the agent-owned `settings.json`. Command-line `--model` and the administrator's `UNIT_001_MODEL` override it. No paid request is made during setup. Successful setup offers to start a stopped service; changing a running service requires a stop and start. Cancellation never starts the service. Guided setup is available in release `0.0.4` and later; the individual login and start commands below remain available.
+
+Finish or cancel setup before issuing another installation, update, stop or kill command. Setup holds the management lock while credentials and settings change, so those operations report busy. An interrupted update must be recovered before setup can begin.
 
 The installer reports the ID and configuration path. Complete sign-in before starting:
 

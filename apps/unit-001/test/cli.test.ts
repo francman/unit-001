@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { main, type Runtime } from "../src/cli.ts";
 import { serviceEndpoint } from "../src/service.ts";
+import { saveDefaultModel } from "../src/settings.ts";
 
 let home: string;
 beforeEach(async () => {
@@ -50,6 +51,75 @@ function runtime(env: Record<string, string>, stdin = ""): { runtime: Runtime; o
 const signal = new AbortController().signal;
 
 describe("main", () => {
+	it("rejects setup without a terminal before reading or writing agent files", async () => {
+		const run = runtime({});
+		expect(await main(["setup"], run.runtime, signal)).toBe(2);
+		expect(run.err()).toContain("interactive terminal");
+		expect(await readdir(home)).toEqual([]);
+	});
+
+	it("completes guided setup through the CLI and repairs invalid settings", async () => {
+		await mkdir(join(home, "data"), { recursive: true });
+		await writeFile(join(home, "data", "settings.json"), "broken");
+		const run = runtime({ OPENAI_API_KEY: "dummy-never-dispatched" });
+		const input = new PassThrough();
+		const answers = ["openai", "keep", "gpt-5", "yes"];
+		const output = new Writable({
+			write(_chunk, _encoding, callback) {
+				callback();
+			},
+		});
+		const error = new Writable({
+			write(chunk, _encoding, callback) {
+				const text = chunk.toString();
+				if (text === "Choose: " || text.startsWith("Model [") || text === "Save configuration? [Y/n]: ")
+					setImmediate(() => input.write(`${answers.shift()}\n`));
+				callback();
+			},
+		});
+		try {
+			expect(
+				await main(
+					["setup"],
+					{ ...run.runtime, stdin: input, stdout: output, stderr: error, interactive: true },
+					signal,
+				),
+			).toBe(0);
+			expect(JSON.parse(await readFile(join(home, "data", "settings.json"), "utf8"))).toEqual({
+				schemaVersion: 1,
+				model: "openai/gpt-5",
+			});
+			expect((await readdir(join(home, "data"))).sort()).toEqual(["settings.json"]);
+		} finally {
+			input.destroy();
+		}
+	});
+
+	it.skipIf(process.platform === "win32")("uses the saved model on headless startup", async () => {
+		await saveDefaultModel(join(home, "data"), "openai/gpt-5");
+		const owner = runtime({ OPENAI_API_KEY: "dummy-never-dispatched" });
+		const controller = new AbortController();
+		const running = main(["serve", "--inhibited"], owner.runtime, controller.signal);
+		try {
+			await expect.poll(owner.err).toContain("service ready");
+		} finally {
+			controller.abort();
+			expect(await running).toBe(0);
+		}
+	});
+
+	it("gives explicit and environment models precedence over saved settings", async () => {
+		await saveDefaultModel(join(home, "data"), "unknown/not-configured");
+		const saved = runtime({});
+		expect(await main(["--print", "hi"], saved.runtime, signal)).toBe(1);
+		expect(saved.err()).toContain('Provider "unknown" is not supported');
+		const env = runtime({ UNIT_001_MODEL: "openai/not-in-catalog" });
+		expect(await main(["--print", "hi"], env.runtime, signal)).toBe(1);
+		expect(env.err()).toContain("not in the openai catalog");
+		const explicit = runtime({ UNIT_001_MODEL: "unknown/not-configured" });
+		expect(await main(["--model", "openai/not-in-catalog", "--print", "hi"], explicit.runtime, signal)).toBe(1);
+		expect(explicit.err()).toContain("not in the openai catalog");
+	});
 	it.skipIf(process.platform === "win32")(
 		"serves inhibited inspection and maintenance controls without executing work",
 		async () => {
@@ -73,11 +143,7 @@ describe("main", () => {
 				expect(cancel.err()).toContain("inhibited");
 				const enter = runtime({});
 				expect(
-					await main(
-						["maintenance-enter", "--operation-id", "update", "--timeout-ms", "0"],
-						enter.runtime,
-						signal,
-					),
+					await main(["maintenance-enter", "--operation-id", "update", "--timeout-ms", "0"], enter.runtime, signal),
 				).toBe(0);
 				expect(JSON.parse(enter.out())).toMatchObject({ state: "held", result: "drained" });
 				const release = runtime({});
@@ -265,43 +331,40 @@ describe("main", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32")(
-		"sends leading-hyphen prompts and literal help through the CLI",
-		async () => {
-			const directory = join(home, "data");
-			await mkdir(join(directory, "control"), { recursive: true });
-			const received: unknown[] = [];
-			const server = createServer((socket) => {
-				let buffer = "";
-				socket.setEncoding("utf8");
-				socket.on("data", (chunk: string) => {
-					buffer += chunk;
-					const newline = buffer.indexOf("\n");
-					if (newline === -1) return;
-					received.push(JSON.parse(buffer.slice(0, newline)));
-					socket.end(`${JSON.stringify({ type: "reply", reply: { status: "answered", text: "received" } })}\n`);
-				});
+	it.skipIf(process.platform === "win32")("sends leading-hyphen prompts and literal help through the CLI", async () => {
+		const directory = join(home, "data");
+		await mkdir(join(directory, "control"), { recursive: true });
+		const received: unknown[] = [];
+		const server = createServer((socket) => {
+			let buffer = "";
+			socket.setEncoding("utf8");
+			socket.on("data", (chunk: string) => {
+				buffer += chunk;
+				const newline = buffer.indexOf("\n");
+				if (newline === -1) return;
+				received.push(JSON.parse(buffer.slice(0, newline)));
+				socket.end(`${JSON.stringify({ type: "reply", reply: { status: "answered", text: "received" } })}\n`);
 			});
-			await new Promise<void>((resolve, reject) => {
-				server.once("error", reject);
-				server.listen(serviceEndpoint(directory, "work", process.platform), resolve);
-			});
-			try {
-				for (const prompt of ["- explain this failure", "--help"]) {
-					const run = runtime({});
-					expect(
-						await main(["send", "--session", "work", "--request-id", "retry", "--", prompt], run.runtime, signal),
-					).toBe(0);
-					expect(run.out()).toBe("received\n");
-					expect(received.at(-1)).toEqual({ type: "send", prompt, requestId: "retry" });
-				}
-			} finally {
-				await new Promise<void>((resolve, reject) =>
-					server.close((error) => (error === undefined ? resolve() : reject(error))),
-				);
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(serviceEndpoint(directory, "work", process.platform), resolve);
+		});
+		try {
+			for (const prompt of ["- explain this failure", "--help"]) {
+				const run = runtime({});
+				expect(
+					await main(["send", "--session", "work", "--request-id", "retry", "--", prompt], run.runtime, signal),
+				).toBe(0);
+				expect(run.out()).toBe("received\n");
+				expect(received.at(-1)).toEqual({ type: "send", prompt, requestId: "retry" });
 			}
-		},
-	);
+		} finally {
+			await new Promise<void>((resolve, reject) =>
+				server.close((error) => (error === undefined ? resolve() : reject(error))),
+			);
+		}
+	});
 });
 
 describe("built binary", () => {

@@ -21,15 +21,14 @@ After publication, download directly on the server. No GitHub account, download 
 curl --fail --location --output unit-001-linux-x64.tar.gz \
   https://github.com/francman/unit-001-releases/releases/latest/download/unit-001-linux-x64.tar.gz
 tar -xzf unit-001-linux-x64.tar.gz
-cd unit-001-0.0.3-linux-x64
+cd unit-001-0.0.4-linux-x64
 bash ./check-vps.sh
 sudo ./install.sh --name bob
-sudo bob login anthropic
-sudo bob start
+sudo bob setup
 sudo bob service-status
 ```
 
-Use the extracted release directory if its version differs. The installer verifies its payload; bundled public trust configures automatic updates, which begin with `bob start`. Provider sign-in remains separate: use `openai` instead, or the protected environment described in [operations](operations.md).
+Use the extracted release directory if its version differs. The installer verifies its payload; bundled public trust configures automatic updates, which begin when the service starts. Setup guides provider sign-in or API key entry, model selection, and optional service start. The protected provider environment remains available as described in [operations](operations.md).
 
 For acceptance on the approved host, record the UUID printed by installation; substitute it for `UUID`:
 

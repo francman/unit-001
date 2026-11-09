@@ -22,6 +22,8 @@ import {
 	type ServiceRequest,
 	serviceEndpoint,
 } from "./service.ts";
+import { readDefaultModel, saveDefaultModel } from "./settings.ts";
+import { runSetup } from "./setup.ts";
 import { runRichAttach } from "./terminal-ui.ts";
 
 /** What the CLI reads from its process, so tests can run it against fakes. */
@@ -126,6 +128,42 @@ async function account(
 	);
 }
 
+async function setup(command: Extract<Command, { kind: "setup" }>, runtime: Runtime, signal: AbortSignal) {
+	if (!runtime.interactive) throw new UsageError("Setup requires an interactive terminal.");
+	const directory = resolveDirectory(command.dataDir, runtime);
+	let savedModel: string | undefined;
+	try {
+		savedModel = await readDefaultModel(directory);
+	} catch (error) {
+		if (!(error instanceof ConfigurationError)) throw error;
+		runtime.stderr.write("Existing settings are invalid; completing setup will replace them.\n");
+	}
+	const result = await runSetup(
+		{
+			terminal: terminalFor(runtime),
+			interactive: runtime.interactive,
+			env: runtime.env,
+			credentials: credentialStore(directory, runtime),
+			platform: runtime.platform,
+			launch:
+				runtime.managed === undefined
+					? { kind: "foreground", name: "agent" }
+					: { kind: "managed", name: runtime.managed.name },
+			currentModel: runtime.env.UNIT_001_MODEL || savedModel,
+			saveModel: (model) => saveDefaultModel(directory, model),
+		},
+		signal,
+	);
+	if (result.kind === "cancelled") return 130;
+	if (runtime.env.UNIT_001_MODEL && runtime.env.UNIT_001_MODEL !== result.model)
+		runtime.stderr.write(
+			"UNIT_001_MODEL overrides the saved model. Update that environment setting to use this choice.\n",
+		);
+	if (runtime.managed === undefined)
+		runtime.stdout.write("Setup saved. Run this launcher without setup to begin chatting.\n");
+	return 0;
+}
+
 async function run(
 	command: Extract<Command, { kind: "run" | "serve" }>,
 	runtime: Runtime,
@@ -134,11 +172,10 @@ async function run(
 	const options = command.options;
 	const directory = resolveDirectory(options.dataDir, runtime);
 	const file = sessionFile(directory, options.session, runtime.platform);
-	const endpoint =
-		command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
+	const endpoint = command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
 	const { models, choice } = await createConfiguredModels(
 		runtime.env,
-		options.model,
+		options.model ?? (runtime.env.UNIT_001_MODEL || (await readDefaultModel(directory))),
 		credentialStore(directory, runtime),
 	);
 
@@ -265,7 +302,8 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 			return 0;
 		}
 		let code: number;
-		if (command.kind === "run" || command.kind === "serve") code = await run(command, runtime, signal);
+		if (command.kind === "setup") code = await setup(command, runtime, signal);
+		else if (command.kind === "run" || command.kind === "serve") code = await run(command, runtime, signal);
 		else if (
 			command.kind === "send" ||
 			command.kind === "service-status" ||

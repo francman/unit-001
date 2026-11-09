@@ -1,7 +1,9 @@
 // Exercises named installation authority and lifecycle without changing the host's services.
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,6 +66,9 @@ async function setup() {
 		},
 		async unitExists(unit) {
 			return unit === paths.unit;
+		},
+		async unitRunning() {
+			return false;
 		},
 	};
 	return { root, record, paths, calls, context };
@@ -137,6 +142,194 @@ test("#19 two names route to separate accounts, UUIDs and state", async () => {
 	assert.equal(calls[0][2], record.account);
 	assert.equal(calls[1][2], second.account);
 	assert.ok(calls[1].includes(`/var/lib/unit-001/agents/${otherId}`));
+});
+
+test("setup requires root, an interactive terminal and no extra arguments before launching the app", async () => {
+	const { context, calls, root } = await setup();
+	const before = readInstallation(id, root);
+	for (const [args, overrides, message] of [
+		[["setup"], { uid: 1001, interactive: true }, /sudo agent setup/],
+		[["setup"], { interactive: false }, /interactive terminal/],
+		[["setup", "--yes"], { interactive: true }, /Invalid setup arguments/],
+	]) {
+		await assert.rejects(dispatchAgent(id, "agent", args, { ...context, ...overrides }), message);
+	}
+	assert.deepEqual(calls, []);
+	assert.deepEqual(readInstallation(id, root), before);
+});
+
+test("setup configures as the installation account and declining start preserves stopped intent", async () => {
+	const { context, record, root, calls } = await setup();
+	await writeInstallation({ ...record, desiredState: "stopped" }, root);
+	const prompts = [];
+	let forwarded;
+	assert.equal(await dispatchAgent(id, "agent", ["setup"], {
+		...context,
+		interactive: true,
+		async applicationEnvironment() {
+			return { OPENAI_API_KEY: "protected provider key" };
+		},
+		async run(command, args, capture, environment, options) {
+			calls.push([command, ...args]);
+			assert.equal(capture, false);
+			assert.deepEqual(options, { forwardSignals: true });
+			forwarded = environment;
+			// Authentication writes must not overlap an update backup or rollback.
+			await assert.rejects(withManagementLock(async () => assert.fail("Update acquired setup lock"), root), /Another install, update, or lifecycle operation/);
+			return 0;
+		},
+		async confirm(prompt) {
+			prompts.push(prompt);
+			return false;
+		},
+	}), 0);
+	assert.deepEqual(calls, [[
+		"runuser", "-u", record.account, "--", "/opt/trusted-release/runtime/bin/node",
+		"/opt/trusted-release/app/dist/named.js", id, "agent", `/var/lib/unit-001/agents/${id}`, "setup",
+	]]);
+	assert.deepEqual(forwarded, { OPENAI_API_KEY: "protected provider key" });
+	assert.deepEqual(prompts, ["Start agent now? [y/N] "]);
+	assert.equal(readInstallation(id, root).desiredState, "stopped");
+	await withManagementLock(async () => {}, root);
+});
+
+test("setup starts the selected custom name only after successful configuration and explicit confirmation", async () => {
+	const { context, record, root, calls, paths } = await setup();
+	await writeInstallation({ ...record, name: "bob", desiredState: "stopped" }, root);
+	const prompts = [];
+	assert.equal(await dispatchAgent(id, "bob", ["setup"], {
+		...context,
+		interactive: true,
+		async confirm(prompt) {
+			assert.equal(calls[0][0], "runuser");
+			assert.equal(calls.length, 1);
+			prompts.push(prompt);
+			return true;
+		},
+	}), 0);
+	assert.deepEqual(prompts, ["Start bob now? [y/N] "]);
+	assert.ok(calls.some(call => call[0] === "systemctl" && call[1] === "enable" && call.includes(paths.unit)));
+	assert.equal(readInstallation(id, root).desiredState, "running");
+});
+
+test("setup failure, EOF and interruption never prompt for start and preserve the child exit status", async () => {
+	for (const code of [1, 2, 130]) {
+		const { context, record, root } = await setup();
+		await writeInstallation({ ...record, desiredState: "stopped" }, root);
+		const result = await dispatchAgent(id, "agent", ["setup"], {
+			...context,
+			interactive: true,
+			async run() {
+				throw Object.assign(new Error("Child cancelled or failed"), { exitCode: code });
+			},
+			async confirm() {
+				assert.fail("Failed setup must never ask to start");
+			},
+		});
+		assert.equal(result, code);
+		assert.equal(readInstallation(id, root).desiredState, "stopped");
+		await withManagementLock(async () => {}, root);
+	}
+});
+
+test("#32 setup wrapper retains the management lock until its signalled child finishes", { timeout: 10000, skip: process.platform === "win32" }, async () => {
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+		const { root } = await setup();
+		const childFile = join(root, "setup-child.mjs");
+		const parentFile = join(root, "setup-parent.mjs");
+		await writeFile(childFile, `process.stdin.resume();
+process.stdin.once('end', () => process.exit(0));
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => {
+  process.stdout.write('child-stopping\\n');
+  process.stdin.once('data', () => process.exit(0));
+});
+process.stdout.write('child-ready\\n');
+`);
+		await writeFile(parentFile, `import { run } from ${JSON.stringify(new URL("../deploy/agent-command.mjs", import.meta.url).href)};
+import { withManagementLock } from ${JSON.stringify(new URL("../deploy/installation.mjs", import.meta.url).href)};
+try {
+  await withManagementLock(() => run(process.execPath, [${JSON.stringify(childFile)}], false, {}, { forwardSignals: true }), ${JSON.stringify(root)});
+} catch (error) {
+  process.exitCode = error.exitCode ?? 1;
+}
+`);
+		const parent = spawn(process.execPath, [parentFile], { stdio: ["pipe", "pipe", "inherit"] });
+		try {
+			assert.match((await once(parent.stdout, "data"))[0].toString(), /child-ready/);
+			const stopping = once(parent.stdout, "data");
+			parent.kill(signal);
+			assert.match((await stopping)[0].toString(), /child-stopping/);
+			await assert.rejects(withManagementLock(async () => assert.fail("Update acquired setup lock before child exit"), root), /Another install, update, or lifecycle operation/);
+			const closed = once(parent, "close");
+			parent.stdin.end("finish\n");
+			assert.equal((await closed)[0], { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 }[signal]);
+			await withManagementLock(async () => {}, root);
+		} finally {
+			if (!parent.stdin.writableEnded) parent.stdin.end("finish\n");
+			if (parent.exitCode === null) parent.kill("SIGKILL");
+		}
+	}
+});
+
+test("#32 setup rejects an incomplete update before launching any configuration writes", async () => {
+	for (const phase of ["holding", "backed-up", "candidate", "committed", "restored"]) {
+		const { context, root, calls } = await setup();
+		const update = updatePaths(id, root);
+		await mkdir(update.configDirectory, { recursive: true });
+		await writeFile(update.journal, JSON.stringify({ schemaVersion: 1, id, operationId: "pending-update", phase }), { mode: 0o600 });
+		await assert.rejects(dispatchAgent(id, "agent", ["setup"], { ...context, interactive: true }), /update recover before setup/);
+		assert.deepEqual(calls, []);
+		await withManagementLock(async () => {}, root);
+	}
+});
+
+test("#32 an active administrative operation blocks setup before authentication begins", async () => {
+	const { context, root, calls } = await setup();
+	await withManagementLock(async () => {
+		await assert.rejects(dispatchAgent(id, "agent", ["setup"], { ...context, interactive: true }), /Another install, update, or lifecycle operation/);
+	}, root);
+	assert.deepEqual(calls, []);
+});
+
+test("#32 a completed update journal permits setup", async () => {
+	const { context, root, calls } = await setup();
+	const update = updatePaths(id, root);
+	await mkdir(update.configDirectory, { recursive: true });
+	await writeFile(update.journal, JSON.stringify({ schemaVersion: 1, id, operationId: "completed-update", phase: "complete" }), { mode: 0o600 });
+	assert.equal(await dispatchAgent(id, "agent", ["setup"], { ...context, interactive: true }), 0);
+	assert.equal(calls[0][0], "runuser");
+});
+
+test("#32 setup's start prompt names the environment model override without exposing credentials", async () => {
+	const { context, record, root } = await setup();
+	await writeInstallation({ ...record, desiredState: "stopped" }, root);
+	let prompt;
+	await dispatchAgent(id, "agent", ["setup"], {
+		...context,
+		interactive: true,
+		async applicationEnvironment() {
+			return { OPENAI_API_KEY: "never-display-this", UNIT_001_MODEL: "openai/gpt-5" };
+		},
+		async confirm(value) { prompt = value; return false; },
+	});
+	assert.equal(prompt, "Start agent now using UNIT_001_MODEL (overrides the saved setup model)? [y/N] ");
+	assert.doesNotMatch(prompt, /openai\/gpt-5/);
+	assert.doesNotMatch(prompt, /never-display-this/);
+});
+
+test("setup never restarts an already running service and explains how to apply changed settings", async () => {
+	const { context, record, root, calls } = await setup();
+	const notices = [];
+	assert.equal(await dispatchAgent(id, "agent", ["setup"], {
+		...context,
+		interactive: true,
+		async unitRunning() { return true; },
+		notice(message) { notices.push(message); },
+		async confirm() { assert.fail("Running setup must not offer an ineffective start"); },
+	}), 0);
+	assert.equal(calls.length, 1);
+	assert.deepEqual(notices, ["Settings are saved. To apply changes, stop and start agent.\n"]);
+	assert.equal(readInstallation(id, root).desiredState, record.desiredState);
 });
 
 test("#20 confirmation defaults to no and --yes does not confer root authority", async () => {

@@ -34,6 +34,7 @@ export type Command =
 	| { readonly kind: "login"; readonly provider: string; readonly dataDir?: string }
 	| { readonly kind: "logout"; readonly provider: string; readonly dataDir?: string }
 	| { readonly kind: "status"; readonly dataDir?: string }
+	| { readonly kind: "setup"; readonly dataDir?: string }
 	| { readonly kind: "serve"; readonly options: Omit<RunOptions, "print"> }
 	| { readonly kind: "send"; readonly options: ServiceOptions; readonly prompt: string; readonly requestId?: string }
 	| { readonly kind: "service-status"; readonly options: ServiceOptions }
@@ -50,6 +51,7 @@ const VALUE_FLAGS = new Map<string, "print" | "session" | "model" | "dataDir">([
 ]);
 
 export const USAGE = `Usage: agent [options]
+       agent setup                      choose a provider, sign in, and save a default model
        agent login <anthropic|openai>   sign in with a Claude or ChatGPT subscription
        agent logout <anthropic|openai>  remove a stored sign-in
        agent status                     show how each provider is configured
@@ -64,7 +66,7 @@ Starts the agent. Its conversations persist, so a restarted process resumes unfi
 Options:
   -p, --print <prompt>   Answer one prompt and exit ("-" reads the prompt from standard input)
       --session <name>   Session to open or create (default: ${DEFAULT_SESSION})
-      --model <id>       Model as provider/model-id (default: UNIT_001_MODEL, else the configured provider)
+      --model <id>       Model as provider/model-id (default: UNIT_001_MODEL, saved setup choice, then provider)
       --data-dir <path>  Where sessions are stored (default: UNIT_001_HOME, else the per-user data directory)
       --plain            Basic line-oriented interface (attach only)
   -v, --version          Print the version
@@ -75,7 +77,7 @@ Use agent send [options] -- <prompt> when the prompt starts with a hyphen.
 A provider is used when you have signed in to it or set its key (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY,
 OPENROUTER_API_KEY), checked in that order. A stored sign-in wins over a key for the same provider.`;
 
-function parseAccountCommand(kind: "login" | "logout" | "status", rest: readonly string[]): Command {
+function parseAccountCommand(kind: "login" | "logout" | "status" | "setup", rest: readonly string[]): Command {
 	let dataDir: string | undefined;
 	const positional: string[] = [];
 	for (let index = 0; index < rest.length; index++) {
@@ -92,7 +94,7 @@ function parseAccountCommand(kind: "login" | "logout" | "status", rest: readonly
 		}
 	}
 	const withDataDir = dataDir === undefined ? {} : { dataDir };
-	if (kind === "status") {
+	if (kind === "status" || kind === "setup") {
 		if (positional.length > 0) throw new UsageError(`Unexpected argument: ${positional[0]}`);
 		return { kind, ...withDataDir };
 	}
@@ -201,7 +203,8 @@ export function parseArguments(argv: readonly string[]): Command {
 			throw new UsageError("Maintenance timeout must be 0 to 30000 ms.");
 		return { kind: first, operationId, timeoutMs, options };
 	}
-	if (first === "login" || first === "logout" || first === "status") return parseAccountCommand(first, argv.slice(1));
+	if (first === "login" || first === "logout" || first === "status" || first === "setup")
+		return parseAccountCommand(first, argv.slice(1));
 	if (first === "serve" || first === "send" || first === "service-status" || first === "cancel" || first === "attach")
 		return parseServiceCommand(first, argv.slice(1));
 	const values: { print?: string; session?: string; model?: string; dataDir?: string } = {};

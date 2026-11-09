@@ -9,15 +9,7 @@ describe("parseArguments", () => {
 
 	it("reads every option, in both the spaced and the = form", () => {
 		expect(
-			parseArguments([
-				"-p",
-				"hello",
-				"--session",
-				"work",
-				"--model=anthropic/claude-sonnet-5-5",
-				"--data-dir",
-				"/d",
-			]),
+			parseArguments(["-p", "hello", "--session", "work", "--model=anthropic/claude-sonnet-5-5", "--data-dir", "/d"]),
 		).toEqual({
 			kind: "run",
 			options: { print: "hello", session: "work", model: "anthropic/claude-sonnet-5-5", dataDir: "/d" },
@@ -52,6 +44,13 @@ describe("parseArguments", () => {
 });
 
 describe("parseArguments account commands", () => {
+	it("parses setup with a source data directory and rejects credentials in arguments", () => {
+		expect(parseArguments(["setup"])).toEqual({ kind: "setup" });
+		expect(parseArguments(["setup", "--data-dir=/d"])).toEqual({ kind: "setup", dataDir: "/d" });
+		expect(parseArguments(["setup", "--help"])).toEqual({ kind: "help" });
+		expect(() => parseArguments(["setup", "--api-key", "secret"])).toThrow(UsageError);
+		expect(() => parseArguments(["setup", "openai"])).toThrow(UsageError);
+	});
 	it("parses login, logout, and status", () => {
 		expect(parseArguments(["login", "anthropic"])).toEqual({ kind: "login", provider: "anthropic" });
 		expect(parseArguments(["logout", "openai", "--data-dir", "/d"])).toEqual({

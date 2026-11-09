@@ -27,8 +27,7 @@ The upstream guard and checkpoint/request-preparation benchmark budgets are in p
 Use the [one-minute deployment guide](docs/deployment.md). The default command is `agent`; `install.sh --name bob` creates `bob` instead. Each name is bound to a stable installation ID and its own account, service, credentials, sessions, and workspace. Releases can be shared between agents.
 
 ```bash
-sudo agent login anthropic
-sudo agent start
+sudo agent setup                 # provider, sign-in or API key, model, optional service start
 sudo agent attach                   # interactive client of the running service
 sudo agent send "Inspect the working repository"
 sudo agent service-status
@@ -44,6 +43,8 @@ Public releases require no GitHub account, download token, or manual verificatio
 
 ## Subscriptions
 
+In release `0.0.4` and later, `sudo agent setup` guides provider selection, subscription sign-in or hidden API key entry, and default-model selection. It preserves existing credentials unless you choose replacement. The installed command offers to start a stopped service after setup succeeds; a running service needs a stop and start to apply changed settings. Setup requires an interactive terminal and makes no paid model request. Source use supports `setup` without service management.
+
 `sudo agent login anthropic` (Claude Pro or Max) and `sudo agent login openai` (ChatGPT Plus or Pro) open the provider's sign-in flow, with a paste-the-code fallback for machines without a browser. `logout <provider>` removes the sign-in and `status` reports provider configuration without printing secrets. Application commands run as the named agent's account, including when invoked through `sudo`, so credentials retain the correct ownership. Tokens refresh automatically.
 
 Sign-ins are stored in `auth.json` in the data directory, readable only by the agent account (mode 0600 on macOS and Linux; on Windows it inherits your profile directory's access rules). A stored sign-in wins over an API key for the same provider.
@@ -56,7 +57,8 @@ Whether a provider lets third-party tools use a subscription is that provider's 
 |---|---|
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | A provider is used when you are signed in to it or its key is set, checked in this order; the first picks the provider and its default model |
 | `UNIT_001_MODEL` | `provider/model-id`; set in the named agent's environment file and restart the service |
-| Source CLI `--model` | Explicit `provider/model-id`, overriding `UNIT_001_MODEL` |
+| Saved setup model | Stored in `settings.json` beside credentials; used when neither `--model` nor `UNIT_001_MODEL` is set |
+| Source CLI `--model` | Explicit `provider/model-id`, overriding `UNIT_001_MODEL` and the saved setup choice |
 | Source CLI `UNIT_001_HOME` or `--data-dir` | Where development sessions are stored; the flag wins |
 
 Managed paths come from the installation record; caller-supplied paths cannot redirect a named agent. Its state is under `/var/lib/unit-001/agents/<id>` and root-owned configuration under `/etc/unit-001/agents/<id>`. The installer reports the ID and configuration path.
