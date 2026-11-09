@@ -1,6 +1,7 @@
 // Measures cold indexing, warm broad recall, and forget invalidation without provider calls.
 import { strictEqual } from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { type ConversationId, createSession } from "@earendil-works/pi-durable";
@@ -62,7 +63,7 @@ for (const [count, coldBudget, warmBudget, commitBudget] of [
 		}),
 	);
 	recall.clear();
-	const directory = await mkdtemp("/tmp/unit-memory-commit-bench-");
+	const directory = await mkdtemp(join(tmpdir(), "unit-memory-commit-bench-"));
 	const session = createSession(await openNodeSqliteStorage(join(directory, "state.sqlite")));
 	try {
 		await session.commit(async (tx) => Object.assign(await tx.doc(MemoryDoc), state), context);

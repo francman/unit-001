@@ -1,5 +1,6 @@
 // Issues #6–#9: independent app acceptance across SQLite reopen, forgetting and maintenance.
 import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -41,7 +42,7 @@ describe("independent persistent memory acceptance", () => {
 		recall.clear();
 	});
 	it("keeps replay identities, excludes forgotten evidence, and drains sleeping maintenance", async () => {
-		const directory = await mkdtemp("/tmp/unit-memory-acceptance-");
+		const directory = await mkdtemp(join(tmpdir(), "unit-memory-acceptance-"));
 		const faux = fauxProvider();
 		const models = createModels();
 		models.setProvider(faux.provider);

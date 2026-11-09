@@ -1,6 +1,7 @@
 // Measures the actual memory-enabled submit-to-faux-provider path and cold document replay.
 import { strictEqual } from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -14,7 +15,7 @@ import { reportEnvironment, summarize } from "./benchmark.ts";
 reportEnvironment();
 for (const count of process.argv[2] === undefined ? [1000, 10000] : [Number(process.argv[2])]) {
 	if (count !== 1000 && count !== 10000) throw new Error("Expected a fixture size of 1000 or 10000");
-	const directory = await mkdtemp("/tmp/unit-memory-request-bench-");
+	const directory = await mkdtemp(join(tmpdir(), "unit-memory-request-bench-"));
 	const file = join(directory, "state.sqlite");
 	const seed = createSession(await openNodeSqliteStorage(file));
 	await seed.commit(async (tx) => {
