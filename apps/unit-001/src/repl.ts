@@ -1,7 +1,8 @@
 import { createInterface } from "node:readline/promises";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
-import { DeltaPrinter, liveText, ToolAnnouncer } from "./render.ts";
+import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-control.ts";
+import { DeltaPrinter, liveText, sanitizeTerminalText, ToolAnnouncer } from "./render.ts";
 
 export interface Terminal {
 	readonly input: NodeJS.ReadableStream;
@@ -12,7 +13,7 @@ export interface Terminal {
 }
 
 const HELP =
-	"Commands: /help shows this, /status shows activity, /exit (or Ctrl+D) quits. Ctrl+C stops the current run.";
+	"Commands: /help, /status, /memory [stats|recall <query>|remember <text>|forget <id>|sleep], /exit (or Ctrl+D). Ctrl+C stops the current run.";
 
 /** Runs one prompt, streaming the answer to `terminal.out` and tool use to `terminal.err`. */
 async function turn(agent: Agent, prompt: string, terminal: Terminal, signal: AbortSignal): Promise<Reply> {
@@ -80,6 +81,7 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 	let current: AbortController | undefined;
 	let stopping: Promise<void> | undefined;
 	let closing = false;
+	let forget: { readonly id: string; readonly requestId: string } | undefined;
 
 	const onAbort = () => {
 		current?.abort();
@@ -126,11 +128,45 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 		if (interactive) readline.prompt();
 		for await (const line of readline) {
 			const text = line.trim();
+			if (forget !== undefined) {
+				const pending = forget;
+				forget = undefined;
+				try {
+					if (text.toLowerCase() === "yes")
+						terminal.err(
+							`${describeMemory(await agent.memory({ operation: "forget", ...pending, confirmed: true }, BACKGROUND_CONTEXT))}\n`,
+						);
+					else terminal.err("Forget cancelled.\n");
+				} catch (error) {
+					terminal.err(`Memory: ${error instanceof Error ? error.message : String(error)}\n`);
+				}
+				if (interactive) readline.prompt();
+				continue;
+			}
 			if (text === "/exit" || text === "/quit") break;
 			if (text === "/help") terminal.err(`${HELP}\n`);
-			else if (text === "/status")
-				terminal.err(`${agent.name}: ${(await agent.status(BACKGROUND_CONTEXT)).busy ? "busy" : "idle"}\n`);
-			else if (text.startsWith("/")) terminal.err(`Unknown command ${text.split(/\s/, 1)[0]}. ${HELP}\n`);
+			else if (text === "/status") {
+				const status = await agent.status(BACKGROUND_CONTEXT);
+				terminal.err(
+					`${agent.name}: ${status.busy ? "busy" : "idle"}; PID ${status.runtime.pid}; started ${new Date(status.runtime.startedAt).toISOString()}; uptime ${Math.floor(status.runtime.uptimeMs / 1000)}s; observed ${new Date(status.runtime.observedAt).toISOString()}\n`,
+				);
+			} else if (text === "/memory" || text.startsWith("/memory ")) {
+				try {
+					const match = /^\/memory(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/.exec(text);
+					const request = memoryCommand(match?.[1], match?.[2]);
+					if (request.operation === "confirm-forget") {
+						forget = { id: request.id, requestId: request.requestId };
+						terminal.err(
+							`Forget ${sanitizeTerminalText(request.id)}? Type yes; any other input cancels. History remains. [No]\n`,
+						);
+					} else
+						terminal.err(
+							`${describeMemory(await agent.memory(request satisfies MemoryRequest, BACKGROUND_CONTEXT))}\n`,
+						);
+				} catch (error) {
+					terminal.err(`Memory: ${error instanceof Error ? error.message : String(error)}\n`);
+				}
+			} else if (text.startsWith("/")) terminal.err(`Unknown command ${text.split(/\s/, 1)[0]}. ${HELP}\n`);
 			else if (text !== "") {
 				current = new AbortController();
 				try {

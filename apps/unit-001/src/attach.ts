@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import { ATTACH_HELP as HELP } from "./attach-help.ts";
+import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-control.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import type { Terminal } from "./repl.ts";
 import { requestService, type ServiceView, watchService } from "./service.ts";
@@ -23,6 +24,7 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 	let pendingView: ServiceView | undefined;
 	let pendingNotice = "";
 	let flushQueued = false;
+	let forget: { readonly id: string; readonly requestId: string } | undefined;
 	const paint = (write: () => void) => {
 		if (reader !== undefined && terminal.output !== undefined) {
 			cursorTo(terminal.output, 0);
@@ -96,16 +98,60 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 		if (local.signal.aborted) return;
 		flush();
 		const text = line.trim();
+		const runMemory = (request: MemoryRequest) => {
+			void requestService(endpoint, { type: "memory", request }, local.signal).then(
+				(response) => {
+					if (!local.signal.aborted)
+						err(
+							`${response.type === "memory" ? describeMemory(response.result) : response.type === "error" ? response.message : "Unexpected memory response."}\n`,
+						);
+				},
+				(error: unknown) => {
+					if (!local.signal.aborted) err(`Memory: ${describeError(error)}\n`);
+				},
+			);
+		};
+		if (forget !== undefined) {
+			const pending = forget;
+			forget = undefined;
+			if (text.toLowerCase() === "yes") runMemory({ operation: "forget", ...pending, confirmed: true });
+			else err("Forget cancelled.\n");
+			return;
+		}
 		if (text === "/exit" || text === "/detach") {
 			detach();
 			return;
 		}
 		if (text === "/help") err(`${HELP}\n`);
-		else if (text === "/status" && view !== undefined)
-			err(
-				`${view.name}: ${view.busy ? "working" : "ready"}; PID ${view.pid}; version ${view.version}; session ${basename(endpoint, ".sock")}\n`,
+		else if (text === "/status") {
+			if (view !== undefined)
+				err(
+					`${view.name}: ${view.busy ? "working" : "ready"}; PID ${view.pid}; version ${view.version}; session ${basename(endpoint, ".sock")}\n`,
+				);
+			void requestService(endpoint, { type: "status" }, local.signal).then(
+				(response) => {
+					if (response.type === "status")
+						err(
+							`${response.name}: ${response.busy ? "working" : "ready"}; PID ${response.pid}; version ${response.version}; session ${basename(endpoint, ".sock")}; started ${new Date(response.runtime.startedAt).toISOString()}; uptime ${Math.floor(response.runtime.uptimeMs / 1000)}s; observed ${new Date(response.runtime.observedAt).toISOString()}\n`,
+						);
+					else if (response.type === "error") err(`${response.message}\n`);
+				},
+				(error: unknown) => {
+					if (!local.signal.aborted) err(`Status: ${describeError(error)}\n`);
+				},
 			);
-		else if (text === "/cancel") cancel();
+		} else if (text === "/memory" || text.startsWith("/memory ")) {
+			try {
+				const match = /^\/memory(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/.exec(text);
+				const request = memoryCommand(match?.[1], match?.[2]);
+				if (request.operation === "confirm-forget") {
+					forget = { id: request.id, requestId: request.requestId };
+					err(`Forget ${request.id}? Type yes; any other input cancels. History remains. [No]\n`);
+				} else runMemory(request);
+			} catch (error) {
+				err(`Memory: ${describeError(error)}\n`);
+			}
+		} else if (text === "/cancel") cancel();
 		else if (text.startsWith("/")) err(`Unknown command. ${HELP}\n`);
 		else if (text !== "") {
 			if (sending) {

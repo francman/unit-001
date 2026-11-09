@@ -1,6 +1,6 @@
 {
 	"name": "unit-001",
-	"version": "0.0.5",
+	"version": "0.0.6",
 	"description": "unit-001: a durable agent built on Pi Durable",
 	"private": true,
 	"type": "module",
@@ -19,12 +19,12 @@
 	],
 	"scripts": {
 		"clean": "shx rm -rf dist",
-		"build": "tsc -p tsconfig.build.json",
+		"build": "npm --prefix ../../packages/unit-memory run build && tsc -p tsconfig.build.json",
 		"typecheck": "tsc -p tsconfig.json",
 		"release:build": "node scripts/build-release.mjs",
 		"test:release": "node --test test/release.test.mjs",
 		"test:management": "node --test test/management.test.mjs test/activation.test.mjs",
-		"bench": "tsc -p bench/tsconfig.json && node --conditions=source --experimental-strip-types bench/checkpoint-commit.bench.ts && node --conditions=source --experimental-strip-types bench/request-preparation.bench.ts",
+		"bench": "tsc -p bench/tsconfig.json && node --conditions=source --experimental-strip-types bench/checkpoint-commit.bench.ts && node --conditions=source --experimental-strip-types bench/request-preparation.bench.ts && node --conditions=source --experimental-strip-types bench/memory-recall.bench.ts && node --conditions=source --experimental-strip-types bench/memory-request.bench.ts",
 		"test": "vitest --run",
 		"start": "node dist/bin.js"
 	},
@@ -43,7 +43,8 @@
 		"@earendil-works/pi-durable": "1.4.0",
 		"@earendil-works/pi-tui": "1.4.0",
 		"@tufjs/models": "4.1.1",
-		"tuf-js": "5.0.1"
+		"tuf-js": "5.0.1",
+		"unit-memory": "0.0.1"
 	},
 	"devDependencies": {
 		"shx": "0.3.4",

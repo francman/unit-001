@@ -9,7 +9,15 @@ describe("parseArguments", () => {
 
 	it("reads every option, in both the spaced and the = form", () => {
 		expect(
-			parseArguments(["-p", "hello", "--session", "work", "--model=anthropic/claude-sonnet-5-5", "--data-dir", "/d"]),
+			parseArguments([
+				"-p",
+				"hello",
+				"--session",
+				"work",
+				"--model=anthropic/claude-sonnet-5-5",
+				"--data-dir",
+				"/d",
+			]),
 		).toEqual({
 			kind: "run",
 			options: { print: "hello", session: "work", model: "anthropic/claude-sonnet-5-5", dataDir: "/d" },
@@ -84,6 +92,30 @@ describe("parseArguments account commands", () => {
 });
 
 describe("parseArguments service commands", () => {
+	it("#8 parses owner-only memory commands with explicit automation confirmation", () => {
+		expect(parseArguments(["memory"])).toEqual({
+			kind: "memory",
+			request: { operation: "stats" },
+			yes: false,
+			options: { session: "default" },
+		});
+		expect(parseArguments(["memory", "recall", "violet theme", "--session", "work"])).toMatchObject({
+			kind: "memory",
+			request: { operation: "recall", query: "violet theme" },
+			options: { session: "work" },
+		});
+		expect(parseArguments(["memory", "forget", "memory:a", "--yes", "--request-id", "retry"])).toMatchObject({
+			request: { operation: "confirm-forget", id: "memory:a", requestId: "retry" },
+			yes: true,
+		});
+		for (const args of [
+			["memory", "stats", "extra"],
+			["memory", "recall"],
+			["memory", "stats", "--yes"],
+			["memory", "remember", "x", "y"],
+		])
+			expect(() => parseArguments(args)).toThrow(UsageError);
+	});
 	it("parses inhibited startup and bounded maintenance controls", () => {
 		// #18: Inhibition belongs to service startup, never a client-side admission override.
 		expect(parseArguments(["serve", "--inhibited"])).toEqual({

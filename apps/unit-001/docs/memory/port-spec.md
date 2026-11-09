@@ -130,7 +130,9 @@ App wiring therefore includes admission metadata, not only `AgentOptions.extensi
 
 ### Background capture: issue #7
 
-Do not perform extraction or scan a run inside `afterRun`. The hook returns one `runEndTask` carrying only the run bounds (`first`, `answer`, `last`), conversation ID, and generation task ID.
+The run-end hook may read at most three raw entries within the completed run's inclusive bounds through one public `api.entries` call. Only when that page covers the entire interval may the existing deterministic extractor prove there are no candidates or oversized skipped candidates and return without creating work. An incomplete page or any candidate/skipped candidate retains the original dispatcher path. This bounded exception avoids empty-learning task and receipt commits that otherwise add SQLite checkpoint contention between consecutive requests; it does not permit a full-history scan or extraction before a provider request.
+
+When work remains, the hook returns one `runEndTask` carrying only the run bounds (`first`, `answer`, `last`), conversation ID, and generation task ID.
 
 Durable commits the answer and settles its inputs before calling `afterRun`, but the returned tasks are children that **keep the run and conversation busy until they finish**. The child must therefore be a short dispatcher: in one `runtime.commit`, check `captures`, create a **conversation-owned** task with `background: true` and `abandonOnRestart` unset, record its ID, and finish the dispatcher. Background applies only to conversation-owned tasks; setting it on an ordinary child is not the solution.
 
@@ -147,7 +149,7 @@ The deterministic initial extractor keeps user statements explicitly beginning `
 
 Only host-established human input entries qualify for these user rules. Assistant output, tool text, compaction summaries, synthetic mission prompts, and previous recall blocks cannot become user preferences or instructions. Record agent/tool observations only through an explicit remember call initially; later semantic extraction may propose them with the correct provenance. Synthetic mission submissions must use a distinct custom entry kind or host provenance before automatic capture is enabled for them. The memory layer must never guess authorship from prose.
 
-Use default importance `0.5` for captured candidates. Identical content may be deduplicated within one origin, but do not merge contradictory statements or distinct authors automatically. The stable capture write key includes generation task ID, source entry ID, and candidate ordinal. Record a completed receipt even when no candidates were found. A fault is visible through Durable reports and the capture record; the next ordinary user response must not wait for retry.
+Use default importance `0.5` for captured candidates. Identical content may be deduplicated within one origin, but do not merge contradictory statements or distinct authors automatically. The stable capture write key includes generation task ID, source entry ID, and candidate ordinal. Once dispatched, record a completed receipt even when no candidates were found; proven-empty short runs create neither task nor receipt. A fault is visible through Durable reports and the capture record; the next ordinary user response must not wait for retry.
 
 An optional future LLM extractor must run as durable background work, validate a bounded structured result, retain source citations and provenance, report its spend, and fall back to these deterministic rules when unavailable or malformed. It cannot promote extracted prose to authority or silently enable paid calls.
 

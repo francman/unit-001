@@ -25,6 +25,17 @@ afterEach(() => {
 	for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
+test("#6–#9 local memory package includes its compiled runtime in the release artifact", () => {
+	const [packed] = JSON.parse(
+		execFileSync("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], {
+			cwd: new URL("../../../packages/unit-memory/", import.meta.url),
+			encoding: "utf8",
+		}),
+	);
+	assert(packed.files.some((file) => file.path === "dist/index.js" && file.size > 0));
+	assert(packed.files.some((file) => file.path === "dist/background.js" && file.size > 0));
+});
+
 test("#36 bundled terminal design resolves its setup guide inside the signed documentation inventory", () => {
 	const directory = mkdtempSync(join(tmpdir(), "unit-release-docs-"));
 	temporary.push(directory);
@@ -35,6 +46,24 @@ test("#36 bundled terminal design resolves its setup guide inside the signed doc
 	assert.deepEqual(setup, readFileSync(new URL("../docs/setup-experience.md", import.meta.url)));
 	writeReleaseChecksums(directory);
 	assert.match(readFileSync(join(directory, "SHA256SUMS"), "utf8"), /\.\/docs\/setup-experience\.md/);
+	assert.deepEqual(
+		readFileSync(join(directory, "docs/memory.md")),
+		readFileSync(new URL("../docs/memory.md", import.meta.url)),
+	);
+	assert.match(readFileSync(join(directory, "SHA256SUMS"), "utf8"), /\.\/docs\/memory\.md/);
+	// #6–#9: bundled memory documentation must resolve its verification and capacity links.
+	const memory = readFileSync(join(directory, "docs/memory.md"), "utf8");
+	assert.match(memory, /\]\(memory\/verification\.md\)/);
+	assert.match(memory, /\]\(memory\/reference-practices\.md\)/);
+	assert.deepEqual(
+		readFileSync(join(directory, "docs/memory/reference-practices.md")),
+		readFileSync(new URL("../docs/memory/reference-practices.md", import.meta.url)),
+	);
+	assert.match(readFileSync(join(directory, "docs/memory/verification.md"), "utf8"), /\]\(\.\.\/latency\.md\)/);
+	assert.deepEqual(
+		readFileSync(join(directory, "docs/latency.md")),
+		readFileSync(new URL("../docs/latency.md", import.meta.url)),
+	);
 });
 
 test("#16 Linux archives exclude macOS extended attributes and AppleDouble companions", () => {

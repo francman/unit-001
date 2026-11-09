@@ -1,5 +1,6 @@
 /**
- * Submit-to-provider latency through unit-001: scheduling, prompt assembly, and one beforeRequest hook.
+ * Submit-to-provider latency through unit-001: scheduling, prompt assembly, default memory and one extra hook.
+ * Consecutive requests include durable capture contention and SQLite checkpoint tails; no samples are removed.
  * Acceptance: cold and warm p95 <= 10 ms (measured baseline and headroom in docs/latency.md).
  * Run: node --conditions=source --experimental-strip-types bench/request-preparation.bench.ts
  */

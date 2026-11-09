@@ -1,5 +1,5 @@
 // Conversation-local host provenance and recall queries for admitted inputs.
-import { defineDoc, defineEntry } from "@earendil-works/pi-durable";
+import { type ConversationId, defineDoc, defineEntry, type SubmissionId, type Tx } from "@earendil-works/pi-durable";
 
 /** Input origin supplied by the host rather than inferred from model text. */
 export type InputOrigin = "human" | "mission";
@@ -23,3 +23,23 @@ export const MemoryInputsDoc = defineDoc<MemoryInputsState>({
 	initial: () => ({ inputs: {} }),
 	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 63,
 });
+
+/** Record host metadata after conversation.submit, inside the same admission transaction. */
+export async function recordMemoryInput(
+	tx: Tx,
+	conversationId: ConversationId,
+	submissionId: SubmissionId,
+	origin: InputOrigin,
+	query: string,
+): Promise<void> {
+	const inputs = await tx.doc(MemoryInputsDoc, conversationId);
+	const boundedQuery = Array.from(query).slice(0, 2000).join("");
+	const existing = inputs.inputs[submissionId];
+	// A deduplicated submission may be retried with different wire input; its first provenance is immutable.
+	if (existing !== undefined) {
+		if (existing.origin !== origin || existing.query !== boundedQuery)
+			throw new Error("Memory input admission conflicts with the original submission");
+		return;
+	}
+	inputs.inputs[submissionId] = { origin, query: boundedQuery };
+}

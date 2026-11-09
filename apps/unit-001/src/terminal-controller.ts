@@ -4,6 +4,8 @@ import { basename } from "node:path";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
 import { ATTACH_HELP } from "./attach-help.ts";
+import { describeMemory, type MemoryRequest, type MemoryResult, memoryCommand } from "./memory-control.ts";
+import type { RuntimeFacts } from "./orientation.ts";
 import { requestService, type ServiceView, watchService } from "./service.ts";
 import { serviceView } from "./service-view.ts";
 
@@ -57,6 +59,18 @@ export function createTerminalController(
 				const response = await requestService(endpoint, { type: "cancel" }, signal);
 				if (response.type === "error") throw new Error(response.message);
 			},
+			async memory(request, signal) {
+				const response = await requestService(endpoint, { type: "memory", request }, signal);
+				if (response.type === "error") throw new Error(response.message);
+				if (response.type !== "memory") throw new Error("Unexpected memory response.");
+				return response.result;
+			},
+			async runtime(signal) {
+				const response = await requestService(endpoint, { type: "status" }, signal);
+				if (response.type === "error") throw new Error(response.message);
+				if (response.type !== "status") throw new Error("Unexpected status response.");
+				return response.runtime;
+			},
 		},
 		onChange,
 		signal,
@@ -104,6 +118,14 @@ export function createForegroundTerminalController(
 				signal.throwIfAborted();
 				await agent.abort(BACKGROUND_CONTEXT);
 			},
+			async memory(request, signal) {
+				signal.throwIfAborted();
+				return agent.memory(request, BACKGROUND_CONTEXT);
+			},
+			async runtime(signal) {
+				signal.throwIfAborted();
+				return (await agent.status(BACKGROUND_CONTEXT)).runtime;
+			},
 		},
 		onChange,
 		signal,
@@ -116,11 +138,13 @@ interface ConversationTransport {
 	watch(listener: (view: ServiceView) => void, signal: AbortSignal): Promise<void>;
 	send(prompt: string, requestId: string, signal: AbortSignal): Promise<Reply>;
 	cancel(signal: AbortSignal): Promise<void>;
+	memory(request: MemoryRequest, signal: AbortSignal): Promise<MemoryResult>;
+	runtime(signal: AbortSignal): Promise<RuntimeFacts>;
 }
 
 const HELP = `${ATTACH_HELP}\nDefault rich controls: PageUp/PageDown scroll; Ctrl+Shift+F searches the displayed transcript when forwarded by the terminal; Enter/Shift+Enter moves between matches; Esc closes search.\nUsage covers conversation-model estimates, excluding tool/subagent costs and subscription billing.`;
 const FOREGROUND_HELP =
-	"/help /status /cancel /exit. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
+	"/help /status /memory [stats|recall <query>|remember <text>|forget <id>|sleep] /cancel /exit. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
 const MAX_INPUT_BYTES = 16_384;
 
 class OwnerTerminalController implements TerminalController {
@@ -135,6 +159,7 @@ class OwnerTerminalController implements TerminalController {
 	#cancelAfterAdmission = false;
 	#finished = false;
 	#startup: ReturnType<typeof setTimeout> | undefined;
+	#forget: { readonly id: string; readonly requestId: string } | undefined;
 
 	constructor(transport: ConversationTransport, onChange: (state: TerminalState) => void, signal: AbortSignal) {
 		this.#transport = transport;
@@ -164,6 +189,13 @@ class OwnerTerminalController implements TerminalController {
 	submit(input: string): TerminalInputResult {
 		if (this.#finished) return { status: "rejected" };
 		const text = input.trim();
+		if (this.#forget !== undefined) {
+			const pending = this.#forget;
+			this.#forget = undefined;
+			if (text.toLowerCase() === "yes") void this.#memory({ operation: "forget", ...pending, confirmed: true });
+			else this.#notice("Forget cancelled.");
+			return { status: "command" };
+		}
 		if (text === "/exit" || text === "/detach") {
 			this.detach();
 			return { status: "command" };
@@ -179,7 +211,24 @@ class OwnerTerminalController implements TerminalController {
 					? "Connecting to the service."
 					: `${view.name}: ${view.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${view.pid}; version ${view.version}.`,
 			);
+			void this.#status();
 			return { status: "command" };
+		}
+		if (text === "/memory" || text.startsWith("/memory ")) {
+			try {
+				const match = /^\/memory(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/.exec(text);
+				const request = memoryCommand(match?.[1], match?.[2]);
+				if (request.operation === "confirm-forget") {
+					this.#forget = { id: request.id, requestId: request.requestId };
+					this.#notice(
+						`Forget ${request.id}? Type yes to confirm; any other input cancels. Conversation history remains. [No]`,
+					);
+				} else void this.#memory(request);
+				return { status: "command" };
+			} catch (error) {
+				this.#notice(describeError(error), "error");
+				return { status: "rejected" };
+			}
 		}
 		if (text === "/cancel") {
 			this.cancel();
@@ -264,9 +313,13 @@ class OwnerTerminalController implements TerminalController {
 			if (this.#finished) return;
 			// The watch is authoritative for transcript output; never duplicate an answer from the send reply.
 			if (reply.status === "failed")
-				this.#notice(`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`, "error");
+				this.#notice(
+					`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`,
+					"error",
+				);
 		} catch (error) {
-			if (!this.#finished) this.#notice(`Send failed: ${describeError(error)}; retry request ${requestId}.`, "error");
+			if (!this.#finished)
+				this.#notice(`Send failed: ${describeError(error)}; retry request ${requestId}.`, "error");
 		} finally {
 			this.#cancelAfterAdmission = false;
 			if (!this.#finished) {
@@ -287,6 +340,39 @@ class OwnerTerminalController implements TerminalController {
 				this.#state = { ...this.#state, cancelling: false };
 				this.#publish();
 			}
+		}
+	}
+
+	async #memory(request: MemoryRequest): Promise<void> {
+		try {
+			const result = await this.#transport.memory(request, this.#local.signal);
+			if (!this.#finished) {
+				if (result.operation === "recall") {
+					if (result.records.length === 0) this.#notice(describeMemory(result));
+					for (const record of result.records) {
+						const points = Array.from(record.content);
+						const content =
+							points.length > 700
+								? `${points.slice(0, 700).join("")}… [preview truncated; use memory recall in the terminal]`
+								: record.content;
+						this.#notice(describeMemory({ operation: "recall", records: [{ ...record, content }] }));
+					}
+				} else this.#notice(describeMemory(result));
+			}
+		} catch (error) {
+			if (!this.#finished) this.#notice(`Memory: ${describeError(error)}`, "error");
+		}
+	}
+
+	async #status(): Promise<void> {
+		try {
+			const facts = await this.#transport.runtime(this.#local.signal);
+			if (!this.#finished)
+				this.#notice(
+					`${facts.name}: ${this.#state.view?.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${facts.pid}; ${facts.provider}/${facts.modelId}; started ${new Date(facts.startedAt).toISOString()}; uptime ${Math.floor(facts.uptimeMs / 1000)}s; observed ${new Date(facts.observedAt).toISOString()}.`,
+				);
+		} catch (error) {
+			if (!this.#finished) this.#notice(`Status: ${describeError(error)}`, "error");
 		}
 	}
 
