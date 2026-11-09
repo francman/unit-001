@@ -14,6 +14,21 @@ import termios
 import time
 
 
+def verify_appearance(output, monochrome):
+    """#36: Require identity chrome and host-contrasting emphasis without prescribing a cyan palette."""
+    header = rb"unit-001  \xc2\xb7  agent  /  default"
+    assert re.search(header, output), "Managed terminal identity/session header is missing"
+    colors = re.findall(rb"\x1b\[([0-9;]*)m", output)
+    if monochrome:
+        assert not any(
+            int(code) in range(30, 50) or int(code) in range(90, 108)
+            for parameters in colors for code in parameters.split(b";") if code
+        ), "NO_COLOR was lost across the managed privilege boundary"
+    else:
+        assert re.search(rb"\x1b\[1;39m" + header, output), "Rich identity header lacks bold terminal-foreground styling"
+        assert b"\x1b[32mREADY" in output, "Ready status lost its semantic color"
+
+
 def verify_case(monochrome):
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
@@ -78,14 +93,7 @@ def verify_case(monochrome):
                 raise
         else:
             assert restored[3] == original[3], "Detach left terminal input flags changed"
-        colors = re.findall(rb"\x1b\[([0-9;]*)m", output)
-        if monochrome:
-            assert not any(
-                int(code) in range(30, 50) or int(code) in range(90, 108)
-                for parameters in colors for code in parameters.split(b";") if code
-            ), "NO_COLOR was lost across the managed privilege boundary"
-        else:
-            assert b"\x1b[1;36m" in output, "Normal rich header has no cyan styling"
+        verify_appearance(bytes(output), monochrome)
         print(f"Managed PTY passed: {'NO_COLOR' if monochrome else 'color'}; ready, detach, terminal restored.")
     finally:
         if child is not None and child.poll() is None:
