@@ -1,5 +1,21 @@
 # Terminal assessment: service ownership before interface parity
 
+## Modern terminal composition review for #36
+
+The terminal should open as an application, with a stable identity, one obvious composer, readable state and discoverable actions. The November 9 review compared the live OMP setup baseline, Herdr's official terminal preview and configuration documentation, and OpenCode's TUI documentation and home-view source. No production Herdr pane, provider account or model request was used for this comparison.
+
+| Reference | Pattern adopted in unit-001 |
+|---|---|
+| [OMP setup](terminal-assessment-omp.md#live-setup-and-chat-comparison-for-36) | Persistent step chrome, framed searchable choices, highlighted selection and fixed keyboard guidance. |
+| [Herdr terminal preview](https://herdr.dev/tui/) and [theme/layout configuration](https://herdr.dev/tui/docs/configuration/) | Stable identity and activity regions, semantic state labels, transparent host-aware foreground, and a clear distinction between a client view and a durable owner. |
+| [OpenCode TUI](https://docs.opencode.ai/docs/tui/) and [home composition](https://github.com/anomalyco/opencode/blob/dev/packages/tui/src/routes/home.tsx) | The default command opens the TUI; an empty workspace has a branded purpose, focused composer and compact contextual actions. |
+
+The implementation opens the owner client for a bare managed invocation before credentials or storage are read. Explicit foreground flags retain their original meaning. Source foreground chat uses the same rich presentation through its already-open Agent, without creating another database owner. A stopped service shows a persistent setup/start screen rather than flashing a raw socket error. Empty conversations receive a compact welcome region; narrow screens prioritize model, input and actionable hints over branding.
+
+The gate is independent real-terminal review at 80×24 and 40×12, with light/dark and monochrome frames, normal typing before Enter, masked secret entry, paste, resizing, busy/error states and lifetime-safe exit. This review does not claim feature parity with session browsers, dashboards, plugins or collaborative runtimes; those are separate features rather than requirements for a polished first interaction.
+
+## Historical baseline before #21
+
 Baseline reviewed 2026-11-07 before #21 implementation; see [current terminal behavior](terminal.md). Recommend a service-aware terminal client before adopting a full-screen interface. This is a source/docs assessment, not a hands-on benchmark of competitors.
 
 ## Evidence

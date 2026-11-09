@@ -1,8 +1,16 @@
 // Controls an attached terminal through the single storage owner's bounded local protocol.
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
+import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
+import type { Agent, Reply } from "./agent.ts";
 import { ATTACH_HELP } from "./attach-help.ts";
 import { requestService, type ServiceView, watchService } from "./service.ts";
+import { serviceView } from "./service-view.ts";
+
+export interface TerminalNotice {
+	readonly kind: "info" | "error";
+	readonly text: string;
+}
 
 /** Latest bounded service view and client state; presentation must sanitize all untrusted strings. */
 export interface TerminalState {
@@ -10,7 +18,7 @@ export interface TerminalState {
 	readonly view?: ServiceView;
 	readonly sending: boolean;
 	readonly cancelling: boolean;
-	readonly notices: readonly string[];
+	readonly notices: readonly TerminalNotice[];
 }
 
 /** A rejected input must stay in the editor; commands and admitted sends may clear it. */
@@ -34,16 +42,91 @@ export function createTerminalController(
 	onChange: (state: TerminalState) => void,
 	signal: AbortSignal,
 ): TerminalController {
-	return new OwnerTerminalController(endpoint, onChange, signal);
+	return new OwnerTerminalController(
+		{
+			session: basename(endpoint, ".sock"),
+			ownership: "attached",
+			watch: (listener, signal) => watchService(endpoint, listener, signal),
+			async send(prompt, requestId, signal) {
+				const response = await requestService(endpoint, { type: "send", prompt, requestId }, signal);
+				if (response.type === "error") throw new Error(response.message);
+				if (response.type !== "reply") throw new Error("The service returned an unexpected send response.");
+				return response.reply;
+			},
+			async cancel(signal) {
+				const response = await requestService(endpoint, { type: "cancel" }, signal);
+				if (response.type === "error") throw new Error(response.message);
+			},
+		},
+		onChange,
+		signal,
+	);
+}
+
+/** Uses the already-open foreground owner with the same view, admission and cancellation controls. */
+export function createForegroundTerminalController(
+	agent: Agent,
+	session: string,
+	version: string,
+	onChange: (state: TerminalState) => void,
+	signal: AbortSignal,
+): TerminalController {
+	return new OwnerTerminalController(
+		{
+			session,
+			ownership: "foreground",
+			async watch(listener, signal) {
+				const { context, cancel } = withCancel(BACKGROUND_CONTEXT);
+				const abort = () => cancel();
+				signal.addEventListener("abort", abort, { once: true });
+				if (signal.aborted) abort();
+				const watch = await agent.watchConversation(context);
+				try {
+					const identity = { pid: process.pid, version, name: agent.name, installationId: null };
+					listener(serviceView(watch.value, identity));
+					watch.start(async (call) => {
+						if (call.kind === "value") listener(serviceView(call.value, identity));
+						else throw call.error;
+					});
+					const end = await watch.closed;
+					if (end.kind === "failed" || end.kind === "listener_error") throw end.error;
+				} finally {
+					signal.removeEventListener("abort", abort);
+					await watch.stop();
+					cancel();
+				}
+			},
+			async send(prompt, requestId, signal) {
+				signal.throwIfAborted();
+				return agent.ask(prompt, BACKGROUND_CONTEXT, { requestId });
+			},
+			async cancel(signal) {
+				signal.throwIfAborted();
+				await agent.abort(BACKGROUND_CONTEXT);
+			},
+		},
+		onChange,
+		signal,
+	);
+}
+
+interface ConversationTransport {
+	readonly session: string;
+	readonly ownership: "attached" | "foreground";
+	watch(listener: (view: ServiceView) => void, signal: AbortSignal): Promise<void>;
+	send(prompt: string, requestId: string, signal: AbortSignal): Promise<Reply>;
+	cancel(signal: AbortSignal): Promise<void>;
 }
 
 const HELP = `${ATTACH_HELP}\nDefault rich controls: PageUp/PageDown scroll; Ctrl+Shift+F searches the displayed transcript when forwarded by the terminal; Enter/Shift+Enter moves between matches; Esc closes search.\nUsage covers conversation-model estimates, excluding tool/subagent costs and subscription billing.`;
+const FOREGROUND_HELP =
+	"/help /status /cancel /exit. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
 const MAX_INPUT_BYTES = 16_384;
 
 class OwnerTerminalController implements TerminalController {
 	readonly closed: Promise<number>;
 	readonly #resolveClose: (code: number) => void;
-	readonly #endpoint: string;
+	readonly #transport: ConversationTransport;
 	readonly #onChange: (state: TerminalState) => void;
 	readonly #signal: AbortSignal;
 	readonly #local = new AbortController();
@@ -53,8 +136,8 @@ class OwnerTerminalController implements TerminalController {
 	#finished = false;
 	#startup: ReturnType<typeof setTimeout> | undefined;
 
-	constructor(endpoint: string, onChange: (state: TerminalState) => void, signal: AbortSignal) {
-		this.#endpoint = endpoint;
+	constructor(transport: ConversationTransport, onChange: (state: TerminalState) => void, signal: AbortSignal) {
+		this.#transport = transport;
 		this.#onChange = onChange;
 		this.#signal = signal;
 		this.#onSignal = () => this.detach();
@@ -68,7 +151,7 @@ class OwnerTerminalController implements TerminalController {
 		}
 		signal.addEventListener("abort", this.#onSignal, { once: true });
 		this.#startup = setTimeout(() => {
-			this.#notice("Service did not provide initial state within 5 seconds.");
+			this.#notice("Agent did not provide initial state within 5 seconds.", "error");
 			this.#finish("failed", 1);
 		}, 5_000);
 		void this.#observe();
@@ -86,7 +169,7 @@ class OwnerTerminalController implements TerminalController {
 			return { status: "command" };
 		}
 		if (text === "/help") {
-			this.#notice(HELP);
+			this.#notice(this.#transport.ownership === "attached" ? HELP : FOREGROUND_HELP);
 			return { status: "command" };
 		}
 		if (text === "/status") {
@@ -94,7 +177,7 @@ class OwnerTerminalController implements TerminalController {
 			this.#notice(
 				view === undefined
 					? "Connecting to the service."
-					: `${view.name}: ${view.busy ? "working" : "ready"}; session ${basename(this.#endpoint, ".sock")}; PID ${view.pid}; version ${view.version}.`,
+					: `${view.name}: ${view.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${view.pid}; version ${view.version}.`,
 			);
 			return { status: "command" };
 		}
@@ -103,7 +186,7 @@ class OwnerTerminalController implements TerminalController {
 			return { status: "command" };
 		}
 		if (text.startsWith("/")) {
-			this.#notice(`Unknown command. ${HELP}`);
+			this.#notice(`Unknown command. ${this.#transport.ownership === "attached" ? HELP : FOREGROUND_HELP}`);
 			return { status: "rejected" };
 		}
 		if (text === "") return { status: "command" };
@@ -151,46 +234,39 @@ class OwnerTerminalController implements TerminalController {
 
 	detach(): void {
 		if (this.#finished) return;
-		this.#notice("Detached; detaching does not cancel admitted work.");
+		this.#notice(
+			this.#transport.ownership === "attached"
+				? "Detached; detaching does not cancel admitted work."
+				: "Closing the foreground session; unfinished work can resume on the next launch.",
+		);
 		this.#finish("detached", 0);
 	}
 
 	async #observe(): Promise<void> {
 		try {
-			await watchService(
-				this.#endpoint,
-				(view) => {
-					clearTimeout(this.#startup);
-					this.#state = { ...this.#state, connection: "attached", view };
-					this.#publish();
-					if (this.#cancelAfterAdmission && view.busy) this.cancel();
-				},
-				this.#local.signal,
-			);
+			await this.#transport.watch((view) => {
+				clearTimeout(this.#startup);
+				this.#state = { ...this.#state, connection: "attached", view };
+				this.#publish();
+				if (this.#cancelAfterAdmission && view.busy) this.cancel();
+			}, this.#local.signal);
 			if (!this.#finished) this.#finish("detached", 0);
 		} catch (error) {
 			if (this.#finished) return;
-			this.#notice(`Service disconnected: ${describeError(error)}. Reattach to inspect persisted work.`);
+			this.#notice(`Service disconnected: ${describeError(error)}. Reattach to inspect persisted work.`, "error");
 			this.#finish("failed", 1);
 		}
 	}
 
 	async #send(text: string, requestId: string): Promise<void> {
 		try {
-			const response = await requestService(
-				this.#endpoint,
-				{ type: "send", prompt: text, requestId },
-				this.#local.signal,
-			);
+			const reply = await this.#transport.send(text, requestId, this.#local.signal);
 			if (this.#finished) return;
 			// The watch is authoritative for transcript output; never duplicate an answer from the send reply.
-			if (response.type === "error") this.#notice(response.message);
-			else if (response.type === "reply" && response.reply.status === "failed")
-				this.#notice(
-					`Unanswered: ${response.reply.reason}${response.reply.detail === undefined ? "" : ` (${response.reply.detail})`}`,
-				);
+			if (reply.status === "failed")
+				this.#notice(`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`, "error");
 		} catch (error) {
-			if (!this.#finished) this.#notice(`Send failed: ${describeError(error)}; retry request ${requestId}.`);
+			if (!this.#finished) this.#notice(`Send failed: ${describeError(error)}; retry request ${requestId}.`, "error");
 		} finally {
 			this.#cancelAfterAdmission = false;
 			if (!this.#finished) {
@@ -202,13 +278,10 @@ class OwnerTerminalController implements TerminalController {
 
 	async #cancel(): Promise<void> {
 		try {
-			const response = await requestService(this.#endpoint, { type: "cancel" }, this.#local.signal);
-			if (!this.#finished)
-				this.#notice(
-					response.type === "error" ? response.message : "Cancellation requested; waiting for service state.",
-				);
+			await this.#transport.cancel(this.#local.signal);
+			if (!this.#finished) this.#notice("Cancellation requested; waiting for service state.");
 		} catch (error) {
-			if (!this.#finished) this.#notice(`Cancel failed: ${describeError(error)}`);
+			if (!this.#finished) this.#notice(`Cancel failed: ${describeError(error)}`, "error");
 		} finally {
 			if (!this.#finished) {
 				this.#state = { ...this.#state, cancelling: false };
@@ -217,9 +290,9 @@ class OwnerTerminalController implements TerminalController {
 		}
 	}
 
-	#notice(text: string): void {
+	#notice(text: string, kind: TerminalNotice["kind"] = "info"): void {
 		const notice = text.length > 1024 ? `${text.slice(0, 1000)} [notice truncated]` : text;
-		this.#state = { ...this.#state, notices: [...this.#state.notices.slice(-7), notice] };
+		this.#state = { ...this.#state, notices: [...this.#state.notices.slice(-7), { kind, text: notice }] };
 		this.#publish();
 	}
 

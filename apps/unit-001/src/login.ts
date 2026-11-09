@@ -35,8 +35,14 @@ export async function runLogin(
 	const { interaction, close } = createLoginInteraction(terminal, signal, platform);
 	try {
 		await models.login(subscription.provider, "oauth", interaction, { agentName: launch.name });
+	} catch (error) {
+		if (!interaction.signal.aborted) throw error;
 	} finally {
 		close();
+	}
+	if (interaction.signal.aborted) {
+		terminal.err("Sign-in cancelled.\n");
+		return 130;
 	}
 	const next =
 		launch.kind === "managed"

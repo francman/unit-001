@@ -25,3 +25,18 @@ Local baseline before #21: [repl](../src/repl.ts), [render](../src/render.ts), [
 Borrow interaction patterns, not OMP's runtime wholesale. Native tooling, remote collaboration, voice, themes and agent dashboards add scope beyond the immediate VPS operator need. Keep changes inside unit-owned packages without new dependencies or upstream modifications.
 
 The foreground #21 slice adds `/status`, correct recovery cancellation, cancellation-listener cleanup, and a reusable terminal sanitizer. The table records the comparison baseline, not a completion checklist.
+
+## Live setup and chat comparison for #36
+
+The follow-up review ran installed OMP `18.13.3` with an empty profile and no provider environment, and unit-001 `0.0.4` in real PTYs. No model request was submitted. OMP source was reviewed at [`21f1188cf88b2f534c092181968cd5a4d1a9c296`](https://github.com/can1357/oh-my-pi/tree/21f1188cf88b2f534c092181968cd5a4d1a9c296); that source revision is newer than the installed binary, so source and observed behavior are distinguished here.
+
+| Pattern | Observed OMP behavior and primary source | Unit implementation direction |
+| --- | --- | --- |
+| Stable setup frame | Step counter, strong title/subtitle, framed picker and fixed keyboard footer; [wizard overlay](https://github.com/can1357/oh-my-pi/blob/21f1188cf88b2f534c092181968cd5a4d1a9c296/packages/tui/src/setup/wizard-overlay.ts). | One focused step at a time, shared visual language with attached chat. |
+| Visible selection/search | Typing `OpenRouter` immediately displays `Search: OpenRouter` and filters the provider list; [sign-in scene](https://github.com/can1357/oh-my-pi/blob/21f1188cf88b2f534c092181968cd5a4d1a9c296/packages/tui/src/setup/scenes/sign-in.ts). | Visible editable search, highlighted selection, explicit credential state and masked secret input. |
+| Model choice | Bounded model browser, current/default selection and inline status; [model scene](https://github.com/can1357/oh-my-pi/blob/21f1188cf88b2f534c092181968cd5a4d1a9c296/packages/tui/src/setup/scenes/model.ts). | Search selected-provider models without a paid probe or an unbounded terminal dump. |
+| Small terminal | The installed OMP's logo consumes eight rows at 40×12, cropping its picker and footer. | Preserve active input, selection and help first; reduce branding instead of reproducing that defect. |
+
+The unit baseline reproduced invisible provider typing before Enter. Attached chat at 40×12 also lost its send hint and spent four transcript rows on two tool outcomes. The presentation changes label the composer, compress tool rows, keep the model readable, prioritize send/cancel/detach help and distinguish errors without relying on color.
+
+OMP is MIT-licensed. This work independently implements its interaction patterns through existing public Pi APIs; it does not copy OMP branding, assets, runtime or scene code. Actual terminal acceptance is required in addition to logic tests; the [interaction specification](setup-experience.md) defines the gate.

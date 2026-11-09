@@ -41,15 +41,71 @@ describe("subscriptionFor", () => {
 });
 
 describe("runLogin", () => {
+	it("does not report sign-in success if cancellation races with provider completion", async () => {
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const errors: string[] = [];
+		const models = {
+			login: async () => {
+				input.write("\x03");
+				return oauth;
+			},
+		};
+		expect(
+			await runLogin(
+				models as never,
+				"openai",
+				{
+					input,
+					output,
+					out: () => {},
+					err: (text) => {
+						errors.push(text);
+					},
+				},
+				new AbortController().signal,
+				"linux",
+			),
+		).toBe(130);
+		expect(errors.join("")).not.toContain("Signed in with");
+		input.destroy();
+		output.destroy();
+	});
+	it("returns interruption rather than success after a cancelled provider poll", async () => {
+		// #36: OAuth cancellation must propagate through setup without resuming another prompt.
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const errors: string[] = [];
+		const models = {
+			login: async (_provider: string, _type: string, interaction: AuthInteraction) =>
+				new Promise<never>((_resolve, reject) => {
+					interaction.signal?.addEventListener("abort", () => reject(interaction.signal?.reason), { once: true });
+				}),
+		};
+		const pending = runLogin(
+			models as never,
+			"openai",
+			{
+				input,
+				output,
+				out: () => {},
+				err: (text) => {
+					errors.push(text);
+				},
+			},
+			new AbortController().signal,
+			"linux",
+		);
+		input.write("\x03");
+		expect(await pending).toBe(130);
+		expect(errors.join("")).not.toContain("Signed in with");
+		input.destroy();
+		output.destroy();
+	});
 	it("runs the provider's oauth login with a terminal interaction and reports success", async () => {
 		const calls: { provider: string; type: string; interaction: AuthInteraction; agentName?: string }[] = [];
 		const models = {
-			login: async (
-				provider: string,
-				type: string,
-				interaction: AuthInteraction,
-				options?: { agentName?: string },
-			) => {
+			login: async (provider: string, type: string, interaction: AuthInteraction, options?: { agentName?: string }) => {
 				calls.push({
 					provider,
 					type,

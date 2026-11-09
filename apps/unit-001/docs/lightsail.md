@@ -21,7 +21,7 @@ After publication, download directly on the server. No GitHub account, download 
 curl --fail --location --output unit-001-linux-x64.tar.gz \
   https://github.com/francman/unit-001-releases/releases/latest/download/unit-001-linux-x64.tar.gz
 tar -xzf unit-001-linux-x64.tar.gz
-cd unit-001-0.0.4-linux-x64
+cd unit-001-0.0.5-linux-x64
 bash ./check-vps.sh
 sudo ./install.sh --name bob
 sudo bob setup

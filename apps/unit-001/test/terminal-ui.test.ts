@@ -96,6 +96,82 @@ function launch() {
 }
 
 describe("rich service terminal", () => {
+	it("labels the composer and shows typing immediately without submitting", () => {
+		// #36: real typing feedback and a named composer are acceptance requirements, not just action results.
+		const app = launch();
+		try {
+			app.update();
+			expect(app.screen().join("\n")).toContain("Ask bob");
+			app.terminal.input("Can you explain");
+			app.tui.renderNow(true);
+			expect(app.screen().join("\n")).toContain("Can you explain");
+			expect(app.screen().join("\n")).toContain("Message");
+			expect(app.actions.submit).not.toHaveBeenCalled();
+			app.update({ ...base, busy: true, text: "A live answer" });
+			expect(app.screen().join("\n")).toContain("Can you explain");
+		} finally {
+			app.tui.stop();
+		}
+	});
+
+	it("keeps model, send, newline and detach guidance visible at 40 by 12", () => {
+		// #36: optional process metadata must not displace the primary model or send action on SSH terminals.
+		const app = launch();
+		try {
+			app.terminal.columns = 40;
+			app.terminal.rows = 12;
+			app.terminal.resize();
+			app.update({ ...base, model: { provider: "anthropic", modelId: "claude-sonnet-5-5" } });
+			const screen = app.screen();
+			expect(screen).toHaveLength(12);
+			expect(screen[1]).toContain("anthropic/claude-sonnet-5-5");
+			expect(screen[1]).not.toContain("PID");
+			expect(screen.join("\n")).toContain("Ctrl+J newline");
+			expect(screen.at(-2)).toContain("Enter send");
+			expect(screen.at(-2)).toContain("cost unknown");
+			expect(screen.at(-1)).toContain("Ctrl+C exit");
+			expect(screen.at(-1)).toContain("Ctrl+D detach");
+			expect(screen.every((line) => visibleWidth(line) <= 40)).toBe(true);
+			app.update({ ...base, busy: true });
+			expect(app.screen().at(-1)).toContain("Ctrl+C cancel");
+		} finally {
+			app.tui.stop();
+		}
+	});
+
+	it("uses one line per tool outcome and distinguishes actionable failures from notices", () => {
+		// #36: compact outcome rows preserve conversation space; failures must be visible without color.
+		const app = launch();
+		try {
+			app.update(
+				{
+					...base,
+					tools: [
+						{ callId: "one", name: "read", status: "succeeded" },
+						{ callId: "two", name: "bash", status: "failed" },
+					],
+				},
+				{
+					notices: [
+						{ kind: "error", text: "Send failed: connection lost" },
+						{ kind: "info", text: "Submitting request fixture" },
+					],
+				},
+			);
+			const screen = app.screen();
+			expect(screen.filter((line) => line.includes("[succeeded] read"))).toHaveLength(1);
+			expect(screen.filter((line) => line.includes("[failed] bash"))).toHaveLength(1);
+			expect(screen.join("\n")).toContain("Error · Send failed: connection lost");
+			expect(screen.join("\n")).toContain("Notice · Request submitted.");
+			expect(screen.join("\n")).not.toContain("Submitting request fixture");
+			app.update(base, {
+				notices: [{ kind: "error", text: "Send failed: connection lost; retry request fixture-recovery-id." }],
+			});
+			expect(app.screen().join("\n")).toContain("fixture-recovery-id");
+		} finally {
+			app.tui.stop();
+		}
+	});
 	it("shows owner activity while a submission awaits its final reply", () => {
 		// #25: awaiting the final send reply must not hide authoritative running or cancelling activity.
 		const app = launch();
@@ -186,7 +262,12 @@ describe("rich service terminal", () => {
 			try {
 				await expect.poll(() => requests.length).toBe(1);
 				if (kind === "signal") controller.abort();
-				else client?.destroy();
+				else {
+					client?.destroy();
+					await expect.poll(() => terminal.stopped).toBe(false);
+					await new Promise((resolve) => setTimeout(resolve, 30));
+					terminal.input("\x04");
+				}
 				expect(await running).toBe(kind === "signal" ? 0 : 1);
 				expect(terminal.events).toEqual(["drain", "stop"]);
 				expect(requests).toEqual([{ type: "watch" }]);
@@ -231,7 +312,7 @@ describe("rich service terminal", () => {
 						},
 					],
 				},
-				{ notices: ["Provider error details remain readable here."] },
+				{ notices: [{ kind: "error", text: "Provider error details remain readable here." }] },
 			);
 			const text = app.tui.getScreenLines().join("\n");
 			expect(text).not.toMatch(/\x1b\]8;;(?:javascript:|https:)/);
@@ -366,6 +447,104 @@ describe("rich service terminal", () => {
 			expect(text).not.toMatch(/[\x00\x1b\x7f-\x9f]/);
 		} finally {
 			app.tui.stop();
+		}
+	});
+	it("shows a branded empty workspace and distinguishes foreground exit from service detach", () => {
+		// #36: the normal source launcher must look like the same application, without claiming a service remains alive.
+		const terminal = new FakeTerminal();
+		const tui = new TuiAltScreen(terminal, true, undefined, { mouse: false, copyOnSelect: false });
+		const actions = {
+			submit: vi.fn((): TerminalInputResult => ({ status: "command" })),
+			cancel: vi.fn(),
+			detach: vi.fn(),
+		};
+		const view = new RichAttachView(tui, "default", actions, { ownership: "foreground", colorMode: "monochrome" });
+		tui.setLayoutRoot(view);
+		tui.start();
+		try {
+			view.update({
+				connection: "attached",
+				view: { ...base, entries: [] },
+				sending: false,
+				cancelling: false,
+				notices: [],
+			});
+			tui.renderNow(true);
+			const screen = tui.getScreenLines().map(stripTerminalSequences).join("\n");
+			expect(screen).toContain("unit-001");
+			expect(screen).toContain("Durable agent workspace");
+			expect(screen).toContain("Ask a question or describe a task");
+			expect(screen).toContain("foreground");
+			expect(screen).toContain("Ctrl+D exit");
+			expect(screen).not.toContain("Ctrl+D detach");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("renders fenced code as a labeled code block at narrow widths", () => {
+		// #36: Markdown fence syntax should not make a formatted reply look like raw source.
+		const app = launch();
+		try {
+			app.terminal.columns = 40;
+			app.terminal.resize();
+			app.update({
+				...base,
+				entries: [{ id: 1, role: "assistant", text: "```bash\nsudo agent setup\n```", truncated: false }],
+				text: "",
+			});
+			const screen = app.screen().join("\n");
+			expect(screen).toContain("── bash");
+			expect(screen).toContain("sudo agent setup");
+			expect(screen).not.toContain("```");
+		} finally {
+			app.tui.stop();
+		}
+	});
+
+	it("keeps an actionable unavailable screen until the user exits", () => {
+		const terminal = new FakeTerminal();
+		terminal.columns = 40;
+		terminal.rows = 12;
+		const tui = new TuiAltScreen(terminal, true, undefined, { mouse: false, copyOnSelect: false });
+		const actions = {
+			submit: vi.fn((): TerminalInputResult => ({ status: "rejected" })),
+			cancel: vi.fn(),
+			detach: vi.fn(),
+		};
+		const view = new RichAttachView(tui, "default", actions, {
+			name: "bob",
+			colorMode: "monochrome",
+			unavailableHint: "Configure: sudo bob setup\nStart: sudo bob start\nOpen: sudo bob",
+		});
+		tui.setLayoutRoot(view);
+		tui.addInputListener((data) => view.handleGlobalInput(data));
+		tui.start();
+		try {
+			// #36: failure can follow an error notice with no new snapshot or notice array.
+			const state: TerminalState = {
+				connection: "connecting",
+				sending: false,
+				cancelling: false,
+				notices: [{ kind: "error", text: "Endpoint unavailable" }],
+			};
+			view.update(state);
+			view.update({ ...state, connection: "failed" });
+			tui.renderNow(true);
+			const screen = tui.getScreenLines().map(stripTerminalSequences).join("\n");
+			expect(screen).toContain("bob");
+			expect(screen).toContain("Agent unavailable");
+			expect(screen).toContain("sudo bob setup");
+			expect(screen).toContain("sudo bob start");
+			expect(screen).not.toContain("Connecting");
+			expect(screen).not.toContain("Ask agent");
+			expect(screen).not.toContain("Enter send");
+			expect(screen).toContain("Ctrl+D exit");
+			terminal.input("\x03");
+			expect(actions.detach).toHaveBeenCalledOnce();
+			expect(actions.cancel).not.toHaveBeenCalled();
+		} finally {
+			tui.stop();
 		}
 	});
 });

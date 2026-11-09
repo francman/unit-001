@@ -31,6 +31,56 @@ function setup(lines = "") {
 }
 
 describe("createLoginInteraction", () => {
+	it.each(["EOF", "Ctrl+D"] as const)(
+		"aborts interactive provider polling on %s without an active prompt",
+		async (exit) => {
+			// #36: a suspended setup UI cannot cancel a provider after readline consumes terminal EOF.
+			const input = new PassThrough();
+			const output = new PassThrough();
+			const login = createLoginInteraction(
+				{ input, output, out: () => {}, err: () => {} },
+				new AbortController().signal,
+			);
+			try {
+				if (exit === "EOF") input.end();
+				else input.write("\x04");
+				await expect.poll(() => login.interaction.signal.aborted).toBe(true);
+			} finally {
+				login.close();
+				input.destroy();
+				output.destroy();
+			}
+		},
+	);
+	it("releases successful interactive login without marking it cancelled", () => {
+		// #36: explicit cleanup must not turn completed authentication into cancellation.
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const login = createLoginInteraction({ input, output, out: () => {}, err: () => {} }, new AbortController().signal);
+		login.close();
+		expect(login.interaction.signal.aborted).toBe(false);
+		input.destroy();
+		output.destroy();
+	});
+	it("aborts provider polling on Ctrl+C even when no answer prompt is active", async () => {
+		// #36: closing readline alone leaves an OAuth poll running in the background.
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const login = createLoginInteraction(
+			{ input, output, out: () => {}, err: () => {} },
+			new AbortController().signal,
+			"linux",
+		);
+		try {
+			input.write("\x03");
+			expect(login.interaction.signal.aborted).toBe(true);
+			await expect(login.interaction.prompt({ type: "text", message: "Code:" })).rejects.toThrow("Sign-in cancelled");
+		} finally {
+			login.close();
+			input.destroy();
+			output.destroy();
+		}
+	});
 	it("prints info messages with their links", () => {
 		const { login, err } = setup();
 		login.interaction.notify({
