@@ -3,12 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { TranscriptContext } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { createMemoryExtension } from "unit-memory";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "../src/agent.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -48,6 +49,42 @@ async function launch(
 }
 
 describe("default owner memory", () => {
+	it("#6 prepares reopened memory before readiness and refreshes real record changes after receipt-only capture", async () => {
+		const content = "Violet approval policy seed";
+		const first = await launch("prepared.sqlite");
+		await first.agent.memory({ operation: "remember", content, requestId: "prepared" }, context);
+		await first.agent.close(context);
+		const normalization = vi.spyOn(String.prototype, "normalize");
+		try {
+			const requests: string[] = [];
+			const capture = (request: TranscriptContext) => {
+				requests.push(JSON.stringify(request.messages));
+				return fauxAssistantMessage("done");
+			};
+			const second = await launch("prepared.sqlite", [capture, capture, capture]);
+			expect(normalization.mock.contexts.some((receiver) => String(receiver) === content)).toBe(true);
+			normalization.mockClear();
+			await second.agent.ask("Violet approval?", context);
+			await second.agent.idle(context);
+			await expect
+				.poll(async () => await second.agent.memory({ operation: "stats" }, context))
+				.toMatchObject({ pendingCaptures: 0 });
+			expect(requests[0]).toContain(content);
+			expect(normalization.mock.contexts.some((receiver) => String(receiver) === content)).toBe(false);
+			normalization.mockClear();
+			await second.agent.ask("Violet approval again?", context);
+			await second.agent.idle(context);
+			expect(normalization.mock.contexts.some((receiver) => String(receiver) === content)).toBe(false);
+			await second.agent.memory(
+				{ operation: "remember", content: "Juniper approval policy update", requestId: "changed" },
+				context,
+			);
+			await second.agent.ask("Juniper approval?", context);
+			expect(requests[2]).toContain("Juniper approval policy update");
+		} finally {
+			normalization.mockRestore();
+		}
+	});
 	it("#6 retains structured evidence after public conversation compaction and feeds it to the reopened owner's request", async () => {
 		const file = "compaction.sqlite";
 		const first = await launch(file, [
@@ -158,12 +195,31 @@ describe("default owner memory", () => {
 	});
 
 	it("#7 captures host human preferences in the background without an extraction model request", async () => {
-		const { agent, faux } = await launch("capture.sqlite", [fauxAssistantMessage("Noted.")]);
+		let userContext = "";
+		const { agent, faux } = await launch("capture.sqlite", [
+			fauxAssistantMessage("Noted."),
+			(request) => {
+				userContext = request.messages
+					.flatMap((message) =>
+						message.role !== "user"
+							? []
+							: typeof message.content === "string"
+								? [message.content]
+								: message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])),
+					)
+					.join("\n");
+				return fauxAssistantMessage("Violet dashboards.");
+			},
+		]);
 		await agent.ask("I prefer violet dashboards", context);
 		await expect
 			.poll(async () => await agent.memory({ operation: "recall", query: "violet" }, context))
 			.toMatchObject({ records: [{ origin: "user", content: expect.stringContaining("violet") }] });
 		expect(faux.state.callCount).toBe(1);
+		await agent.ask("What dashboards do I prefer?", context);
+		expect(userContext).toContain("Retrieved memory evidence");
+		expect(userContext).toContain('"derivation":"capture"');
+		expect(faux.state.callCount).toBe(2);
 	});
 
 	it("#9 drains with sleeping memory tasks and preserves held state and memory through owner close/reopen", async () => {

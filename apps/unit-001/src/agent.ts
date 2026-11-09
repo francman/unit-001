@@ -133,6 +133,7 @@ export class Agent {
 			const inhibited = options.startup?.kind === "inhibited" || held;
 			if (!inhibited) {
 				await root.commit((tx) => reconcileMemoryTasks(tx, root.id, Date.now()), context);
+				memory.recall.prepare(await harness.snapshot(MemoryDoc, context));
 				harness.resume();
 			}
 			return new Agent(harness, root, interrupted, name, inhibited, runtime, memory);
@@ -347,8 +348,9 @@ export class Agent {
 				throw new Error("Maintenance operation does not own this hold.");
 			document.current = { protocol: 1, state: "open", operationId: null };
 		}, context);
-		this.#inhibited = false;
 		await this.#root.commit((tx) => reconcileMemoryTasks(tx, this.#root.id, Date.now()), context);
+		this.#memory.recall.prepare(await this.#harness.snapshot(MemoryDoc, context));
+		this.#inhibited = false;
 		this.#harness.resume();
 		return { type: "maintenance", protocol: 1, state: "open", operationId: null };
 	}

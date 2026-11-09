@@ -1,11 +1,13 @@
 // Issues #6/#8: deterministic whole-token recall and stale-summary exclusion.
 
+import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import type { ConversationId } from "@earendil-works/pi-durable";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { memoryEvidence } from "../src/injection.ts";
-import type { MemoryState } from "../src/memory.ts";
+import { MemoryDoc, type MemoryState } from "../src/memory.ts";
 import { forgetMemory, rememberMemory } from "../src/operations.ts";
 import { MemoryRecall, memoryTokens } from "../src/recall.ts";
+import { sqliteFixture } from "./sqlite-fixture.ts";
 
 function state(): MemoryState {
 	return { revision: 0, records: {}, receipts: {}, captures: {}, consolidation: { state: "idle" } };
@@ -20,6 +22,38 @@ function add(memory: MemoryState, key: string, content: string) {
 }
 
 describe("bounded lexical recall", () => {
+	it("prepares the owner index and reuses structurally shared records after a SQLite receipt-only commit", async () => {
+		// #6: bookkeeping must not move bank-wide tokenization back onto the next request.
+		const fixture = await sqliteFixture();
+		const recall = new MemoryRecall();
+		const normalization = vi.spyOn(String.prototype, "normalize");
+		try {
+			await fixture.session.commit(async (tx) => add(await tx.doc(MemoryDoc), "one", "violet approval"), context);
+			const first = await fixture.session.snapshot(MemoryDoc, context);
+			recall.prepare(first);
+			expect(normalization).toHaveBeenCalledTimes(1);
+			await fixture.session.commit(
+				async (tx) => forgetMemory(await tx.doc(MemoryDoc), { writeKey: "missing", id: "absent" }),
+				context,
+			);
+			const second = await fixture.session.snapshot(MemoryDoc, context);
+			expect(second).not.toBe(first);
+			expect(second?.records).toBe(first?.records);
+			normalization.mockClear();
+			recall.prepare(second);
+			expect(normalization).not.toHaveBeenCalled();
+			expect(recall.recall(second, "violet", { now: 0 })[0]?.id).toBe("memory:one");
+			expect(normalization).toHaveBeenCalledTimes(1);
+			recall.prepare(undefined);
+			normalization.mockClear();
+			recall.prepare(second);
+			expect(normalization).toHaveBeenCalledTimes(1);
+		} finally {
+			normalization.mockRestore();
+			recall.clear();
+			await fixture.close();
+		}
+	});
 	it("keeps flags exact, normalizes Unicode, and matches identifiers without substring fallback", () => {
 		const memory = state();
 		const recall = new MemoryRecall();

@@ -16,7 +16,9 @@ Host admission calls `conversation.submit(tx, draft)` before other table writes,
 
 A custom extension clock must match the Harness clock. Each recall cache belongs to one Harness and must be cleared when that owner closes.
 
-Both documents begin at version 1 and checkpoint after 64 deltas. There is no earlier released schema to migrate. A future shape change must bump the version and provide a deterministic migration; persisted upgrade/rejection behavior is covered by SQLite fixture tests. Checkpoints bound replay depth, not total memory size. No memory latency budget is claimed by this foundation.
+After reconciliation, call `service.recall.prepare(await harness.snapshot(MemoryDoc, context))` before enabling scheduling or advertising owner readiness. This moves initial cold indexing into startup. Requests still revalidate current snapshots; receipt-only commits reuse Durable's structurally shared record map. This removes repeated indexing work without hiding startup cost.
+
+Both documents begin at version 1 and checkpoint after 64 deltas. There is no earlier released schema to migrate. A future shape change must bump the version and provide a deterministic migration; persisted upgrade/rejection behavior is covered by SQLite fixture tests. Checkpoints bound replay depth, not total memory size. See [measured latency and capacity limits](../../apps/unit-001/docs/latency.md).
 
 ## Develop
 

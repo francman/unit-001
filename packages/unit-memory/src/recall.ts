@@ -30,6 +30,19 @@ export class MemoryRecall {
 	private index = new Map<string, Set<string>>();
 	private records = new Map<string, LiveMemory>();
 
+	/** Prepare committed evidence before owner readiness; receipt-only snapshots retain their shared record index. */
+	prepare(state: MemoryState | undefined): void {
+		if (state === undefined) {
+			this.clear();
+			return;
+		}
+		if (this.state === state && this.revision === state.revision) return;
+		// Durable shares unchanged document buckets. Same-object callers may instead mutate a transaction-local state.
+		if (this.state === state || this.state?.records !== state.records) this.rebuild(state);
+		this.state = state;
+		this.revision = state.revision;
+	}
+
 	/** Retrieve relevant evidence without writes, transcript scans, or external calls. */
 	recall(
 		state: MemoryState | undefined,
@@ -41,7 +54,7 @@ export class MemoryRecall {
 		if (!Number.isFinite(options.now)) throw new Error("Memory timestamp must be finite");
 		const tokens = memoryTokens(query);
 		if (state === undefined || tokens.size === 0) return [];
-		if (this.state !== state || this.revision !== state.revision) this.rebuild(state);
+		this.prepare(state);
 		const matches = new Map<string, number>();
 		for (const token of tokens)
 			for (const id of this.index.get(token) ?? []) matches.set(id, (matches.get(id) ?? 0) + 1);
@@ -128,8 +141,6 @@ export class MemoryRecall {
 				posting.add(record.id);
 			}
 		}
-		this.state = state;
-		this.revision = state.revision;
 	}
 }
 

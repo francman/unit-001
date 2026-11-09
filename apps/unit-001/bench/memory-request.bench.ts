@@ -1,6 +1,6 @@
 // Measures the actual memory-enabled submit-to-faux-provider path and cold document replay.
 import { strictEqual } from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
@@ -38,6 +38,34 @@ for (const count of process.argv[2] === undefined ? [1000, 10000] : [Number(proc
 		await session.close(context);
 	}
 	report(`memory/${count}/storage-open-and-first-snapshot`, count === 1000 ? 20 : 100, replaySamples);
+	const startupSamples: number[] = [];
+	const startupFaux = fauxProvider();
+	const startupModels = createModels();
+	startupModels.setProvider(startupFaux.provider);
+	for (let index = 0; index < 30; index++) {
+		const copy = join(directory, `startup-${index}.sqlite`);
+		await copyFile(file, copy);
+		const started = performance.now();
+		const owner = await Agent.open(
+			{
+				storage: await openNodeSqliteStorage(copy),
+				models: startupModels,
+				model: { provider: "faux", modelId: "faux-1" },
+				cwd: directory,
+			},
+			context,
+		);
+		if (index >= 5) startupSamples.push(performance.now() - started);
+		await owner.close(context);
+	}
+	strictEqual(startupFaux.state.callCount, 0);
+	console.log(
+		JSON.stringify({
+			name: `memory/${count}/owner-open-replay-and-prepare`,
+			...summarize(startupSamples),
+			samples: startupSamples,
+		}),
+	);
 	global.gc?.();
 	const faux = fauxProvider();
 	const models = createModels();
