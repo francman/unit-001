@@ -23,30 +23,49 @@ function add(memory: MemoryState, key: string, content: string) {
 
 describe("bounded lexical recall", () => {
 	it("prepares the owner index and reuses structurally shared records after a SQLite receipt-only commit", async () => {
-		// #6: bookkeeping must not move bank-wide tokenization back onto the next request.
+		// #6: bookkeeping must not move bank-wide scanning or tokenization onto the next request.
 		const fixture = await sqliteFixture();
 		const recall = new MemoryRecall();
 		const normalization = vi.spyOn(String.prototype, "normalize");
 		try {
 			await fixture.session.commit(async (tx) => add(await tx.doc(MemoryDoc), "one", "violet approval"), context);
 			const first = await fixture.session.snapshot(MemoryDoc, context);
-			recall.prepare(first);
+			if (first === undefined) throw new Error("Memory is missing");
+			let recordReads = 0;
+			const records = new Proxy(first.records, {
+				ownKeys(target) {
+					recordReads++;
+					return Reflect.ownKeys(target);
+				},
+				get(target, key) {
+					recordReads++;
+					return typeof key === "string" ? target[key] : undefined;
+				},
+			});
+			recall.prepare({ ...first, records });
+			expect(recordReads).toBeGreaterThan(0);
 			expect(normalization).toHaveBeenCalledTimes(1);
 			await fixture.session.commit(
 				async (tx) => forgetMemory(await tx.doc(MemoryDoc), { writeKey: "missing", id: "absent" }),
 				context,
 			);
 			const second = await fixture.session.snapshot(MemoryDoc, context);
+			if (second === undefined) throw new Error("Memory is missing");
 			expect(second).not.toBe(first);
 			expect(second?.records).toBe(first?.records);
 			normalization.mockClear();
-			recall.prepare(second);
+			recordReads = 0;
+			const shared = { ...second, records };
+			recall.prepare(shared);
+			expect(recordReads).toBe(0);
 			expect(normalization).not.toHaveBeenCalled();
-			expect(recall.recall(second, "violet", { now: 0 })[0]?.id).toBe("memory:one");
+			expect(recall.recall(shared, "violet", { now: 0 })[0]?.id).toBe("memory:one");
+			expect(recordReads).toBe(0);
 			expect(normalization).toHaveBeenCalledTimes(1);
 			recall.prepare(undefined);
 			normalization.mockClear();
-			recall.prepare(second);
+			recall.prepare(shared);
+			expect(recordReads).toBeGreaterThan(0);
 			expect(normalization).toHaveBeenCalledTimes(1);
 		} finally {
 			normalization.mockRestore();
