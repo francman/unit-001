@@ -105,12 +105,18 @@ describe.skipIf(process.platform === "win32")("attached chat in a real terminal"
 		expect((await requests(app)).map((request) => request.type)).toEqual(["watch"]);
 	});
 
-	it("matches the visible Ctrl+C action to cancel while busy and detach when idle", async () => {
+	// #36: Wide help says cancel/exit in both states; only owner activity proves cancellation completed.
+	it.each([80, 40])("cancels busy work and detaches only after the owner is ready at %i columns", async (columns) => {
 		const app = await attached(true);
+		await app.tmux("resize-window", "-t", "setup", "-x", String(columns), "-y", "24");
+		await app.waitFor(/^[^\n]*\bWORKING\b/m);
 		await app.waitFor(/Ctrl\+C.*cancel/i);
 		await app.key("C-c");
-		await app.waitFor(/Ctrl\+C.*exit/i);
-		expect((await requests(app)).filter((request) => request.type === "cancel")).toHaveLength(1);
+		await expect
+			.poll(async () => (await requests(app)).filter((request) => request.type === "cancel"), { timeout: 8000 })
+			.toHaveLength(1);
+		await app.waitFor(/^[^\n]*\bREADY\b/m);
+		if (columns < 64) await app.waitFor(/Ctrl\+C exit/);
 		await app.key("C-c");
 		await app.restored(0);
 		expect((await requests(app)).filter((request) => request.type === "cancel")).toHaveLength(1);
