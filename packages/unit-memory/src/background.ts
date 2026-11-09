@@ -1,4 +1,5 @@
 // Short run-end dispatch and lifecycle reconciliation for durable memory maintenance.
+import type { Context } from "@earendil-works/chord/context";
 import {
 	type ConversationId,
 	defineTask,
@@ -8,7 +9,7 @@ import {
 	type TaskRecord,
 	type Tx,
 } from "@earendil-works/pi-durable";
-import { type CaptureInput, MemoryCapture } from "./capture.ts";
+import { type CaptureInput, captureCandidates, MemoryCapture } from "./capture.ts";
 import { MemoryConsolidation, scheduleMemoryConsolidation } from "./consolidation.ts";
 import { MemoryDoc } from "./memory.ts";
 
@@ -42,19 +43,35 @@ export const MemoryCaptureDispatcher = defineTask<CaptureInput, { phase: "dispat
 	},
 });
 
-/** Build constant-time run-end dispatch without extracting or reading transcript history. */
+/** Skip empty short runs with one bounded history read; longer runs retain durable extraction. */
 export function createMemoryBackground() {
 	return {
 		tasks: [MemoryCaptureDispatcher, MemoryCapture, MemoryConsolidation],
-		afterRun: (run: RunSummary, api: HookApi) => ({
-			tasks: [
-				runEndTask(MemoryCaptureDispatcher, {
-					...run,
-					conversationId: api.conversationId,
-					generationTaskId: api.taskId,
-				}),
-			],
-		}),
+		afterRun: async (run: RunSummary, api: HookApi, context: Context) => {
+			const page = await api.entries(
+				{ minEntryId: run.first, maxEntryId: run.last, order: "ascending" },
+				3,
+				undefined,
+				context,
+			);
+			if (
+				page.next === undefined &&
+				page.items.every((entry) => {
+					const extracted = captureCandidates(entry);
+					return extracted.candidates.length === 0 && extracted.skipped === 0;
+				})
+			)
+				return;
+			return {
+				tasks: [
+					runEndTask(MemoryCaptureDispatcher, {
+						...run,
+						conversationId: api.conversationId,
+						generationTaskId: api.taskId,
+					}),
+				],
+			};
+		},
 	};
 }
 

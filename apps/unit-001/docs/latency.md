@@ -21,6 +21,8 @@ The request metric is a composite response-path measurement, not an isolated mea
 
 Automatic memory recall has separate growth measurements below. The composite request budget is not a memory retrieval budget.
 
+Run-end capture now reads at most three entries from the completed run. If that is the complete interval and the existing extractor finds neither candidates nor invalid oversized candidates, it creates no capture task or receipt. Longer runs retain durable background extraction. This trades one bounded read and parsing of short input for fewer empty-learning commits; it does not scan history before a provider request or change SQLite checkpoint policy. On the host below, the unchanged consecutive-request benchmark measured warm median 0.730 ms and p95 1.035 ms after this change. Linux CI verification remains required.
+
 ## Memory growth measurements
 
 `node --conditions=source --experimental-strip-types apps/unit-001/bench/memory-recall.bench.ts` measures the actual memory index, evidence formatter, forgetting, and SQLite document commits without providers. Each record contains approximately 500 characters and matches the broad query `redis`. Cold starts with a new index over an existing in-memory document; warm reuses that index. Forget includes tombstoning a successive record and reconciling changed index postings. SQLite commits add a content-free receipt to the growing document. Setup and storage opening are outside timing. These are component measurements, excluding full request assembly, document replay on reopen, and network latency.

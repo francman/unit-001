@@ -1,22 +1,29 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import fs, { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileCredentialStore } from "../src/credentials.ts";
 
 const fixture = fileURLToPath(new URL("./fixtures/increment.ts", import.meta.url));
 let directory: string;
 let file: string;
 let store: FileCredentialStore;
+const platform = process.platform;
 
 beforeEach(async () => {
 	directory = await mkdtemp(join(tmpdir(), "unit-001-credentials-"));
 	file = join(directory, "nested", "auth.json");
 	store = new FileCredentialStore(file);
 });
-afterEach(() => rm(directory, { recursive: true, force: true }));
+afterEach(async () => {
+	vi.restoreAllMocks();
+	syncBuiltinESMExports();
+	Object.defineProperty(process, "platform", { value: platform });
+	await rm(directory, { recursive: true, force: true });
+});
 
 const oauth = (access: string) => ({ type: "oauth", access, refresh: "r", expires: 1 }) as const;
 const key = (value: string) => ({ type: "api_key", key: value }) as const;
@@ -168,4 +175,90 @@ describe("FileCredentialStore", () => {
 		// A lost update would leave the total below 60.
 		expect(await store.read("counter")).toEqual(key(String(processes * each)));
 	}, 60_000);
+
+	// Regression observed in PR #38's Windows cross-process credentials gate.
+	it.each(["EPERM", "EBUSY"])(
+		"retries transient Windows lock creation %s without entering early",
+		async (errorCode) => {
+			Object.defineProperty(process, "platform", { value: "win32" });
+			const original = fs.open;
+			let attempts = 0;
+			let entered = false;
+			vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+				if (args[0] === `${file}.lock` && ++attempts <= 2) {
+					expect(entered).toBe(false);
+					throw Object.assign(new Error("lock temporarily unavailable"), { code: errorCode });
+				}
+				return original(...args);
+			});
+			syncBuiltinESMExports();
+			await store.modify("counter", async () => {
+				entered = true;
+				return key("1");
+			});
+			expect(attempts).toBe(3);
+			expect(await store.read("counter")).toEqual(key("1"));
+		},
+	);
+
+	it("bounds Windows permission retries and preserves the first denial", async () => {
+		Object.defineProperty(process, "platform", { value: "win32" });
+		const denied = Object.assign(new Error("permanent permission denial"), { code: "EPERM" });
+		const opened = vi
+			.spyOn(fs, "open")
+			.mockRejectedValueOnce(denied)
+			.mockRejectedValue(Object.assign(new Error("later denial"), { code: "EPERM" }));
+		const unlink = vi.spyOn(fs, "unlink");
+		syncBuiltinESMExports();
+		const mutate = vi.fn(async () => key("1"));
+		await expect(store.modify("counter", mutate)).rejects.toBe(denied);
+		expect(opened).toHaveBeenCalledTimes(6);
+		expect(mutate).not.toHaveBeenCalled();
+		expect(unlink).not.toHaveBeenCalled();
+	});
+
+	it("retains the lock deadline during Windows create retries", async () => {
+		Object.defineProperty(process, "platform", { value: "win32" });
+		vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(30_000);
+		const denied = Object.assign(new Error("permission denied at deadline"), { code: "EPERM" });
+		const opened = vi.spyOn(fs, "open").mockRejectedValue(denied);
+		syncBuiltinESMExports();
+		await expect(store.modify("counter", async () => key("1"))).rejects.toBe(denied);
+		expect(opened).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not retry unrelated Windows access errors", async () => {
+		Object.defineProperty(process, "platform", { value: "win32" });
+		const denied = Object.assign(new Error("access denied"), { code: "EACCES" });
+		const opened = vi.spyOn(fs, "open").mockRejectedValue(denied);
+		syncBuiltinESMExports();
+		await expect(store.modify("counter", async () => key("1"))).rejects.toBe(denied);
+		expect(opened).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not retry POSIX permission denial", async () => {
+		Object.defineProperty(process, "platform", { value: "linux" });
+		const denied = Object.assign(new Error("permission denied"), { code: "EPERM" });
+		const opened = vi.spyOn(fs, "open").mockRejectedValue(denied);
+		syncBuiltinESMExports();
+		await expect(store.modify("counter", async () => key("1"))).rejects.toBe(denied);
+		expect(opened).toHaveBeenCalledTimes(1);
+	});
+
+	it("aborts a Windows lock retry without admitting the mutation", async () => {
+		Object.defineProperty(process, "platform", { value: "win32" });
+		const controller = new AbortController();
+		const aborted = new Error("cancel lock wait");
+		const opened = vi.spyOn(fs, "open").mockImplementation(async () => {
+			controller.abort(aborted);
+			throw Object.assign(new Error("pending deletion"), { code: "EPERM" });
+		});
+		syncBuiltinESMExports();
+		const mutate = vi.fn(async () => key("1"));
+		await expect(store.modify("counter", mutate, { signal: controller.signal })).rejects.toThrow(
+			/cancel lock wait|aborted/,
+		);
+		expect(opened).toHaveBeenCalledTimes(1);
+		expect(mutate).not.toHaveBeenCalled();
+	});
 });

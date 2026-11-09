@@ -12,6 +12,7 @@ const LOCK_WAIT_MS = 30_000;
 /** A lock this old belongs to a process that died. */
 const LOCK_STALE_MS = 60_000;
 const RENAME_RETRIES = 5;
+const LOCK_CREATE_RETRIES = 5;
 
 function code(error: unknown): string | undefined {
 	return error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
@@ -142,13 +143,29 @@ export class FileCredentialStore implements CredentialStore {
 	async #lock(signal: AbortSignal | undefined): Promise<() => Promise<void>> {
 		await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
 		const deadline = Date.now() + LOCK_WAIT_MS;
+		let transientAttempts = 0;
+		let transientFailure: unknown;
 		for (;;) {
+			signal?.throwIfAborted();
 			try {
 				const handle = await open(this.#lockPath, "wx", 0o600);
 				await handle.close();
 				return () => unlink(this.#lockPath).catch(() => {});
 			} catch (error) {
-				if (code(error) !== "EEXIST") throw error;
+				if (code(error) === "EEXIST") {
+					transientAttempts = 0;
+					transientFailure = undefined;
+				} else if (process.platform === "win32" && ["EPERM", "EBUSY"].includes(code(error) ?? "")) {
+					// Windows may deny exclusive creation while a previous lock is pending deletion.
+					// Never infer ownership or remove a lock from this error; permanent denial stays visible.
+					transientFailure ??= error;
+					if (transientAttempts >= LOCK_CREATE_RETRIES || Date.now() >= deadline) throw transientFailure;
+					transientAttempts++;
+					await sleep(LOCK_POLL_MS, undefined, { signal });
+					continue;
+				} else {
+					throw error;
+				}
 			}
 			const age = await stat(this.#lockPath).then(
 				(info) => Date.now() - info.mtimeMs,
@@ -160,7 +177,7 @@ export class FileCredentialStore implements CredentialStore {
 			}
 			if (Date.now() > deadline) throw new Error(`Timed out waiting for the credentials lock at ${this.#lockPath}.`);
 			signal?.throwIfAborted();
-			await sleep(LOCK_POLL_MS);
+			await sleep(LOCK_POLL_MS, undefined, { signal });
 		}
 	}
 }
