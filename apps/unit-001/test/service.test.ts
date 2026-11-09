@@ -84,6 +84,38 @@ const signal = () => new AbortController().signal;
 const reply = (text: string) => fauxAssistantMessage([fauxText(text)]);
 
 describe.skipIf(process.platform === "win32")("headless local service", () => {
+	it("#8 inspects and changes memory through the existing owner without another SQLite writer or model call", async () => {
+		const service = await launch([]);
+		const remembered = await requestService(
+			service.path,
+			{ type: "memory", request: { operation: "remember", content: "Violet dashboard", requestId: "wire-memory" } },
+			signal(),
+		);
+		if (remembered.type !== "memory" || remembered.result.operation !== "remember")
+			throw new Error("Unexpected memory response");
+		expect(
+			await requestService(service.path, { type: "memory", request: { operation: "stats" } }, signal()),
+		).toMatchObject({ type: "memory", result: { working: 1 } });
+		expect(
+			await requestService(
+				service.path,
+				{ type: "memory", request: { operation: "recall", query: "violet" } },
+				signal(),
+			),
+		).toMatchObject({ result: { records: [{ id: remembered.result.id, origin: "user" }] } });
+		expect(
+			await requestService(
+				service.path,
+				{
+					type: "memory",
+					request: { operation: "forget", id: remembered.result.id, requestId: "wire-forget", confirmed: true },
+				},
+				signal(),
+			),
+		).toEqual({ type: "memory", result: { operation: "forget", removed: true } });
+		expect(service.faux.state.callCount).toBe(0);
+		await expect(acquireSessionLock(join(directory, "session.sqlite.lock"))).rejects.toThrow("already running");
+	});
 	it("exposes durable maintenance controls while rejecting new admissions", async () => {
 		// #18: Only the owner changes the session gate; clients never open a second SQLite writer.
 		const service = await launch([reply("Allowed")]);
@@ -311,6 +343,16 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 			busy: false,
 			inhibited: false,
 			maintenance: { protocol: 1, state: "open", operationId: null },
+			runtime: {
+				application: "unit-001",
+				name: "agent",
+				provider: "faux",
+				modelId: "faux-1",
+				pid: process.pid,
+				startedAt: expect.any(Number),
+				uptimeMs: expect.any(Number),
+				observedAt: expect.any(Number),
+			},
 		});
 		expect(
 			await requestService(service.path, { type: "send", prompt: "Capital of France?", requestId: "q1" }, signal()),

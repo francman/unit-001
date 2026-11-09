@@ -17,7 +17,7 @@ Download the public Linux archive from the [stable download channel](distributio
 
 ```bash
 tar -xzf unit-001-linux-x64.tar.gz
-cd unit-001-0.0.5-linux-x64
+cd unit-001-0.0.6-linux-x64
 sudo ./install.sh
 ```
 
@@ -61,7 +61,7 @@ sudo agent start
 
 `stop` gracefully closes the harness and preserves unfinished work. `kill` immediately terminates the owned process group and tools; interrupted external effects may need reconciliation. Both preserve durable state and prevent reboot or updates from restarting the agent until explicit `start`.
 
-`sudo agent cancel` instead aborts the current run while leaving the service available. `service-status` reports identity, PID, release version, and busy state. Logs belong to `unit-001@<id>.service` in the system journal. The host must stay on and awake for work to progress.
+`sudo agent cancel` instead aborts the current run while leaving the service available. Durable memory maintenance remains background work. `service-status` reports identity, PID, release version, busy state, and observed owner-process start time/uptime. Logs belong to `unit-001@<id>.service` in the system journal. The host must stay on and awake for work to progress.
 
 Stop, kill, and uninstall default to **No**. Decline or EOF makes no changes. Without a terminal, they require `--yes`; that skips action confirmation, not authorization. Use `sudo -n` or an already-root process for deterministic automation. There is no hidden privilege escalation.
 
@@ -97,4 +97,4 @@ Rollback requires code that understands the stored documents and task checkpoint
 
 ## Scope
 
-Named installations, submitted work, lifecycle controls and the independent update infrastructure are implemented. Maintainers must complete initial publication before public downloads are live. Published bundles configure host trust automatically. Autonomous mission decisions and memory remain separate work in #14–#17 and #3–#9. Old singleton installations are not automatically migrated. Source execution has no managed-system administrative behavior.
+Named installations, submitted work, lifecycle controls, session memory and the independent update infrastructure are implemented. Published bundles configure host trust automatically. See [memory commands](memory.md) for inspection, capture, recall and confirmed forgetting. Autonomous mission decisions remain separate work in #14–#17. Old singleton installations are not automatically migrated. Source execution has no managed-system administrative behavior.

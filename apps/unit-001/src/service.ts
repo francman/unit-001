@@ -11,12 +11,15 @@ import {
 	type MaintenanceState,
 	validateOperationId,
 } from "./maintenance.ts";
+import { type MemoryRequest, type MemoryResult, parseMemoryRequest, parseMemoryResult } from "./memory-control.ts";
+import type { RuntimeFacts } from "./orientation.ts";
 import { validateSessionName } from "./paths.ts";
 import { parseServiceEvent, type ServiceView, serviceView } from "./service-view.ts";
 
 export type { ServiceEvent, ServiceView } from "./service-view.ts";
 
 export type ServiceRequest =
+	| { readonly type: "memory"; readonly request: MemoryRequest }
 	| { readonly type: "send"; readonly prompt: string; readonly requestId?: string }
 	| { readonly type: "status" | "cancel" };
 
@@ -25,6 +28,7 @@ export type MaintenanceRequest =
 	| { readonly type: "maintenance-release"; readonly operationId: string };
 
 export type ServiceResponse =
+	| { readonly type: "memory"; readonly result: MemoryResult }
 	| MaintenanceResult
 	| { readonly type: "reply"; readonly reply: Reply }
 	| {
@@ -36,6 +40,7 @@ export type ServiceResponse =
 			readonly busy: boolean;
 			readonly inhibited: boolean;
 			readonly maintenance: MaintenanceState;
+			readonly runtime: RuntimeFacts;
 	  }
 	| { readonly type: "cancelled" }
 	| { readonly type: "error"; readonly message: string };
@@ -299,6 +304,10 @@ async function handleRequest(
 		await agent.abort(BACKGROUND_CONTEXT);
 		return { type: "cancelled" };
 	}
+	if (value.type === "memory") {
+		if (!("request" in value)) throw new UsageError("Missing memory request.");
+		return { type: "memory", result: await agent.memory(parseMemoryRequest(value.request), BACKGROUND_CONTEXT) };
+	}
 	if (value.type === "maintenance-enter" || value.type === "maintenance-release") {
 		const operationId = "operationId" in value ? value.operationId : undefined;
 		validateOperationId(operationId);
@@ -339,6 +348,8 @@ function parseResponse(wire: string): ServiceResponse {
 	const value: unknown = JSON.parse(wire);
 	// A failed or different local service must not be mistaken for a valid reply.
 	if (typeof value === "object" && value !== null && "type" in value) {
+		if (value.type === "memory" && "result" in value)
+			return { type: "memory", result: parseMemoryResult(value.result) };
 		if (
 			value.type === "maintenance" &&
 			"protocol" in value &&
@@ -378,6 +389,33 @@ function parseResponse(wire: string): ServiceResponse {
 			"inhibited" in value &&
 			typeof value.inhibited === "boolean" &&
 			"maintenance" in value &&
+			"runtime" in value &&
+			typeof value.runtime === "object" &&
+			value.runtime !== null &&
+			"application" in value.runtime &&
+			value.runtime.application === "unit-001" &&
+			"name" in value.runtime &&
+			typeof value.runtime.name === "string" &&
+			"provider" in value.runtime &&
+			typeof value.runtime.provider === "string" &&
+			"modelId" in value.runtime &&
+			typeof value.runtime.modelId === "string" &&
+			"pid" in value.runtime &&
+			typeof value.runtime.pid === "number" &&
+			Number.isSafeInteger(value.runtime.pid) &&
+			value.runtime.pid > 0 &&
+			"startedAt" in value.runtime &&
+			typeof value.runtime.startedAt === "number" &&
+			Number.isSafeInteger(value.runtime.startedAt) &&
+			value.runtime.startedAt > 0 &&
+			"uptimeMs" in value.runtime &&
+			typeof value.runtime.uptimeMs === "number" &&
+			Number.isSafeInteger(value.runtime.uptimeMs) &&
+			value.runtime.uptimeMs >= 0 &&
+			"observedAt" in value.runtime &&
+			typeof value.runtime.observedAt === "number" &&
+			Number.isSafeInteger(value.runtime.observedAt) &&
+			value.runtime.observedAt > 0 &&
 			typeof value.maintenance === "object" &&
 			value.maintenance !== null &&
 			"protocol" in value.maintenance &&
@@ -395,6 +433,16 @@ function parseResponse(wire: string): ServiceResponse {
 				installationId: value.installationId,
 				busy: value.busy,
 				inhibited: value.inhibited,
+				runtime: {
+					application: "unit-001",
+					name: value.runtime.name,
+					provider: value.runtime.provider,
+					modelId: value.runtime.modelId,
+					pid: value.runtime.pid,
+					startedAt: value.runtime.startedAt,
+					uptimeMs: value.runtime.uptimeMs,
+					observedAt: value.runtime.observedAt,
+				},
 				maintenance:
 					value.maintenance.state === "open"
 						? { protocol: 1, state: "open", operationId: null }

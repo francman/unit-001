@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { fauxAssistantMessage, fauxProvider, fauxText } from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Agent } from "../src/agent.ts";
@@ -24,13 +24,19 @@ afterEach(async () => {
 	await rm(directory, { recursive: true, force: true });
 });
 
-async function launch(responses: Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0]) {
+async function launch(responses: Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0], name?: string) {
 	const faux = fauxProvider();
 	faux.setResponses(responses);
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const agent = await Agent.open(
-		{ storage: await openNodeSqliteStorage(file), models, model, cwd: directory },
+		{
+			storage: await openNodeSqliteStorage(file),
+			models,
+			model,
+			cwd: directory,
+			...(name === undefined ? {} : { name }),
+		},
 		context,
 	);
 	open.push(agent);
@@ -40,6 +46,59 @@ async function launch(responses: Parameters<ReturnType<typeof fauxProvider>["set
 const reply = (text: string) => fauxAssistantMessage([fauxText(text)]);
 
 describe("Agent", () => {
+	it("orients the named host separately from its model and describes durable capabilities truthfully", async () => {
+		let requestText = "";
+		const { agent } = await launch(
+			[
+				(request) => {
+					requestText = JSON.stringify(request.messages);
+					return reply("I am bob, running in unit-001.");
+				},
+			],
+			"bob",
+		);
+		await agent.ask("Who are you and do you remember prior conversations?", context);
+		expect(requestText).toContain("unit-001, the durable agent named bob");
+		expect(requestText).toContain("configured model is faux/faux-1");
+		expect(requestText).toContain("persist in this session across restarts");
+		expect(requestText).toContain("Autonomous mission scheduling is not implemented");
+		expect(requestText).toContain("unit_status");
+	});
+
+	it("reads authoritative owner process runtime through a local tool", async () => {
+		let toolResult = "";
+		const before = Date.now();
+		const first = await launch(
+			[
+				fauxAssistantMessage(fauxToolCall("unit_status", {}), { stopReason: "toolUse" }),
+				(request) => {
+					toolResult = JSON.stringify(request.messages);
+					return reply("Owner status read.");
+				},
+			],
+			"bob",
+		);
+		await first.agent.ask("How long have you been running?", context);
+		const status = await first.agent.status(context);
+		expect(status.runtime).toMatchObject({
+			application: "unit-001",
+			name: "bob",
+			provider: "faux",
+			modelId: "faux-1",
+			pid: process.pid,
+		});
+		expect(status.runtime.startedAt).toBeLessThanOrEqual(before);
+		expect(status.runtime.startedAt).toBe(Math.floor(performance.timeOrigin));
+		expect(status.runtime.uptimeMs).toBeGreaterThanOrEqual(0);
+		expect(toolResult).toContain('\\"application\\":\\"unit-001\\"');
+		expect(toolResult).toContain('\\"startedAt\\":');
+		expect(toolResult).toContain('\\"observedAt\\":');
+		expect(status.runtime.observedAt).toBeGreaterThanOrEqual(before);
+		await first.agent.close(context);
+		const second = await launch([], "bob");
+		expect((await second.agent.status(context)).runtime.startedAt).toBe(status.runtime.startedAt);
+	});
+
 	it("answers a prompt", async () => {
 		const { agent } = await launch([reply("Paris.")]);
 		expect(await agent.ask("Capital of France?", context)).toEqual({ status: "answered", text: "Paris." });
@@ -49,6 +108,7 @@ describe("Agent", () => {
 	it("keeps the conversation across a restart", async () => {
 		const first = await launch([reply("Paris.")]);
 		await first.agent.ask("Capital of France?", context);
+		await first.agent.idle(context);
 		await first.agent.close(context);
 
 		// The model of the restarted agent receives the first exchange as context, not just the new question.

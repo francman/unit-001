@@ -12,7 +12,8 @@ The composer border names the agent and shows the newline shortcut; ordinary typ
 
 - **Enter** submits; **Ctrl+J** or **Shift+Enter** inserts a newline. The footer shows the active shortcuts.
 - **PageUp/PageDown** scroll; **Ctrl+Shift+F** searches the displayed transcript when the terminal forwards that key combination distinctly. In search, **Enter/Shift+Enter** moves between matches and **Esc** closes search. These are default bindings; this does not search older or other sessions' history.
-- `/status` shows identity, session, PID, version and activity; `/help` lists commands.
+- `/status` shows identity, session, PID, version and activity, then fresh owner-process start time, uptime and observation time; `/help` lists commands.
+- `/memory` shows counts; `recall QUERY` finds evidence, `remember TEXT` stores a statement, `forget ID` asks for confirmation, and `sleep` schedules consolidation. See [memory commands](memory.md). These operations never submit a model request.
 - `/cancel`, or **Ctrl+C** while working/submitting, cancels shared work. Cancellation can also withdraw queued inputs from other attached operators.
 - `/exit`, `/detach`, **Ctrl+D**, EOF or a lost SSH connection detaches without cancelling admitted work. Idle **Ctrl+C** also detaches. Unsent drafts are not saved after exit.
 

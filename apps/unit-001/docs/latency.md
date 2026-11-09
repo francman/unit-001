@@ -19,7 +19,34 @@ Cold means the first measured operation in a fresh SQLite database and freshly o
 
 The request metric is a composite response-path measurement, not an isolated measurement of prompt assembly or hook dispatch. Its assertions verify that the section and hook reach the provider request and that each run finishes successfully. In the warm case, the same conversation grows: measured requests have 5 through 29 earlier user/assistant exchanges after the five warmups. Cold requests have no earlier exchange. This is a short-session baseline, not a long-history scaling claim.
 
-Automatic memory recall is not implemented. Its benchmark and any isolated memory prompt/hook benchmarks must arrive with those implementations, using representative memory counts and request shapes. Do not substitute a dummy recall operation or treat the composite request budget as a memory retrieval budget.
+Automatic memory recall has separate growth measurements below. The composite request budget is not a memory retrieval budget.
+
+## Memory growth measurements
+
+`node --conditions=source --experimental-strip-types apps/unit-001/bench/memory-recall.bench.ts` measures the actual memory index, evidence formatter, forgetting, and SQLite document commits without providers. Each record contains approximately 500 characters and matches the broad query `redis`. Cold starts with a new index over an existing in-memory document; warm reuses that index. Forget includes tombstoning a successive record and reconciling changed index postings. SQLite commits add a content-free receipt to the growing document. Setup and storage opening are outside timing. These are component measurements, excluding full request assembly, document replay on reopen, and network latency.
+
+Independent verification on 2026-11-09, Apple M5 Pro, macOS arm64, Node v24.15.0, working branch `feat/durable-memory`:
+
+| Records | Cold index + evidence p95 / budget ms | Warm recall + evidence p95 / budget ms | Forget + reconcile p95 / budget ms | SQLite receipt commit p95 / budget ms |
+|---:|---:|---:|---:|---:|
+| 100 | 0.750 / 2 | 0.067 / 1 | 0.060 / 2 | 0.144 / 2 |
+| 1,000 | 5.921 / 20 | 0.142 / 2 | 0.236 / 20 | 0.471 / 5 |
+| 10,000 | 66.681 / 200 | 1.120 / 10 | 3.362 / 200 | 3.008 / 20 |
+
+Budgets were fixed before this verification run from calibration p95 values of 0.794/6.086/61.032 ms cold, 0.070/0.129/0.719 ms warm, 0.580/6.003/62.318 ms after forget, and 0.139/0.478/2.461 ms for receipt commits. Cold/rebuild budgets allow approximately three times the calibrated duration, rounded upward; warm/commit budgets leave additional scheduling headroom. They are provisional local regression guards, not a VPS or CI performance guarantee. The script emits all samples, MAD, and environment metadata and fails above each budget.
+
+At 10,000 records the serialized document was 8.93 MB after 30 forget receipts, compared with 0.87 MB at 1,000. This is serialized state size, not process resident memory or SQLite file size. Checkpoints bound replay depth; records, receipts, tombstones and capture outcomes continue growing. Cold indexing remains proportional to live content. Revision reconciliation scans records and updates changed postings; broad warm queries still visit matching records. Ranking references and copying only selected evidence reduced the earlier 10,000-record warm p95 from approximately 42 ms to 1.12 ms. This does not establish constant-time retrieval or bounded total storage.
+
+`memory-request.bench.ts` covers the complete `Agent.ask()` path through entry into the faux provider, asserting that retrieved evidence reaches the actual request. Its fixture has pending working memories, so default background consolidation runs concurrently; these results include that maintenance workload. It measures 25 requests after the first request and five warmups. It also measures 25 storage-open/first-document-read operations after five warmups. The database has a document checkpoint without a long delta tail; this does not measure worst-case replay. On the same host, fixed-budget verification produced:
+
+| Records | Open + first snapshot p95 / budget ms | Submit-to-provider p95 / budget ms | First request ms (one observation) |
+|---:|---:|---:|---:|
+| 1,000 | 1.722 / 20 | 1.935 / 20 | 20.655 |
+| 10,000 | 14.428 / 100 | 35.763 / 150 | 98.334 |
+
+Budgets were fixed before verification from initial open/read p95 values of 2.53/15.79 ms and request p95 values of 2.07/34.86 ms, with conservative scheduling headroom. First-request observations are single measurements, not percentiles or acceptance guarantees. Network/provider generation remains excluded.
+
+Run `node --expose-gc --conditions=source --experimental-strip-types apps/unit-001/bench/memory-request.bench.ts 10000` for a separate process with one fixture size. That run observed RSS of 286 MB before requests, 501 MB afterward, and 461 MB after explicit garbage collection. RSS includes the process, storage replay, retained heap pages and background work; it is not memory-index allocation or a measured peak. The 1,000-record separate run observed 160/191/191 MB. These macOS measurements do not establish Linux capacity, and **10,000 memories are not guaranteed to fit the 512 MB VPS plan**. Linux/VPS latency and memory calibration, long replay tails and a total-storage retention policy remain outstanding.
 
 ## Unit-001 measurements
 

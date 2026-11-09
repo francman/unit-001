@@ -28,7 +28,7 @@ export const NODE_RELEASE = {
 };
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const upstreamPackages = ["telemetry", "chord", "tui", "codemode", "ai", "durable"];
+const checkoutPackages = ["telemetry", "chord", "tui", "codemode", "ai", "durable", "unit-memory"];
 
 /** Rejects a runtime download unless both its pinned and official checksums agree. */
 export function verifyNodeDownload(contents, officialChecksums) {
@@ -123,7 +123,7 @@ function packDependencies(app) {
 	const vendor = join(app, "vendor");
 	mkdirSync(vendor);
 	const packages = [];
-	for (const name of upstreamPackages) {
+	for (const name of checkoutPackages) {
 		const directory = join(repository, "packages", name);
 		const manifest = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
 		const output = execFileSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", vendor], {
@@ -247,6 +247,9 @@ export function writeReleaseDocumentation(stage) {
 	for (const name of [
 		"deployment.md",
 		"operations.md",
+		"memory.md",
+		"memory/verification.md",
+		"latency.md",
 		"lightsail.md",
 		"terminal.md",
 		"terminal-design.md",
@@ -256,6 +259,7 @@ export function writeReleaseDocumentation(stage) {
 		"updates.md",
 		"distribution.md",
 	]) {
+		mkdirSync(dirname(join(stage, "docs", name)), { recursive: true });
 		cpSync(join(repository, "apps/unit-001/docs", name), join(stage, "docs", name));
 	}
 }
@@ -274,7 +278,7 @@ export function buildRelease(out, options = {}) {
 	const scratch = mkdtempSync(join(output, ".build-"));
 	try {
 		npm(["run", "hydrate-model-data", "--workspace", "packages/ai"]);
-		for (const name of upstreamPackages) {
+		for (const name of checkoutPackages) {
 			npm(["run", name === "ai" ? "build:offline" : "build", "--workspace", `packages/${name}`]);
 		}
 		npm(["run", "build", "--workspace", "apps/unit-001"]);

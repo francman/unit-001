@@ -6,6 +6,7 @@ import {
 	type Conversation,
 	type ConversationWatch,
 	createRegistry,
+	defineEntry,
 	defineExtension,
 	type Extension,
 	Harness,
@@ -14,11 +15,25 @@ import {
 	type Report,
 	type Storage,
 	type Submission,
-	section,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { CodingTools, createPowerShellTool } from "@earendil-works/pi-durable/tools";
+import {
+	createMemoryExtension,
+	forgetMemory,
+	isMemoryBackgroundTask,
+	MemoryDoc,
+	MemoryInputEntry,
+	type MemoryService,
+	memoryStats,
+	reconcileMemoryTasks,
+	recordMemoryInput,
+	rememberMemory,
+	scheduleMemoryConsolidation,
+} from "unit-memory";
 import { MaintenanceDoc, type MaintenanceResult, type MaintenanceState, validateOperationId } from "./maintenance.ts";
+import { type MemoryRequest, type MemoryResult, parseMemoryRequest } from "./memory-control.ts";
+import { createRuntimeFacts, orientationExtension, type RuntimeFacts } from "./orientation.ts";
 import type { ModelChoice } from "./provider.ts";
 
 export interface AgentOptions {
@@ -41,6 +56,8 @@ export type Reply =
 
 type Message = { readonly role?: string; readonly content?: unknown };
 
+const MemoryOperatorEntry = defineEntry<{ operation: "remember"; content: string }>("unit.memory.operator");
+
 function textOf(message: Message | undefined): string | undefined {
 	if (message?.role !== "assistant" || !Array.isArray(message.content)) return undefined;
 	return (message.content as readonly { type: string; text?: string }[])
@@ -53,30 +70,42 @@ export class Agent {
 	readonly #harness: Harness;
 	readonly name: string;
 	readonly #root: Conversation;
+	readonly #runtime: () => RuntimeFacts;
+	readonly #memory: MemoryService;
 	#inhibited: boolean;
 	/** True when a run was unfinished at open; it resumes only when execution is not inhibited. */
 	readonly interrupted: boolean;
 
-	private constructor(harness: Harness, root: Conversation, interrupted: boolean, name: string, inhibited: boolean) {
+	private constructor(
+		harness: Harness,
+		root: Conversation,
+		interrupted: boolean,
+		name: string,
+		inhibited: boolean,
+		runtime: () => RuntimeFacts,
+		memory: MemoryService,
+	) {
 		this.name = name;
 		this.#harness = harness;
 		this.#root = root;
 		this.interrupted = interrupted;
 		this.#inhibited = inhibited;
+		this.#runtime = runtime;
+		this.#memory = memory;
 	}
 
 	/** Opens the session, resuming unfinished work only outside startup inhibition and persistent maintenance holds. */
 	static async open(options: AgentOptions, context: Context): Promise<Agent> {
 		const name = options.name ?? "agent";
-		const preamble = `You are ${name}, a durable coding agent. Your conversation and unfinished work survive restarts. Be concise, and say what you changed or found.`;
+		const runtime = createRuntimeFacts(name, options.model);
+		const memory = createMemoryExtension();
 		const registry = createRegistry();
 		registry.install(CodingTools);
 		if ((options.platform ?? process.platform) === "win32") {
 			registry.install(defineExtension({ name: "powershell", tools: [createPowerShellTool()] }));
 		}
-		registry.install(
-			defineExtension({ name: "unit-001", sections: [section("preamble", () => preamble, { tag: false })] }),
-		);
+		registry.install(orientationExtension(runtime));
+		registry.install(memory.extension);
 		for (const extension of options.extensions ?? []) registry.install(extension);
 
 		const harness = await Harness.open(
@@ -102,10 +131,14 @@ export class Agent {
 				context,
 			);
 			const inhibited = options.startup?.kind === "inhibited" || held;
-			if (!inhibited) harness.resume();
-			return new Agent(harness, root, interrupted, name, inhibited);
+			if (!inhibited) {
+				await root.commit((tx) => reconcileMemoryTasks(tx, root.id, Date.now()), context);
+				harness.resume();
+			}
+			return new Agent(harness, root, interrupted, name, inhibited, runtime, memory);
 		} catch (error) {
 			await harness.close(context).catch(() => {});
+			memory.close();
 			throw error;
 		}
 	}
@@ -119,11 +152,14 @@ export class Agent {
 		const id = await this.#root.commit(async (tx) => {
 			if ((await tx.doc(MaintenanceDoc)).current.state === "held")
 				throw new Error("Service is held for maintenance.");
-			return this.#root.submit(tx, {
+			const id = await this.#root.submit(tx, {
 				type: "input",
 				content: text,
+				entry: { kind: MemoryInputEntry.kind, data: { origin: "human" } },
 				...(options.requestId === undefined ? {} : { requestId: options.requestId }),
 			});
+			await recordMemoryInput(tx, this.#root.id, id, "human", text);
+			return id;
 		}, context);
 		const submission = await this.#harness.submission(id, context);
 		if (submission === undefined) throw new Error("Admitted submission is unavailable.");
@@ -182,8 +218,72 @@ export class Agent {
 		return this.#root.abort(context);
 	}
 
-	close(context: Context): Promise<void> {
-		return this.#harness.close(context);
+	async close(context: Context): Promise<void> {
+		try {
+			await this.#harness.close(context);
+		} finally {
+			this.#memory.close();
+		}
+	}
+
+	/** Reads or changes session memory through its sole storage owner, without model calls. */
+	async memory(request: MemoryRequest, context: Context): Promise<MemoryResult> {
+		const input = parseMemoryRequest(request);
+		if (input.operation === "stats") {
+			const stats = memoryStats(await this.#harness.snapshot(MemoryDoc, context));
+			return { operation: "stats", ...stats, consolidation: stats.consolidation.state };
+		}
+		if (input.operation === "recall") {
+			const state = await this.#harness.snapshot(MemoryDoc, context);
+			return {
+				operation: "recall",
+				records: this.#memory.recall.recall(state, input.query, { topK: 5, now: Date.now() }).map((record) => ({
+					id: record.id,
+					content: record.content,
+					origin: record.provenance.origin,
+					tier: record.tier.kind,
+					score: record.score,
+				})),
+			};
+		}
+		this.requireActive();
+		return this.#root.commit(async (tx) => {
+			if ((await tx.doc(MaintenanceDoc)).current.state === "held")
+				throw new Error("Service is held for maintenance.");
+			const state = await tx.doc(MemoryDoc);
+			if (input.operation === "forget")
+				return {
+					operation: "forget",
+					removed: forgetMemory(state, { writeKey: `operator:${input.requestId}`, id: input.id }),
+				};
+			if (input.operation === "remember") {
+				const writeKey = `operator:${input.requestId}`;
+				const receipt = state.receipts[writeKey];
+				if (receipt !== undefined) {
+					if (receipt.kind !== "remember") throw new Error("Memory request ID already belongs to forget.");
+					return { operation: "remember", id: receipt.memoryId };
+				}
+				const entry = await tx.appendEntry(MemoryOperatorEntry, this.#root.id, {
+					data: { operation: "remember", content: input.content },
+				});
+				const id = rememberMemory(state, {
+					writeKey,
+					content: input.content,
+					now: Date.now(),
+					provenance: {
+						origin: "user",
+						conversationId: this.#root.id,
+						entryIds: [entry.id],
+						derivation: "explicit",
+					},
+				});
+				await scheduleMemoryConsolidation(tx, this.#root.id, Date.now());
+				return { operation: "remember", id };
+			}
+			const taskId = await reconcileMemoryTasks(tx, this.#root.id, Date.now());
+			if (taskId === undefined) throw new Error("No pending memories need consolidation.");
+			return { operation: "sleep", taskId };
+		}, context);
 	}
 
 	/** Resolves when storage closes or fails, so a host can stop advertising a failed agent. */
@@ -192,10 +292,14 @@ export class Agent {
 	}
 
 	/** Reports whether the conversation has an unfinished foreground run. */
-	async status(
-		context: Context,
-	): Promise<{ readonly busy: boolean; readonly inhibited: boolean; readonly maintenance: MaintenanceState }> {
+	async status(context: Context): Promise<{
+		readonly busy: boolean;
+		readonly inhibited: boolean;
+		readonly maintenance: MaintenanceState;
+		readonly runtime: RuntimeFacts;
+	}> {
 		return {
+			runtime: this.#runtime(),
 			busy: (await this.#harness.snapshot(LiveDoc, this.#root.id, context))?.run !== undefined,
 			inhibited: this.#inhibited,
 			maintenance: (await this.#harness.snapshot(MaintenanceDoc, context))?.current ?? {
@@ -206,7 +310,7 @@ export class Agent {
 		};
 	}
 
-	/** Closes admissions durably and observes all session work without cancelling or enabling scheduling. */
+	/** Holds admissions and drains foreground work; durable memory tasks finish/checkpoint when the owner closes. */
 	async enterMaintenance(operationId: string, timeoutMs: number, context: Context): Promise<MaintenanceResult> {
 		validateOperationId(operationId);
 		if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 30_000)
@@ -221,7 +325,10 @@ export class Agent {
 		const deadline = performance.now() + timeoutMs;
 		for (;;) {
 			const inspection = await this.#harness.inspect(context);
-			if (inspection.tasks.length === 0 && inspection.submissions.length === 0) {
+			if (
+				inspection.tasks.every((task) => isMemoryBackgroundTask(task.record)) &&
+				inspection.submissions.length === 0
+			) {
 				return { type: "maintenance", protocol: 1, state: "held", operationId, result: "drained" };
 			}
 			if (performance.now() >= deadline)
@@ -241,6 +348,7 @@ export class Agent {
 			document.current = { protocol: 1, state: "open", operationId: null };
 		}, context);
 		this.#inhibited = false;
+		await this.#root.commit((tx) => reconcileMemoryTasks(tx, this.#root.id, Date.now()), context);
 		this.#harness.resume();
 		return { type: "maintenance", protocol: 1, state: "open", operationId: null };
 	}

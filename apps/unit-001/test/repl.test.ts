@@ -82,7 +82,7 @@ describe("runRepl", () => {
 		const agent = await launch([]);
 		const io = terminal("/status\n/exit\n");
 		await runRepl(agent, io.terminal, signal());
-		expect(io.err()).toBe("agent: idle\n");
+		expect(io.err()).toMatch(/^agent: idle; PID \d+; started .*; uptime \d+s; observed .*\n$/);
 		expect(io.out()).toBe("");
 	});
 

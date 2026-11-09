@@ -1,4 +1,5 @@
 import { UsageError } from "./errors.ts";
+import { memoryCommand } from "./memory-control.ts";
 
 export const DEFAULT_SESSION = "default";
 
@@ -22,6 +23,12 @@ export interface AttachOptions extends ServiceOptions {
 }
 
 export type Command =
+	| {
+			readonly kind: "memory";
+			readonly request: ReturnType<typeof memoryCommand>;
+			readonly yes: boolean;
+			readonly options: ServiceOptions;
+	  }
 	| {
 			readonly kind: "maintenance-enter";
 			readonly operationId: string;
@@ -60,6 +67,7 @@ export const USAGE = `Usage: agent [options]
        agent send <prompt> [options]     ask the running service (optional --request-id for safe retries)
        agent service-status [options]    inspect the running service
        agent cancel [options]            abort its current run
+       agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]
 
 Starts the agent. Its conversations persist, so a restarted process resumes unfinished work.
 
@@ -73,6 +81,7 @@ Options:
   -h, --help             Print this help
 
 Use agent send [options] -- <prompt> when the prompt starts with a hyphen.
+Memory commands contact the running owner. Forget asks for confirmation; --yes confirms for scripts.
 
 A provider is used when you have signed in to it or set its key (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY,
 OPENROUTER_API_KEY), checked in that order. A stored sign-in wins over a key for the same provider.`;
@@ -176,6 +185,48 @@ function parseServiceCommand(
 /** Parses the command line, without the node and script entries. Throws `UsageError` on anything unrecognized. */
 export function parseArguments(argv: readonly string[]): Command {
 	const first = argv[0];
+	if (first === "memory") {
+		const values = new Map<string, string>();
+		const operands: string[] = [];
+		let yes = false;
+		for (let index = 1; index < argv.length; index++) {
+			const argument = argv[index];
+			if (argument === "--help" || argument === "-h") return { kind: "help" };
+			if (argument === "--yes") {
+				if (yes) throw new UsageError("Option --yes was given more than once.");
+				yes = true;
+				continue;
+			}
+			if (argument === "--") {
+				operands.push(...argv.slice(index + 1));
+				break;
+			}
+			if (!argument.startsWith("-")) {
+				operands.push(argument);
+				continue;
+			}
+			const equals = argument.indexOf("=");
+			const flag = equals < 0 ? argument : argument.slice(0, equals);
+			if (!["--session", "--data-dir", "--request-id"].includes(flag))
+				throw new UsageError(`Unknown memory option: ${flag}`);
+			const value = equals < 0 ? argv[++index] : argument.slice(equals + 1);
+			if (!value || values.has(flag)) throw new UsageError(`Option ${flag} needs one value.`);
+			values.set(flag, value);
+		}
+		const operation = operands[0] ?? "stats";
+		if (operands.length > 2 || ((operation === "stats" || operation === "sleep") && operands.length > 1))
+			throw new UsageError("Memory expects one quoted query, statement or ID.");
+		if (yes && operation !== "forget") throw new UsageError("--yes applies only to memory forget.");
+		return {
+			kind: "memory",
+			request: memoryCommand(operation, operands[1], values.get("--request-id")),
+			yes,
+			options: {
+				session: values.get("--session") ?? DEFAULT_SESSION,
+				...(values.has("--data-dir") ? { dataDir: values.get("--data-dir") } : {}),
+			},
+		};
+	}
 	if (first === "maintenance-enter" || first === "maintenance-release") {
 		const values = new Map<string, string>();
 		for (let index = 1; index < argv.length; index++) {

@@ -54,6 +54,47 @@ function runtime(env: Record<string, string>, stdin = ""): { runtime: Runtime; o
 const signal = new AbortController().signal;
 
 describe("main", () => {
+	it.skipIf(process.platform === "win32")(
+		"#8 uses the running owner for memory and requires explicit script forget confirmation",
+		async () => {
+			const directory = join(home, "data");
+			await mkdir(join(directory, "control"), { recursive: true });
+			await writeFile(join(directory, "auth.json"), "invalid; memory clients must never read credentials");
+			const requests: unknown[] = [];
+			const server = createServer((socket) =>
+				socket.once("data", (wire) => {
+					requests.push(JSON.parse(String(wire)));
+					socket.end(`${JSON.stringify({ type: "memory", result: { operation: "forget", removed: true } })}\n`);
+				}),
+			);
+			await new Promise<void>((resolve) =>
+				server.listen(serviceEndpoint(directory, "default", process.platform), resolve),
+			);
+			try {
+				const unconfirmed = runtime({});
+				expect(await main(["memory", "forget", "memory:a"], unconfirmed.runtime, signal)).toBe(2);
+				expect(requests).toEqual([]);
+				const confirmed = runtime({});
+				expect(
+					await main(
+						["memory", "forget", "memory:a", "--yes", "--request-id", "retry"],
+						confirmed.runtime,
+						signal,
+					),
+				).toBe(0);
+				expect(requests).toEqual([
+					{
+						type: "memory",
+						request: { operation: "forget", id: "memory:a", requestId: "retry", confirmed: true },
+					},
+				]);
+				expect(confirmed.out()).toContain("Immutable conversation history remains");
+				expect((await readdir(directory)).sort()).toEqual(["auth.json", "control"]);
+			} finally {
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+			}
+		},
+	);
 	it("rejects setup without a terminal before reading or writing agent files", async () => {
 		const run = runtime({});
 		expect(await main(["setup"], run.runtime, signal)).toBe(2);
@@ -147,7 +188,11 @@ describe("main", () => {
 				expect(cancel.err()).toContain("inhibited");
 				const enter = runtime({});
 				expect(
-					await main(["maintenance-enter", "--operation-id", "update", "--timeout-ms", "0"], enter.runtime, signal),
+					await main(
+						["maintenance-enter", "--operation-id", "update", "--timeout-ms", "0"],
+						enter.runtime,
+						signal,
+					),
 				).toBe(0);
 				expect(JSON.parse(enter.out())).toMatchObject({ state: "held", result: "drained" });
 				const release = runtime({});
@@ -335,40 +380,43 @@ describe("main", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32")("sends leading-hyphen prompts and literal help through the CLI", async () => {
-		const directory = join(home, "data");
-		await mkdir(join(directory, "control"), { recursive: true });
-		const received: unknown[] = [];
-		const server = createServer((socket) => {
-			let buffer = "";
-			socket.setEncoding("utf8");
-			socket.on("data", (chunk: string) => {
-				buffer += chunk;
-				const newline = buffer.indexOf("\n");
-				if (newline === -1) return;
-				received.push(JSON.parse(buffer.slice(0, newline)));
-				socket.end(`${JSON.stringify({ type: "reply", reply: { status: "answered", text: "received" } })}\n`);
+	it.skipIf(process.platform === "win32")(
+		"sends leading-hyphen prompts and literal help through the CLI",
+		async () => {
+			const directory = join(home, "data");
+			await mkdir(join(directory, "control"), { recursive: true });
+			const received: unknown[] = [];
+			const server = createServer((socket) => {
+				let buffer = "";
+				socket.setEncoding("utf8");
+				socket.on("data", (chunk: string) => {
+					buffer += chunk;
+					const newline = buffer.indexOf("\n");
+					if (newline === -1) return;
+					received.push(JSON.parse(buffer.slice(0, newline)));
+					socket.end(`${JSON.stringify({ type: "reply", reply: { status: "answered", text: "received" } })}\n`);
+				});
 			});
-		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(serviceEndpoint(directory, "work", process.platform), resolve);
-		});
-		try {
-			for (const prompt of ["- explain this failure", "--help"]) {
-				const run = runtime({});
-				expect(
-					await main(["send", "--session", "work", "--request-id", "retry", "--", prompt], run.runtime, signal),
-				).toBe(0);
-				expect(run.out()).toBe("received\n");
-				expect(received.at(-1)).toEqual({ type: "send", prompt, requestId: "retry" });
+			await new Promise<void>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(serviceEndpoint(directory, "work", process.platform), resolve);
+			});
+			try {
+				for (const prompt of ["- explain this failure", "--help"]) {
+					const run = runtime({});
+					expect(
+						await main(["send", "--session", "work", "--request-id", "retry", "--", prompt], run.runtime, signal),
+					).toBe(0);
+					expect(run.out()).toBe("received\n");
+					expect(received.at(-1)).toEqual({ type: "send", prompt, requestId: "retry" });
+				}
+			} finally {
+				await new Promise<void>((resolve, reject) =>
+					server.close((error) => (error === undefined ? resolve() : reject(error))),
+				);
 			}
-		} finally {
-			await new Promise<void>((resolve, reject) =>
-				server.close((error) => (error === undefined ? resolve() : reject(error))),
-			);
-		}
-	});
+		},
+	);
 });
 
 describe("built binary", () => {
@@ -423,7 +471,9 @@ describe("named runtime", () => {
 					);
 				}),
 			);
-			await new Promise<void>((resolve) => server.listen(serviceEndpoint(state, "default", process.platform), resolve));
+			await new Promise<void>((resolve) =>
+				server.listen(serviceEndpoint(state, "default", process.platform), resolve),
+			);
 			try {
 				const running = main(
 					[],

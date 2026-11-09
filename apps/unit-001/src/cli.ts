@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Report } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
@@ -12,8 +13,10 @@ import { FileCredentialStore } from "./credentials.ts";
 import { ConfigurationError, UsageError } from "./errors.ts";
 import { acquireSessionLock } from "./lock.ts";
 import { describeStatus, runLogin, runLogout, subscriptionFor } from "./login.ts";
+import { describeMemory, type MemoryRequest } from "./memory-control.ts";
 import { credentialsFile, dataDirectory, sessionFile } from "./paths.ts";
 import { createConfiguredModels, createModelsFor } from "./provider.ts";
+import { sanitizeTerminalText } from "./render.ts";
 import { runPrint, runRepl, type Terminal } from "./repl.ts";
 import {
 	type MaintenanceRequest,
@@ -178,7 +181,8 @@ async function run(
 	const options = command.options;
 	const directory = resolveDirectory(options.dataDir, runtime);
 	const file = sessionFile(directory, options.session, runtime.platform);
-	const endpoint = command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
+	const endpoint =
+		command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
 	const { models, choice } = await createConfiguredModels(
 		runtime.env,
 		options.model ?? (runtime.env.UNIT_001_MODEL || (await readDefaultModel(directory))),
@@ -233,7 +237,7 @@ async function run(
 async function control(
 	command: Extract<
 		Command,
-		{ kind: "send" | "service-status" | "cancel" | "attach" | "maintenance-enter" | "maintenance-release" }
+		{ kind: "send" | "service-status" | "cancel" | "attach" | "maintenance-enter" | "maintenance-release" | "memory" }
 	>,
 	runtime: Runtime,
 	signal: AbortSignal,
@@ -259,6 +263,42 @@ async function control(
 						unavailableHint: `Configure: sudo ${runtime.managed.name} setup\nStart: sudo ${runtime.managed.name} start\nOpen: sudo ${runtime.managed.name}`,
 					}),
 		});
+	}
+	if (command.kind === "memory") {
+		let request: MemoryRequest;
+		if (command.request.operation === "confirm-forget") {
+			if (!command.yes) {
+				if (!runtime.interactive)
+					throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
+				const readline = createInterface({ input: runtime.stdin, output: runtime.stdout });
+				try {
+					const answer = await readline.question(
+						`Forget ${sanitizeTerminalText(command.request.id)}? Conversation history remains. [y/N] `,
+						{ signal },
+					);
+					if (answer.trim().toLowerCase() !== "y" && answer.trim().toLowerCase() !== "yes") {
+						runtime.stdout.write("Forget cancelled.\n");
+						return 0;
+					}
+				} finally {
+					readline.close();
+				}
+			}
+			request = {
+				operation: "forget",
+				id: command.request.id,
+				requestId: command.request.requestId,
+				confirmed: true,
+			};
+		} else request = command.request;
+		const response = await requestService(endpoint, { type: "memory", request }, signal);
+		if (response.type === "error") {
+			runtime.stderr.write(`${response.message}\n`);
+			return 1;
+		}
+		if (response.type !== "memory") throw new Error("Unexpected memory response.");
+		runtime.stdout.write(`${describeMemory(response.result)}\n`);
+		return 0;
 	}
 	const request: ServiceRequest | MaintenanceRequest =
 		command.kind === "maintenance-enter"
@@ -336,7 +376,8 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 			command.kind === "cancel" ||
 			command.kind === "attach" ||
 			command.kind === "maintenance-enter" ||
-			command.kind === "maintenance-release"
+			command.kind === "maintenance-release" ||
+			command.kind === "memory"
 		)
 			code = await control(command, runtime, signal);
 		else code = await account(command, runtime, signal);

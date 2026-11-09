@@ -7,14 +7,14 @@ A durable agent built on [Pi Durable](../../packages/durable). Its conversation 
 - **Always on and mission-driven.** Given a mission and operating boundaries, the agent proactively decides what to do next, executes, verifies results, and adapts without waiting for another user prompt. Missions and unfinished work must survive restarts. It asks for input when a decision exceeds its authority or requires missing information.
 - **Simple to download and install.** One public download includes the runtime, dependencies and update verification keys. Users need no GitHub account, download credentials, signing keys or manual trust configuration. Model-provider sign-in remains separate.
 
-The current launcher resumes interrupted runs, but autonomous mission execution and persistent memory remain to be built.
+The launcher resumes interrupted runs and retains session memory. Autonomous mission execution remains to be built.
 
 ## Design tenets
 
 - **Keep upstream Pi unchanged.** Build on Pi Durable through its public APIs. Unit-specific work belongs in `apps/unit-*` and `packages/unit-*`; never modify upstream files. The upstream guard enforces this, with `package-lock.json` as the sole exception. Raise missing capabilities upstream instead of patching Pi locally.
 - **Keep response latency minimal.** Keep recall, prompt assembly, hooks, and checkpoint commits within measured latency budgets. Run slow work, such as memory extraction and consolidation, in resumable background tasks so it does not delay responses.
 
-The upstream guard and checkpoint/request-preparation benchmark budgets are in place. Memory-specific budgets arrive with the memory implementations.
+The upstream guard and checkpoint/request-preparation benchmark budgets are in place. Memory recall uses an in-process lexical index; extraction and consolidation run as durable background tasks.
 
 ## Requirements
 
@@ -40,6 +40,8 @@ sudo -n agent stop --yes        # no action or sudo prompt; fails if unauthorize
 Public releases require no GitHub account, download token, or manual verification-key setup. The signed bundle includes its public update trust and configures automatic updates; they start when you start the agent. Existing update preferences survive upgrades. See the [download flow](docs/distribution.md) and [one-minute update overview](docs/updates.md). This deployment foundation precedes autonomous mission execution.
 
 `attach` opens a full-screen terminal with Markdown conversation, live tool status, model/usage metadata, and a multiline composer. Enter sends; Ctrl+J inserts a newline. `/exit` or an SSH disconnect leaves work running; `/cancel` cancels shared work. Use `attach --plain` for basic terminals and `send` for pipes. Foreground chat remains separate. See [terminal behavior and comparison](docs/terminal.md) for controls, bounded history, cost estimates, and remaining gaps.
+
+Use `/memory` in chat or `sudo agent memory stats` to inspect structured memory. `recall`, `remember`, confirmed `forget`, and `sleep` operate through the running owner without a model request. Memory survives restarts within one session; separate sessions and installations stay isolated. See the [one-minute memory guide](docs/memory.md).
 
 ## Subscriptions
 
