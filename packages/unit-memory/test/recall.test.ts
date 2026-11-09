@@ -22,6 +22,28 @@ function add(memory: MemoryState, key: string, content: string) {
 }
 
 describe("bounded lexical recall", () => {
+	it("retains exact token order for plain words, underscore parts, normalized text and flags", () => {
+		// #6: skipping redundant plain-word splitting must preserve the lexical index vocabulary.
+		expect([
+			...memoryTokens("plain a_b _leading trailing_ __double__ the_and redis_redis ＣＡＦÉ --the_and -flag"),
+		]).toEqual([
+			"--the_and",
+			"-flag",
+			"plain",
+			"a_b",
+			"b",
+			"_leading",
+			"leading",
+			"trailing_",
+			"trailing",
+			"__double__",
+			"double",
+			"the_and",
+			"redis_redis",
+			"redis",
+			"café",
+		]);
+	});
 	it("prepares the owner index and reuses structurally shared records after a SQLite receipt-only commit", async () => {
 		// #6: bookkeeping must not move bank-wide scanning or tokenization onto the next request.
 		const fixture = await sqliteFixture();

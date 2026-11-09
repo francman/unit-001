@@ -17,8 +17,9 @@ export function memoryTokens(text: string): Set<string> {
 		return " ";
 	});
 	for (const match of remaining.matchAll(/[\p{L}\p{N}_]+/gu)) {
-		if (!stopWords.has(match[0])) tokens.add(match[0]);
-		for (const part of match[0].split("_")) if (part && !stopWords.has(part)) tokens.add(part);
+		const token = match[0];
+		if (!stopWords.has(token)) tokens.add(token);
+		if (token.includes("_")) for (const part of token.split("_")) if (part && !stopWords.has(part)) tokens.add(part);
 	}
 	return tokens;
 }

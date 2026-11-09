@@ -47,6 +47,7 @@ jobs:
           done
 
       - name: Run latency benchmarks
+        id: latency
         run: |
           found=0
           for workspace in $(node .github/scripts/unit-workspaces.mjs bench); do
@@ -58,3 +59,8 @@ jobs:
           if [ "$found" = 0 ]; then
             echo "::warning::No unit workspace defines a bench script; no latency budget was checked."
           fi
+
+      - name: Diagnose full memory request latency after a failed budget
+        if: failure() && steps.latency.conclusion == 'failure'
+        working-directory: apps/unit-001
+        run: node --conditions=source --experimental-strip-types bench/memory-request.bench.ts
