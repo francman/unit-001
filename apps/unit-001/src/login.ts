@@ -46,7 +46,7 @@ export async function runLogin(
 	}
 	const next =
 		launch.kind === "managed"
-			? `Use sudo ${launch.name} attach if already running; otherwise run sudo ${launch.name} start, then sudo ${launch.name} attach.`
+			? `Authorized operators can use ${launch.name} attach if already running; otherwise run sudo ${launch.name} start, then ${launch.name} attach.`
 			: "For foreground chat, run this launcher again without login arguments.";
 	terminal.err(`Signed in with ${subscription.label}. ${next}\n`);
 	return 0;

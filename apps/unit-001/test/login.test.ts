@@ -105,7 +105,12 @@ describe("runLogin", () => {
 	it("runs the provider's oauth login with a terminal interaction and reports success", async () => {
 		const calls: { provider: string; type: string; interaction: AuthInteraction; agentName?: string }[] = [];
 		const models = {
-			login: async (provider: string, type: string, interaction: AuthInteraction, options?: { agentName?: string }) => {
+			login: async (
+				provider: string,
+				type: string,
+				interaction: AuthInteraction,
+				options?: { agentName?: string },
+			) => {
 				calls.push({
 					provider,
 					type,
@@ -142,8 +147,10 @@ describe("runLogin", () => {
 			}),
 		).toBe(0);
 		expect(io.err()).toContain(
-			`Use sudo ${name} attach if already running; otherwise run sudo ${name} start, then sudo ${name} attach.`,
+			`Authorized operators can use ${name} attach if already running; otherwise run sudo ${name} start, then ${name} attach.`,
 		);
+		// #33: only service administration should ask for sudo after authentication succeeds.
+		expect(io.err()).not.toContain(`sudo ${name} attach`);
 		expect(io.err()).not.toContain(`Run ${name} to start.`);
 	});
 

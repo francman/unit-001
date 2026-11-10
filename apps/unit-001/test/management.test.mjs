@@ -47,12 +47,13 @@ async function setup() {
 	const context = {
 		root,
 		uid: 0,
+		groups: () => [],
 		async run(command, args) {
 			calls.push([command, ...args]);
 			return args[0] === "show" ? "inactive\n" : 0;
 		},
 		async account() {
-			return { uid: 1001 };
+			return { uid: 1001, gid: 1001 };
 		},
 		async release() {
 			return "/opt/trusted-release";
@@ -132,6 +133,165 @@ test("#19 root app commands drop privileges and bind identity before opening dat
 	await assert.rejects(dispatchAgent(id, "bob", ["status"], context), /renamed/);
 });
 
+test("#33 public help/version never switch account or read provider environment", async () => {
+	const { context, calls } = await setup();
+	for (const action of ["--help", "-h", "--version", "-v"]) {
+		await dispatchAgent(id, "agent", [action], {
+			...context,
+			uid: 2001,
+			async account() {
+				assert.fail("Public commands must not need an installation account lookup");
+			},
+			async applicationEnvironment() {
+				assert.fail("Public commands must not read provider credentials");
+			},
+			async execApp(node, args) {
+				calls.push([node, ...args]);
+				return 0;
+			},
+		});
+		assert.deepEqual(calls.at(-1), [
+			"/opt/trusted-release/runtime/bin/node",
+			"/opt/trusted-release/app/dist/named.js",
+			id,
+			"agent",
+			`/var/lib/unit-001/agents/${id}`,
+			"--operator",
+			action,
+		]);
+	}
+});
+
+test("#33 only the installation group gets a normal-user client without private environment access", async () => {
+	const { context, calls } = await setup();
+	const operator = {
+		...context,
+		uid: 2001,
+		groups: () => [1001],
+		async applicationEnvironment() {
+			assert.fail("Operator clients must not read provider credentials");
+		},
+		async execApp(node, args) {
+			calls.push([node, ...args]);
+			return 0;
+		},
+	};
+	await dispatchAgent(id, "agent", ["service-status"], operator);
+	assert.equal(calls[0].at(-2), "--operator");
+	assert.equal(calls[0].at(-1), "service-status");
+	await assert.rejects(
+		dispatchAgent(id, "agent", ["service-status"], { ...operator, groups: () => [2002] }),
+		/operator access/,
+	);
+	assert.equal(calls.length, 1);
+});
+
+test("#33 changing operator membership requires root and preserves other groups", async () => {
+	const { context, calls, record, root, paths } = await setup();
+	await software(record, root, paths);
+	const notices = [];
+	await assert.rejects(
+		dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], { ...context, uid: 2001 }),
+		/require root/,
+	);
+	assert.deepEqual(calls, []);
+	await dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], {
+		...context,
+		notice: (message) => notices.push(message),
+	});
+	assert.deepEqual(calls[0], ["usermod", "--append", "--groups", "ua-111111111111411181111111", "ubuntu"]);
+	assert.match(notices[0], /Reconnect SSH/);
+	await dispatchAgent(id, "agent", ["operator", "remove", "ubuntu"], {
+		...context,
+		notice: (message) => notices.push(message),
+	});
+	assert.deepEqual(calls[1], ["gpasswd", "--delete", "ubuntu", "ua-111111111111411181111111"]);
+	assert.match(notices[1], /Existing sessions retain their groups/);
+});
+
+// #33: The exact legacy unit remains owned after an old updater publishes new application code.
+async function legacyUnit(paths) {
+	const current = await readFile(paths.unitFile, "utf8");
+	const legacy = current.replace(`RuntimeDirectory=unit-001-${id}\nRuntimeDirectoryMode=0750\n`, "");
+	assert.equal(
+		createHash("sha256")
+			.update(legacy.replaceAll(id, "@ID@").replaceAll("ua-111111111111411181111111", "@ACCOUNT@"))
+			.digest("hex"),
+		"566fc74ff71df178eb6c773477ebf44d8ac9cf551aa01ab5214d126defc3b874",
+	);
+	await writeFile(paths.unitFile, legacy);
+	return { current, legacy };
+}
+
+test("#33 legacy operator bootstrap requires stopped intent and never silently restarts work", async () => {
+	const { context, calls, record, root, paths } = await setup();
+	await software(record, root, paths);
+	const { current, legacy } = await legacyUnit(paths);
+	const operatorContext = { ...context, notice() {} };
+	await assert.rejects(dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], operatorContext), /Stop agent first/);
+	assert.deepEqual(calls, []);
+	assert.equal(await readFile(paths.unitFile, "utf8"), legacy);
+	await writeInstallation({ ...record, desiredState: "stopped" }, root);
+	await assert.rejects(
+		dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], {
+			...operatorContext,
+			async unitRunning() {
+				return true;
+			},
+		}),
+		/Stop agent first/,
+	);
+	await dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], operatorContext);
+	assert.equal(await readFile(paths.unitFile, "utf8"), current);
+	assert.deepEqual(calls, [
+		["systemctl", "daemon-reload"],
+		["usermod", "--append", "--groups", record.account, "ubuntu"],
+	]);
+	assert.equal(readInstallation(id, root).desiredState, "stopped");
+});
+
+test("#33 failed operator policy reload restores the exact old unit and does not grant access", async () => {
+	const { context, record, root, paths } = await setup();
+	await software(record, root, paths);
+	const { legacy } = await legacyUnit(paths);
+	await writeInstallation({ ...record, desiredState: "stopped" }, root);
+	let reloads = 0;
+	await assert.rejects(
+		dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], {
+			...context,
+			notice() {},
+			async run(command, args) {
+				assert.deepEqual([command, ...args], ["systemctl", "daemon-reload"]);
+				if (++reloads === 1) throw new Error("reload failure");
+			},
+		}),
+		/reload failure/,
+	);
+	assert.equal(reloads, 2);
+	assert.equal(await readFile(paths.unitFile, "utf8"), legacy);
+	assert.equal(readInstallation(id, root).desiredState, "stopped");
+});
+
+test("#33 uninstall recognizes the exact legacy unit and preserves a customized unit", async () => {
+	for (const custom of [false, true]) {
+		const { context, record, root, paths } = await setup();
+		await software(record, root, paths);
+		const { legacy } = await legacyUnit(paths);
+		if (custom) await writeFile(paths.unitFile, `${legacy}# administrator customization\n`);
+		if (custom) {
+			await assert.rejects(lifecycle(record, "uninstall", context), /unowned service unit/);
+			assert.equal(await readFile(paths.unitFile, "utf8"), `${legacy}# administrator customization\n`);
+			await assert.rejects(
+				dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], { ...context, notice() {} }),
+				/unowned service unit/,
+			);
+		} else {
+			await lifecycle(record, "uninstall", context);
+			await assert.rejects(readFile(paths.unitFile), { code: "ENOENT" });
+		}
+	}
+});
+
 test("#19 two names route to separate accounts, UUIDs and state", async () => {
 	const { context, record, calls, root } = await setup();
 	const second = { ...record, id: otherId, name: "bob", account: "ua-222222222222422282222222" };
@@ -163,30 +323,46 @@ test("setup configures as the installation account and declining start preserves
 	await writeInstallation({ ...record, desiredState: "stopped" }, root);
 	const prompts = [];
 	let forwarded;
-	assert.equal(await dispatchAgent(id, "agent", ["setup"], {
-		...context,
-		interactive: true,
-		async applicationEnvironment() {
-			return { OPENAI_API_KEY: "protected provider key" };
-		},
-		async run(command, args, capture, environment, options) {
-			calls.push([command, ...args]);
-			assert.equal(capture, false);
-			assert.deepEqual(options, { forwardSignals: true });
-			forwarded = environment;
-			// Authentication writes must not overlap an update backup or rollback.
-			await assert.rejects(withManagementLock(async () => assert.fail("Update acquired setup lock"), root), /Another install, update, or lifecycle operation/);
-			return 0;
-		},
-		async confirm(prompt) {
-			prompts.push(prompt);
-			return false;
-		},
-	}), 0);
-	assert.deepEqual(calls, [[
-		"runuser", "-u", record.account, "--", "/opt/trusted-release/runtime/bin/node",
-		"/opt/trusted-release/app/dist/named.js", id, "agent", `/var/lib/unit-001/agents/${id}`, "setup",
-	]]);
+	assert.equal(
+		await dispatchAgent(id, "agent", ["setup"], {
+			...context,
+			interactive: true,
+			async applicationEnvironment() {
+				return { OPENAI_API_KEY: "protected provider key" };
+			},
+			async run(command, args, capture, environment, options) {
+				calls.push([command, ...args]);
+				assert.equal(capture, false);
+				assert.deepEqual(options, { forwardSignals: true });
+				forwarded = environment;
+				// Authentication writes must not overlap an update backup or rollback.
+				await assert.rejects(
+					withManagementLock(async () => assert.fail("Update acquired setup lock"), root),
+					/Another install, update, or lifecycle operation/,
+				);
+				return 0;
+			},
+			async confirm(prompt) {
+				prompts.push(prompt);
+				return false;
+			},
+		}),
+		0,
+	);
+	assert.deepEqual(calls, [
+		[
+			"runuser",
+			"-u",
+			record.account,
+			"--",
+			"/opt/trusted-release/runtime/bin/node",
+			"/opt/trusted-release/app/dist/named.js",
+			id,
+			"agent",
+			`/var/lib/unit-001/agents/${id}`,
+			"setup",
+		],
+	]);
 	assert.deepEqual(forwarded, { OPENAI_API_KEY: "protected provider key" });
 	assert.deepEqual(prompts, ["Start agent now? [y/N] "]);
 	assert.equal(readInstallation(id, root).desiredState, "stopped");
@@ -197,18 +373,21 @@ test("setup starts the selected custom name only after successful configuration 
 	const { context, record, root, calls, paths } = await setup();
 	await writeInstallation({ ...record, name: "bob", desiredState: "stopped" }, root);
 	const prompts = [];
-	assert.equal(await dispatchAgent(id, "bob", ["setup"], {
-		...context,
-		interactive: true,
-		async confirm(prompt) {
-			assert.equal(calls[0][0], "runuser");
-			assert.equal(calls.length, 1);
-			prompts.push(prompt);
-			return true;
-		},
-	}), 0);
+	assert.equal(
+		await dispatchAgent(id, "bob", ["setup"], {
+			...context,
+			interactive: true,
+			async confirm(prompt) {
+				assert.equal(calls[0][0], "runuser");
+				assert.equal(calls.length, 1);
+				prompts.push(prompt);
+				return true;
+			},
+		}),
+		0,
+	);
 	assert.deepEqual(prompts, ["Start bob now? [y/N] "]);
-	assert.ok(calls.some(call => call[0] === "systemctl" && call[1] === "enable" && call.includes(paths.unit)));
+	assert.ok(calls.some((call) => call[0] === "systemctl" && call[1] === "enable" && call.includes(paths.unit)));
 	assert.equal(readInstallation(id, root).desiredState, "running");
 });
 
@@ -232,52 +411,70 @@ test("setup failure, EOF and interruption never prompt for start and preserve th
 	}
 });
 
-test("#32 setup wrapper retains the management lock until its signalled child finishes", { timeout: 10000, skip: process.platform === "win32" }, async () => {
-	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-		const { root } = await setup();
-		const childFile = join(root, "setup-child.mjs");
-		const parentFile = join(root, "setup-parent.mjs");
-		await writeFile(childFile, `process.stdin.resume();
+test(
+	"#32 setup wrapper retains the management lock until its signalled child finishes",
+	{ timeout: 10000, skip: process.platform === "win32" },
+	async () => {
+		for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+			const { root } = await setup();
+			const childFile = join(root, "setup-child.mjs");
+			const parentFile = join(root, "setup-parent.mjs");
+			await writeFile(
+				childFile,
+				`process.stdin.resume();
 process.stdin.once('end', () => process.exit(0));
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => {
   process.stdout.write('child-stopping\\n');
   process.stdin.once('data', () => process.exit(0));
 });
 process.stdout.write('child-ready\\n');
-`);
-		await writeFile(parentFile, `import { run } from ${JSON.stringify(new URL("../deploy/agent-command.mjs", import.meta.url).href)};
+`,
+			);
+			await writeFile(
+				parentFile,
+				`import { run } from ${JSON.stringify(new URL("../deploy/agent-command.mjs", import.meta.url).href)};
 import { withManagementLock } from ${JSON.stringify(new URL("../deploy/installation.mjs", import.meta.url).href)};
 try {
   await withManagementLock(() => run(process.execPath, [${JSON.stringify(childFile)}], false, {}, { forwardSignals: true }), ${JSON.stringify(root)});
 } catch (error) {
   process.exitCode = error.exitCode ?? 1;
 }
-`);
-		const parent = spawn(process.execPath, [parentFile], { stdio: ["pipe", "pipe", "inherit"] });
-		try {
-			assert.match((await once(parent.stdout, "data"))[0].toString(), /child-ready/);
-			const stopping = once(parent.stdout, "data");
-			parent.kill(signal);
-			assert.match((await stopping)[0].toString(), /child-stopping/);
-			await assert.rejects(withManagementLock(async () => assert.fail("Update acquired setup lock before child exit"), root), /Another install, update, or lifecycle operation/);
-			const closed = once(parent, "close");
-			parent.stdin.end("finish\n");
-			assert.equal((await closed)[0], { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 }[signal]);
-			await withManagementLock(async () => {}, root);
-		} finally {
-			if (!parent.stdin.writableEnded) parent.stdin.end("finish\n");
-			if (parent.exitCode === null) parent.kill("SIGKILL");
+`,
+			);
+			const parent = spawn(process.execPath, [parentFile], { stdio: ["pipe", "pipe", "inherit"] });
+			try {
+				assert.match((await once(parent.stdout, "data"))[0].toString(), /child-ready/);
+				const stopping = once(parent.stdout, "data");
+				parent.kill(signal);
+				assert.match((await stopping)[0].toString(), /child-stopping/);
+				await assert.rejects(
+					withManagementLock(async () => assert.fail("Update acquired setup lock before child exit"), root),
+					/Another install, update, or lifecycle operation/,
+				);
+				const closed = once(parent, "close");
+				parent.stdin.end("finish\n");
+				assert.equal((await closed)[0], { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 }[signal]);
+				await withManagementLock(async () => {}, root);
+			} finally {
+				if (!parent.stdin.writableEnded) parent.stdin.end("finish\n");
+				if (parent.exitCode === null) parent.kill("SIGKILL");
+			}
 		}
-	}
-});
+	},
+);
 
 test("#32 setup rejects an incomplete update before launching any configuration writes", async () => {
 	for (const phase of ["holding", "backed-up", "candidate", "committed", "restored"]) {
 		const { context, root, calls } = await setup();
 		const update = updatePaths(id, root);
 		await mkdir(update.configDirectory, { recursive: true });
-		await writeFile(update.journal, JSON.stringify({ schemaVersion: 1, id, operationId: "pending-update", phase }), { mode: 0o600 });
-		await assert.rejects(dispatchAgent(id, "agent", ["setup"], { ...context, interactive: true }), /update recover before setup/);
+		await writeFile(update.journal, JSON.stringify({ schemaVersion: 1, id, operationId: "pending-update", phase }), {
+			mode: 0o600,
+		});
+		await assert.rejects(
+			dispatchAgent(id, "agent", ["setup"], { ...context, interactive: true }),
+			/update recover before setup/,
+		);
 		assert.deepEqual(calls, []);
 		await withManagementLock(async () => {}, root);
 	}
@@ -286,7 +483,10 @@ test("#32 setup rejects an incomplete update before launching any configuration 
 test("#32 an active administrative operation blocks setup before authentication begins", async () => {
 	const { context, root, calls } = await setup();
 	await withManagementLock(async () => {
-		await assert.rejects(dispatchAgent(id, "agent", ["setup"], { ...context, interactive: true }), /Another install, update, or lifecycle operation/);
+		await assert.rejects(
+			dispatchAgent(id, "agent", ["setup"], { ...context, interactive: true }),
+			/Another install, update, or lifecycle operation/,
+		);
 	}, root);
 	assert.deepEqual(calls, []);
 });
@@ -295,7 +495,11 @@ test("#32 a completed update journal permits setup", async () => {
 	const { context, root, calls } = await setup();
 	const update = updatePaths(id, root);
 	await mkdir(update.configDirectory, { recursive: true });
-	await writeFile(update.journal, JSON.stringify({ schemaVersion: 1, id, operationId: "completed-update", phase: "complete" }), { mode: 0o600 });
+	await writeFile(
+		update.journal,
+		JSON.stringify({ schemaVersion: 1, id, operationId: "completed-update", phase: "complete" }),
+		{ mode: 0o600 },
+	);
 	assert.equal(await dispatchAgent(id, "agent", ["setup"], { ...context, interactive: true }), 0);
 	assert.equal(calls[0][0], "runuser");
 });
@@ -310,7 +514,10 @@ test("#32 setup's start prompt names the environment model override without expo
 		async applicationEnvironment() {
 			return { OPENAI_API_KEY: "never-display-this", UNIT_001_MODEL: "openai/gpt-5" };
 		},
-		async confirm(value) { prompt = value; return false; },
+		async confirm(value) {
+			prompt = value;
+			return false;
+		},
 	});
 	assert.equal(prompt, "Start agent now using UNIT_001_MODEL (overrides the saved setup model)? [y/N] ");
 	assert.doesNotMatch(prompt, /openai\/gpt-5/);
@@ -320,13 +527,22 @@ test("#32 setup's start prompt names the environment model override without expo
 test("setup never restarts an already running service and explains how to apply changed settings", async () => {
 	const { context, record, root, calls } = await setup();
 	const notices = [];
-	assert.equal(await dispatchAgent(id, "agent", ["setup"], {
-		...context,
-		interactive: true,
-		async unitRunning() { return true; },
-		notice(message) { notices.push(message); },
-		async confirm() { assert.fail("Running setup must not offer an ineffective start"); },
-	}), 0);
+	assert.equal(
+		await dispatchAgent(id, "agent", ["setup"], {
+			...context,
+			interactive: true,
+			async unitRunning() {
+				return true;
+			},
+			notice(message) {
+				notices.push(message);
+			},
+			async confirm() {
+				assert.fail("Running setup must not offer an ineffective start");
+			},
+		}),
+		0,
+	);
 	assert.equal(calls.length, 1);
 	assert.deepEqual(notices, ["Settings are saved. To apply changes, stop and start agent.\n"]);
 	assert.equal(readInstallation(id, root).desiredState, record.desiredState);

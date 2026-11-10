@@ -17,7 +17,7 @@ Download the public Linux archive from the [stable download channel](distributio
 
 ```bash
 tar -xzf unit-001-linux-x64.tar.gz
-cd unit-001-0.0.6-linux-x64
+cd unit-001-0.0.7-linux-x64
 sudo ./install.sh
 ```
 
@@ -38,17 +38,45 @@ The installer reports the ID and configuration path. Complete sign-in before sta
 ```bash
 sudo agent login anthropic
 sudo agent start
-sudo agent service-status
-sudo agent send "Inspect the working repository"
+agent service-status
+agent send "Inspect the working repository"
 ```
 
 Use `openai` for ChatGPT sign-in. API keys and `UNIT_001_MODEL=provider/model-id` can instead go in the agent's root-owned `environment` file; keep it mode `0600` and restart after changes. Subscription login and refresh still require verification with your provider account.
 
 Even through `sudo`, application commands drop to the recorded agent account before accessing credentials or executing tools. Only administrative lifecycle operations retain root. A named command's environment or data-path arguments cannot redirect it to another installation.
 
-`send` uses the owner's private socket, never a second SQLite writer. For a leading-hyphen prompt, use `sudo agent send -- "- explain this failure"`. Use `--request-id` when retrying after a disconnected client to avoid duplicate admission.
+`send` contacts the existing owner, never a second SQLite writer. For a leading-hyphen prompt, use `agent send -- "- explain this failure"`. Use `--request-id` when retrying after a disconnected client to avoid duplicate admission.
 
-For interactive use, run `sudo agent attach` in an SSH terminal. It shows bounded recent conversation and live progress without opening storage. `/exit`, EOF, and SSH disconnect detach; `/cancel` or Ctrl+C while busy cancels the shared session's run. Reattach after a service restart. Use `send` for pipes and scripts. See [terminal behavior](terminal.md) for output limits and shared-session controls.
+For interactive use, run `agent` or `agent attach` in an SSH terminal. It shows bounded recent conversation and live progress without opening storage. `/exit`, EOF, and SSH disconnect detach; `/cancel` or Ctrl+C while busy cancels the shared session's run. Reattach after a service restart. Use `send` for pipes and scripts. See [terminal behavior](terminal.md) for output limits and shared-session controls.
+
+## Operator access and sudo
+
+| Normal authorized operator | Administrator with sudo |
+|---|---|
+| Chat, attach, send, cancel, runtime status, memory stats/recall/remember/forget/sleep | Install, setup, login/logout, model configuration, identity/access changes, start/stop/kill/uninstall, updates and maintenance |
+
+Help and version are public. Normal `agent status` reports the running owner; `sudo agent status` retains the provider-configuration summary. Source `agent status` also retains that summary. Explicit foreground-owner options require administrator access on installed commands.
+
+A new installation grants the nonroot account that invoked `sudo ./install.sh` membership in this installation's dedicated group. Reconnect SSH or log out and back in afterward. Direct-root installs and upgrades do not guess an operator. For an existing Bob installation:
+
+```bash
+sudo bob stop
+sudo bob operator add ubuntu
+sudo bob start
+# Reconnect SSH before running normal-user commands.
+bob status
+bob memory stats
+bob
+```
+
+An update from 0.0.6 preserves its original service definition. Bob keeps running through its private owner interface; operator access remains unconfigured until the sequence above. While stopped, `operator add` verifies the selected release and exact legacy service definition, installs its operator runtime policy, and reloads systemd. It never restarts Bob itself. A failed reload restores the previous definition. Grants on an already configured service do not require stopping it.
+
+Use `sudo bob operator remove USER` to remove membership. Existing login processes retain their groups and connected clients remain attached until closed; end those sessions to complete revocation. Grants belong to one installation and survive rename and upgrades.
+
+The operator client stays under the caller's UID and connects to `/run/unit-001-UUID/default.sock`. The directory is mode `0750`, owned by the service account and its dedicated group; the socket is `0660`. Private state remains `0700`, credentials `0600`, and the administrator socket stays inside private state at `0600`. The owner rejects maintenance and administrative messages on the operator socket. Clients never read provider environment/credentials, enter the private workspace, or open SQLite.
+
+Grant access only to trusted operators. Their chat retains the existing coding tools, which can read or modify files accessible to Bob, including Bob-owned settings and credentials. OS permissions prevent direct client access; they do not sandbox tool execution. Administrative command checks do not constrain arbitrary work delegated to those tools.
 
 ## Stop, kill, and start
 
@@ -61,7 +89,7 @@ sudo agent start
 
 `stop` gracefully closes the harness and preserves unfinished work. `kill` immediately terminates the owned process group and tools; interrupted external effects may need reconciliation. Both preserve durable state and prevent reboot or updates from restarting the agent until explicit `start`.
 
-`sudo agent cancel` instead aborts the current run while leaving the service available. Durable memory maintenance remains background work. `service-status` reports identity, PID, release version, busy state, and observed owner-process start time/uptime. Logs belong to `unit-001@<id>.service` in the system journal. The host must stay on and awake for work to progress.
+`agent cancel` instead aborts the current run while leaving the service available. Durable memory maintenance remains background work. `service-status` reports identity, PID, release version, busy state, and observed owner-process start time/uptime. Logs belong to `unit-001@<id>.service` in the system journal. The host must stay on and awake for work to progress.
 
 Stop, kill, and uninstall default to **No**. Decline or EOF makes no changes. Without a terminal, they require `--yes`; that skips action confirmation, not authorization. Use `sudo -n` or an already-root process for deterministic automation. There is no hidden privilege escalation.
 
@@ -69,7 +97,7 @@ Stop, kill, and uninstall default to **No**. Decline or EOF makes no changes. Wi
 
 ```bash
 sudo agent rename bob
-sudo bob service-status
+bob service-status
 ```
 
 Rename preserves UUID, account, credentials, sessions, workspace, and service identity. It changes the command and record, then gracefully restarts a running service to refresh its cached name. No old-name alias remains. Collisions fail without overwriting their target; interrupted rename is recoverable from the authoritative record.

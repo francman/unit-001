@@ -6,6 +6,7 @@ import {
 	assertSafePath,
 	installationPaths,
 	listInstallations,
+	ownedServiceUnit,
 	removeOwnedAgentCommand,
 	removeUnusedRelease,
 	validateRelease,
@@ -113,13 +114,8 @@ export async function lifecycle(record, action, context, newName) {
 		if (error.code !== "ENOENT") throw error;
 	});
 	if (text !== undefined) {
-		const template =
-			releaseInfo === undefined
-				? undefined
-				: (await readFile(join(release, "deploy/unit-001.service"), "utf8"))
-						.replaceAll("@ID@", record.id)
-						.replaceAll("@ACCOUNT@", record.account);
-		if (text !== template) throw new Error("Refusing to remove an unowned service unit.");
+		if (releaseInfo === undefined) throw new Error("Refusing to remove an unowned service unit.");
+		ownedServiceUnit(record, root);
 	}
 	const helpers = ["agent-command.mjs", "lifecycle.mjs", "installation.mjs", "update-activation.mjs"];
 	for (const file of helpers) {

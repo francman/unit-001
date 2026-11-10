@@ -186,6 +186,76 @@ export function writeInstallation(record, root = "/") {
 	atomicFile(installationPaths(record.id, root).record, `${JSON.stringify(record, null, "\t")}\n`, 0o644, root);
 }
 
+// Exact service template shipped in 0.0.6 (d002562a); signed old updaters retain it during application updates.
+const LEGACY_SERVICE_UNIT = `# Runs the headless agent under its dedicated account with persistent local state.
+[Unit]
+Description=unit-001 durable agent @ID@
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@ACCOUNT@
+Group=@ACCOUNT@
+WorkingDirectory=/var/lib/unit-001/agents/@ID@/workspace
+Environment=HOME=/var/lib/unit-001/agents/@ID@
+EnvironmentFile=-/etc/unit-001/agents/@ID@/environment
+ExecStart=/opt/unit-001/agents/@ID@/current/runtime/bin/node /usr/lib/unit-001/agents/@ID@/agent-command.mjs @ID@ --service
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/unit-001/agents/@ID@
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+`;
+
+/** Recognizes only the selected verified unit or the exact legacy 0.0.6 unit retained by old updaters. */
+export function ownedServiceUnit(record, root = "/") {
+	const paths = installationPaths(record.id, root);
+	const release = join(resolve(root), "opt/unit-001/releases", record.releaseVersion);
+	if (validateRelease(release, root).version !== record.releaseVersion)
+		throw new Error("Service release version mismatch.");
+	const render = (text) => text.replaceAll("@ID@", record.id).replaceAll("@ACCOUNT@", record.account);
+	const selected = render(readFileSync(join(release, "deploy/unit-001.service"), "utf8"));
+	trustedFile(paths.unitFile, root);
+	const installed = readFileSync(paths.unitFile, "utf8");
+	if (installed !== selected && installed !== render(LEGACY_SERVICE_UNIT))
+		throw new Error("Refusing to change an unowned service unit.");
+	return { installed, selected };
+}
+
+/** Enables operator runtime provisioning only while a legacy-unit installation is explicitly stopped. */
+export async function configureOperatorService(record, context) {
+	const { installed, selected } = ownedServiceUnit(record, context.root);
+	if (installed === selected) return false;
+	if (
+		record.desiredState !== "stopped" ||
+		(await context.unitRunning(installationPaths(record.id, context.root).unit))
+	)
+		throw new Error(`Stop ${record.name} first with sudo ${record.name} stop, then retry operator add and start it.`);
+	const path = installationPaths(record.id, context.root).unitFile;
+	atomicFile(path, selected, 0o644, context.root);
+	try {
+		await context.run("systemctl", ["daemon-reload"]);
+	} catch (error) {
+		atomicFile(path, installed, 0o644, context.root);
+		await context.run("systemctl", ["daemon-reload"]);
+		throw error;
+	}
+	return true;
+}
+
 /** Reads bounded release bootstrap metadata without requiring administrator ownership or changing the host. */
 export function readReleaseUpdateBootstrap(release) {
 	try {
@@ -532,6 +602,15 @@ async function installRelease(source, root, name, dryRun) {
 		return;
 	}
 	if (root === "/" && process.getuid() !== 0) throw new Error("Live installation requires root.");
+	let installingOperator;
+	if (root === "/" && old === undefined && process.env.SUDO_UID !== undefined && process.env.SUDO_UID !== "0") {
+		const uid = process.env.SUDO_UID;
+		if (!/^[1-9][0-9]*$/.test(uid)) throw new Error("Invalid installing operator UID.");
+		const fields = execFileSync("getent", ["passwd", uid], { encoding: "utf8" }).trim().split(":");
+		if (fields[2] !== uid || fields[0] !== process.env.SUDO_USER)
+			throw new Error("Installing operator does not match its OS account.");
+		installingOperator = fields[0];
+	}
 	await withManagementLock(async (fd) => {
 		const latest = listInstallations(root).find((current) => current.name === name);
 		if (latest?.id !== old?.id)
@@ -660,6 +739,18 @@ async function installRelease(source, root, name, dryRun) {
 		);
 		if (updatesConfigured)
 			console.log(`Signed public updates are configured automatically and run while ${name} is started.`);
+		if (installingOperator !== undefined) {
+			try {
+				execFileSync("usermod", ["--append", "--groups", record.account, installingOperator], { stdio: "inherit" });
+				console.log(
+					`Operator access granted to ${installingOperator}. Reconnect SSH or log out and back in to refresh groups.`,
+				);
+			} catch {
+				process.stderr.write(
+					`Installation succeeded, but operator access was not granted. Retry sudo ${name} operator add ${installingOperator}.\n`,
+				);
+			}
+		}
 	}, root);
 }
 

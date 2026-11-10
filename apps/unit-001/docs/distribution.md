@@ -8,7 +8,7 @@ The distribution target is a separate public repository, `francman/unit-001-rele
 https://github.com/francman/unit-001-releases/releases/latest/download/unit-001-linux-x64.tar.gz
 ```
 
-Check [release availability](https://github.com/francman/unit-001-releases/releases) before downloading. Installation examples target release `0.0.5`; use the extracted directory for your downloaded version.
+Check [release availability](https://github.com/francman/unit-001-releases/releases) before downloading. Installation examples target release `0.0.7`; use the extracted directory for your downloaded version.
 
 The initial supported target is Ubuntu Server 24.04 LTS on x86-64. After installation, run `sudo agent setup` to choose a provider, sign in or enter an API key, select a model, and optionally start the service. Guided setup is available in release `0.0.4` and later. Public-release updates are already configured and begin when the service starts. `sudo agent update disable` turns them off; existing preferences survive upgrades.
 

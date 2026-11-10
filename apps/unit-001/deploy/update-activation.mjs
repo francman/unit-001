@@ -28,6 +28,7 @@ import { fileURLToPath } from "node:url";
 import {
 	assertSafePath,
 	installationPaths,
+	ownedServiceUnit,
 	readInstallation,
 	trustedFile,
 	trustedParents,
@@ -569,6 +570,33 @@ function stageRelease(candidate, context) {
 function publishApplication(record, version, context) {
 	const paths = installationPaths(record.id, context.root);
 	const release = join(resolve(context.root), "opt/unit-001/releases", version);
+	const journal = readUpdateJournal(record.id, context.root);
+	// This one known rollback crosses the operator-unit migration. Its executing 0.0.7 core owns recovery.
+	if (journal?.previousRecord.releaseVersion === "0.0.7" && journal.candidateVersion === "0.0.6") {
+		ownedServiceUnit(journal.previousRecord, context.root);
+		const template = readFileSync(join(release, "deploy/unit-001.service"), "utf8");
+		const expected =
+			version === "0.0.6"
+				? "566fc74ff71df178eb6c773477ebf44d8ac9cf551aa01ab5214d126defc3b874"
+				: "338be3844ce0bad92dfab8f55df482c1d062bf5795ec320441c7785cf68ccc8a";
+		if (!["0.0.6", "0.0.7"].includes(version) || createHash("sha256").update(template).digest("hex") !== expected)
+			throw new Error("Unsupported service policy transition; preserve the existing unit for administrator review.");
+		const temporary = `${paths.unitFile}.${randomUUID()}.tmp`;
+		try {
+			const fd = openSync(temporary, "wx", 0o644);
+			try {
+				writeFileSync(fd, template.replaceAll("@ID@", record.id).replaceAll("@ACCOUNT@", record.account));
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+			renameSync(temporary, paths.unitFile);
+			syncDirectory(dirname(paths.unitFile));
+		} finally {
+			rmSync(temporary, { force: true });
+		}
+		context.fault?.("service-unit");
+	}
 	for (const file of ["agent-command.mjs", "installation.mjs", "lifecycle.mjs", "update-activation.mjs"]) {
 		if (existsSync(join(release, "deploy", file)))
 			cpSync(join(release, "deploy", file), join(paths.management, file));
@@ -627,6 +655,7 @@ export async function activateUpdate(record, candidate, context) {
 		const admission = await context.admit?.(record, candidate);
 		if (admission) return admission;
 		if (record.desiredState !== "running") return { status: "deferred", reason: "Operator intent is stopped." };
+		if (record.releaseVersion === "0.0.7" && candidate.version === "0.0.6") ownedServiceUnit(record, context.root);
 		const sessions = join(installationPaths(record.id, context.root).state, "sessions");
 		assertSafePath(sessions, context.root);
 		if (existsSync(sessions) && !lstatSync(sessions).isDirectory())

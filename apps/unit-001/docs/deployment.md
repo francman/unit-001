@@ -1,16 +1,19 @@
 # Install and run your agent
 
-Use **Ubuntu Server 24.04 LTS, x86-64**, on an always-on machine or VM. The release includes Node 24 and locked dependencies; no separate Node, compiler, GPU, or database server is required.
+Use **Ubuntu Server 24.04 LTS, x86-64**, on an always-on host. The bundle includes Node 24 and dependencies; no separate Node, npm or database installation is required.
 
-For Amazon Lightsail, use the [VPS setup guide](lightsail.md) and run the bundled `check-vps.sh` before installing.
+For Lightsail, follow the [VPS guide](lightsail.md) and run `bash check-vps.sh` first.
 
-1. Download the public Linux bundle, extract it, and run `sudo ./install.sh`. The installer verifies the bundled file inventory. The command defaults to `agent`; use `sudo ./install.sh --name bob` for `bob` instead. Existing command names are never overwritten. See [download availability](distribution.md) for the stable link and publication state.
-2. Run `sudo agent setup` to choose a provider, sign in or enter an API key, select a model, and optionally start the service. Existing credentials can be kept. Guided setup is available in release `0.0.4` and later.
-3. Submit work with `sudo agent send "your task"`; inspect it with `sudo agent service-status`.
-4. Use `sudo agent stop`, `kill`, or `uninstall`. Each asks for confirmation. For unattended use, append `--yes` and use `sudo -n` so authorization failure cannot prompt.
+1. [Download](distribution.md), extract, and run `sudo ./install.sh`. Add `--name bob` to name the agent Bob; the default is `agent`.
+2. Run `sudo agent setup` to select a provider/model, sign in or enter a key, and start the service.
+3. Reconnect SSH to refresh the new operator group. For an existing installation, run `sudo agent stop`, `sudo agent operator add USER`, then `sudo agent start` first.
+4. Use `agent` for the terminal interface, `agent send "your task"` for scripts, `agent status` for runtime facts, and `agent memory stats` for memory.
+5. Use `sudo agent stop`, `kill`, or `uninstall` for service administration. Confirmation defaults to No; automation uses `sudo -n` with `--yes`.
 
-Each agent has its own stable ID, account, service, sessions, credentials, and workspace. Renaming preserves that identity. Stop/kill remains effective until an explicit start. Uninstall preserves data, configuration, and account ownership, and leaves another agent's software untouched.
+Each installation has its own account and private state. Stop/kill persists until explicit start; uninstall retains data and credentials.
 
-Public signed bundles include verification keys and update settings automatically; users do not configure signing keys or GitHub credentials. Updates begin with the normal agent start and preserve stopped intent. Maintainers must publish the initial signed release before the public download is live. Autonomous mission decisions and memory remain roadmap work.
+Memory edits need no sudo; forgetting still asks for confirmation. Configuration, credentials, identity, access and updates require sudo. Operators retain the agent's coding-tool file authority; this is not a tool sandbox.
+
+Public signed bundles include verification keys and update settings automatically. Updates preserve stopped intent. Autonomous mission decisions remain separate work.
 
 See [operations](operations.md) for configuration, rename, upgrades, and recovery.

@@ -6,7 +6,13 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import { parseEnv } from "node:util";
-import { assertSafePath, installationPaths, readInstallation, withManagementLock } from "./installation.mjs";
+import {
+	assertSafePath,
+	configureOperatorService,
+	installationPaths,
+	readInstallation,
+	withManagementLock,
+} from "./installation.mjs";
 import { lifecycle, recoverRename } from "./lifecycle.mjs";
 import { readUpdateJournal, updatePaths } from "./update-activation.mjs";
 
@@ -19,9 +25,38 @@ export async function dispatchAgent(id, expectedName, args, context) {
 	if (!service && expectedName !== record.name)
 		throw new Error("This agent command was renamed; use its current name.");
 	const action = args[0];
+	if (!service && action === "operator") {
+		if (context.uid !== 0) throw new Error(`Run sudo ${record.name} operator; access changes require root.`);
+		if (args.length !== 3 || !["add", "remove"].includes(args[1]))
+			throw new Error("Usage: NAME operator <add|remove> USER");
+		const user = args[2];
+		if (!/^[a-z_][a-z0-9_-]*[$]?$/i.test(user)) throw new Error("Invalid operator account name.");
+		await context.account(user);
+		return withManagementLock(async () => {
+			const current = await readInstallation(id, context.root);
+			if (current.name !== expectedName || current.desiredState === "uninstalled")
+				throw new Error("The installation changed; retry its current command.");
+			let servicePrepared = false;
+			if (args[1] === "add") {
+				const journal = readUpdateJournal(id, context.root);
+				if (journal && journal.phase !== "complete")
+					throw new Error("Recover the incomplete update before changing operator access.");
+				servicePrepared = await configureOperatorService(current, context);
+			}
+			await context.run(
+				args[1] === "add" ? "usermod" : "gpasswd",
+				args[1] === "add" ? ["--append", "--groups", current.account, user] : ["--delete", user, current.account],
+			);
+			context.notice(
+				args[1] === "add"
+					? `Operator access granted to ${user}. ${servicePrepared ? `Service policy prepared; run sudo ${current.name} start. ` : ""}Reconnect SSH or log out and back in to refresh groups.\n`
+					: `Operator membership removed for ${user}. Existing sessions retain their groups until logout; close them to complete revocation.\n`,
+			);
+			return 0;
+		}, context.root);
+	}
 	if (!service && action === "setup") {
-		if (context.uid !== 0)
-			throw new Error(`Run sudo ${record.name} setup; this command does not elevate itself.`);
+		if (context.uid !== 0) throw new Error(`Run sudo ${record.name} setup; this command does not elevate itself.`);
 		if (args.length !== 1) throw new Error("Invalid setup arguments.");
 		if (context.interactive !== true) throw new Error("Setup requires an interactive terminal.");
 		// Update rollback can restore account state, so configuration writes must share its full transaction lock.
@@ -68,39 +103,46 @@ async function dispatchApplication(record, expectedName, args, context) {
 	const service = expectedName === "--service";
 	const action = args[0];
 	if (record.desiredState === "uninstalled") throw new Error("This agent is uninstalled.");
+	const paths = installationPaths(id, context.root);
+	const release = await context.release(paths.current);
+	const node = join(release, "runtime/bin/node");
+	const app = join(release, "app/dist/named.js");
+	if (!service && context.uid !== 0 && args.length === 1 && ["--help", "-h", "--version", "-v"].includes(action))
+		return context.execApp(node, [app, id, record.name, `/var/lib/unit-001/agents/${id}`, "--operator", ...args]);
 	const account = await context.account(record.account);
 	if (
 		service &&
 		(args.length !== 0 || context.uid !== account.uid || context.uid === 0 || record.desiredState !== "running")
 	)
 		throw new Error("Service startup requires the installation account and running operator intent.");
-	if (context.uid !== 0 && context.uid !== account.uid)
-		throw new Error("Run this command as root or the installation account.");
-	const paths = installationPaths(id, context.root);
-	const release = await context.release(paths.current);
-	const node = join(release, "runtime/bin/node");
-	const app = join(release, "app/dist/named.js");
+	const operator = !service && context.uid !== 0 && context.uid !== account.uid;
+	if (operator && !context.groups().includes(account.gid))
+		throw new Error(
+			"Run this command as root or the installation account, or ask an administrator for operator access. Reconnect SSH after a grant to refresh your groups.",
+		);
 	const journal = service ? readUpdateJournal(id, context.root) : null;
 	const appArgs = [
 		app,
 		id,
 		record.name,
 		`/var/lib/unit-001/agents/${id}`,
+		...(operator ? ["--operator"] : []),
 		...(service ? ["serve", ...(journal && journal.phase !== "complete" ? ["--inhibited"] : [])] : args),
 	];
 	const environment = context.uid === 0 ? await context.applicationEnvironment(paths.environment) : {};
 	// runuser establishes the recorded account before Node opens config, credentials, sockets or state.
 	let result;
 	try {
-		result = context.uid === 0
-			? await context.run(
-				"runuser",
-				["-u", record.account, "--", node, ...appArgs],
-				false,
-				environment,
-				...(action === "setup" ? [{ forwardSignals: true }] : []),
-			)
-			: await context.execApp(node, appArgs);
+		result =
+			context.uid === 0
+				? await context.run(
+						"runuser",
+						["-u", record.account, "--", node, ...appArgs],
+						false,
+						environment,
+						...(action === "setup" ? [{ forwardSignals: true }] : []),
+					)
+				: await context.execApp(node, appArgs);
 	} catch (error) {
 		if (action === "setup" && Number.isInteger(error.exitCode) && error.exitCode > 0) return error.exitCode;
 		throw error;
@@ -176,7 +218,10 @@ export function run(command, args, capture = false, applicationEnvironment = {},
 			else
 				reject(
 					Object.assign(new Error(`${command} failed (${interrupted ?? signal ?? code}).`), {
-						exitCode: interrupted === undefined ? code ?? 128 + (constants.signals[signal] ?? 1) : 128 + constants.signals[interrupted],
+						exitCode:
+							interrupted === undefined
+								? (code ?? 128 + (constants.signals[signal] ?? 1))
+								: 128 + constants.signals[interrupted],
 					}),
 				);
 		});
@@ -229,6 +274,7 @@ export async function configuredEnvironment(path, root = "/") {
 const context = {
 	root: "/",
 	uid: process.geteuid?.(),
+	groups: () => [process.getgid(), ...process.getgroups()],
 	interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
 	run,
 	applicationEnvironment: configuredEnvironment,
@@ -239,9 +285,10 @@ const context = {
 	async account(name) {
 		const fields = (await run("getent", ["passwd", name], true)).trim().split(":");
 		const uid = Number(fields[2]);
-		if (fields[0] !== name || !Number.isSafeInteger(uid) || uid <= 0)
+		const gid = Number(fields[3]);
+		if (fields[0] !== name || !Number.isSafeInteger(uid) || uid <= 0 || !Number.isSafeInteger(gid) || gid <= 0)
 			throw new Error("Invalid installation account.");
-		return { uid };
+		return { uid, gid };
 	},
 	async release(current) {
 		return realpath(current);
