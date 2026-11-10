@@ -33,6 +33,8 @@ If an operator stopped the agent during an interrupted update, recovery preserve
 
 Version `0.0.2` introduces the maintenance protocol. Install this baseline manually before enabling automatic updates on an older installation. This slice supports the default managed session only; additional session databases defer updates.
 
+The 0.0.6 updater retains the existing systemd definition when installing 0.0.7. Bob's private owner and automatic updates remain available, but normal-user operator access needs a one-time administrator step: `sudo bob stop`, `sudo bob operator add USER`, then `sudo bob start`. Reconnect SSH afterward. Only the missing runtime directory permits this compatibility path; an existing directory with unsafe ownership, mode or a symlink is rejected. Explicit 0.0.7-to-0.0.6 rollback restores the exact known legacy service definition before the old owner starts. General service-template evolution remains follow-up work in #18.
+
 Releases declare state format, minimum reader and maintenance-protocol versions. Unsupported declarations hold for operator review. A release number alone never proves state compatibility. Explicit rollback drains again and changes compatible code while preserving current credentials, workspace and durable state. It never restores a historical backup after new work has been allowed to execute.
 
 Rollback pins the selected previous version before activation so the next timer check cannot reinstall the rejected release. The pin remains if rollback fails. Inspect `update status`, recover as needed, and explicitly `unpin` when ready to follow stable again.

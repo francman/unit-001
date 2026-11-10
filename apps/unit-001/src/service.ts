@@ -149,29 +149,39 @@ export async function runService(
 	try {
 		if (operatorServer !== undefined && operatorPath !== undefined) {
 			// systemd provisions this installation-owned directory; operators cannot replace its socket.
-			const directory = await lstat(dirname(operatorPath));
-			if (
-				!directory.isDirectory() ||
-				directory.isSymbolicLink() ||
-				directory.uid !== process.getuid?.() ||
-				directory.gid !== process.getgid?.() ||
-				(directory.mode & 0o777) !== 0o750
-			)
-				throw new ConfigurationError(
-					"Operator runtime directory must belong to the service account with mode 0750.",
-				);
-			await unlink(operatorPath).catch((error: NodeJS.ErrnoException) => {
+			const directory = await lstat(dirname(operatorPath)).catch((error: NodeJS.ErrnoException) => {
 				if (error.code !== "ENOENT") throw error;
+				return undefined;
 			});
-			operatorPrepared = true;
-			await new Promise<void>((resolve, reject) => {
-				operatorServer.once("error", reject);
-				operatorServer.listen(operatorPath, () => {
-					operatorServer.off("error", reject);
-					resolve();
+			if (directory === undefined) {
+				// Old signed updaters preserve the old systemd unit; keep the existing owner available until admin migration.
+				log(
+					`Operator access is not configured. Stop ${agent.name}, run sudo ${agent.name} operator add USER, then start it.\n`,
+				);
+			} else {
+				if (
+					!directory.isDirectory() ||
+					directory.isSymbolicLink() ||
+					directory.uid !== process.getuid?.() ||
+					directory.gid !== process.getgid?.() ||
+					(directory.mode & 0o777) !== 0o750
+				)
+					throw new ConfigurationError(
+						"Operator runtime directory must belong to the service account with mode 0750.",
+					);
+				await unlink(operatorPath).catch((error: NodeJS.ErrnoException) => {
+					if (error.code !== "ENOENT") throw error;
 				});
-			});
-			await chmod(operatorPath, 0o660);
+				operatorPrepared = true;
+				await new Promise<void>((resolve, reject) => {
+					operatorServer.once("error", reject);
+					operatorServer.listen(operatorPath, () => {
+						operatorServer.off("error", reject);
+						resolve();
+					});
+				});
+				await chmod(operatorPath, 0o660);
+			}
 		}
 		// The updater's private readiness probe must not succeed before operator access is prepared.
 		await new Promise<void>((resolve, reject) => {

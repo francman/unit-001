@@ -98,6 +98,34 @@ const signal = () => new AbortController().signal;
 const reply = (text: string) => fauxAssistantMessage([fauxText(text)]);
 
 describe.skipIf(process.platform === "win32")("headless local service", () => {
+	it("#33 keeps the private owner healthy when an old systemd unit lacks the operator directory", async () => {
+		const service = await launch([reply("still available")]);
+		const controller = new AbortController();
+		const privatePath = join(directory, "legacy-private", "default.sock");
+		const operatorPath = join(directory, "missing-runtime", "default.sock");
+		const logs: string[] = [];
+		const running = runService(
+			service.agent,
+			privatePath,
+			"fixture-version",
+			(text) => logs.push(text),
+			controller.signal,
+			null,
+			operatorPath,
+		);
+		void running.catch(() => {});
+		try {
+			await expect.poll(() => logs.some((text) => text.includes("service ready:"))).toBe(true);
+			expect(logs[0]).toContain("Operator access is not configured");
+			expect(await requestService(privatePath, { type: "send", prompt: "still available" }, signal())).toMatchObject(
+				{ type: "reply", reply: { text: "still available" } },
+			);
+			await expect(stat(operatorPath)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			controller.abort();
+			await running;
+		}
+	});
 	it.each(["mode", "symlink"])(
 		"#33 rejects an invalid operator runtime directory (%s) without unlinking existing contents",
 		async (kind) => {

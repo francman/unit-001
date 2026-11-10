@@ -61,12 +61,16 @@ Help and version are public. Normal `agent status` reports the running owner; `s
 A new installation grants the nonroot account that invoked `sudo ./install.sh` membership in this installation's dedicated group. Reconnect SSH or log out and back in afterward. Direct-root installs and upgrades do not guess an operator. For an existing Bob installation:
 
 ```bash
+sudo bob stop
 sudo bob operator add ubuntu
+sudo bob start
 # Reconnect SSH before running normal-user commands.
 bob status
 bob memory stats
 bob
 ```
+
+An update from 0.0.6 preserves its original service definition. Bob keeps running through its private owner interface; operator access remains unconfigured until the sequence above. While stopped, `operator add` verifies the selected release and exact legacy service definition, installs its operator runtime policy, and reloads systemd. It never restarts Bob itself. A failed reload restores the previous definition. Grants on an already configured service do not require stopping it.
 
 Use `sudo bob operator remove USER` to remove membership. Existing login processes retain their groups and connected clients remain attached until closed; end those sessions to complete revocation. Grants belong to one installation and survive rename and upgrades.
 

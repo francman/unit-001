@@ -6,7 +6,7 @@ For Lightsail, follow the [VPS guide](lightsail.md) and run `bash check-vps.sh` 
 
 1. [Download](distribution.md), extract, and run `sudo ./install.sh`. Add `--name bob` to name the agent Bob; the default is `agent`.
 2. Run `sudo agent setup` to select a provider/model, sign in or enter a key, and start the service.
-3. Reconnect SSH to refresh the new operator group. Existing installations first need `sudo agent operator add USER`.
+3. Reconnect SSH to refresh the new operator group. For an existing installation, run `sudo agent stop`, `sudo agent operator add USER`, then `sudo agent start` first.
 4. Use `agent` for the terminal interface, `agent send "your task"` for scripts, `agent status` for runtime facts, and `agent memory stats` for memory.
 5. Use `sudo agent stop`, `kill`, or `uninstall` for service administration. Confirmation defaults to No; automation uses `sudo -n` with `--yes`.
 

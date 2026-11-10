@@ -187,7 +187,8 @@ test("#33 only the installation group gets a normal-user client without private 
 });
 
 test("#33 changing operator membership requires root and preserves other groups", async () => {
-	const { context, calls } = await setup();
+	const { context, calls, record, root, paths } = await setup();
+	await software(record, root, paths);
 	const notices = [];
 	await assert.rejects(
 		dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], { ...context, uid: 2001 }),
@@ -206,6 +207,89 @@ test("#33 changing operator membership requires root and preserves other groups"
 	});
 	assert.deepEqual(calls[1], ["gpasswd", "--delete", "ubuntu", "ua-111111111111411181111111"]);
 	assert.match(notices[1], /Existing sessions retain their groups/);
+});
+
+// #33: The exact legacy unit remains owned after an old updater publishes new application code.
+async function legacyUnit(paths) {
+	const current = await readFile(paths.unitFile, "utf8");
+	const legacy = current.replace(`RuntimeDirectory=unit-001-${id}\nRuntimeDirectoryMode=0750\n`, "");
+	assert.equal(
+		createHash("sha256")
+			.update(legacy.replaceAll(id, "@ID@").replaceAll("ua-111111111111411181111111", "@ACCOUNT@"))
+			.digest("hex"),
+		"566fc74ff71df178eb6c773477ebf44d8ac9cf551aa01ab5214d126defc3b874",
+	);
+	await writeFile(paths.unitFile, legacy);
+	return { current, legacy };
+}
+
+test("#33 legacy operator bootstrap requires stopped intent and never silently restarts work", async () => {
+	const { context, calls, record, root, paths } = await setup();
+	await software(record, root, paths);
+	const { current, legacy } = await legacyUnit(paths);
+	const operatorContext = { ...context, notice() {} };
+	await assert.rejects(dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], operatorContext), /Stop agent first/);
+	assert.deepEqual(calls, []);
+	assert.equal(await readFile(paths.unitFile, "utf8"), legacy);
+	await writeInstallation({ ...record, desiredState: "stopped" }, root);
+	await assert.rejects(
+		dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], {
+			...operatorContext,
+			async unitRunning() {
+				return true;
+			},
+		}),
+		/Stop agent first/,
+	);
+	await dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], operatorContext);
+	assert.equal(await readFile(paths.unitFile, "utf8"), current);
+	assert.deepEqual(calls, [
+		["systemctl", "daemon-reload"],
+		["usermod", "--append", "--groups", record.account, "ubuntu"],
+	]);
+	assert.equal(readInstallation(id, root).desiredState, "stopped");
+});
+
+test("#33 failed operator policy reload restores the exact old unit and does not grant access", async () => {
+	const { context, record, root, paths } = await setup();
+	await software(record, root, paths);
+	const { legacy } = await legacyUnit(paths);
+	await writeInstallation({ ...record, desiredState: "stopped" }, root);
+	let reloads = 0;
+	await assert.rejects(
+		dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], {
+			...context,
+			notice() {},
+			async run(command, args) {
+				assert.deepEqual([command, ...args], ["systemctl", "daemon-reload"]);
+				if (++reloads === 1) throw new Error("reload failure");
+			},
+		}),
+		/reload failure/,
+	);
+	assert.equal(reloads, 2);
+	assert.equal(await readFile(paths.unitFile, "utf8"), legacy);
+	assert.equal(readInstallation(id, root).desiredState, "stopped");
+});
+
+test("#33 uninstall recognizes the exact legacy unit and preserves a customized unit", async () => {
+	for (const custom of [false, true]) {
+		const { context, record, root, paths } = await setup();
+		await software(record, root, paths);
+		const { legacy } = await legacyUnit(paths);
+		if (custom) await writeFile(paths.unitFile, `${legacy}# administrator customization\n`);
+		if (custom) {
+			await assert.rejects(lifecycle(record, "uninstall", context), /unowned service unit/);
+			assert.equal(await readFile(paths.unitFile, "utf8"), `${legacy}# administrator customization\n`);
+			await assert.rejects(
+				dispatchAgent(id, "agent", ["operator", "add", "ubuntu"], { ...context, notice() {} }),
+				/unowned service unit/,
+			);
+		} else {
+			await lifecycle(record, "uninstall", context);
+			await assert.rejects(readFile(paths.unitFile), { code: "ENOENT" });
+		}
+	}
 });
 
 test("#19 two names route to separate accounts, UUIDs and state", async () => {

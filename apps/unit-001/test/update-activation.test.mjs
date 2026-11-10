@@ -49,7 +49,16 @@ function release(root, version, stateCompatibility = compatibility) {
 		"updater/runtime/bin/node": "independent node",
 		"updater/lib/update.mjs": "independent core",
 		"updater/lib/update-activation.mjs": "activation core",
+		"deploy/unit-001.service": readFileSync(
+			fileURLToPath(new URL("../deploy/unit-001.service", import.meta.url)),
+			"utf8",
+		),
 	};
+	if (version === "0.0.6")
+		files["deploy/unit-001.service"] = files["deploy/unit-001.service"].replace(
+			"RuntimeDirectory=unit-001-@ID@\nRuntimeDirectoryMode=0750\n",
+			"",
+		);
 	for (const name of ["installation.mjs", "lifecycle.mjs", "agent-command.mjs", "update-activation.mjs"])
 		files[`deploy/${name}`] = readFileSync(fileURLToPath(new URL(`../deploy/${name}`, import.meta.url)), "utf8");
 	for (const [path, text] of Object.entries(files)) {
@@ -65,7 +74,7 @@ function release(root, version, stateCompatibility = compatibility) {
 	return directory;
 }
 
-function setup(mode = "healthy") {
+function setup(mode = "healthy", versions = { baseline: "0.0.2", candidate: "0.0.3" }) {
 	const root = mkdtempSync(join(tmpdir(), "unit-update-"));
 	roots.push(root);
 	const record = {
@@ -73,7 +82,7 @@ function setup(mode = "healthy") {
 		id,
 		name: "agent",
 		account: "ua-111111111111411181111111",
-		releaseVersion: "0.0.2",
+		releaseVersion: versions.baseline,
 		desiredState: "running",
 	};
 	writeInstallation(record, root);
@@ -85,9 +94,16 @@ function setup(mode = "healthy") {
 	database.exec("CREATE TABLE proof(value TEXT)");
 	database.close();
 	writeFileSync(join(paths.state, "marker"), "old state");
-	const old = release(root, "0.0.2");
-	const next = release(root, "0.0.3");
-	symlinkSync("../../releases/0.0.2", paths.current);
+	const old = release(root, versions.baseline);
+	const next = release(root, versions.candidate);
+	symlinkSync(`../../releases/${versions.baseline}`, paths.current);
+	mkdirSync(dirname(paths.unitFile), { recursive: true });
+	writeFileSync(
+		paths.unitFile,
+		readFileSync(join(old, "deploy/unit-001.service"), "utf8")
+			.replaceAll("@ID@", id)
+			.replaceAll("@ACCOUNT@", record.account),
+	);
 	const calls = [];
 	let running = mode !== "broken";
 	let inhibited = false;
@@ -138,8 +154,69 @@ function setup(mode = "healthy") {
 		},
 	};
 	installUpdateCore(record, old, context);
-	return { root, record, paths, context, calls, candidate: { releasePath: next, version: "0.0.3", compatibility } };
+	return {
+		root,
+		record,
+		paths,
+		context,
+		calls,
+		candidate: { releasePath: next, version: versions.candidate, compatibility },
+	};
 }
+
+// #33: A bootstrapped operator unit must not break the old 0.0.6 lifecycle after explicit code rollback.
+test("#33 legacy rollback preserves custom service policy before draining or stopping work", async () => {
+	const fixture = setup("healthy", { baseline: "0.0.7", candidate: "0.0.6" });
+	const custom = `${readFileSync(fixture.paths.unitFile, "utf8")}# administrator customization\n`;
+	writeFileSync(fixture.paths.unitFile, custom);
+	await assert.rejects(activateUpdate(fixture.record, fixture.candidate, fixture.context), /unowned service unit/);
+	assert.deepEqual(fixture.calls, []);
+	assert.equal(readFileSync(fixture.paths.unitFile, "utf8"), custom);
+});
+
+test("#33 explicit 0.0.7 to 0.0.6 activation restores the exact legacy unit before startup", async () => {
+	const fixture = setup("healthy", { baseline: "0.0.7", candidate: "0.0.6" });
+	const legacy = readFileSync(join(fixture.candidate.releasePath, "deploy/unit-001.service"), "utf8")
+		.replaceAll("@ID@", id)
+		.replaceAll("@ACCOUNT@", fixture.record.account);
+	const run = fixture.context.run;
+	fixture.context.run = async (command, args, ...rest) => {
+		if (command === "systemctl" && args[0] === "start")
+			assert.equal(readFileSync(fixture.paths.unitFile, "utf8"), legacy);
+		return run(command, args, ...rest);
+	};
+	assert.equal((await activateUpdate(fixture.record, fixture.candidate, fixture.context)).status, "updated");
+	assert.equal(readFileSync(fixture.paths.unitFile, "utf8"), legacy);
+	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.6");
+});
+
+for (const phase of ["service-unit", "candidate"])
+	test(`#33 interrupted legacy rollback at ${phase} restores the operator unit and owner`, async () => {
+		const fixture = setup("healthy", { baseline: "0.0.7", candidate: "0.0.6" });
+		const previous = readFileSync(fixture.paths.unitFile, "utf8");
+		const run = fixture.context.run;
+		let crashed = false;
+		fixture.context.fault = (current) => {
+			if (current === phase) {
+				crashed = true;
+				throw new Error("power loss");
+			}
+		};
+		fixture.context.run = async (...args) => {
+			if (crashed) throw new Error("power loss");
+			return run(...args);
+		};
+		await assert.rejects(activateUpdate(fixture.record, fixture.candidate, fixture.context), /power loss/);
+		assert.notEqual(readFileSync(fixture.paths.unitFile, "utf8"), previous);
+		assert.equal(readInstallation(id, fixture.root).releaseVersion, phase === "candidate" ? "0.0.6" : "0.0.7");
+		delete fixture.context.fault;
+		fixture.context.run = run;
+		await recoverUpdate(fixture.record, fixture.context);
+		assert.equal(readFileSync(fixture.paths.unitFile, "utf8"), previous);
+		assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.7");
+		assert.equal(readlinkSync(fixture.paths.current), "../../releases/0.0.7");
+		assert.equal(readUpdateJournal(id, fixture.root).phase, "complete");
+	});
 
 test("#18 independent core survives an unusable application and activates a compatible repair", async () => {
 	const fixture = setup("broken");

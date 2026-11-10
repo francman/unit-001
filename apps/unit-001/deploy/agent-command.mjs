@@ -6,7 +6,13 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import { parseEnv } from "node:util";
-import { assertSafePath, installationPaths, readInstallation, withManagementLock } from "./installation.mjs";
+import {
+	assertSafePath,
+	configureOperatorService,
+	installationPaths,
+	readInstallation,
+	withManagementLock,
+} from "./installation.mjs";
 import { lifecycle, recoverRename } from "./lifecycle.mjs";
 import { readUpdateJournal, updatePaths } from "./update-activation.mjs";
 
@@ -30,13 +36,20 @@ export async function dispatchAgent(id, expectedName, args, context) {
 			const current = await readInstallation(id, context.root);
 			if (current.name !== expectedName || current.desiredState === "uninstalled")
 				throw new Error("The installation changed; retry its current command.");
+			let servicePrepared = false;
+			if (args[1] === "add") {
+				const journal = readUpdateJournal(id, context.root);
+				if (journal && journal.phase !== "complete")
+					throw new Error("Recover the incomplete update before changing operator access.");
+				servicePrepared = await configureOperatorService(current, context);
+			}
 			await context.run(
 				args[1] === "add" ? "usermod" : "gpasswd",
 				args[1] === "add" ? ["--append", "--groups", current.account, user] : ["--delete", user, current.account],
 			);
 			context.notice(
 				args[1] === "add"
-					? `Operator access granted to ${user}. Reconnect SSH or log out and back in to refresh groups.\n`
+					? `Operator access granted to ${user}. ${servicePrepared ? `Service policy prepared; run sudo ${current.name} start. ` : ""}Reconnect SSH or log out and back in to refresh groups.\n`
 					: `Operator membership removed for ${user}. Existing sessions retain their groups until logout; close them to complete revocation.\n`,
 			);
 			return 0;
