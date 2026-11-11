@@ -64,6 +64,16 @@ test("#36 bundled terminal design resolves its setup guide inside the signed doc
 		readFileSync(join(directory, "docs/latency.md")),
 		readFileSync(new URL("../docs/latency.md", import.meta.url)),
 	);
+	// #14: the installed mission commands must have their complete authority and recovery guide.
+	assert.deepEqual(
+		readFileSync(join(directory, "docs/missions/design.md")),
+		readFileSync(new URL("../docs/missions/design.md", import.meta.url)),
+	);
+	assert.match(readFileSync(join(directory, "SHA256SUMS"), "utf8"), /\.\/docs\/missions\/design\.md/);
+	assert.deepEqual(
+		readFileSync(join(directory, "docs/missions/verification.md")),
+		readFileSync(new URL("../docs/missions/verification.md", import.meta.url)),
+	);
 });
 
 test("#16 Linux archives exclude macOS extended attributes and AppleDouble companions", () => {

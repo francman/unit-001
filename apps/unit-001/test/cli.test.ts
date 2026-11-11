@@ -500,9 +500,11 @@ describe("named runtime", () => {
 		).toBe(1);
 		expect(run.err()).toContain("not in the openai catalog");
 		const selected = runtime({});
-		expect(await main(["--session", "work"], { ...selected.runtime, interactive: true, managed }, signal)).toBe(1);
+		// #14: an unconfigured owner retains the explicit ordinary-work session without inventing a provider.
+		expect(await main(["--session", "work"], { ...selected.runtime, interactive: true, managed }, signal)).toBe(0);
 		expect(selected.err()).toContain("No model provider is configured");
 		expect(selected.err()).not.toContain("Cannot connect to bob");
+		expect(await readdir(join(managed.state, "sessions"))).toContain("work.sqlite");
 	});
 	it("uses the installed name in help and rejects conflicting state paths", async () => {
 		// #19: named commands bind runtime identity and state rather than the caller environment.
@@ -540,10 +542,12 @@ describe("modern default foreground entry", () => {
 		}
 	});
 
-	it("points an unconfigured foreground user to guided setup", async () => {
+	it("#14 opens an unconfigured foreground owner with setup guidance and no credential writes", async () => {
 		const run = runtime({});
-		expect(await main([], { ...run.runtime, interactive: true }, signal)).toBe(1);
+		expect(await main([], { ...run.runtime, interactive: true }, signal)).toBe(0);
 		expect(run.err()).toContain("Run agent setup");
-		expect(await readdir(home)).toEqual([]);
+		expect(run.err()).toContain("Mission drafting and memory remain available");
+		expect(await readdir(join(home, "data", "sessions"))).toContain("default.sqlite");
+		await expect(readFile(join(home, "data", "auth.json"))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });

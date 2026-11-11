@@ -2,6 +2,7 @@ import { createInterface } from "node:readline/promises";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
 import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-control.ts";
+import { describeMission } from "./missions/command.ts";
 import { DeltaPrinter, liveText, sanitizeTerminalText, ToolAnnouncer } from "./render.ts";
 
 export interface Terminal {
@@ -13,7 +14,7 @@ export interface Terminal {
 }
 
 const HELP =
-	"Commands: /help, /status, /memory [stats|recall <query>|remember <text>|forget <id>|sleep], /exit (or Ctrl+D). Ctrl+C stops the current run.";
+	"Commands: /help, /status, /mission, /memory [stats|recall <query>|remember <text>|forget <id>|sleep], /exit (or Ctrl+D). Ctrl+C stops the current run.";
 
 /** Runs one prompt, streaming the answer to `terminal.out` and tool use to `terminal.err`. */
 async function turn(agent: Agent, prompt: string, terminal: Terminal, signal: AbortSignal): Promise<Reply> {
@@ -102,7 +103,11 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 	try {
 		if (signal.aborted) return 0;
 		if (interactive) terminal.err(`${agent.name} ready. ${HELP}\n`);
-		if (agent.interrupted) {
+		const initial = await agent.status(BACKGROUND_CONTEXT);
+		if (signal.aborted) return 0;
+		if (agent.interrupted && initial.runtime.configuration === "unconfigured")
+			terminal.err("Interrupted work is preserved. Configure a provider and reopen the owner to resume it.\n");
+		if (agent.interrupted && initial.runtime.configuration === "configured") {
 			current = new AbortController();
 			const recovering = current;
 			const { context, cancel } = withCancel(BACKGROUND_CONTEXT);
@@ -150,6 +155,16 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 				terminal.err(
 					`${agent.name}: ${status.busy ? "busy" : "idle"}; PID ${status.runtime.pid}; started ${new Date(status.runtime.startedAt).toISOString()}; uptime ${Math.floor(status.runtime.uptimeMs / 1000)}s; observed ${new Date(status.runtime.observedAt).toISOString()}\n`,
 				);
+			} else if (text === "/mission" || text === "/mission status" || text === "/mission setup") {
+				try {
+					terminal.err(`${describeMission(await agent.mission({ operation: "status" }, BACKGROUND_CONTEXT))}\n`);
+					if (text === "/mission setup")
+						terminal.err(
+							`Close this foreground session, run ${agent.name} serve, then run ${agent.name} mission setup in another terminal.\n`,
+						);
+				} catch (error) {
+					terminal.err(`Mission: ${error instanceof Error ? error.message : String(error)}\n`);
+				}
 			} else if (text === "/memory" || text.startsWith("/memory ")) {
 				try {
 					const match = /^\/memory(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/.exec(text);
