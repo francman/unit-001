@@ -2,6 +2,10 @@
 
 Read the [one-minute overview](deployment.md) first. Managed installations target Ubuntu Server 24.04 LTS on x86-64. Source development remains available on macOS, Linux, and Windows.
 
+## Local verification; no GitHub Actions
+
+GitHub Actions is disabled for the source and public release repositories. Do not enable or dispatch it, including self-hosted Actions. Local full checks, focused tests, actual terminal inspection and required native acceptance remain mandatory. See [standalone verification](#standalone-verification) for commands, signed local publication and explicit coverage gaps. GitHub PRs, issues, boards and release assets remain available.
+
 ## Build and verify a release
 
 From the repository root, with network access, `curl`, and `tar` available:
@@ -11,7 +15,7 @@ npm ci --ignore-scripts
 node apps/unit-001/scripts/build-release.mjs --out .artifacts/unit-001-release
 ```
 
-The builder hydrates Pi model data, compiles the app and required Pi packages, installs locked production dependencies without lifecycle scripts, and bundles a pinned Node 24 runtime. It verifies Node's checksum and hashes the complete payload. This development build stays unconfigured. Public production builds also pass `--update-root /secure/root.json`; the separate publication workflow supplies that approved public metadata automatically. The installer then configures public updates without asking users for keys or credentials. See [continuous updates](updates.md) for maintainer setup and recovery.
+The builder hydrates Pi model data, compiles the app and required Pi packages, installs locked production dependencies without lifecycle scripts, and bundles a pinned Node 24 runtime. It verifies Node's checksum and hashes the complete payload. This development build stays unconfigured. Public production builds also pass `--update-root /secure/root.json`; the trusted local maintainer supplies that approved public metadata. The installer then configures public updates without asking users for keys or credentials. See [continuous updates](updates.md) for maintainer setup and recovery.
 
 Download the public Linux archive from the [stable download channel](distribution.md). For the current app version:
 
@@ -126,3 +130,65 @@ Rollback requires code that understands the stored documents and task checkpoint
 ## Scope
 
 Named installations, submitted work, lifecycle controls, session memory and the independent update infrastructure are implemented. Published bundles configure host trust automatically. See [memory commands](memory.md) for inspection, capture, recall and confirmed forgetting. Autonomous mission decisions remain separate work in #14–#17. Old singleton installations are not automatically migrated. Source execution has no managed-system administrative behavior.
+
+## Standalone verification
+
+**Use no GitHub Actions.** Actions is disabled repository-wide for `francman/unit-001` and `francman/unit-001-releases`, including scheduled, manual and self-hosted workflows. Existing workflow files remain unchanged and inert. GitHub PRs, issues, boards, release assets and APIs remain usable. Bob's runtime and signed updater do not depend on Actions.
+
+### Required local proof
+
+| Change | Required evidence |
+|---|---|
+| Documentation | Full-file review, valid links and actual pre-commit hook |
+| Runtime | Full `npm run check`, changed/focused faux-provider tests and original latency gates |
+| Terminal or access | Actual rich/plain PTYs, key entry, resize and terminal restoration; Linux UID/tool isolation for access changes |
+| Platform-sensitive code | Relevant native platform results; unavailable Windows/macOS/Linux proof remains pending |
+| Installer, service policy or updater | Packaging and recovery tests plus real disposable Ubuntu24/systemd published-old migration, crash, rollback and recovery acceptance |
+| Public release | Exact clean merged-main SHA, packaged Ubuntu runtime smoke, signed TUF/source/hash/freshness checks, anonymous download equality and safe production acceptance |
+
+Run commands from a separate clean checkout. Hydrate dependencies with `npm ci --ignore-scripts`; build prerequisites when tests need built output. Use specific test files or the repository's non-e2e `./test.sh`, never an unbounded full Vitest invocation. Keep faux providers and avoid paid test calls. App-focused examples:
+
+```bash
+npm run check
+node --test apps/unit-001/test/release.test.mjs
+cd apps/unit-001
+node ../../node_modules/vitest/dist/cli.js --run test/operator-client.test.ts
+```
+
+Choose tests for the actual change; these examples do not replace the full relevant acceptance set. Run each changed test file. Existing package/app bench scripts retain their original thresholds. Do not silently raise a gate, skip checks, weaken permissions or label unavailable proof passed. Record exact source SHA, commands, results and gaps in the PR. Upstream model-catalog issue #35 remains unresolved; disabling hosted CI does not fix it.
+
+### Security coverage after disabling Actions
+
+The former daily npm vulnerability/signature audit and environment-specific platform jobs no longer run automatically. **No replacement standalone security schedule is established yet.** Until one is reviewed and deployed, maintainers must run these checks locally and record their observation time:
+
+```bash
+node scripts/npm-audit.mjs
+npm audit signatures --omit=dev
+```
+
+Review findings; do not automatically rewrite dependencies to make an audit green. Environment/SSH changes still need their relevant Rust, public execution-environment, native daemon and default-shell fixtures. Unavailable platforms remain a visible coverage gap. A future non-Actions scheduler must run on a separate trusted build machine, with bounded commands and failure reporting. Do not add a CI runner to the production VPS or re-enable Actions for security checks.
+
+### Native acceptance is not simulated Docker proof
+
+The existing named disposable Docker path proves Linux UID, coding-tool and PTY behavior but deliberately skips published-old migration and signed-update/crash fixtures. Those scripts currently require an explicitly guarded native Ubuntu24/systemd host. DockerDesktop on the development machine is ARM with x64 emulation; no full-native local VM path is established. Do not spoof `GITHUB_ACTIONS` or other runner markers to bypass a guard.
+
+A standalone replacement needs an isolated disposable Linuxx64/systemd host, explicit local authorization and refusal of any existing installation, with the same real migration/recovery assertions. Evaluate an existing Docker/systemd container or separate small VM first; review guard changes before execution. No new software, daemon, account or third-party service is installed by this policy. Until actual proof exists, acceptance requiring those mechanisms remains pending. Previously collected native evidence remains historical evidence for its exact source SHA, not proof of later changes.
+
+### Build and publish without Actions
+
+Use a separate clean checkout at exact merged main and an isolated Linuxx64 build host/container. Review dependency locks and model-data provenance. Use the existing `apps/unit-001/scripts/build-release.mjs` with the approved public root's exact bytes. Build outside the source checkout, verify the packaged Node/runtime, help/version, file inventory and installer dry run, and retain artifact SHA256 plus dirty=false/source SHA. A macOS build is not Linux artifact proof. Never build or test on Bob's production VPS.
+
+Keep private signing material outside the container and downloads. The existing standalone publisher accepts the candidate:
+
+```bash
+node apps/unit-001/scripts/update-repository.mjs fetch --out PREVIOUS
+node apps/unit-001/scripts/update-repository.mjs prepare \
+  --archive ARCHIVE --root APPROVED_PUBLIC_ROOT --keys PROTECTED_ONLINE_KEYS \
+  --previous PREVIOUS --out PUBLICATION --source-commit EXACT_MERGED_SHA
+node apps/unit-001/scripts/update-repository.mjs publish \
+  --out PUBLICATION --root APPROVED_PUBLIC_ROOT
+```
+
+Never upload the offline root private key or persist a broad personal token. Serialize publication, inspect remote state before retrying, preserve immutable asset identity and publish freshness last through the existing tool. Verify the bundle anonymously against TUF and compare immutable/latest/local bytes before normal signed production activation. Preserve settings, credentials, name, UUID and running/stopped intent; make no paid model requests for deployment checks.
+
+Metadata renewal is also standalone. Timestamp expiry remains 48 hours; no replacement automatic renewal schedule is established. [Updates](updates.md) gives the manual renewal commands and recovery rules. Do not confuse a healthy running agent with a fresh downloadable update feed.
