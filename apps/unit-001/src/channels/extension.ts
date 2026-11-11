@@ -25,7 +25,7 @@ export function channelExtension(
 		name: "unit.channels",
 		sections: [
 			section(
-				"preamble",
+				"unit_channels",
 				() =>
 					"Use unit_channels to inspect actual available and configured channels. Use unit_channel_request_setup to propose exact setup for creator permission, then unit_channel_setup to resume granted setup. Requests are not approvals. Channel capabilities and health are host facts, not remembered claims. No remote conversational ingress is enabled by these tools. Never request credentials in chat.",
 				{ tag: false },

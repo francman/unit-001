@@ -15,6 +15,7 @@ import { channelExtension } from "../../src/channels/extension.ts";
 import { type ChannelStore, runChannelSetup } from "../../src/channels/setup.ts";
 import { TELEGRAM_ADAPTER, TelegramClient } from "../../src/channels/telegram.ts";
 import { telegramSetupAdapter } from "../../src/channels/telegram-setup.ts";
+import { introspectionExtension } from "../../src/introspection/extension.ts";
 import { grantFixture } from "./fixtures.ts";
 
 let directory: string;
@@ -60,7 +61,7 @@ describe("channel integration", () => {
 		]);
 		const models = createModels();
 		models.setProvider(faux.provider);
-		const options = { models, model, cwd: directory, extensions: [extension] };
+		const options = { models, model, cwd: directory, extensions: [extension, introspectionExtension()] };
 		const agent = await Agent.open(
 			{ ...options, storage: await openNodeSqliteStorage(join(directory, "session.sqlite")) },
 			BACKGROUND_CONTEXT,
@@ -85,6 +86,9 @@ describe("channel integration", () => {
 		expect(observed).toContain("setup-1");
 		expect(observed).toContain("awaiting_creator");
 		expect(observed).toContain("unit_channel_setup");
+		expect(observed).toContain("You operate inside unit-001");
+		expect(observed).toContain("unit_inspect_os");
+		expect(observed).toContain("Never request credentials");
 	});
 
 	it("runs real managed-bot HTTP setup and keeps tokens solely in owner-private files", async () => {
