@@ -6,6 +6,8 @@ The recovery journal, exact ownership checks, memory tombstones, bounded views, 
 
 Audit for [#48](https://github.com/francman/unit-001/issues/48), against `edf7503a58ab3ea47f99578c96e27b3a6d1e9d1e`, merged through PR #43 as `d7f4690b354dc562e4470beb945506f2fc2bae23`. Findings are refactoring opportunities, not claims that the proposed code already exists. No repository or production files were changed.
 
+Publication follow-through: refactor A subsequently merged in [PR #52](https://github.com/francman/unit-001/pull/52) as `c6c75dbff4a2f926295ff03631381210a2961ce6`, completing implementation issue #50. That is merged source, not a new production release. The traces below describe the audited baseline; the remaining refactors are still proposals.
+
 ## 1. Bypass a validation-only consolidation phase
 
 **Problem.** `packages/unit-memory/src/consolidation.ts:86` schedules `summarize`, but that handler at line 92 does not create a summary. It snapshots the selected sources, checks their revisions, and commits a transition to `publish`. `publish` immediately repeats that snapshot validation at line 109, builds deterministic text outside the transaction, then validates the sources again inside its publication transaction at line 120.
