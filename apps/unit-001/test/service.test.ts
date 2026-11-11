@@ -98,6 +98,62 @@ const signal = () => new AbortController().signal;
 const reply = (text: string) => fauxAssistantMessage([fauxText(text)]);
 
 describe.skipIf(process.platform === "win32")("headless local service", () => {
+	it.each([
+		{ configuration: undefined, provider: "faux", modelId: "faux-1", valid: true },
+		{ configuration: "configured", provider: "faux", modelId: "faux-1", valid: true },
+		{ configuration: "unconfigured", provider: null, modelId: null, valid: true },
+		{ configuration: undefined, provider: null, modelId: null, valid: false },
+		{ configuration: undefined, provider: "faux", modelId: 4, valid: false },
+		{ configuration: "configured", provider: null, modelId: null, valid: false },
+		{ configuration: "unconfigured", provider: "faux", modelId: "faux-1", valid: false },
+		{ configuration: null, provider: "faux", modelId: "faux-1", valid: false },
+	])("#14 validates current and published 0.0.7 status configuration: $configuration/$valid", async (input) => {
+		const path = join(directory, "status.sock");
+		const runtime = {
+			application: "unit-001",
+			name: "agent",
+			...(input.configuration === undefined ? {} : { configuration: input.configuration }),
+			provider: input.provider,
+			modelId: input.modelId,
+			pid: 1,
+			startedAt: 1,
+			uptimeMs: 0,
+			observedAt: 1,
+		};
+		const server = createServer((socket) =>
+			socket.once("data", () =>
+				socket.end(
+					`${JSON.stringify({
+						type: "status",
+						pid: 1,
+						version: "0.0.7",
+						name: "agent",
+						installationId: null,
+						busy: false,
+						inhibited: false,
+						maintenance: { protocol: 1, state: "open", operationId: null },
+						runtime,
+					})}\n`,
+				),
+			),
+		);
+		await new Promise<void>((resolve) => server.listen(path, resolve));
+		try {
+			const response = requestService(path, { type: "status" }, signal());
+			if (!input.valid) await expect(response).rejects.toThrow("Invalid service response");
+			else
+				await expect(response).resolves.toMatchObject({
+					type: "status",
+					runtime: {
+						configuration: input.configuration ?? "configured",
+						provider: input.provider,
+						modelId: input.modelId,
+					},
+				});
+		} finally {
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
+	});
 	it("#33 keeps the private owner healthy when an old systemd unit lacks the operator directory", async () => {
 		const service = await launch([reply("still available")]);
 		const controller = new AbortController();
@@ -489,6 +545,7 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 			maintenance: { protocol: 1, state: "open", operationId: null },
 			runtime: {
 				application: "unit-001",
+				configuration: "configured",
 				name: "agent",
 				provider: "faux",
 				modelId: "faux-1",

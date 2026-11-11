@@ -1,4 +1,4 @@
-// Dispatches a literal installation UUID through its root-owned record; app commands never run as root.
+// Dispatches a fixed installation: agent work drops root, while administrative metadata stays privileged.
 import { spawn } from "node:child_process";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { constants } from "node:os";
@@ -25,6 +25,21 @@ export async function dispatchAgent(id, expectedName, args, context) {
 	if (!service && expectedName !== record.name)
 		throw new Error("This agent command was renamed; use its current name.");
 	const action = args[0];
+	if (!service && action === "mission" && ["creator", "approve"].includes(args[1])) {
+		if (context.uid !== 0)
+			throw new Error(
+				`Run sudo ${record.name} mission ${args[1]}; mission authority requires the host administrator.`,
+			);
+		if (args.some((argument) => argument === "--id" || argument.startsWith("--id=")))
+			throw new Error("A named mission command cannot change installation identity.");
+		const release = await context.release(installationPaths(id, context.root).current);
+		return context.run(
+			join(release, "runtime/bin/node"),
+			[join(release, "deploy/mission.mjs"), ...args.slice(1), "--id", id],
+			false,
+			context.administratorOrigin ?? {},
+		);
+	}
 	if (!service && action === "operator") {
 		if (context.uid !== 0) throw new Error(`Run sudo ${record.name} operator; access changes require root.`);
 		if (args.length !== 3 || !["add", "remove"].includes(args[1]))
@@ -274,6 +289,10 @@ export async function configuredEnvironment(path, root = "/") {
 const context = {
 	root: "/",
 	uid: process.geteuid?.(),
+	administratorOrigin:
+		process.env.SUDO_UID === undefined
+			? {}
+			: { SUDO_UID: process.env.SUDO_UID, SUDO_USER: process.env.SUDO_USER ?? "" },
 	groups: () => [process.getgid(), ...process.getgroups()],
 	interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
 	run,

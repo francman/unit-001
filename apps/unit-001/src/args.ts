@@ -1,5 +1,6 @@
 import { UsageError } from "./errors.ts";
 import { memoryCommand } from "./memory-control.ts";
+import { type MissionCommand, parseMissionCommand } from "./missions/command.ts";
 
 export const DEFAULT_SESSION = "default";
 
@@ -23,6 +24,7 @@ export interface AttachOptions extends ServiceOptions {
 }
 
 export type Command =
+	| { readonly kind: "mission"; readonly command: MissionCommand; readonly options: ServiceOptions }
 	| {
 			readonly kind: "memory";
 			readonly request: ReturnType<typeof memoryCommand>;
@@ -68,6 +70,7 @@ export const USAGE = `Usage: agent [options]
        agent service-status [options]    inspect the running service
        agent cancel [options]            abort its current run
        agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]
+       agent mission [status|setup|draft|propose|creator|approve] [options]
 
 Starts the agent. Its conversations persist, so a restarted process resumes unfinished work.
 
@@ -185,6 +188,14 @@ function parseServiceCommand(
 /** Parses the command line, without the node and script entries. Throws `UsageError` on anything unrecognized. */
 export function parseArguments(argv: readonly string[]): Command {
 	const first = argv[0];
+	if (first === "mission") {
+		try {
+			const { command, ...options } = parseMissionCommand(argv.slice(1));
+			return { kind: "mission", command, options };
+		} catch (error) {
+			throw new UsageError(error instanceof Error ? error.message : String(error));
+		}
+	}
 	if (first === "memory") {
 		const values = new Map<string, string>();
 		const operands: string[] = [];

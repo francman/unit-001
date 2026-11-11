@@ -45,6 +45,9 @@ export interface SetupScreen {
 	readonly title: string;
 	readonly description: string;
 	readonly detail?: readonly string[];
+	readonly flow?: "mission";
+	readonly totalSteps?: number;
+	readonly fieldLabel?: string;
 }
 
 export class SetupBack extends Error {}
@@ -73,7 +76,7 @@ export class SetupUI implements Component {
 	#filtered: readonly SetupChoice[] = [];
 	#list: SelectList | undefined;
 	#preferred: string | undefined;
-	#mode: "choice" | "secret" | "busy" = "choice";
+	#mode: "choice" | "secret" | "field" | "busy" = "choice";
 	#notice = "";
 	#running = false;
 	#pending: { resolve: (value: string) => void; reject: (error: Error) => void; cleanup: () => void } | undefined;
@@ -129,6 +132,18 @@ export class SetupUI implements Component {
 			}
 			this.finish(value);
 		};
+		return this.wait(signal);
+	}
+
+	/** Edits a nonsecret mission field using the same input, paste handling and terminal owner as provider setup. */
+	text(screen: SetupScreen, value: string, signal: AbortSignal): Promise<string> {
+		this.#screen = screen;
+		this.#mode = "field";
+		this.#input = new Input({ prompt: "" });
+		// Native paste inserts the saved text with the cursor at its end, unlike setValue's preserved cursor.
+		this.#input.handleInput(`\x1b[200~${sanitizeTerminalText(value).replace(/\s/g, " ")}\x1b[201~`);
+		this.#input.focused = true;
+		this.#input.onSubmit = (value) => this.finish(value);
 		return this.wait(signal);
 	}
 
@@ -200,18 +215,26 @@ export class SetupUI implements Component {
 		const height = this.#terminal.rows;
 		const compact = width < 50 || height < 16;
 		const inner = Math.max(1, width - 4);
-		const lines = [this.accent(`${this.#name} / setup`) + this.muted(`  ·  Step ${this.#screen.step} of 4`)];
+		const review = this.#mode === "choice" && this.#screen.step === 4 && this.#screen.flow !== "mission";
+		const lines = [
+			this.accent(`${this.#name} / ${this.#screen.flow ?? "setup"}`) +
+				this.muted(`  ·  Step ${this.#screen.step} of ${this.#screen.totalSteps ?? 4}`),
+		];
 		if (!compact) lines.push("");
 		lines.push(this.accent(this.#screen.title));
 		if (!compact) lines.push(this.muted(this.#screen.description), "");
 		const label =
-			this.#mode === "secret"
-				? "API key"
-				: this.#screen.step === 1
-					? "Search providers"
-					: this.#screen.step === 3
-						? "Search models"
-						: "Search choices";
+			this.#mode === "field"
+				? (this.#screen.fieldLabel ?? "Value")
+				: this.#mode === "secret"
+					? "API key"
+					: this.#screen.flow === "mission"
+						? "Search mission fields"
+						: this.#screen.step === 1
+							? "Search providers"
+							: this.#screen.step === 3
+								? "Search models"
+								: "Search choices";
 		const body: string[] = [];
 		if (this.#screen.detail) {
 			for (const detail of this.#screen.detail) {
@@ -229,18 +252,18 @@ export class SetupUI implements Component {
 		if (this.#mode === "choice") {
 			const maxItems = Math.max(
 				1,
-				Math.min(10, height - lines.length - body.length - (compact ? 8 : 7) + (this.#screen.step === 4 ? 2 : 0)),
+				Math.min(10, height - lines.length - body.length - (compact ? 8 : 7) + (review ? 2 : 0)),
 			);
 			const selected = this.#list?.getSelectedItem()?.value;
 			this.buildList(maxItems, selected);
 			const renderedList = this.#list?.render(inner) ?? [];
-			const listLines = compact && this.#screen.step === 4 ? renderedList.slice(0, maxItems) : renderedList;
+			const listLines = compact && review ? renderedList.slice(0, maxItems) : renderedList;
 			const reserved = Math.min(maxItems, this.#choices.length) + (this.#choices.length > maxItems ? 1 : 0);
 			body.push(...listLines);
 			while (body.length < reserved) body.push("");
 		}
 		if (this.#mode === "busy") body.push(this.muted("Saving…"));
-		else if (this.#screen.step !== 4) body.push(this.muted(label), ...this.#input.render(inner));
+		else if (!review) body.push(this.muted(label), ...this.#input.render(inner));
 		if (this.#mode === "secret")
 			body.push(this.muted(`${Array.from(this.#input.getValue()).length} characters · hidden`));
 		lines.push(this.muted(`╭${"─".repeat(Math.max(0, width - 2))}╮`));
@@ -254,14 +277,14 @@ export class SetupUI implements Component {
 		lines.push(this.muted(`╰${"─".repeat(Math.max(0, width - 2))}╯`));
 		if (this.#notice) lines.push(this.warning(this.#notice));
 		const help =
-			this.#mode === "secret"
+			this.#mode === "secret" || this.#mode === "field"
 				? `${this.hint("tui.input.submit")} continue  ${this.hint("unit.setup.back")} back  ${this.hint("unit.setup.cancel")} cancel`
 				: `${this.hint("tui.select.up")}/${this.hint("tui.select.down")} select  ${this.hint("tui.input.submit")} confirm  ${this.hint("unit.setup.back")} back  ${this.hint("unit.setup.cancel")} cancel`;
 		if (this.#mode === "busy") lines.push(this.muted(`${this.hint("unit.setup.cancel")} cancel`));
 		else if (compact) {
 			lines.push(
 				this.muted(
-					this.#mode === "secret"
+					this.#mode === "secret" || this.#mode === "field"
 						? `${this.hint("tui.input.submit")} continue`
 						: `${this.hint("tui.select.up")}/${this.hint("tui.select.down")} select  ${this.hint("tui.input.submit")} confirm`,
 				),
