@@ -8,21 +8,24 @@ Start with a recommendation readable in under one minute, then an official-sourc
 
 The appendix must define components and interfaces, stored state and migrations, identity and permissions, approval rules, failure and restart behavior, resource limits, acceptance fixtures and ordered coding tasks. Name unresolved decisions explicitly. Reuse the existing owner and public Pi Durable APIs; do not introduce a second agent runtime or modify upstream Pi. A research result is not permission to enable external actions.
 
-## Work registry
+## Definitions and implementation boundaries
 
-| Ticket | Work | Responsible role | Current phase |
-|---|---|---|---|
-| [#10](https://github.com/francman/unit-001/issues/10) | README and upstream sync | Documentation queue | Missing sync/layout/attribution |
-| [#14](https://github.com/francman/unit-001/issues/14) | Mission and creator agreement | Mission contract/review | Design under review |
-| [#33](https://github.com/francman/unit-001/issues/33) | Everyday operator access | Access integration/release operations | Release acceptance |
-| [#39](https://github.com/francman/unit-001/issues/39) | Browser | Research/review agent | Draft under review |
-| [#40](https://github.com/francman/unit-001/issues/40) | Messaging | Messaging research/review | Draft under review |
-| [#41](https://github.com/francman/unit-001/issues/41) | Organizations and Paperclip | Release operations research | Draft under review |
-| [#42](https://github.com/francman/unit-001/issues/42) | Operational facts and costs | Self-metrics research/review | Draft under review |
-| [#44](https://github.com/francman/unit-001/issues/44) | Security posture | Security research/review | Draft under review |
-| [#45](https://github.com/francman/unit-001/issues/45) | Voice | Dedicated voice research | Draft under review |
-| [#46](https://github.com/francman/unit-001/issues/46) | Peer teams | Release operations research | Draft under review |
-| [#47](https://github.com/francman/unit-001/issues/47) | Autonomous-agent qualities | Research/review agent | Draft under review |
+The [report index](README.md) links recommendations and coding definitions. The board holds live priorities and progress; this document preserves scope.
+
+| Ticket | Work | Definition |
+|---|---|---|
+| [#10](https://github.com/francman/unit-001/issues/10) | README and upstream sync | [Application README](../../README.md) |
+| [#14](https://github.com/francman/unit-001/issues/14) | Mission and creator agreement | [Mission-first implementation](agent-qualities.md#coding-ready-first-implementation) |
+| [#33](https://github.com/francman/unit-001/issues/33) | Everyday operator access | [Operator access](../operations.md#operator-access-and-sudo) |
+| [#39](https://github.com/francman/unit-001/issues/39) | Browser | [Browser worker](browser.md) |
+| [#40](https://github.com/francman/unit-001/issues/40) | Messaging | [Messaging adapters](messaging.md) |
+| [#41](https://github.com/francman/unit-001/issues/41) | Organizations and Paperclip | [Organization adapter](organizations.md) |
+| [#42](https://github.com/francman/unit-001/issues/42) | Operational facts and costs | [Receipt-based metrics](self-metrics.md) |
+| [#44](https://github.com/francman/unit-001/issues/44) | Security posture | [Factual posture report](security-posture.md) |
+| [#45](https://github.com/francman/unit-001/issues/45) | Voice | [Speech adapters](voice.md) |
+| [#46](https://github.com/francman/unit-001/issues/46) | Peer teams | [Collaboration contract](peer-collaboration.md) |
+| [#47](https://github.com/francman/unit-001/issues/47) | Autonomous-agent qualities | [Agency qualities](agent-qualities.md) |
+| [#48](https://github.com/francman/unit-001/issues/48) | Simplicity audit | [Feature-preserving refactors](simplicity-audit.md) |
 
 ## Mission agreement — #14
 
