@@ -83,12 +83,13 @@ export const MemoryConsolidation = defineTask<null, ConsolidationCheckpoint, nul
 				return {
 					status: "running",
 					checkpoint: {
-						phase: "summarize",
+						phase: "publish",
 						sources: pending.slice(0, 50).map(({ id, revision }) => ({ id, revision })),
 					},
 				};
 			}, context);
 		},
+		// Released readers may have persisted this phase; new selections validate inside publication instead.
 		summarize: async (task, runtime, context) => {
 			const state = await runtime.snapshot(MemoryDoc, context);
 			const sources = task.state.checkpoint.sources;
