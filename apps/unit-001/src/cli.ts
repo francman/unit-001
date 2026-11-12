@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Report } from "@earendil-works/pi-durable";
@@ -16,6 +16,7 @@ import { describeStatus, runLogin, runLogout, subscriptionFor } from "./login.ts
 import { describeMemory, type MemoryRequest } from "./memory-control.ts";
 import { credentialsFile, dataDirectory, sessionFile } from "./paths.ts";
 import { createConfiguredModels, createModelsFor } from "./provider.ts";
+import { runRemoteCommand } from "./remote/cli.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import { runPrint, runRepl, type Terminal } from "./repl.ts";
 import {
@@ -183,8 +184,7 @@ async function run(
 	const options = command.options;
 	const directory = resolveDirectory(options.dataDir, runtime);
 	const file = sessionFile(directory, options.session, runtime.platform);
-	const endpoint =
-		command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
+	const endpoint = command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
 	const { models, choice } = await createConfiguredModels(
 		runtime.env,
 		options.model ?? (runtime.env.UNIT_001_MODEL || (await readDefaultModel(directory))),
@@ -259,11 +259,7 @@ async function control(
 	const endpoint =
 		runtime.managed?.access === "operator"
 			? operatorEndpoint(runtime.managed.id, command.options.session)
-			: serviceEndpoint(
-					resolveDirectory(command.options.dataDir, runtime),
-					command.options.session,
-					runtime.platform,
-				);
+			: serviceEndpoint(resolveDirectory(command.options.dataDir, runtime), command.options.session, runtime.platform);
 	if (command.kind === "attach") {
 		const terminal = command.options.plain ? undefined : richTerminalFor(runtime);
 		if (terminal === undefined) return runAttach(endpoint, terminalFor(runtime), signal);
@@ -281,8 +277,7 @@ async function control(
 		let request: MemoryRequest;
 		if (command.request.operation === "confirm-forget") {
 			if (!command.yes) {
-				if (!runtime.interactive)
-					throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
+				if (!runtime.interactive) throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
 				const readline = createInterface({ input: runtime.stdin, output: runtime.stdout });
 				try {
 					const answer = await readline.question(
@@ -358,6 +353,20 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		serving = command.kind === "serve";
 		foreground = command.kind === "run" && command.options.print === undefined && runtime.interactive;
 		if (signal.aborted) return serving ? 0 : 130;
+		if (command.kind === "remote")
+			return await runRemoteCommand(
+				command.command,
+				{
+					directory: join(
+						dataDirectory({ platform: runtime.platform, env: runtime.env, home: runtime.home }),
+						"remotes",
+					),
+					terminal: terminalFor(runtime),
+					richTerminal: richTerminalFor(runtime),
+					colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+				},
+				signal,
+			);
 		if (command.kind === "help") {
 			const usage =
 				runtime.managed?.access === "operator"
@@ -380,8 +389,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		}
 		if (runtime.managed?.access === "operator") {
 			if (command.kind === "status") {
-				if (command.dataDir !== undefined)
-					throw new UsageError("Operator clients cannot change their data directory.");
+				if (command.dataDir !== undefined) throw new UsageError("Operator clients cannot change their data directory.");
 				return control({ kind: "service-status", options: { session: "default" } }, runtime, signal);
 			}
 			if (

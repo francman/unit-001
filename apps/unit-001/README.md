@@ -45,6 +45,8 @@ Public releases require no GitHub account, download token, or manual verificatio
 
 Use `/memory` in the terminal interface or `agent memory stats` to inspect structured memory. `recall`, `remember`, confirmed `forget`, and `sleep` operate through the running owner without a model request. Memory survives restarts within one session; separate sessions and installations stay isolated. See the [one-minute memory guide](docs/memory.md).
 
+A macOS or Linux source client can open the same rich interface against a named remote installation: `remote add work --host unit-01 --agent agent`, then `remote connect work`. Provider credentials and storage stay with the remote owner. See [remote sessions](docs/remote-sessions.md) for client requirements, SSH trust and reconnect behavior.
+
 ## Subscriptions
 
 In release `0.0.4` and later, `sudo agent setup` guides provider selection, subscription sign-in or hidden API key entry, and default-model selection. It preserves existing credentials unless you choose replacement. The installed command offers to start a stopped service after setup succeeds; a running service needs a stop and start to apply changed settings. Setup requires an interactive terminal and makes no paid model request. Source use supports `setup` without service management.

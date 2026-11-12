@@ -1,12 +1,12 @@
 // Controls an attached terminal through the single storage owner's bounded local protocol.
 import { randomUUID } from "node:crypto";
-import { basename } from "node:path";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
 import { ATTACH_HELP } from "./attach-help.ts";
 import { describeMemory, type MemoryRequest, type MemoryResult, memoryCommand } from "./memory-control.ts";
 import type { RuntimeFacts } from "./orientation.ts";
-import { requestService, type ServiceView, watchService } from "./service.ts";
+import type { ServiceView } from "./service.ts";
+import { localServiceClient, type ServiceClient } from "./service-client.ts";
 import { serviceView } from "./service-view.ts";
 
 export interface TerminalNotice {
@@ -21,6 +21,7 @@ export interface TerminalState {
 	readonly sending: boolean;
 	readonly cancelling: boolean;
 	readonly notices: readonly TerminalNotice[];
+	readonly unresolvedRequestIds?: readonly string[];
 }
 
 /** A rejected input must stay in the editor; commands and admitted sends may clear it. */
@@ -44,29 +45,42 @@ export function createTerminalController(
 	onChange: (state: TerminalState) => void,
 	signal: AbortSignal,
 ): TerminalController {
+	return createServiceTerminalController(localServiceClient(endpoint), onChange, signal);
+}
+
+/** Attaches the same terminal controller to a local or authenticated remote owner. */
+export function createServiceTerminalController(
+	client: ServiceClient,
+	onChange: (state: TerminalState) => void,
+	signal: AbortSignal,
+): TerminalController {
 	return new OwnerTerminalController(
 		{
-			session: basename(endpoint, ".sock"),
+			session: client.session,
 			ownership: "attached",
-			watch: (listener, signal) => watchService(endpoint, listener, signal),
+			watch: (listener, signal, connecting) =>
+				client.watch((event) => {
+					if (event.type === "view") listener(event.view);
+					else connecting(event.message);
+				}, signal),
 			async send(prompt, requestId, signal) {
-				const response = await requestService(endpoint, { type: "send", prompt, requestId }, signal);
+				const response = await client.request({ type: "send", prompt, requestId }, signal);
 				if (response.type === "error") throw new Error(response.message);
 				if (response.type !== "reply") throw new Error("The service returned an unexpected send response.");
 				return response.reply;
 			},
 			async cancel(signal) {
-				const response = await requestService(endpoint, { type: "cancel" }, signal);
+				const response = await client.request({ type: "cancel" }, signal);
 				if (response.type === "error") throw new Error(response.message);
 			},
 			async memory(request, signal) {
-				const response = await requestService(endpoint, { type: "memory", request }, signal);
+				const response = await client.request({ type: "memory", request }, signal);
 				if (response.type === "error") throw new Error(response.message);
 				if (response.type !== "memory") throw new Error("Unexpected memory response.");
 				return response.result;
 			},
 			async runtime(signal) {
-				const response = await requestService(endpoint, { type: "status" }, signal);
+				const response = await client.request({ type: "status" }, signal);
 				if (response.type === "error") throw new Error(response.message);
 				if (response.type !== "status") throw new Error("Unexpected status response.");
 				return response.runtime;
@@ -135,7 +149,11 @@ export function createForegroundTerminalController(
 interface ConversationTransport {
 	readonly session: string;
 	readonly ownership: "attached" | "foreground";
-	watch(listener: (view: ServiceView) => void, signal: AbortSignal): Promise<void>;
+	watch(
+		listener: (view: ServiceView) => void,
+		signal: AbortSignal,
+		connecting: (message: string) => void,
+	): Promise<void>;
 	send(prompt: string, requestId: string, signal: AbortSignal): Promise<Reply>;
 	cancel(signal: AbortSignal): Promise<void>;
 	memory(request: MemoryRequest, signal: AbortSignal): Promise<MemoryResult>;
@@ -205,11 +223,15 @@ class OwnerTerminalController implements TerminalController {
 			return { status: "command" };
 		}
 		if (text === "/status") {
+			if (this.#state.unresolvedRequestIds?.length)
+				this.#notice(
+					`Unconfirmed requests: ${this.#state.unresolvedRequestIds.join(", ")}. Inspect persisted work before retrying.`,
+				);
 			const view = this.#state.view;
 			this.#notice(
 				view === undefined
 					? "Connecting to the service."
-					: `${view.name}: ${view.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${view.pid}; version ${view.version}.`,
+					: `${this.#state.connection === "attached" ? "" : "Last observed (disconnected): "}${view.name}: ${view.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${view.pid}; version ${view.version}.`,
 			);
 			void this.#status();
 			return { status: "command" };
@@ -249,6 +271,13 @@ class OwnerTerminalController implements TerminalController {
 			);
 			return { status: "rejected" };
 		}
+		if ((this.#state.unresolvedRequestIds?.length ?? 0) >= 8) {
+			this.#notice(
+				"Eight requests have unconfirmed outcomes. Detach to retain their IDs and inspect the owner before submitting more.",
+				"error",
+			);
+			return { status: "rejected" };
+		}
 		if (Buffer.byteLength(text) > MAX_INPUT_BYTES) {
 			this.#notice("Prompt exceeds 16 KiB; it was not submitted.");
 			return { status: "rejected" };
@@ -258,7 +287,11 @@ class OwnerTerminalController implements TerminalController {
 			this.#notice("Encoded prompt exceeds 64 KiB; it was not submitted.");
 			return { status: "rejected" };
 		}
-		this.#state = { ...this.#state, sending: true };
+		this.#state = {
+			...this.#state,
+			sending: true,
+			unresolvedRequestIds: [...(this.#state.unresolvedRequestIds ?? []), requestId],
+		};
 		this.#notice(`Submitting request ${requestId}; retry with this --request-id after a disconnect.`);
 		void this.#send(text, requestId);
 		return { status: "submitted", requestId };
@@ -293,12 +326,22 @@ class OwnerTerminalController implements TerminalController {
 
 	async #observe(): Promise<void> {
 		try {
-			await this.#transport.watch((view) => {
-				clearTimeout(this.#startup);
-				this.#state = { ...this.#state, connection: "attached", view };
-				this.#publish();
-				if (this.#cancelAfterAdmission && view.busy) this.cancel();
-			}, this.#local.signal);
+			await this.#transport.watch(
+				(view) => {
+					clearTimeout(this.#startup);
+					this.#state = { ...this.#state, connection: "attached", view };
+					this.#publish();
+					if (this.#cancelAfterAdmission && view.busy) this.cancel();
+				},
+				this.#local.signal,
+				(message) => {
+					clearTimeout(this.#startup);
+					this.#cancelAfterAdmission = false;
+					this.#forget = undefined;
+					this.#state = { ...this.#state, connection: "connecting" };
+					this.#notice(message);
+				},
+			);
 			if (!this.#finished) this.#finish("detached", 0);
 		} catch (error) {
 			if (this.#finished) return;
@@ -310,16 +353,16 @@ class OwnerTerminalController implements TerminalController {
 	async #send(text: string, requestId: string): Promise<void> {
 		try {
 			const reply = await this.#transport.send(text, requestId, this.#local.signal);
+			this.#state = {
+				...this.#state,
+				unresolvedRequestIds: this.#state.unresolvedRequestIds?.filter((id) => id !== requestId),
+			};
 			if (this.#finished) return;
 			// The watch is authoritative for transcript output; never duplicate an answer from the send reply.
 			if (reply.status === "failed")
-				this.#notice(
-					`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`,
-					"error",
-				);
+				this.#notice(`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`, "error");
 		} catch (error) {
-			if (!this.#finished)
-				this.#notice(`Send failed: ${describeError(error)}; retry request ${requestId}.`, "error");
+			if (!this.#finished) this.#notice(`Send failed; retry request ${requestId}: ${describeError(error)}`, "error");
 		} finally {
 			this.#cancelAfterAdmission = false;
 			if (!this.#finished) {

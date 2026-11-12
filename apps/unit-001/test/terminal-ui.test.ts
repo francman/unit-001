@@ -96,6 +96,24 @@ function launch() {
 }
 
 describe("rich service terminal", () => {
+	it("#55 keeps an unconfirmed request ID visible at narrow widths despite rolling notices", () => {
+		const app = launch();
+		const id = "aa49e3de-4cb1-4caf-9b98-26e4c399c12d";
+		try {
+			app.terminal.columns = 40;
+			app.terminal.rows = 12;
+			app.terminal.resize();
+			app.update(base, {
+				unresolvedRequestIds: [id],
+				notices: Array.from({ length: 8 }, () => ({ kind: "info" as const, text: "Reconnecting view" })),
+			});
+			expect(app.screen().join("\n")).toContain(`ID ${id}`);
+			expect(app.screen().at(-2)).toContain("cost unknown");
+			expect(app.screen().at(-1)).toContain("detach");
+		} finally {
+			app.tui.stop();
+		}
+	});
 	it("labels the composer and shows typing immediately without submitting", () => {
 		// #36: real typing feedback and a named composer are acceptance requirements, not just action results.
 		const app = launch();

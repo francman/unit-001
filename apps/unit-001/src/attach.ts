@@ -1,23 +1,33 @@
 // Attaches a terminal to the service owner without opening storage or tying work to the client lifetime.
 import { randomUUID } from "node:crypto";
-import { basename } from "node:path";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import { ATTACH_HELP as HELP } from "./attach-help.ts";
 import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-control.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import type { Terminal } from "./repl.ts";
-import { requestService, type ServiceView, watchService } from "./service.ts";
+import type { ServiceView } from "./service.ts";
+import { localServiceClient, type ServiceClient } from "./service-client.ts";
 
 const MAX_INPUT_BYTES = 16_384;
 
 /** Runs a service terminal client; exit, EOF, signals, or connection loss never abort admitted service work. */
 export async function runAttach(endpoint: string, terminal: Terminal, signal: AbortSignal): Promise<number> {
+	return runServiceAttach(localServiceClient(endpoint), terminal, signal);
+}
+
+/** Uses the existing plain terminal for a local or authenticated remote service client. */
+export async function runServiceAttach(
+	client: ServiceClient,
+	terminal: Terminal,
+	signal: AbortSignal,
+): Promise<number> {
 	if (signal.aborted) return 0;
 	const local = new AbortController();
 	const renderer = new AttachedOutput(terminal);
 	let reader: Interface | undefined;
 	let view: ServiceView | undefined;
 	let sending = false;
+	let connected = false;
 	let cancelling = false;
 	let code = 0;
 	let cancelAfterAdmission = false;
@@ -51,8 +61,7 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 		const safe = sanitizeTerminalText(text);
 		if (reader?.line !== undefined && reader.line !== "" && !local.signal.aborted) {
 			const combined = pendingNotice + safe;
-			pendingNotice =
-				combined.length > 8192 ? `[Earlier client notices omitted.]\n${combined.slice(-8000)}` : combined;
+			pendingNotice = combined.length > 8192 ? `[Earlier client notices omitted.]\n${combined.slice(-8000)}` : combined;
 			return;
 		}
 		paint(() => {
@@ -68,6 +77,10 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 	signal.addEventListener("abort", onSignal, { once: true });
 	const cancel = () => {
 		if (cancelling || local.signal.aborted) return;
+		if (!connected) {
+			err("Not connected; no cancellation was sent.\n");
+			return;
+		}
 		if (sending && view?.busy !== true) {
 			cancelAfterAdmission = true;
 			err("Cancellation queued until the submitted work is visible.\n");
@@ -76,7 +89,7 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 		cancelAfterAdmission = false;
 		cancelling = true;
 		void Promise.resolve()
-			.then(() => requestService(endpoint, { type: "cancel" }, local.signal))
+			.then(() => client.request({ type: "cancel" }, local.signal))
 			.then(
 				(response) => {
 					if (!local.signal.aborted)
@@ -99,7 +112,7 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 		flush();
 		const text = line.trim();
 		const runMemory = (request: MemoryRequest) => {
-			void requestService(endpoint, { type: "memory", request }, local.signal).then(
+			void client.request({ type: "memory", request }, local.signal).then(
 				(response) => {
 					if (!local.signal.aborted)
 						err(
@@ -126,13 +139,13 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 		else if (text === "/status") {
 			if (view !== undefined)
 				err(
-					`${view.name}: ${view.busy ? "working" : "ready"}; PID ${view.pid}; version ${view.version}; session ${basename(endpoint, ".sock")}\n`,
+					`${connected ? "" : "Last observed (disconnected): "}${view.name}: ${view.busy ? "working" : "ready"}; PID ${view.pid}; version ${view.version}; session ${client.session}\n`,
 				);
-			void requestService(endpoint, { type: "status" }, local.signal).then(
+			void client.request({ type: "status" }, local.signal).then(
 				(response) => {
 					if (response.type === "status")
 						err(
-							`${response.name}: ${response.busy ? "working" : "ready"}; PID ${response.pid}; version ${response.version}; session ${basename(endpoint, ".sock")}; started ${new Date(response.runtime.startedAt).toISOString()}; uptime ${Math.floor(response.runtime.uptimeMs / 1000)}s; observed ${new Date(response.runtime.observedAt).toISOString()}\n`,
+							`${response.name}: ${response.busy ? "working" : "ready"}; PID ${response.pid}; version ${response.version}; session ${client.session}; started ${new Date(response.runtime.startedAt).toISOString()}; uptime ${Math.floor(response.runtime.uptimeMs / 1000)}s; observed ${new Date(response.runtime.observedAt).toISOString()}\n`,
 						);
 					else if (response.type === "error") err(`${response.message}\n`);
 				},
@@ -154,10 +167,12 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 		} else if (text === "/cancel") cancel();
 		else if (text.startsWith("/")) err(`Unknown command. ${HELP}\n`);
 		else if (text !== "") {
+			if (!connected) {
+				err("Remote is reconnecting; prompt was not submitted.\n");
+				return;
+			}
 			if (sending) {
-				err(
-					"A submission is pending. Wait, /cancel, or /detach; additional prompts are not queued by this client.\n",
-				);
+				err("A submission is pending. Wait, /cancel, or /detach; additional prompts are not queued by this client.\n");
 				return;
 			}
 			if (Buffer.byteLength(text) > MAX_INPUT_BYTES) {
@@ -169,7 +184,7 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 			sending = true;
 			// Committed watch events own answer output; the send result supplies only failure diagnostics.
 			void Promise.resolve()
-				.then(() => requestService(endpoint, { type: "send", prompt: text, requestId }, local.signal))
+				.then(() => client.request({ type: "send", prompt: text, requestId }, local.signal))
 				.then(
 					(response) => {
 						if (local.signal.aborted) return;
@@ -215,40 +230,46 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 		detach();
 	}, 5_000);
 	try {
-		await watchService(
-			endpoint,
-			(next) => {
-				const first = view === undefined;
-				view = next;
-				if (first) {
-					clearTimeout(startup);
-					err(
-						`Attached to ${next.name}; session ${basename(endpoint, ".sock")}; PID ${next.pid}; version ${next.version}.\n${HELP}\n`,
-					);
-				}
-				if (reader?.line !== undefined && reader.line !== "") pendingView = next;
-				else {
-					pendingView = undefined;
-					paint(() => renderer.update(next));
-				}
-				if (cancelAfterAdmission && next.busy) cancel();
-				if (first) {
-					terminal.input.on("data", onData);
-					reader = createInterface({
-						input: terminal.input,
-						output: terminal.output,
-						terminal: terminal.output !== undefined,
-					});
-					reader.on("line", onLine);
-					reader.on("close", detach);
-					reader.on("SIGINT", () => (view?.busy === true || sending ? cancel() : detach()));
-					terminal.input.on("keypress", onKeypress);
-					reader.setPrompt("> ");
-					paint(() => {});
-				}
-			},
-			local.signal,
-		);
+		await client.watch((event) => {
+			if (event.type === "connecting") {
+				clearTimeout(startup);
+				connected = false;
+				cancelAfterAdmission = false;
+				forget = undefined;
+				err(`${event.message}\n`);
+				return;
+			}
+			const next = event.view;
+			connected = true;
+			const first = view === undefined;
+			view = next;
+			if (first) {
+				clearTimeout(startup);
+				err(
+					`Attached to ${next.name}; session ${client.session}; PID ${next.pid}; version ${next.version}.\n${HELP}\n`,
+				);
+			}
+			if (reader?.line !== undefined && reader.line !== "") pendingView = next;
+			else {
+				pendingView = undefined;
+				paint(() => renderer.update(next));
+			}
+			if (cancelAfterAdmission && next.busy) cancel();
+			if (first) {
+				terminal.input.on("data", onData);
+				reader = createInterface({
+					input: terminal.input,
+					output: terminal.output,
+					terminal: terminal.output !== undefined,
+				});
+				reader.on("line", onLine);
+				reader.on("close", detach);
+				reader.on("SIGINT", () => (view?.busy === true || sending ? cancel() : detach()));
+				terminal.input.on("keypress", onKeypress);
+				reader.setPrompt("> ");
+				paint(() => {});
+			}
+		}, local.signal);
 	} catch (error) {
 		if (!local.signal.aborted) {
 			code = 1;

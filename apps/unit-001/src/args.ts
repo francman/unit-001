@@ -1,5 +1,6 @@
 import { UsageError } from "./errors.ts";
 import { memoryCommand } from "./memory-control.ts";
+import { parseRemoteArguments, type RemoteCommand } from "./remote/args.ts";
 
 export const DEFAULT_SESSION = "default";
 
@@ -23,6 +24,7 @@ export interface AttachOptions extends ServiceOptions {
 }
 
 export type Command =
+	| { readonly kind: "remote"; readonly command: RemoteCommand }
 	| {
 			readonly kind: "memory";
 			readonly request: ReturnType<typeof memoryCommand>;
@@ -67,6 +69,7 @@ export const USAGE = `Usage: agent [options]
        agent send <prompt> [options]     ask the running service (optional --request-id for safe retries)
        agent service-status [options]    inspect the running service
        agent cancel [options]            abort its current run
+       agent remote --help               connect this terminal to a named remote installation
        agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]
 
 Starts the agent. Its conversations persist, so a restarted process resumes unfinished work.
@@ -185,6 +188,7 @@ function parseServiceCommand(
 /** Parses the command line, without the node and script entries. Throws `UsageError` on anything unrecognized. */
 export function parseArguments(argv: readonly string[]): Command {
 	const first = argv[0];
+	if (first === "remote") return { kind: "remote", command: parseRemoteArguments(argv.slice(1)) };
 	if (first === "memory") {
 		const values = new Map<string, string>();
 		const operands: string[] = [];

@@ -23,8 +23,10 @@ import {
 import type { Agent } from "./agent.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import type { ServiceView } from "./service.ts";
+import type { ServiceClient } from "./service-client.ts";
 import {
 	createForegroundTerminalController,
+	createServiceTerminalController,
 	createTerminalController,
 	type TerminalController,
 	type TerminalState,
@@ -67,6 +69,22 @@ export async function runRichAttach(
 		terminal,
 		signal,
 		(onChange) => createTerminalController(endpoint, onChange, signal),
+		options,
+	);
+}
+
+/** Uses the existing rich terminal for an authenticated remote service client. */
+export async function runRichServiceAttach(
+	client: ServiceClient,
+	terminal: Terminal,
+	signal: AbortSignal,
+	options: RichAttachOptions = {},
+): Promise<number> {
+	return runRichConversation(
+		client.session,
+		terminal,
+		signal,
+		(onChange) => createServiceTerminalController(client, onChange, signal),
 		options,
 	);
 }
@@ -132,6 +150,8 @@ async function runRichConversation(
 			await terminal.drainInput(1000);
 		} finally {
 			tui.stop();
+			for (const id of controller.state.unresolvedRequestIds ?? [])
+				terminal.write(`Unconfirmed request ID ${id}; inspect persisted work before an explicit retry.\n`);
 		}
 	}
 	return result;
@@ -222,6 +242,20 @@ export class RichAttachView extends VStack {
 			shrink: 1,
 			visible: () => this.#state.connection !== "failed",
 		});
+		this.addChild(
+			new StatusLines((width) => {
+				const ids = this.#state.unresolvedRequestIds ?? [];
+				const id = ids.at(-1) ?? "";
+				return [
+					this.#theme.warning(
+						width < 64
+							? `ID ${id}`
+							: `Unconfirmed request ${id}${ids.length > 1 ? ` (+${ids.length - 1}; /status lists all)` : ""}`,
+					),
+				];
+			}),
+			{ basis: 1, minSize: 1, shrink: 0, visible: () => (this.#state.unresolvedRequestIds?.length ?? 0) > 0 },
+		);
 		this.addChild(this.#footer, { basis: 2, minSize: 1, shrink: 0 });
 		this.update(this.#state);
 	}
