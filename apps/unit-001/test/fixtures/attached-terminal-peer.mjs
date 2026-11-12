@@ -62,6 +62,11 @@ const server = createServer((socket) => {
 		if (request.type === "watch") {
 			watchers.add(socket);
 			publish();
+		} else if (request.type === "mission" && request.request.operation === "status") {
+			// #14: a first-start read must not disturb a peer that does not support mission formation.
+			socket.end(
+				`${JSON.stringify({ type: "error", message: "Mission formation is unavailable in this fixture" })}\n`,
+			);
 		} else if (request.type === "cancel") {
 			view = { ...view, busy: false, text: "" };
 			publish();

@@ -5,6 +5,8 @@ import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
 import { ATTACH_HELP } from "./attach-help.ts";
 import { describeMemory, type MemoryRequest, type MemoryResult, memoryCommand } from "./memory-control.ts";
+import { describeMission } from "./missions/command.ts";
+import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import type { RuntimeFacts } from "./orientation.ts";
 import { requestService, type ServiceView, watchService } from "./service.ts";
 import { serviceView } from "./service-view.ts";
@@ -27,6 +29,7 @@ export interface TerminalState {
 export type TerminalInputResult =
 	| { readonly status: "submitted"; readonly requestId: string }
 	| { readonly status: "command" }
+	| { readonly status: "mission-setup" }
 	| { readonly status: "rejected" };
 
 /** Owns client connections only; detaching never aborts service work. */
@@ -70,6 +73,12 @@ export function createTerminalController(
 				if (response.type === "error") throw new Error(response.message);
 				if (response.type !== "status") throw new Error("Unexpected status response.");
 				return response.runtime;
+			},
+			async mission(request, signal) {
+				const response = await requestService(endpoint, { type: "mission", request }, signal);
+				if (response.type === "error") throw new Error(response.message);
+				if (response.type !== "mission") throw new Error("Unexpected mission response.");
+				return response.result;
 			},
 		},
 		onChange,
@@ -126,6 +135,10 @@ export function createForegroundTerminalController(
 				signal.throwIfAborted();
 				return (await agent.status(BACKGROUND_CONTEXT)).runtime;
 			},
+			async mission(request, signal) {
+				signal.throwIfAborted();
+				return agent.mission(request, BACKGROUND_CONTEXT);
+			},
 		},
 		onChange,
 		signal,
@@ -140,11 +153,12 @@ interface ConversationTransport {
 	cancel(signal: AbortSignal): Promise<void>;
 	memory(request: MemoryRequest, signal: AbortSignal): Promise<MemoryResult>;
 	runtime(signal: AbortSignal): Promise<RuntimeFacts>;
+	mission(request: MissionRequest, signal: AbortSignal): Promise<MissionView>;
 }
 
 const HELP = `${ATTACH_HELP}\nDefault rich controls: PageUp/PageDown scroll; Ctrl+Shift+F searches the displayed transcript when forwarded by the terminal; Enter/Shift+Enter moves between matches; Esc closes search.\nUsage covers conversation-model estimates, excluding tool/subagent costs and subscription billing.`;
 const FOREGROUND_HELP =
-	"/help /status /memory [stats|recall <query>|remember <text>|forget <id>|sleep] /cancel /exit. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
+	"/help /status /mission [setup] /memory [stats|recall <query>|remember <text>|forget <id>|sleep] /cancel /exit. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
 const MAX_INPUT_BYTES = 16_384;
 
 class OwnerTerminalController implements TerminalController {
@@ -212,6 +226,11 @@ class OwnerTerminalController implements TerminalController {
 					: `${view.name}: ${view.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${view.pid}; version ${view.version}.`,
 			);
 			void this.#status();
+			return { status: "command" };
+		}
+		if (text === "/mission setup") return { status: "mission-setup" };
+		if (text === "/mission" || text === "/mission status") {
+			void this.#mission();
 			return { status: "command" };
 		}
 		if (text === "/memory" || text.startsWith("/memory ")) {
@@ -294,10 +313,12 @@ class OwnerTerminalController implements TerminalController {
 	async #observe(): Promise<void> {
 		try {
 			await this.#transport.watch((view) => {
+				const first = this.#state.connection === "connecting";
 				clearTimeout(this.#startup);
 				this.#state = { ...this.#state, connection: "attached", view };
 				this.#publish();
 				if (this.#cancelAfterAdmission && view.busy) this.cancel();
+				if (first && this.#transport.session === "default") void this.#mission(true);
 			}, this.#local.signal);
 			if (!this.#finished) this.#finish("detached", 0);
 		} catch (error) {
@@ -369,10 +390,25 @@ class OwnerTerminalController implements TerminalController {
 			const facts = await this.#transport.runtime(this.#local.signal);
 			if (!this.#finished)
 				this.#notice(
-					`${facts.name}: ${this.#state.view?.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${facts.pid}; ${facts.provider}/${facts.modelId}; started ${new Date(facts.startedAt).toISOString()}; uptime ${Math.floor(facts.uptimeMs / 1000)}s; observed ${new Date(facts.observedAt).toISOString()}.`,
+					`${facts.name}: ${this.#state.view?.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${facts.pid}; ${facts.configuration === "unconfigured" ? "provider not configured" : `${facts.provider}/${facts.modelId}`}; started ${new Date(facts.startedAt).toISOString()}; uptime ${Math.floor(facts.uptimeMs / 1000)}s; observed ${new Date(facts.observedAt).toISOString()}.`,
 				);
 		} catch (error) {
 			if (!this.#finished) this.#notice(`Status: ${describeError(error)}`, "error");
+		}
+	}
+
+	async #mission(initial = false): Promise<void> {
+		try {
+			const view = await this.#transport.mission({ operation: "status" }, this.#local.signal);
+			if (this.#finished) return;
+			if (initial) {
+				if (!view.agreementValid)
+					this.#notice(
+						"No verified mission agreement. Use /mission setup to form a saved draft; ordinary work remains available. Autonomous execution is not implemented.",
+					);
+			} else this.#notice(describeMission(view));
+		} catch (error) {
+			if (!this.#finished && !initial) this.#notice(`Mission: ${describeError(error)}`, "error");
 		}
 	}
 

@@ -45,6 +45,7 @@ async function server(initial: ServiceView | null = base) {
 	const sockets = new Set<Socket>();
 	const watchers = new Set<Socket>();
 	const requests: (ServiceRequest | { type: "watch" })[] = [];
+	const missionRequests: ServiceRequest[] = [];
 	let respond = (_request: ServiceRequest, socket: Socket) => {
 		socket.end('{"type":"cancelled"}\n');
 	};
@@ -63,6 +64,11 @@ async function server(initial: ServiceView | null = base) {
 			if (newline === -1) return;
 			const request = JSON.parse(buffer.slice(0, newline)) as ServiceRequest | { type: "watch" };
 			buffer = "";
+			if (request.type === "mission") {
+				missionRequests.push(request);
+				socket.end('{"type":"error","message":"Mission formation unavailable"}\n');
+				return;
+			}
 			requests.push(request);
 			if (request.type === "watch") {
 				watchers.add(socket);
@@ -81,6 +87,7 @@ async function server(initial: ServiceView | null = base) {
 	return {
 		endpoint,
 		requests,
+		missionRequests,
 		respond(fn: typeof respond) {
 			respond = fn;
 		},
@@ -109,6 +116,14 @@ async function connect(owner: Awaited<ReturnType<typeof server>>) {
 }
 
 describe.skipIf(process.platform === "win32")("owner terminal controller", () => {
+	it("offers guided mission setup without admitting a model prompt", async () => {
+		// #14: setup shares the terminal editor; status probes stay read-only and tolerate an older owner.
+		const owner = await server();
+		const { controller } = await connect(owner);
+		await expect.poll(() => owner.missionRequests.length).toBe(1);
+		expect(controller.submit("/mission setup")).toEqual({ status: "mission-setup" });
+		expect(owner.requests).toEqual([{ type: "watch" }]);
+	});
 	it("publishes connecting state and refuses sends until initial committed state arrives", async () => {
 		const owner = await server(null);
 		const states: TerminalState[] = [];
@@ -229,7 +244,9 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 		const owner = await server();
 		const { controller } = await connect(owner);
 		controller.submit("/help");
-		expect(controller.state.notices.at(-1)?.text).toContain("shared session, including other operators' queued inputs");
+		expect(controller.state.notices.at(-1)?.text).toContain(
+			"shared session, including other operators' queued inputs",
+		);
 		expect(controller.state.notices.at(-1)?.text).toContain("Detaching leaves admitted work running");
 		expect(controller.submit("/unknown")).toEqual({ status: "rejected" });
 		for (let count = 0; count < 20; count++) expect(controller.submit("/help")).toEqual({ status: "command" });

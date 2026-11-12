@@ -90,15 +90,26 @@ export async function createConfiguredModels(
 	spec?: string,
 	credentials?: CredentialStore,
 ): Promise<{ readonly models: MutableModels; readonly choice: ModelChoice }> {
-	const requested = spec ?? (env[MODEL_VARIABLE] || undefined);
-	const stored = new Set((await credentials?.list())?.map((entry) => entry.providerId));
-	const choice = requested === undefined ? detectModel(env, stored) : parseModelSpec(requested);
-	if (choice === undefined) {
+	const result = await createOwnerModels(env, spec, credentials);
+	if (result.choice === null) {
 		const keys = PROVIDERS.map((entry) => entry.keys[0]).join(", ");
 		throw new ConfigurationError(
 			`No model provider is configured. Sign in using the installed command’s login subcommand to use a subscription, set one of ${keys}, or pass --model provider/model-id.`,
 		);
 	}
+	return { models: result.models, choice: result.choice };
+}
+
+/** Opens an owner without inventing a provider when none is configured; configured errors remain errors. */
+export async function createOwnerModels(
+	env: Environment,
+	spec?: string,
+	credentials?: CredentialStore,
+): Promise<{ readonly models: MutableModels; readonly choice: ModelChoice | null }> {
+	const requested = spec ?? (env[MODEL_VARIABLE] || undefined);
+	const stored = new Set((await credentials?.list())?.map((entry) => entry.providerId));
+	const choice = requested === undefined ? detectModel(env, stored) : parseModelSpec(requested);
+	if (choice === undefined) return { models: createModels(), choice: null };
 	const models = await createModelsFor(choice.provider, credentials);
 	if (models.getModel(choice.provider, choice.modelId) === undefined) {
 		const known = models

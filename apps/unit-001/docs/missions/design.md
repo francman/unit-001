@@ -1,8 +1,45 @@
 # Durable mission contract
 
-The selected architecture keeps one current mission per Durable Session, with versioned policy, one controller, and an owned execution conversation. The nonexecuting #15a foundation reserves those identities atomically, waits for execution support, and respects its deadline. It admits no model requests, tools, or submissions. Engineering review approved this foundation, not authority to execute a real mission. The autonomous decision/verification loop, admission enforcement, operator controls, and maintenance integration below remain proposed work. Live activation will require an explicit operator policy.
+The first-start slice forms a saved mission agreement with an authenticated creator. A person, elder agent, or organization can supply the goal, scope, evidence requirements, limits and approval boundary through the terminal or local headless commands. Approval records exact terms; it does not start autonomous execution. The controller remains [#15](https://github.com/francman/unit-001/issues/15).
 
-This contract advances [#14](https://github.com/francman/unit-001/issues/14) and guides [#15](https://github.com/francman/unit-001/issues/15) and [#17](https://github.com/francman/unit-001/issues/17). Only the nonexecuting state foundation is reviewed for implementation; broader execution semantics still need review.
+This contract advances [#14](https://github.com/francman/unit-001/issues/14) and guides [#15](https://github.com/francman/unit-001/issues/15) and [#17](https://github.com/francman/unit-001/issues/17). Formation below is the current slice. Sections describing decisions, execution and verification specify later work.
+
+See [formation verification and remaining native coverage](verification.md) for the local acceptance procedure and published rollback-reader check.
+
+## First-start formation
+
+The default owner session offers `/mission setup` without blocking ordinary work. Every submitted field saves a revision; cancellation and restart preserve that exact draft. No provider account or model call is needed to form it. An unconfigured owner still exposes mission, memory and runtime inspection; submitting ordinary model work explains how to configure a provider and restart the owner. Invalid configured authentication remains an error rather than silently becoming unconfigured.
+
+Managed command privileges follow the existing operator boundary:
+
+| Command | Authority and result |
+|---|---|
+| `bob mission status [--json]` | Authorized operator; shows the draft, exact proposal digest, receipt validity and execution availability. |
+| `bob mission setup` | Authorized operator; guided editor saves each submitted field. |
+| `bob mission draft --file terms.json --revision 0 --request-id draft-1` | Authorized operator; saves partial or complete terms. Later edits use the currently displayed revision. |
+| `bob mission propose --revision 1` | Authorized operator; validates complete terms against the provisioned ceiling and saves their digest. |
+| `sudo bob mission creator --file creator.json` | Administrator; binds a local human, elder or organization principal and finite maximum authority. Changing it invalidates previous approval. |
+| `sudo bob mission approve --revision 1 --digest SHA256 --request-id approval-1` | Administrator; issues a receipt for exactly those terms, then asks the existing owner to reconcile it. |
+
+`terms.json` contains `objective`, `scope`, ordered `successCriteria`, `approvalBoundary`, `reviewEveryMs`, and `policy`. Policy requires registered `allowedTools`, positive integer `maxCycles`, `maxRequests`, `maxConsecutiveNoProgress`, nonnegative integer `maxRetries`, and a future `deadlineAt` in epoch milliseconds. Optional `maxEstimatedCost` is an estimate, not a provider billing cap. Empty allowed actions and an empty additional approval boundary are explicit choices; missing required fields never invent allowances.
+
+`creator.json` contains `creator: {kind, id, uid}` and `ceiling: {allowedTools, maxCycles, maxRequests, maxRetries, maxConsecutiveNoProgress, maxDurationMs, maxEstimatedCost?}`. The administrator provisions an existing local OS UID. The supplied label or conversation text cannot authenticate it. Remote channel, Paperclip and organization identity protocols are deferred; an elder or organization currently uses this same provisioned local principal.
+
+Only the primary `default` session forms a mission in this slice. Other sessions remain ordinary work and explicitly reject formation commands. Developer-local instances use the same commands without sudo but report `developer-local` provenance: the user owns both the instance and its authority file, which provides no managed root attestation. Managed setup and provider changes retain their existing sudo and explicit owner-restart requirements.
+
+### Approval and interruption
+
+The root command executes only the selected, verified release's `deploy/mission.mjs`. It is a client of the existing owner, never another SQLite writer, Agent, provider or tool runtime. The private owner socket is not proof of administrator identity: coding tools share that service UID. Authority and approval receipts instead live in protected root-owned `/etc/unit-001/agents/INSTALLATION_ID/mission-authority.json`.
+
+Each receipt binds installation, default session, creator UID and kind, authority revision, mission identity, draft revision and a canonical SHA-256 digest of every approved term. The root command validates finite ceilings and registered action IDs before publishing it atomically. A conversation message, model-claimed identity, memory record, owner document or approval-looking socket request cannot mint that receipt. Coding tools still retain the agent account's file authority; this is command authorization, not an OS sandbox or malicious-model containment claim.
+
+Publishing a receipt precedes the owner's agreement commit. If interrupted, startup reconciles the exact still-current protected receipt, or the administrator retries the same request ID. Changed terms, a stale revision, changed authority or expiry block approval. A pending operator amendment does not change the current agreement; issuing its new protected receipt closes the prior authority immediately. Retained receipt history cannot restore older authority. Proposed terms may need a new deadline after expiry.
+
+### Stored format and execution boundary
+
+`unit.mission` version 2 preserves the existing version-1 `current` record, IDs, policy, counters, tasks and paused/stopped intent. It adds formation revisions, a partial draft, an agreement and a latest-operation replay receipt in the same session document. A version-1 current record seeds an incomplete draft for review; it never becomes automatically agreed. New formation allocates no controller, holder, execution conversation or scheduled task.
+
+An agreement always reports `execution: not-implemented`. The existing nonexecuting version-1 holder remains registered solely so prior persisted tasks can reopen safely; maintenance recognizes only that exact owned holder. Controller admission, tool enforcement, completion proof, pause/resume and autonomous wakeup remain later slices. Reader compatibility must be verified against the exact published rollback artifact; a generic version-1 document reader is not promised to understand version 2.
 
 The agent receives an objective, evidence required for success, and operating boundaries. It chooses an action, executes it, verifies the result, and chooses again without requiring another user prompt. Waiting must consume no model requests. A process restart must preserve the objective, limits, pending work, and reasons for waiting or stopping.
 
@@ -121,7 +158,7 @@ An operator assigns a bounded mission to inspect a repository and produce a repo
 | Slice | Deliverable and acceptance |
 |---|---|
 | #14 contract review | Approve or revise the first-slice choices, authority representation, verifier interface, and finite-limit input requirements above. No execution authority is activated by this document. |
-| #15a durable mission state | Reviewed nonexecuting foundation in `src/missions/state.ts`; SQLite reopen/version boundaries and atomic activation tests. Reject a second mission/controller and stale policy references. Only a deadline holder runs; no autonomous model/tool/submission admission. The first schema is version 1 and has no historical format to migrate. |
+| #15a durable mission state | Existing nonexecuting foundation in `src/missions/state.ts`; the formation slice above migrates its version-1 state to version 2. SQLite reopen/version boundaries and atomic activation tests reject a second mission/controller and stale policy references. Only legacy deadline holders run; formation adds no autonomous model/tool/submission admission. |
 | #15b first executable loop | Faux model, explicit synthetic admission, host verifier, finite request/cycle allowances, and read-only capability fixtures. One assignment produces multiple verified cycles. Crash tests cover before/after admission, dispatched request, tool effect, verification, and completion. |
 | #16 host integration | Wire the reviewed controller into the existing service. Kill/restart a real fixture process and prove persisted-deadline wakeup, one storage owner, and stopped-intent preservation. Existing headless/deployment work satisfies infrastructure, not this mission proof. |
 | #17 controls | Local owner transport for inspect/pause/resume/stop. Test controls while requesting, executing, sleeping, blocked, and restarting. Include delayed controls and changed policy revisions. |

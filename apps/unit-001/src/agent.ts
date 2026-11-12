@@ -1,5 +1,6 @@
 import { setTimeout } from "node:timers/promises";
 import type { Context } from "@earendil-works/chord/context";
+import { Type } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
 import {
 	AssistantEntry,
@@ -8,6 +9,7 @@ import {
 	createRegistry,
 	defineEntry,
 	defineExtension,
+	defineTool,
 	type Extension,
 	Harness,
 	LiveDoc,
@@ -31,8 +33,13 @@ import {
 	rememberMemory,
 	scheduleMemoryConsolidation,
 } from "unit-memory";
+import { ConfigurationError } from "./errors.ts";
 import { MaintenanceDoc, type MaintenanceResult, type MaintenanceState, validateOperationId } from "./maintenance.ts";
 import { type MemoryRequest, type MemoryResult, parseMemoryRequest } from "./memory-control.ts";
+import type { MissionLocation } from "./missions/authority.ts";
+import type { MissionRequest, MissionView } from "./missions/contract.ts";
+import { MissionControl } from "./missions/control.ts";
+import { isMissionHoldTask, MissionDoc, MissionFoundation } from "./missions/state.ts";
 import { createRuntimeFacts, orientationExtension, type RuntimeFacts } from "./orientation.ts";
 import type { ModelChoice } from "./provider.ts";
 
@@ -40,7 +47,8 @@ export interface AgentOptions {
 	readonly storage: Storage;
 	readonly name?: string;
 	readonly models: Models;
-	readonly model: ModelChoice;
+	readonly model: ModelChoice | null;
+	readonly mission?: MissionLocation;
 	/** The working directory tools run in. */
 	readonly cwd: string;
 	readonly platform?: NodeJS.Platform;
@@ -72,6 +80,8 @@ export class Agent {
 	readonly #root: Conversation;
 	readonly #runtime: () => RuntimeFacts;
 	readonly #memory: MemoryService;
+	readonly #mission: MissionControl;
+	readonly #configuration: "configured" | "unconfigured";
 	#inhibited: boolean;
 	/** True when a run was unfinished at open; it resumes only when execution is not inhibited. */
 	readonly interrupted: boolean;
@@ -84,6 +94,8 @@ export class Agent {
 		inhibited: boolean,
 		runtime: () => RuntimeFacts,
 		memory: MemoryService,
+		mission: MissionControl,
+		configuration: "configured" | "unconfigured",
 	) {
 		this.name = name;
 		this.#harness = harness;
@@ -92,6 +104,8 @@ export class Agent {
 		this.#inhibited = inhibited;
 		this.#runtime = runtime;
 		this.#memory = memory;
+		this.#mission = mission;
+		this.#configuration = configuration;
 	}
 
 	/** Opens the session, resuming unfinished work only outside startup inhibition and persistent maintenance holds. */
@@ -106,6 +120,25 @@ export class Agent {
 		}
 		registry.install(orientationExtension(runtime));
 		registry.install(memory.extension);
+		registry.install(MissionFoundation);
+		let mission!: MissionControl;
+		registry.install(
+			defineExtension({
+				name: "unit.mission.inspection",
+				tools: [
+					defineTool({
+						name: "unit_mission_status",
+						description:
+							"Inspect the saved mission draft/agreement and approval provenance; this never starts autonomous work.",
+						parameters: Type.Object({}),
+						replay: "safe",
+						execute: async (_args, _api, ctx) => ({
+							output: [{ type: "text", text: JSON.stringify(await mission.inspect(ctx)) }],
+						}),
+					}),
+				],
+			}),
+		);
 		for (const extension of options.extensions ?? []) registry.install(extension);
 
 		const harness = await Harness.open(
@@ -119,24 +152,58 @@ export class Agent {
 			context,
 		);
 		try {
-			const root = await harness.root(context, { agent: { model: options.model } });
+			const root = await harness.root(context, { agent: options.model === null ? {} : { model: options.model } });
 			// The model is stored with the session; this launch's choice wins, so changing provider keys never strands it.
 			const stored = (await root.agent(context)).model;
-			if (stored?.provider !== options.model.provider || stored.modelId !== options.model.modelId) {
+			if (
+				options.model !== null &&
+				(stored?.provider !== options.model.provider || stored.modelId !== options.model.modelId)
+			) {
 				await root.configure({ model: options.model }, context);
 			}
 			const interrupted = (await harness.snapshot(LiveDoc, root.id, context))?.run !== undefined;
-			const held = await harness.commit(
-				async (tx) => (await tx.doc(MaintenanceDoc)).current.state === "held",
-				context,
-			);
+			const held = await harness.commit(async (tx) => {
+				await tx.doc(MissionDoc);
+				return (await tx.doc(MaintenanceDoc)).current.state === "held";
+			}, context);
 			const inhibited = options.startup?.kind === "inhibited" || held;
-			if (!inhibited) {
+			mission = new MissionControl(
+				harness,
+				options.mission ?? { kind: "developer-local", directory: options.cwd, session: "default" },
+				[
+					...new Set(
+						registry
+							.snapshot()
+							.tools()
+							.map((item) => item.tool.name),
+					),
+				],
+			);
+			if (!inhibited) await mission.initialize(context);
+			const legacy = (await harness.snapshot(MissionDoc, context))?.current ?? null;
+			const pending = options.model === null ? await harness.inspect(context) : undefined;
+			const canSchedule =
+				pending === undefined ||
+				(pending.submissions.length === 0 &&
+					pending.tasks.every(
+						(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
+					));
+			if (!inhibited && canSchedule) {
 				await root.commit((tx) => reconcileMemoryTasks(tx, root.id, Date.now()), context);
 				memory.recall.prepare(await harness.snapshot(MemoryDoc, context));
 				harness.resume();
 			}
-			return new Agent(harness, root, interrupted, name, inhibited, runtime, memory);
+			return new Agent(
+				harness,
+				root,
+				interrupted,
+				name,
+				inhibited,
+				runtime,
+				memory,
+				mission,
+				options.model === null ? "unconfigured" : "configured",
+			);
 		} catch (error) {
 			await harness.close(context).catch(() => {});
 			memory.close();
@@ -150,6 +217,10 @@ export class Agent {
 	 */
 	async submit(text: string, context: Context, options: { readonly requestId?: string } = {}): Promise<Submission> {
 		this.requireActive();
+		if (this.#configuration === "unconfigured")
+			throw new ConfigurationError(
+				`No provider is configured. Run ${this.name} setup (sudo for a managed installation), then restart the owner. Mission drafting remains available without a provider.`,
+			);
 		const id = await this.#root.commit(async (tx) => {
 			if ((await tx.doc(MaintenanceDoc)).current.state === "held")
 				throw new Error("Service is held for maintenance.");
@@ -292,6 +363,12 @@ export class Agent {
 		return this.#harness.closed;
 	}
 
+	/** Reads or drafts the mission through this owner; protected host receipts remain the only managed approval source. */
+	mission(request: MissionRequest, context: Context): Promise<MissionView> {
+		if (request.operation !== "status") this.requireActive();
+		return this.#mission.handle(request, context);
+	}
+
 	/** Reports whether the conversation has an unfinished foreground run. */
 	async status(context: Context): Promise<{
 		readonly busy: boolean;
@@ -326,8 +403,11 @@ export class Agent {
 		const deadline = performance.now() + timeoutMs;
 		for (;;) {
 			const inspection = await this.#harness.inspect(context);
+			const legacy = (await this.#harness.snapshot(MissionDoc, context))?.current ?? null;
 			if (
-				inspection.tasks.every((task) => isMemoryBackgroundTask(task.record)) &&
+				inspection.tasks.every(
+					(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
+				) &&
 				inspection.submissions.length === 0
 			) {
 				return { type: "maintenance", protocol: 1, state: "held", operationId, result: "drained" };
@@ -351,7 +431,16 @@ export class Agent {
 		await this.#root.commit((tx) => reconcileMemoryTasks(tx, this.#root.id, Date.now()), context);
 		this.#memory.recall.prepare(await this.#harness.snapshot(MemoryDoc, context));
 		this.#inhibited = false;
-		this.#harness.resume();
+		const inspection = this.#configuration === "unconfigured" ? await this.#harness.inspect(context) : undefined;
+		const legacy = (await this.#harness.snapshot(MissionDoc, context))?.current ?? null;
+		if (
+			inspection === undefined ||
+			(inspection.submissions.length === 0 &&
+				inspection.tasks.every(
+					(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
+				))
+		)
+			this.#harness.resume();
 		return { type: "maintenance", protocol: 1, state: "open", operationId: null };
 	}
 

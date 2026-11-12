@@ -47,6 +47,7 @@ export interface RichAttachOptions {
 	readonly ownership?: "attached" | "foreground";
 	readonly unavailableHint?: string;
 	readonly name?: string;
+	readonly missionSetup?: (signal: AbortSignal) => Promise<number>;
 }
 
 type Actions = Pick<TerminalController, "submit" | "cancel" | "detach">;
@@ -100,8 +101,33 @@ async function runRichConversation(
 	const tui = new TuiAltScreen(terminal, true, undefined, { mouse: false, copyOnSelect: false });
 	let controller: TerminalController;
 	let closeUnavailable: (() => void) | undefined;
+	const flowAbort = new AbortController();
+	let missionFlow: Promise<void> | undefined;
 	const actions: Actions = {
-		submit: (text) => controller.submit(text),
+		submit: (text) => {
+			const result = controller.submit(text);
+			if (result.status !== "mission-setup") return result;
+			if (options.missionSetup === undefined) return controller.submit("/mission");
+			if (missionFlow !== undefined) return { status: "rejected" };
+			missionFlow = (async () => {
+				await terminal.drainInput(200, 25);
+				tui.stop();
+				try {
+					await options.missionSetup!(AbortSignal.any([signal, flowAbort.signal]));
+				} catch (error) {
+					terminal.write(
+						`Mission setup: ${sanitizeTerminalText(error instanceof Error ? error.message : String(error))}\r\n`,
+					);
+				} finally {
+					missionFlow = undefined;
+					if (!signal.aborted && !flowAbort.signal.aborted && controller.state.connection === "attached") {
+						tui.start();
+						controller.submit("/mission");
+					}
+				}
+			})();
+			return { status: "command" };
+		},
 		cancel: () => controller.cancel(),
 		detach: () => (closeUnavailable === undefined ? controller.detach() : closeUnavailable()),
 	};
@@ -127,6 +153,8 @@ async function runRichConversation(
 			}
 		}
 	} finally {
+		flowAbort.abort();
+		await missionFlow;
 		controller.detach();
 		try {
 			await terminal.drainInput(1000);
@@ -314,7 +342,8 @@ export class RichAttachView extends VStack {
 						: this.#state.sending
 							? "sending"
 							: "ready";
-		const model = view?.model == null ? "model unknown" : `${label(view.model.provider)}/${label(view.model.modelId)}`;
+		const model =
+			view?.model == null ? "model unknown" : `${label(view.model.provider)}/${label(view.model.modelId)}`;
 		const brand = width >= 64 ? "unit-001  ·  " : "";
 		const title = truncateToWidth(`${brand}${name}  /  ${this.#session}`, Math.max(1, width - activity.length - 2));
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(title) - activity.length));
@@ -338,7 +367,9 @@ export class RichAttachView extends VStack {
 		if (this.#state.connection === "failed")
 			return [
 				this.#theme.muted("Run the command above, then reopen."),
-				this.#theme.muted(`${this.keyHint("unit.attach.cancel")} exit · ${this.keyHint("unit.attach.detach")} exit`),
+				this.#theme.muted(
+					`${this.keyHint("unit.attach.cancel")} exit · ${this.keyHint("unit.attach.detach")} exit`,
+				),
 			];
 		const usage = this.#state.view?.usage;
 		const close = this.#ownership === "foreground" ? "exit" : "detach";
@@ -350,7 +381,9 @@ export class RichAttachView extends VStack {
 			const cost =
 				usage == null || usage.cost.kind === "unknown" ? "cost unknown" : `~$${usage.cost.usd.toFixed(4)} est`;
 			const cancel =
-				this.#state.connection === "attached" && (this.#state.view?.busy || this.#state.sending) ? "cancel" : "exit";
+				this.#state.connection === "attached" && (this.#state.view?.busy || this.#state.sending)
+					? "cancel"
+					: "exit";
 			return [
 				this.#theme.muted(`${this.keyHint("tui.input.submit")} send · ${tokens} · ${cost}`),
 				this.#theme.muted(
@@ -405,7 +438,9 @@ export class RichAttachView extends VStack {
 					const card = new Container();
 					card.addChild(
 						new Text(
-							entry.role === "user" ? this.#theme.user("YOU") : this.#theme.accent(label(view.name).toUpperCase()),
+							entry.role === "user"
+								? this.#theme.user("YOU")
+								: this.#theme.accent(label(view.name).toUpperCase()),
 							1,
 							0,
 						),
@@ -421,7 +456,8 @@ export class RichAttachView extends VStack {
 			}
 			const last = view.entries.at(-1);
 			const committed =
-				last?.role === "assistant" && (last.text === view.text || (last.truncated && view.text.startsWith(last.text)));
+				last?.role === "assistant" &&
+				(last.text === view.text || (last.truncated && view.text.startsWith(last.text)));
 			const live = committed ? "" : sanitizeTerminalText(view.text);
 			if (live !== this.#liveText) {
 				this.#live.setText(live);
@@ -430,9 +466,11 @@ export class RichAttachView extends VStack {
 			if (live !== "") {
 				this.transcript.addChild(new Text(this.#theme.accent(`${label(view.name).toUpperCase()}  ·  LIVE`), 1, 0));
 				this.transcript.addChild(this.#live);
-				if (view.textTruncated) this.transcript.addChild(new Text(this.#theme.warning("[Live text truncated]"), 1, 0));
+				if (view.textTruncated)
+					this.transcript.addChild(new Text(this.#theme.warning("[Live text truncated]"), 1, 0));
 			}
-			for (const tool of view.tools) this.transcript.addChild(new ToolCard(label(tool.name), tool.status, this.#theme));
+			for (const tool of view.tools)
+				this.transcript.addChild(new ToolCard(label(tool.name), tool.status, this.#theme));
 			if (view.entries.length === 0 && live === "")
 				this.transcript.addChild(new WelcomePanel(this.#theme, this.#ownership));
 		}
@@ -442,7 +480,9 @@ export class RichAttachView extends VStack {
 			const style = error ? this.#theme.error : this.#theme.muted;
 			// Retry IDs matter after an uncertain failure, not on every successful submission.
 			const text = notice.text.startsWith("Submitting request ") ? "Request submitted." : notice.text;
-			this.transcript.addChild(new Text(style(`${error ? "Error" : "Notice"} · ${sanitizeTerminalText(text)}`), 1, 0));
+			this.transcript.addChild(
+				new Text(style(`${error ? "Error" : "Notice"} · ${sanitizeTerminalText(text)}`), 1, 0),
+			);
 		}
 		if (this.#inputNotice !== "") this.transcript.addChild(new Text(this.#theme.warning(this.#inputNotice), 1, 0));
 	}
@@ -460,10 +500,10 @@ class WelcomePanel implements Component {
 		const title = width < 64 ? " Durable agent workspace" : "  unit-001  /  Durable agent workspace";
 		return [
 			this.#theme.accent(truncateToWidth(title, width)),
-			this.#theme.muted(truncateToWidth(" Ask a question or describe a task below.", width)),
+			this.#theme.muted(truncateToWidth(" Work with your agent or form its mission.", width)),
 			this.#theme.muted(
 				truncateToWidth(
-					`/help commands · /status ${this.#ownership === "foreground" ? "session" : "agent"} details`,
+					`/mission setup · /help · /status ${this.#ownership === "foreground" ? "session" : "agent"} details`,
 					width,
 				),
 			),

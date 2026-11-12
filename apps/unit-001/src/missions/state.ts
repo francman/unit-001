@@ -7,8 +7,10 @@ import {
 	defineTask,
 	type Harness,
 	type TaskId,
+	type TaskRecord,
 	type Tx,
 } from "@earendil-works/pi-durable";
+import { initialFormation, type MissionFormation } from "./contract.ts";
 
 export type MissionPolicy = {
 	allowedTools: string[];
@@ -40,7 +42,7 @@ export type MissionRecord = MissionIdentity & {
 		| { status: "stopped" };
 };
 
-export type MissionState = { current: MissionRecord | null };
+export type MissionState = { current: MissionRecord | null; formation: MissionFormation };
 
 export type MissionActivation = {
 	missionId: string;
@@ -49,12 +51,29 @@ export type MissionActivation = {
 	policy: MissionPolicy;
 };
 
-/** Version-one current mission state; a Session and its conversation forks share this document. */
+/** Preserves legacy ownership and versioned formation; stored prose never establishes execution authority. */
 export const MissionDoc = defineDoc<MissionState>({
 	kind: "unit.mission",
-	version: 1,
+	version: 2,
 	scope: "session",
-	initial: () => ({ current: null }),
+	initial: () => ({ current: null, formation: initialFormation() }),
+	migrate: (value, fromVersion) => {
+		if (fromVersion !== 1) throw new Error(`Unsupported mission document version ${fromVersion}.`);
+		// Version one has this exact app-owned schema; retain every legacy identity, policy and lifecycle field.
+		const current = value.current as MissionRecord | null;
+		const formation = initialFormation();
+		if (current !== null) {
+			formation.nextRevision = 2;
+			formation.draft = {
+				missionId: current.missionId,
+				revision: 1,
+				status: "editing",
+				terms: { objective: current.objective, successCriteria: current.successCriteria, policy: current.policy },
+				digest: null,
+			};
+		}
+		return { current, formation };
+	},
 	checkpointWhen: () => true,
 });
 
@@ -142,6 +161,25 @@ const HoldTask = defineTask<
 
 /** Installs only the nonexecuting deadline holder; contains no tools, model hooks, or request producers. */
 export const MissionFoundation = defineExtension({ name: "unit.mission.foundation", tasks: [HoldTask] });
+
+/** Identifies only the existing nonexecuting holder so maintenance can checkpoint it without discarding it. */
+export function isMissionHoldTask(
+	record: Pick<
+		TaskRecord<unknown, unknown, unknown>,
+		"id" | "conversationId" | "background" | "owner" | "kind" | "version"
+	>,
+	current: MissionRecord | null,
+): boolean {
+	return (
+		current !== null &&
+		record.id === current.controllerTaskId &&
+		record.conversationId === current.controlConversationId &&
+		record.background === true &&
+		record.owner === undefined &&
+		record.kind === "unit.mission.hold" &&
+		record.version === 1
+	);
+}
 
 function matchesIdentity(
 	current: MissionRecord | null,

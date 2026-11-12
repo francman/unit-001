@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ConfigurationError } from "../src/errors.ts";
-import { createConfiguredModels, detectModel, PROVIDERS, parseModelSpec } from "../src/provider.ts";
+import { createConfiguredModels, createOwnerModels, detectModel, PROVIDERS, parseModelSpec } from "../src/provider.ts";
 
 describe("parseModelSpec", () => {
 	it("splits at the first slash, so model ids may contain slashes", () => {
@@ -40,6 +40,23 @@ describe("detectModel", () => {
 });
 
 describe("createConfiguredModels", () => {
+	it("#14 opens an empty owner registry only when no supported provider is selected", async () => {
+		const owner = await createOwnerModels({});
+		expect(owner.choice).toBeNull();
+		expect(owner.models.getProviders()).toEqual([]);
+		await expect(createOwnerModels({}, "nowhere/model")).rejects.toThrow("not supported");
+		await expect(createOwnerModels({}, "openai/not-a-model")).rejects.toThrow("not in the openai catalog");
+		await expect(
+			createOwnerModels({}, undefined, {
+				list: async () => {
+					throw new Error("invalid credential store");
+				},
+				read: async () => undefined,
+				modify: async () => undefined,
+				delete: async () => {},
+			}),
+		).rejects.toThrow("invalid credential store");
+	});
 	it("explains how to configure a provider when there is none", async () => {
 		await expect(createConfiguredModels({})).rejects.toThrow(
 			/No model provider is configured.*login subcommand.*ANTHROPIC_API_KEY/,
