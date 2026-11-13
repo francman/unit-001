@@ -312,7 +312,18 @@ async function control(
 		const response = await requestService(endpoint, { type: "channels", request: { operation: "status" } }, signal);
 		if (response.type === "error") throw new ConfigurationError(response.message);
 		if (response.type !== "channels") throw new Error("Unexpected channel response.");
-		runtime.stdout.write(`${JSON.stringify(response.result)}\n`);
+		const result = response.result;
+		if (result.operation !== "status") throw new Error("Unexpected channel status operation.");
+		const lines = [
+			`Available adapters: ${result.view.available.map((adapter) => `${adapter.id} (${adapter.capabilities.join(", ")})`).join("; ") || "none"}`,
+			...result.view.channels.map(
+				(channel) =>
+					`${channel.request.channelId}: ${channel.outcome.kind}${channel.outcome.kind === "awaiting_creator" ? ` (${channel.outcome.step})` : ""}; ${channel.request.adapter} destination ${channel.request.destination}`,
+			),
+		];
+		if (!result.view.channels.length) lines.push("No channels configured.");
+		lines.push(`Observed: ${new Date(result.observedAt).toISOString()}`);
+		runtime.stdout.write(`${sanitizeTerminalText(lines.join("\n"))}\n`);
 		return 0;
 	}
 	if (command.kind === "mission") {

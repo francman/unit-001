@@ -2,12 +2,14 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough, Readable } from "node:stream";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { describe, expect, it } from "vitest";
 import { Agent } from "../../src/agent.ts";
 import { parseArguments } from "../../src/args.ts";
+import { main } from "../../src/cli.ts";
 import { requestService, runService, serviceEndpoint } from "../../src/service.ts";
 
 describe("channel service", () => {
@@ -44,6 +46,28 @@ describe("channel service", () => {
 				message: "Unknown channel command field.",
 			});
 			expect(models.getProviders()).toEqual([]);
+			const stdout = new PassThrough();
+			let output = "";
+			stdout.on("data", (chunk) => {
+				output += String(chunk);
+			});
+			expect(
+				await main(
+					["channels", "status", "--data-dir", directory],
+					{
+						cwd: directory,
+						home: directory,
+						env: {},
+						platform: process.platform,
+						stdin: Readable.from([]),
+						stdout,
+						stderr: stdout,
+						interactive: false,
+					},
+					controller.signal,
+				),
+			).toBe(0);
+			expect(output).toMatch(/^Available adapters: telegram \(status\)\nNo channels configured\.\nObserved: /);
 			expect(parseArguments(["channels", "status", "--session", "default"])).toEqual({
 				kind: "channels",
 				options: { session: "default" },
