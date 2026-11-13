@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import type { Terminal as RichTerminal } from "@earendil-works/pi-tui";
 import { runServiceAttach } from "../attach.ts";
+import { runMissionSetup } from "../missions/setup.ts";
 import { sanitizeTerminalText } from "../render.ts";
 import type { Terminal } from "../repl.ts";
 import { runRichServiceAttach } from "../terminal-ui.ts";
@@ -52,7 +53,26 @@ export async function runRemoteCommand(
 	try {
 		if (command.action === "connect") {
 			return !command.plain && context.richTerminal !== undefined
-				? await runRichServiceAttach(client, context.richTerminal, signal, { colorMode: context.colorMode })
+				? await runRichServiceAttach(client, context.richTerminal, signal, {
+						colorMode: context.colorMode,
+						missionSetup: async (flowSignal) => {
+							const status = await client.request({ type: "status" }, flowSignal);
+							if (status.type === "error") throw new Error(status.message);
+							if (status.type !== "status") throw new Error("Unexpected remote status response.");
+							return runMissionSetup(
+								terminal,
+								status.name,
+								async (request) => {
+									const response = await client.request({ type: "mission", request }, flowSignal);
+									if (response.type === "error") throw new Error(response.message);
+									if (response.type !== "mission") throw new Error("Unexpected remote mission response.");
+									return response.result;
+								},
+								flowSignal,
+								context.colorMode !== "monochrome",
+							);
+						},
+					})
 				: await runServiceAttach(client, terminal, signal);
 		}
 		const requestId = command.action === "send" ? (command.requestId ?? randomUUID()) : undefined;

@@ -45,6 +45,8 @@ async function owner() {
 	const endpoint = join(directory, "default.sock");
 	const sockets = new Set<Socket>();
 	const watchers = new Set<Socket>();
+	const memorySockets = new Set<Socket>();
+	const sendSockets = new Set<Socket>();
 	const requests: { type: string; requestId?: string }[] = [];
 	let view = base;
 	const server = createServer((socket) => {
@@ -53,6 +55,8 @@ async function owner() {
 		socket.once("close", () => {
 			sockets.delete(socket);
 			watchers.delete(socket);
+			memorySockets.delete(socket);
+			sendSockets.delete(socket);
 		});
 		socket.once("data", (data) => {
 			const request = JSON.parse(String(data).trim()) as { type: string; requestId?: string };
@@ -84,6 +88,8 @@ async function owner() {
 					})}\n`,
 				);
 			else if (request.type === "cancel") socket.end('{"type":"cancelled"}\n');
+			else if (request.type === "memory") memorySockets.add(socket);
+			else if (request.type === "send") sendSockets.add(socket);
 			// Sends deliberately remain unresolved, representing work admitted by the remote owner.
 		});
 	});
@@ -103,6 +109,19 @@ async function owner() {
 	return {
 		requests,
 		open,
+		rejectSend() {
+			for (const socket of sendSockets) socket.end('{"type":"error","message":"Owner rejected send"}\n');
+			sendSockets.clear();
+		},
+		rejectMemory() {
+			for (const socket of memorySockets) socket.end('{"type":"error","message":"Owner rejected mutation"}\n');
+			memorySockets.clear();
+		},
+		replyToMemory() {
+			for (const socket of memorySockets)
+				socket.end('{"type":"memory","result":{"operation":"remember","id":"remembered"}}\n');
+			memorySockets.clear();
+		},
 		view(next: ServiceView) {
 			view = next;
 			for (const socket of watchers) socket.write(`${JSON.stringify({ type: "view", view })}\n`);
@@ -114,6 +133,59 @@ async function owner() {
 }
 
 describe("remote observation and single-attempt admission", () => {
+	it("#55 clears acknowledged memory rejections without exhausting uncertain request slots", async () => {
+		const peer = await owner();
+		const signal = new AbortController();
+		const client = await connectRemoteClient(profile, "default", signal.signal);
+		cleanups.push(() => client.close());
+		const controller = createServiceTerminalController(client, () => {}, signal.signal);
+		cleanups.push(async () => {
+			controller.detach();
+			await controller.closed;
+		});
+		await expect.poll(() => controller.state.connection).toBe("attached");
+		for (let index = 0; index < 9; index++) {
+			controller.submit("/memory remember rejected");
+			await expect.poll(() => peer.requests.filter((request) => request.type === "memory").length).toBe(index + 1);
+			peer.rejectMemory();
+			await expect.poll(() => controller.state.unresolvedRequestIds).toEqual([]);
+			expect(controller.submit("rejected send").status).toBe("submitted");
+			await expect.poll(() => peer.requests.filter((request) => request.type === "send").length).toBe(index + 1);
+			peer.rejectSend();
+			await expect.poll(() => controller.state.sending).toBe(false);
+			expect(controller.state.unresolvedRequestIds).toEqual([]);
+		}
+		expect(controller.submit("still admitted").status).toBe("submitted");
+	});
+	it("#55 retains uncertain memory IDs beyond notices and clears acknowledged mutations", async () => {
+		const peer = await owner();
+		const signal = new AbortController();
+		const client = await connectRemoteClient(profile, "default", signal.signal);
+		cleanups.push(() => client.close());
+		const controller = createServiceTerminalController(client, () => {}, signal.signal);
+		cleanups.push(async () => {
+			controller.detach();
+			await controller.closed;
+		});
+		await expect.poll(() => controller.state.connection).toBe("attached");
+		controller.submit("/memory remember acknowledged");
+		await expect.poll(() => peer.requests.filter((request) => request.type === "memory").length).toBe(1);
+		expect(controller.state.unresolvedRequestIds).toHaveLength(1);
+		peer.replyToMemory();
+		await expect.poll(() => controller.state.unresolvedRequestIds).toEqual([]);
+		controller.submit("/memory remember uncertain");
+		await expect.poll(() => peer.requests.filter((request) => request.type === "memory").length).toBe(2);
+		const ids = controller.state.unresolvedRequestIds;
+		peer.disconnect();
+		await expect.poll(() => controller.state.connection).toBe("connecting");
+		for (let index = 0; index < 12; index++) controller.submit("/help");
+		expect(controller.state.unresolvedRequestIds).toEqual(ids);
+		await expect.poll(() => controller.state.connection).toBe("attached");
+		expect(peer.requests.filter((request) => request.type === "memory")).toHaveLength(2);
+		controller.detach();
+		expect(await controller.closed).toBe(0);
+		expect(controller.state.unresolvedRequestIds).toEqual(ids);
+	});
 	it("#55 performs exactly five SSH reconnect attempts when the host stays offline", async () => {
 		const peer = await owner();
 		const signal = new AbortController();

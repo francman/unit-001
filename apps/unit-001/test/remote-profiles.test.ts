@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +26,15 @@ afterEach(async () => {
 });
 
 describe("private remote profiles", () => {
+	it.skipIf(process.platform === "win32")(
+		"#55 rejects a FIFO profile without waiting for a writer",
+		async () => {
+			const directory = await temporaryDirectory();
+			execFileSync("mkfifo", [join(directory, "blocked.json")]);
+			await expect(readRemoteProfile(directory, "blocked")).rejects.toThrow(/regular file/);
+		},
+		1000,
+	);
 	it("#55 persists an identity pin without keys and removes only the local bookmark", async () => {
 		const directory = await temporaryDirectory();
 		expect(await listRemoteProfiles(join(directory, "absent"))).toEqual([]);

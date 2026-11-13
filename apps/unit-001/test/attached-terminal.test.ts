@@ -49,7 +49,7 @@ describe.skipIf(process.platform === "win32")("attached chat in a real terminal"
 		await app.waitFor("bare command draft");
 		await app.key("C-d");
 		await app.restored(0);
-		expect((await requests(app)).map((request) => request.type)).toEqual(["watch"]);
+		expect((await requests(app)).map((request) => request.type)).toEqual(["watch", "mission"]);
 		expect(await readFile(join(app.data, "auth.json"), "utf8")).toContain("Invalid credential fixture");
 	});
 
@@ -102,7 +102,7 @@ describe.skipIf(process.platform === "win32")("attached chat in a real terminal"
 		expect(narrow).toContain("agent");
 		await app.key("C-d");
 		await app.restored(0);
-		expect((await requests(app)).map((request) => request.type)).toEqual(["watch"]);
+		expect((await requests(app)).map((request) => request.type)).toEqual(["watch", "mission"]);
 	});
 
 	// #36: Wide help says cancel/exit in both states; only owner activity proves cancellation completed.

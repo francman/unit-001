@@ -72,9 +72,41 @@ const choices = [
 const provider = { step: 1, title: "Choose a provider", description: "Connect a model provider." };
 
 describe("setup terminal input and rendering", () => {
+	it.each([
+		[80, 24],
+		[40, 12],
+	])("edits a saved mission field visibly at %s×%s", async (width, height) => {
+		// #14: mission formation reuses native field editing without changing secret-entry behavior.
+		const state = fixture(width, height);
+		const pending = state.ui.text(
+			{
+				flow: "mission",
+				totalSteps: 2,
+				step: 2,
+				title: "Goal",
+				fieldLabel: "Goal",
+				description: "Choose a concrete outcome.",
+			},
+			"Inspect files",
+			state.controller.signal,
+		);
+		expect(state.screen()).toContain("Inspect files");
+		expect(state.screen()).toContain("Goal");
+		expect(state.screen()).toContain("Enter");
+		expect(state.ui.render(width).length).toBeLessThanOrEqual(height);
+		state.input.write(" safely");
+		expect(state.screen()).toContain("Inspect files safely");
+		state.input.write("\r");
+		expect(await pending).toBe("Inspect files safely");
+		await state.ui.close();
+		expect(state.raw.at(-1)).toBe(false);
+	});
 	it("uses configured setup shortcuts in input handling and displayed help", async () => {
 		setKeybindings(
-			new KeybindingsManager({ ...TUI_KEYBINDINGS, ...DEFAULT_SETUP_KEYBINDINGS }, { "unit.setup.cancel": "ctrl+x" }),
+			new KeybindingsManager(
+				{ ...TUI_KEYBINDINGS, ...DEFAULT_SETUP_KEYBINDINGS },
+				{ "unit.setup.cancel": "ctrl+x" },
+			),
 		);
 		const state = fixture();
 		const pending = state.ui.choose(provider, choices, "anthropic", state.controller.signal);
@@ -208,7 +240,9 @@ describe("setup terminal input and rendering", () => {
 				step,
 				title: "Setup step",
 				description: "A description",
-				...(step === 4 ? { detail: ["Provider: OpenAI", "Model: openai/gpt-5", "Credentials: Keep existing"] } : {}),
+				...(step === 4
+					? { detail: ["Provider: OpenAI", "Model: openai/gpt-5", "Credentials: Keep existing"] }
+					: {}),
 			},
 			choices,
 			"anthropic",

@@ -12,6 +12,8 @@ import {
 	validateOperationId,
 } from "./maintenance.ts";
 import { type MemoryRequest, type MemoryResult, parseMemoryRequest, parseMemoryResult } from "./memory-control.ts";
+import type { MissionRequest, MissionView } from "./missions/contract.ts";
+import { parseMissionRequest, parseMissionView } from "./missions/wire.ts";
 import type { RuntimeFacts } from "./orientation.ts";
 import { validateSessionName } from "./paths.ts";
 import { parseServiceEvent, type ServiceView, serviceView } from "./service-view.ts";
@@ -19,6 +21,7 @@ import { parseServiceEvent, type ServiceView, serviceView } from "./service-view
 export type { ServiceEvent, ServiceView } from "./service-view.ts";
 
 export type ServiceRequest =
+	| { readonly type: "mission"; readonly request: MissionRequest }
 	| { readonly type: "memory"; readonly request: MemoryRequest }
 	| { readonly type: "send"; readonly prompt: string; readonly requestId?: string }
 	| { readonly type: "status" | "cancel" };
@@ -28,6 +31,7 @@ export type MaintenanceRequest =
 	| { readonly type: "maintenance-release"; readonly operationId: string };
 
 export type ServiceResponse =
+	| { readonly type: "mission"; readonly result: MissionView }
 	| { readonly type: "memory"; readonly result: MemoryResult }
 	| MaintenanceResult
 	| { readonly type: "reply"; readonly reply: Reply }
@@ -358,9 +362,17 @@ async function handleRequest(
 		value.type !== "status" &&
 		value.type !== "send" &&
 		value.type !== "cancel" &&
-		value.type !== "memory"
+		value.type !== "memory" &&
+		value.type !== "mission"
 	)
 		throw new UsageError("This operation requires the administrator endpoint.");
+	if (value.type === "mission") {
+		if (!("request" in value)) throw new UsageError("Missing mission request.");
+		const request = parseMissionRequest(value.request);
+		if (access === "operator" && (request.operation === "reconcile" || request.operation === "approve-local"))
+			throw new UsageError("Mission approval requires its administrator authority.");
+		return { type: "mission", result: await agent.mission(request, BACKGROUND_CONTEXT) };
+	}
 	if (value.type === "status")
 		return {
 			type: "status",
@@ -419,6 +431,8 @@ export function parseServiceResponse(wire: string): ServiceResponse {
 	const value: unknown = JSON.parse(wire);
 	// A failed or different local service must not be mistaken for a valid reply.
 	if (typeof value === "object" && value !== null && "type" in value) {
+		if (value.type === "mission" && "result" in value)
+			return { type: "mission", result: parseMissionView(value.result) };
 		if (value.type === "memory" && "result" in value)
 			return { type: "memory", result: parseMemoryResult(value.result) };
 		if (
@@ -468,9 +482,16 @@ export function parseServiceResponse(wire: string): ServiceResponse {
 			"name" in value.runtime &&
 			typeof value.runtime.name === "string" &&
 			"provider" in value.runtime &&
-			typeof value.runtime.provider === "string" &&
 			"modelId" in value.runtime &&
-			typeof value.runtime.modelId === "string" &&
+			(((("configuration" in value.runtime && value.runtime.configuration === "configured") ||
+				// The published 0.0.7 owner predates the tag; remote clients still validate its configured fields.
+				(value.version === "0.0.7" && !("configuration" in value.runtime))) &&
+				typeof value.runtime.provider === "string" &&
+				typeof value.runtime.modelId === "string") ||
+				("configuration" in value.runtime &&
+					value.runtime.configuration === "unconfigured" &&
+					value.runtime.provider === null &&
+					value.runtime.modelId === null)) &&
 			"pid" in value.runtime &&
 			typeof value.runtime.pid === "number" &&
 			Number.isSafeInteger(value.runtime.pid) &&
@@ -507,8 +528,13 @@ export function parseServiceResponse(wire: string): ServiceResponse {
 				runtime: {
 					application: "unit-001",
 					name: value.runtime.name,
-					provider: value.runtime.provider,
-					modelId: value.runtime.modelId,
+					...("configuration" in value.runtime && value.runtime.configuration === "unconfigured"
+						? { configuration: "unconfigured" as const, provider: null, modelId: null }
+						: {
+								configuration: "configured" as const,
+								provider: String(value.runtime.provider),
+								modelId: String(value.runtime.modelId),
+							}),
 					pid: value.runtime.pid,
 					startedAt: value.runtime.startedAt,
 					uptimeMs: value.runtime.uptimeMs,

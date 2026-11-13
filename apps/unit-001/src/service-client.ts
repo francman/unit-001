@@ -14,6 +14,7 @@ export type ServiceClientEvent =
 
 export interface ServiceClient {
 	readonly session: string;
+	readonly ownerSession: string;
 	request(request: ServiceRequest, signal: AbortSignal): Promise<ServiceResponse>;
 	watch(listener: (event: ServiceClientEvent) => void, signal: AbortSignal): Promise<void>;
 }
@@ -22,6 +23,7 @@ export interface ServiceClient {
 export function localServiceClient(endpoint: string): ServiceClient {
 	return {
 		session: basename(endpoint, ".sock"),
+		ownerSession: basename(endpoint, ".sock"),
 		request: (request, signal) => requestService(endpoint, request, signal),
 		watch: (listener, signal) => watchService(endpoint, (view) => listener({ type: "view", view }), signal),
 	};

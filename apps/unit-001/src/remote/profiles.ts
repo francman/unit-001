@@ -71,7 +71,10 @@ export async function addRemoteProfile(directory: string, input: RemoteProfile):
 export async function readRemoteProfile(directory: string, name: string): Promise<RemoteProfile> {
 	validateRemoteName(name);
 	await checkDirectory(directory);
-	const file = await open(join(directory, `${name}.json`), constants.O_RDONLY | constants.O_NOFOLLOW);
+	const file = await open(
+		join(directory, `${name}.json`),
+		constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+	);
 	try {
 		const metadata = await file.stat();
 		if (

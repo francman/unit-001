@@ -26,7 +26,15 @@ it("#55 keeps plain attachment alive while the remote retries its first view", a
 	};
 	const client: ServiceClient = {
 		session: "default@remote",
-		async request() {
+		ownerSession: "default",
+		async request(request, signal) {
+			if (request.type === "memory") {
+				input.end("/detach\n");
+				signal.throwIfAborted();
+				return new Promise((_, reject) =>
+					signal.addEventListener("abort", () => reject(new Error("Detached")), { once: true }),
+				);
+			}
 			return { type: "cancelled" };
 		},
 		async watch(listener, signal) {
@@ -53,9 +61,11 @@ it("#55 keeps plain attachment alive while the remote retries its first view", a
 		expect(errors.join("")).not.toContain("did not provide initial state");
 		ready.resolve();
 		await Promise.resolve();
-		input.end("/detach\n");
+		input.write("/memory remember keep this\n");
 		expect(await running).toBe(0);
 		expect(errors.join("")).toContain("Attached to agent; session default@remote");
+		// #55: detaching while a memory mutation is pending must leave its retry ID in scrollback.
+		expect(errors.join("")).toMatch(/Submitting memory request [0-9a-f-]{36}; retain this ID/);
 	} finally {
 		abort.abort();
 		ready.resolve();

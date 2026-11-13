@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -14,8 +14,18 @@ import { ConfigurationError, UsageError } from "./errors.ts";
 import { acquireSessionLock } from "./lock.ts";
 import { describeStatus, runLogin, runLogout, subscriptionFor } from "./login.ts";
 import { describeMemory, type MemoryRequest } from "./memory-control.ts";
+import { parseMissionCeiling } from "./missions/authority.ts";
+import { describeMission } from "./missions/command.ts";
+import {
+	type MissionRequest,
+	type MissionView,
+	missionObject,
+	parseMissionCreator,
+	parseMissionDraftTerms,
+} from "./missions/contract.ts";
+import { runMissionSetup } from "./missions/setup.ts";
 import { credentialsFile, dataDirectory, sessionFile } from "./paths.ts";
-import { createConfiguredModels, createModelsFor } from "./provider.ts";
+import { createConfiguredModels, createModelsFor, createOwnerModels } from "./provider.ts";
 import { runRemoteCommand } from "./remote/cli.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import { runPrint, runRepl, type Terminal } from "./repl.ts";
@@ -185,7 +195,10 @@ async function run(
 	const directory = resolveDirectory(options.dataDir, runtime);
 	const file = sessionFile(directory, options.session, runtime.platform);
 	const endpoint = command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
-	const { models, choice } = await createConfiguredModels(
+	const { models, choice } = await (command.kind === "serve" ||
+		(command.kind === "run" && command.options.print === undefined)
+		? createOwnerModels
+		: createConfiguredModels)(
 		runtime.env,
 		options.model ?? (runtime.env.UNIT_001_MODEL || (await readDefaultModel(directory))),
 		credentialStore(directory, runtime),
@@ -196,6 +209,10 @@ async function run(
 	if (prompt === "") throw new UsageError("The prompt is empty.");
 
 	const terminal = terminalFor(runtime);
+	if (choice === null)
+		terminal.err(
+			`No model provider is configured. Mission drafting and memory remain available. Run ${runtime.managed === undefined ? "" : "sudo "}${runtime.managed?.name ?? "agent"} setup to connect a provider, then restart the owner. Mission formation uses the default session.\n`,
+		);
 
 	const release = await acquireSessionLock(`${file}.lock`);
 	let agent: Agent | undefined;
@@ -206,6 +223,10 @@ async function run(
 				name: runtime.managed?.name ?? "agent",
 				models,
 				model: choice,
+				mission:
+					runtime.managed === undefined
+						? { kind: "developer-local", directory, session: options.session }
+						: { kind: "managed", installationId: runtime.managed.id, session: options.session },
 				cwd: runtime.cwd,
 				platform: runtime.platform,
 				startup: { kind: options.inhibited ? "inhibited" : "active" },
@@ -233,6 +254,14 @@ async function run(
 			? await runRepl(agent, terminal, signal)
 			: await runRichForeground(agent, options.session, await version(), rich, signal, {
 					colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+					missionSetup: (flowSignal) =>
+						runMissionSetup(
+							terminalFor(runtime),
+							opened.name,
+							(request) => opened.mission(request, BACKGROUND_CONTEXT),
+							flowSignal,
+							runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb",
+						),
 				});
 	} finally {
 		try {
@@ -247,7 +276,17 @@ async function run(
 async function control(
 	command: Extract<
 		Command,
-		{ kind: "send" | "service-status" | "cancel" | "attach" | "maintenance-enter" | "maintenance-release" | "memory" }
+		{
+			kind:
+				| "send"
+				| "service-status"
+				| "cancel"
+				| "attach"
+				| "maintenance-enter"
+				| "maintenance-release"
+				| "memory"
+				| "mission";
+		}
 	>,
 	runtime: Runtime,
 	signal: AbortSignal,
@@ -260,11 +299,76 @@ async function control(
 		runtime.managed?.access === "operator"
 			? operatorEndpoint(runtime.managed.id, command.options.session)
 			: serviceEndpoint(resolveDirectory(command.options.dataDir, runtime), command.options.session, runtime.platform);
+	if (command.kind === "mission") {
+		const request = async (request: MissionRequest): Promise<MissionView> => {
+			const response = await requestService(endpoint, { type: "mission", request }, signal);
+			if (response.type === "error") throw new ConfigurationError(response.message);
+			if (response.type !== "mission") throw new Error("Unexpected mission response.");
+			return response.result;
+		};
+		const input = command.command;
+		if (input.action === "setup")
+			return runMissionSetup(
+				terminalFor(runtime),
+				runtime.managed?.name ?? "agent",
+				request,
+				signal,
+				runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb",
+			);
+		let operation: MissionRequest;
+		if (input.action === "draft" || input.action === "creator") {
+			const path = resolve(runtime.cwd, input.file);
+			const info = await lstat(path);
+			if (!info.isFile() || info.isSymbolicLink() || info.size > 32768)
+				throw new UsageError("Mission input must be a regular file of at most 32 KiB.");
+			const data: unknown = JSON.parse(await readFile(path, "utf8"));
+			if (input.action === "draft")
+				operation = {
+					operation: "draft",
+					expectedRevision: input.revision,
+					requestId: input.requestId,
+					terms: parseMissionDraftTerms(data),
+				};
+			else {
+				const authority = missionObject(data);
+				operation = {
+					operation: "configure-local",
+					creator: parseMissionCreator(authority.creator),
+					ceiling: parseMissionCeiling(authority.ceiling),
+				};
+			}
+		} else if (input.action === "propose")
+			operation = { operation: "propose", expectedRevision: input.revision, requestId: input.requestId };
+		else if (input.action === "approve")
+			operation = {
+				operation: "approve-local",
+				expectedRevision: input.revision,
+				requestId: input.requestId,
+				digest: input.digest,
+			};
+		else operation = { operation: "status" };
+		const view = await request(operation);
+		runtime.stdout.write(`${input.json ? JSON.stringify(view) : describeMission(view)}\n`);
+		return 0;
+	}
 	if (command.kind === "attach") {
 		const terminal = command.options.plain ? undefined : richTerminalFor(runtime);
 		if (terminal === undefined) return runAttach(endpoint, terminalFor(runtime), signal);
 		return runRichAttach(endpoint, terminal, signal, {
 			colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+			missionSetup: (flowSignal) =>
+				runMissionSetup(
+					terminalFor(runtime),
+					runtime.managed?.name ?? "agent",
+					async (request) => {
+						const response = await requestService(endpoint, { type: "mission", request }, flowSignal);
+						if (response.type === "error") throw new ConfigurationError(response.message);
+						if (response.type !== "mission") throw new Error("Unexpected mission response.");
+						return response.result;
+					},
+					flowSignal,
+					runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb",
+				),
 			...(runtime.managed === undefined
 				? {}
 				: {
@@ -398,9 +502,12 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				command.kind !== "cancel" &&
 				command.kind !== "service-status" &&
 				command.kind !== "memory" &&
+				command.kind !== "mission" &&
 				!(command.kind === "run" && argv.length === 0 && runtime.interactive)
 			)
 				throw new ConfigurationError("This operation requires the administrator command.");
+			if (command.kind === "mission" && (command.command.action === "creator" || command.command.action === "approve"))
+				throw new ConfigurationError("Mission creator and approval changes require the administrator command.");
 			if (command.kind !== "run" && command.options.dataDir !== undefined)
 				throw new UsageError("Operator clients cannot change their data directory.");
 		}
@@ -424,7 +531,8 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 			command.kind === "attach" ||
 			command.kind === "maintenance-enter" ||
 			command.kind === "maintenance-release" ||
-			command.kind === "memory"
+			command.kind === "memory" ||
+			command.kind === "mission"
 		)
 			code = await control(command, runtime, signal);
 		else code = await account(command, runtime, signal);

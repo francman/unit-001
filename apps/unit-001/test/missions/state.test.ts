@@ -12,6 +12,7 @@ import {
 	defineTask,
 	Harness,
 	type HarnessOptions,
+	type Task,
 	type TaskId,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
@@ -88,6 +89,62 @@ async function waitForTaskState(harness: Harness, id: TaskId, status: "sleeping"
 }
 
 describe("nonexecuting mission foundation", () => {
+	it.each(["paused", "stopped"] as const)(
+		"#14 migrates a version-one %s holder without changing identity or granting agreement",
+		async (status) => {
+			const first = await launch();
+			const legacy = defineDoc<{ current: MissionRecord | null }>({
+				kind: "unit.mission",
+				version: 1,
+				scope: "session",
+				initial: () => ({ current: null }),
+				checkpointWhen: () => true,
+			});
+			const before = await first.harness.commit(async (tx) => {
+				const control = await tx.createConversation({ ownership: { kind: "ownerless" } });
+				// The registered version-one holder has a null result; retain its exported branded identity in the fixture.
+				const holder = MissionFoundation.tasks![0] as Task<
+					{ missionId: string; policyRevision: number },
+					{ phase: "hold" } | { phase: "deadline" },
+					null,
+					object
+				>;
+				const controllerTaskId = await tx.createTask(
+					holder,
+					{ missionId: "legacy-mission", policyRevision: 3 },
+					{ conversationId: control.id, ownership: { kind: "conversation" }, background: true },
+				);
+				const execution = await tx.createConversation({ ownership: { kind: "task", taskId: controllerTaskId } });
+				const record: MissionRecord = {
+					...activation(),
+					missionId: "legacy-mission",
+					revision: 7,
+					policyRevision: 3,
+					controllerTaskId,
+					controlConversationId: control.id,
+					executionConversationId: execution.id,
+					state: { status },
+				};
+				(await tx.doc(legacy)).current = record;
+				return record;
+			}, context);
+			const task = await first.harness.getTask(before.controllerTaskId, context);
+			await closeHarness(first.harness);
+			const second = await launch();
+			await second.harness.commit((tx) => tx.doc(MissionDoc), context);
+			const migrated = (await second.harness.snapshot(MissionDoc, context))!;
+			expect(migrated.current).toEqual(before);
+			expect(await second.harness.getTask(before.controllerTaskId, context)).toEqual(task);
+			expect(migrated.formation.agreement).toBeNull();
+			expect(migrated.formation.draft).toMatchObject({
+				missionId: before.missionId,
+				status: "editing",
+				terms: { objective: before.objective, policy: before.policy },
+			});
+			await expect(second.harness.snapshot(legacy, context)).rejects.toThrow("newer version");
+			expect(second.faux.state.callCount).toBe(0);
+		},
+	);
 	it("atomically stores mission ownership without admitting requests, tools, or submissions", async () => {
 		// #15: activating the state foundation must not imply permission to execute a mission.
 		const { harness, faux } = await launch();
@@ -245,35 +302,40 @@ describe("nonexecuting mission foundation", () => {
 
 	it("refuses a newer persisted document version without discarding it", async () => {
 		const first = await launch();
-		const newer = defineDoc<MissionState>({ ...MissionDoc.definition, version: 2 });
+		const newer = defineDoc<MissionState>({ ...MissionDoc.definition, version: 3 });
 		await first.harness.commit((tx) => tx.doc(newer), context);
 		await closeHarness(first.harness);
 		const second = await launch();
 		await expect(second.harness.snapshot(MissionDoc, context)).rejects.toThrow("newer version");
 	});
 
-	it("requires an explicit persisted migration before a future schema can read version one", async () => {
+	it("requires an explicit persisted migration before a future schema can read version two", async () => {
 		const first = await launch();
 		await activateMission(first.harness, activation(), context);
 		const before = await first.harness.snapshot(MissionDoc, context);
 		await closeHarness(first.harness);
 		const second = await launch();
-		const noMigration = defineDoc<MissionState>({ ...MissionDoc.definition, version: 2 });
+		const noMigration = defineDoc<MissionState>({ ...MissionDoc.definition, version: 3, migrate: undefined });
 		await expect(second.harness.snapshot(noMigration, context)).rejects.toThrow("requires migration");
 		const future = defineDoc<MissionState & { migratedFrom: number }>({
 			...MissionDoc.definition,
-			version: 2,
-			initial: () => ({ current: null, migratedFrom: 2 }),
+			version: 3,
+			initial: () => ({
+				current: null,
+				formation: { nextRevision: 1, draft: null, agreement: null, lastOperation: null },
+				migratedFrom: 3,
+			}),
 			migrate: (value, fromVersion) => ({
-				// The fixture was written with the known version-one MissionDoc shape above.
+				// The fixture was written with the known version-two MissionDoc shape above.
 				current: value.current as MissionRecord | null,
+				formation: value.formation as MissionState["formation"],
 				migratedFrom: fromVersion,
 			}),
 		});
 		await second.harness.commit((tx) => tx.doc(future), context);
 		await closeHarness(second.harness);
 		const third = await launch();
-		expect(await third.harness.snapshot(future, context)).toEqual({ ...before, migratedFrom: 1 });
+		expect(await third.harness.snapshot(future, context)).toEqual({ ...before, migratedFrom: 2 });
 		await expect(third.harness.snapshot(MissionDoc, context)).rejects.toThrow("newer version");
 	});
 

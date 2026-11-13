@@ -42,6 +42,14 @@ try {
 	}
 	const remote = await client(profile);
 	assert.equal((await remote.request({ type: "status" }, signal.signal)).type, "status");
+	if (process.argv[2] === "--published-0.0.7") {
+		// #55: unsupported mission probes must leave the published owner's watch connection usable.
+		assert.equal(
+			(await remote.request({ type: "mission", request: { operation: "status" } }, signal.signal)).type,
+			"error",
+		);
+		assert.equal((await remote.request({ type: "status" }, signal.signal)).type, "status");
+	}
 	const otherSession = await client(profile, "research");
 	assert.equal(otherSession.session, "research@fixture");
 	const answer = await remote.request(

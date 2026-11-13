@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import { ATTACH_HELP as HELP } from "./attach-help.ts";
 import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-control.ts";
+import { describeMission } from "./missions/command.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import type { Terminal } from "./repl.ts";
 import type { ServiceView } from "./service.ts";
@@ -112,6 +113,8 @@ export async function runServiceAttach(
 		flush();
 		const text = line.trim();
 		const runMemory = (request: MemoryRequest) => {
+			if ("requestId" in request)
+				err(`Submitting memory request ${request.requestId}; retain this ID if disconnected.\n`);
 			void client.request({ type: "memory", request }, local.signal).then(
 				(response) => {
 					if (!local.signal.aborted)
@@ -151,6 +154,22 @@ export async function runServiceAttach(
 				},
 				(error: unknown) => {
 					if (!local.signal.aborted) err(`Status: ${describeError(error)}\n`);
+				},
+			);
+		} else if (text === "/mission" || text === "/mission status" || text === "/mission setup") {
+			void client.request({ type: "mission", request: { operation: "status" } }, local.signal).then(
+				(response) => {
+					if (local.signal.aborted) return;
+					err(
+						`${response.type === "mission" ? describeMission(response.result) : response.type === "error" ? response.message : "Unexpected mission response."}\n`,
+					);
+					if (text === "/mission setup")
+						err(
+							"Use NAME mission setup in a separate interactive terminal, or mission draft --file for headless formation.\n",
+						);
+				},
+				(error: unknown) => {
+					if (!local.signal.aborted) err(`Mission: ${describeError(error)}\n`);
 				},
 			);
 		} else if (text === "/memory" || text.startsWith("/memory ")) {

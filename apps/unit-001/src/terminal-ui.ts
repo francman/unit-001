@@ -49,6 +49,7 @@ export interface RichAttachOptions {
 	readonly ownership?: "attached" | "foreground";
 	readonly unavailableHint?: string;
 	readonly name?: string;
+	readonly missionSetup?: (signal: AbortSignal) => Promise<number>;
 }
 
 type Actions = Pick<TerminalController, "submit" | "cancel" | "detach">;
@@ -118,8 +119,34 @@ async function runRichConversation(
 	const tui = new TuiAltScreen(terminal, true, undefined, { mouse: false, copyOnSelect: false });
 	let controller: TerminalController;
 	let closeUnavailable: (() => void) | undefined;
+	const flowAbort = new AbortController();
+	let missionFlow: Promise<void> | undefined;
 	const actions: Actions = {
-		submit: (text) => controller.submit(text),
+		submit: (text) => {
+			const result = controller.submit(text);
+			if (result.status !== "mission-setup") return result;
+			const missionSetup = options.missionSetup;
+			if (missionSetup === undefined) return controller.submit("/mission");
+			if (missionFlow !== undefined) return { status: "rejected" };
+			missionFlow = (async () => {
+				await terminal.drainInput(200, 25);
+				tui.stop();
+				try {
+					await missionSetup(AbortSignal.any([signal, flowAbort.signal]));
+				} catch (error) {
+					terminal.write(
+						`Mission setup: ${sanitizeTerminalText(error instanceof Error ? error.message : String(error))}\r\n`,
+					);
+				} finally {
+					missionFlow = undefined;
+					if (!signal.aborted && !flowAbort.signal.aborted) {
+						tui.start();
+						if (controller.state.connection === "attached") controller.submit("/mission");
+					}
+				}
+			})();
+			return { status: "command" };
+		},
 		cancel: () => controller.cancel(),
 		detach: () => (closeUnavailable === undefined ? controller.detach() : closeUnavailable()),
 	};
@@ -145,6 +172,8 @@ async function runRichConversation(
 			}
 		}
 	} finally {
+		flowAbort.abort();
+		await missionFlow;
 		controller.detach();
 		try {
 			await terminal.drainInput(1000);
@@ -494,10 +523,10 @@ class WelcomePanel implements Component {
 		const title = width < 64 ? " Durable agent workspace" : "  unit-001  /  Durable agent workspace";
 		return [
 			this.#theme.accent(truncateToWidth(title, width)),
-			this.#theme.muted(truncateToWidth(" Ask a question or describe a task below.", width)),
+			this.#theme.muted(truncateToWidth(" Work with your agent or form its mission.", width)),
 			this.#theme.muted(
 				truncateToWidth(
-					`/help commands · /status ${this.#ownership === "foreground" ? "session" : "agent"} details`,
+					`/mission setup · /help · /status ${this.#ownership === "foreground" ? "session" : "agent"} details`,
 					width,
 				),
 			),

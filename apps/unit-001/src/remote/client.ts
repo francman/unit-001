@@ -29,6 +29,7 @@ export async function connectRemoteClient(
 
 class SshServiceClient implements RemoteServiceClient {
 	readonly session: string;
+	readonly ownerSession: string;
 	readonly #profile: RemoteProfile;
 	readonly #remoteSession: string;
 	readonly #local = new AbortController();
@@ -44,6 +45,7 @@ class SshServiceClient implements RemoteServiceClient {
 		this.#profile = profile;
 		this.#remoteSession = session;
 		this.session = `${session}@${profile.name}`;
+		this.ownerSession = session;
 		this.#signal = signal;
 		this.#abort = () => {
 			void this.close();

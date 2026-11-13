@@ -4,6 +4,8 @@ import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
 import { ATTACH_HELP } from "./attach-help.ts";
 import { describeMemory, type MemoryRequest, type MemoryResult, memoryCommand } from "./memory-control.ts";
+import { describeMission } from "./missions/command.ts";
+import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import type { RuntimeFacts } from "./orientation.ts";
 import type { ServiceView } from "./service.ts";
 import { localServiceClient, type ServiceClient } from "./service-client.ts";
@@ -28,6 +30,7 @@ export interface TerminalState {
 export type TerminalInputResult =
 	| { readonly status: "submitted"; readonly requestId: string }
 	| { readonly status: "command" }
+	| { readonly status: "mission-setup" }
 	| { readonly status: "rejected" };
 
 /** Owns client connections only; detaching never aborts service work. */
@@ -57,6 +60,7 @@ export function createServiceTerminalController(
 	return new OwnerTerminalController(
 		{
 			session: client.session,
+			ownerSession: client.ownerSession,
 			ownership: "attached",
 			watch: (listener, signal, connecting) =>
 				client.watch((event) => {
@@ -65,7 +69,7 @@ export function createServiceTerminalController(
 				}, signal),
 			async send(prompt, requestId, signal) {
 				const response = await client.request({ type: "send", prompt, requestId }, signal);
-				if (response.type === "error") throw new Error(response.message);
+				if (response.type === "error") throw new OwnerRequestError(response.message);
 				if (response.type !== "reply") throw new Error("The service returned an unexpected send response.");
 				return response.reply;
 			},
@@ -75,7 +79,7 @@ export function createServiceTerminalController(
 			},
 			async memory(request, signal) {
 				const response = await client.request({ type: "memory", request }, signal);
-				if (response.type === "error") throw new Error(response.message);
+				if (response.type === "error") throw new OwnerRequestError(response.message);
 				if (response.type !== "memory") throw new Error("Unexpected memory response.");
 				return response.result;
 			},
@@ -84,6 +88,12 @@ export function createServiceTerminalController(
 				if (response.type === "error") throw new Error(response.message);
 				if (response.type !== "status") throw new Error("Unexpected status response.");
 				return response.runtime;
+			},
+			async mission(request, signal) {
+				const response = await client.request({ type: "mission", request }, signal);
+				if (response.type === "error") throw new Error(response.message);
+				if (response.type !== "mission") throw new Error("Unexpected mission response.");
+				return response.result;
 			},
 		},
 		onChange,
@@ -102,6 +112,7 @@ export function createForegroundTerminalController(
 	return new OwnerTerminalController(
 		{
 			session,
+			ownerSession: session,
 			ownership: "foreground",
 			async watch(listener, signal) {
 				const { context, cancel } = withCancel(BACKGROUND_CONTEXT);
@@ -140,6 +151,10 @@ export function createForegroundTerminalController(
 				signal.throwIfAborted();
 				return (await agent.status(BACKGROUND_CONTEXT)).runtime;
 			},
+			async mission(request, signal) {
+				signal.throwIfAborted();
+				return agent.mission(request, BACKGROUND_CONTEXT);
+			},
 		},
 		onChange,
 		signal,
@@ -148,6 +163,7 @@ export function createForegroundTerminalController(
 
 interface ConversationTransport {
 	readonly session: string;
+	readonly ownerSession: string;
 	readonly ownership: "attached" | "foreground";
 	watch(
 		listener: (view: ServiceView) => void,
@@ -158,12 +174,16 @@ interface ConversationTransport {
 	cancel(signal: AbortSignal): Promise<void>;
 	memory(request: MemoryRequest, signal: AbortSignal): Promise<MemoryResult>;
 	runtime(signal: AbortSignal): Promise<RuntimeFacts>;
+	mission(request: MissionRequest, signal: AbortSignal): Promise<MissionView>;
 }
 
 const HELP = `${ATTACH_HELP}\nDefault rich controls: PageUp/PageDown scroll; Ctrl+Shift+F searches the displayed transcript when forwarded by the terminal; Enter/Shift+Enter moves between matches; Esc closes search.\nUsage covers conversation-model estimates, excluding tool/subagent costs and subscription billing.`;
 const FOREGROUND_HELP =
-	"/help /status /memory [stats|recall <query>|remember <text>|forget <id>|sleep] /cancel /exit. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
+	"/help /status /mission [setup] /memory [stats|recall <query>|remember <text>|forget <id>|sleep] /cancel /exit. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
 const MAX_INPUT_BYTES = 16_384;
+
+// A wire error acknowledges the request; transport failures leave its outcome unknown.
+class OwnerRequestError extends Error {}
 
 class OwnerTerminalController implements TerminalController {
 	readonly closed: Promise<number>;
@@ -234,6 +254,11 @@ class OwnerTerminalController implements TerminalController {
 					: `${this.#state.connection === "attached" ? "" : "Last observed (disconnected): "}${view.name}: ${view.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${view.pid}; version ${view.version}.`,
 			);
 			void this.#status();
+			return { status: "command" };
+		}
+		if (text === "/mission setup") return { status: "mission-setup" };
+		if (text === "/mission" || text === "/mission status") {
+			void this.#mission();
 			return { status: "command" };
 		}
 		if (text === "/memory" || text.startsWith("/memory ")) {
@@ -328,10 +353,12 @@ class OwnerTerminalController implements TerminalController {
 		try {
 			await this.#transport.watch(
 				(view) => {
+					const first = this.#state.view === undefined;
 					clearTimeout(this.#startup);
 					this.#state = { ...this.#state, connection: "attached", view };
 					this.#publish();
 					if (this.#cancelAfterAdmission && view.busy) this.cancel();
+					if (first && this.#transport.ownerSession === "default") void this.#mission(true);
 				},
 				this.#local.signal,
 				(message) => {
@@ -353,15 +380,13 @@ class OwnerTerminalController implements TerminalController {
 	async #send(text: string, requestId: string): Promise<void> {
 		try {
 			const reply = await this.#transport.send(text, requestId, this.#local.signal);
-			this.#state = {
-				...this.#state,
-				unresolvedRequestIds: this.#state.unresolvedRequestIds?.filter((id) => id !== requestId),
-			};
+			this.#acknowledge(requestId);
 			if (this.#finished) return;
 			// The watch is authoritative for transcript output; never duplicate an answer from the send reply.
 			if (reply.status === "failed")
 				this.#notice(`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`, "error");
 		} catch (error) {
+			if (error instanceof OwnerRequestError) this.#acknowledge(requestId);
 			if (!this.#finished) this.#notice(`Send failed; retry request ${requestId}: ${describeError(error)}`, "error");
 		} finally {
 			this.#cancelAfterAdmission = false;
@@ -387,8 +412,22 @@ class OwnerTerminalController implements TerminalController {
 	}
 
 	async #memory(request: MemoryRequest): Promise<void> {
+		const requestId = "requestId" in request ? request.requestId : undefined;
+		if (requestId !== undefined) {
+			if (this.#state.connection !== "attached") {
+				this.#notice("Not attached; the memory request was not sent.");
+				return;
+			}
+			if ((this.#state.unresolvedRequestIds?.length ?? 0) >= 8) {
+				this.#notice("Eight requests have unconfirmed outcomes. Inspect persisted work before sending more.", "error");
+				return;
+			}
+			this.#state = { ...this.#state, unresolvedRequestIds: [...(this.#state.unresolvedRequestIds ?? []), requestId] };
+			this.#publish();
+		}
 		try {
 			const result = await this.#transport.memory(request, this.#local.signal);
+			if (requestId !== undefined) this.#acknowledge(requestId);
 			if (!this.#finished) {
 				if (result.operation === "recall") {
 					if (result.records.length === 0) this.#notice(describeMemory(result));
@@ -403,8 +442,17 @@ class OwnerTerminalController implements TerminalController {
 				} else this.#notice(describeMemory(result));
 			}
 		} catch (error) {
+			if (requestId !== undefined && error instanceof OwnerRequestError) this.#acknowledge(requestId);
 			if (!this.#finished) this.#notice(`Memory: ${describeError(error)}`, "error");
 		}
+	}
+
+	#acknowledge(requestId: string): void {
+		this.#state = {
+			...this.#state,
+			unresolvedRequestIds: this.#state.unresolvedRequestIds?.filter((id) => id !== requestId),
+		};
+		this.#publish();
 	}
 
 	async #status(): Promise<void> {
@@ -412,10 +460,25 @@ class OwnerTerminalController implements TerminalController {
 			const facts = await this.#transport.runtime(this.#local.signal);
 			if (!this.#finished)
 				this.#notice(
-					`${facts.name}: ${this.#state.view?.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${facts.pid}; ${facts.provider}/${facts.modelId}; started ${new Date(facts.startedAt).toISOString()}; uptime ${Math.floor(facts.uptimeMs / 1000)}s; observed ${new Date(facts.observedAt).toISOString()}.`,
+					`${facts.name}: ${this.#state.view?.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${facts.pid}; ${facts.configuration === "unconfigured" ? "provider not configured" : `${facts.provider}/${facts.modelId}`}; started ${new Date(facts.startedAt).toISOString()}; uptime ${Math.floor(facts.uptimeMs / 1000)}s; observed ${new Date(facts.observedAt).toISOString()}.`,
 				);
 		} catch (error) {
 			if (!this.#finished) this.#notice(`Status: ${describeError(error)}`, "error");
+		}
+	}
+
+	async #mission(initial = false): Promise<void> {
+		try {
+			const view = await this.#transport.mission({ operation: "status" }, this.#local.signal);
+			if (this.#finished) return;
+			if (initial) {
+				if (!view.agreementValid)
+					this.#notice(
+						"No verified mission agreement. Use /mission setup to form a saved draft; ordinary work remains available. Autonomous execution is not implemented.",
+					);
+			} else this.#notice(describeMission(view));
+		} catch (error) {
+			if (!this.#finished && !initial) this.#notice(`Mission: ${describeError(error)}`, "error");
 		}
 	}
 

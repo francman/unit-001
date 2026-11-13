@@ -17,8 +17,9 @@ import {
 } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { ServiceView } from "../src/service.ts";
+import type { ServiceClient, ServiceClientEvent } from "../src/service-client.ts";
 import type { TerminalInputResult, TerminalState } from "../src/terminal-controller.ts";
-import { DEFAULT_APP_KEYBINDINGS, RichAttachView, runRichAttach } from "../src/terminal-ui.ts";
+import { DEFAULT_APP_KEYBINDINGS, RichAttachView, runRichAttach, runRichServiceAttach } from "../src/terminal-ui.ts";
 
 class FakeTerminal implements Terminal {
 	columns = 80;
@@ -29,6 +30,7 @@ class FakeTerminal implements Terminal {
 	stopped = false;
 	events: string[] = [];
 	start(input: (data: string) => void, resize: () => void): void {
+		this.stopped = false;
 		this.input = input;
 		this.resize = resize;
 	}
@@ -96,6 +98,42 @@ function launch() {
 }
 
 describe("rich service terminal", () => {
+	it("#55 restarts the editor when mission setup ends during a remote reconnect", async () => {
+		const terminal = new FakeTerminal();
+		const abort = new AbortController();
+		const setup = Promise.withResolvers<number>();
+		const missionSetup = vi.fn(() => setup.promise);
+		let observe: (event: ServiceClientEvent) => void = () => {};
+		const client: ServiceClient = {
+			session: "default@fixture",
+			ownerSession: "default",
+			async request() {
+				return { type: "error", message: "Unsupported mission" };
+			},
+			async watch(listener, signal) {
+				observe = listener;
+				listener({ type: "view", view: base });
+				await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+			},
+		};
+		const running = runRichServiceAttach(client, terminal, abort.signal, { missionSetup });
+		try {
+			terminal.input("/mission setup");
+			terminal.input("\r");
+			await expect.poll(() => missionSetup.mock.calls.length).toBe(1);
+			expect(terminal.stopped).toBe(true);
+			observe({ type: "connecting", message: "Remote reconnecting" });
+			setup.resolve(130);
+			await expect.poll(() => terminal.stopped).toBe(false);
+			observe({ type: "view", view: base });
+			terminal.input("\x04");
+			expect(await running).toBe(0);
+		} finally {
+			setup.resolve(130);
+			abort.abort();
+			await running;
+		}
+	});
 	it("#55 keeps an unconfirmed request ID visible at narrow widths despite rolling notices", () => {
 		const app = launch();
 		const id = "aa49e3de-4cb1-4caf-9b98-26e4c399c12d";
@@ -263,11 +301,17 @@ describe("rich service terminal", () => {
 			const requests: unknown[] = [];
 			let client: Socket | undefined;
 			const server = createServer((socket) => {
-				client = socket;
 				socket.on("error", () => {});
 				socket.once("data", (data) => {
-					requests.push(JSON.parse(String(data).trim()));
-					socket.write(`${JSON.stringify({ type: "view", view: base })}\n`);
+					const request: unknown = JSON.parse(String(data).trim());
+					requests.push(request);
+					if (typeof request === "object" && request !== null && "type" in request && request.type === "watch") {
+						client = socket;
+						socket.write(`${JSON.stringify({ type: "view", view: base })}\n`);
+					} else
+						socket.end(
+							`${JSON.stringify({ type: "error", message: "Mission inspection unavailable in this fixture" })}\n`,
+						);
 				});
 			});
 			await new Promise<void>((resolve, reject) => {
@@ -278,7 +322,8 @@ describe("rich service terminal", () => {
 			const controller = new AbortController();
 			const running = runRichAttach(endpoint, terminal, controller.signal, { colorMode: "monochrome" });
 			try {
-				await expect.poll(() => requests.length).toBe(1);
+				// #14: first attach inspects mission status, but must never submit work or cancel the owner.
+				await expect.poll(() => requests.length).toBe(2);
 				if (kind === "signal") controller.abort();
 				else {
 					client?.destroy();
@@ -288,7 +333,7 @@ describe("rich service terminal", () => {
 				}
 				expect(await running).toBe(kind === "signal" ? 0 : 1);
 				expect(terminal.events).toEqual(["drain", "stop"]);
-				expect(requests).toEqual([{ type: "watch" }]);
+				expect(requests).toEqual([{ type: "watch" }, { type: "mission", request: { operation: "status" } }]);
 			} finally {
 				controller.abort();
 				await running;
@@ -491,7 +536,8 @@ describe("rich service terminal", () => {
 			const screen = tui.getScreenLines().map(stripTerminalSequences).join("\n");
 			expect(screen).toContain("unit-001");
 			expect(screen).toContain("Durable agent workspace");
-			expect(screen).toContain("Ask a question or describe a task");
+			expect(screen).toContain("Work with your agent or form its mission");
+			expect(screen).toContain("/mission setup");
 			expect(screen).toContain("foreground");
 			expect(screen).toContain("Ctrl+D exit");
 			expect(screen).not.toContain("Ctrl+D detach");
