@@ -1,5 +1,5 @@
 // Defines channel capabilities, setup requests and public operational state without credentials.
-import type { MissionCreator } from "../missions/contract.ts";
+import { type MissionCreator, parseMissionCreator } from "../missions/contract.ts";
 
 export const CHANNEL_CAPABILITIES = ["status", "notify", "mission_control", "trusted_operator_execution"] as const;
 
@@ -96,6 +96,40 @@ export function channelIdentity(value: unknown): string {
 	if (!/^[a-zA-Z0-9_.:-]{1,100}$/.test(key) || ["__proto__", "constructor", "prototype"].includes(key))
 		throw new Error("Invalid channel request identity.");
 	return key;
+}
+
+/** Parses a saved owner proposal before a privileged issuer relies on its exact terms. */
+export function parseChannelRequest(value: unknown): ChannelRequest {
+	const input = channelObject(value);
+	if (input.session !== "default") throw new Error("Invalid channel session.");
+	const revision = channelInteger(input.revision);
+	const authorityRevision = channelInteger(input.authorityRevision);
+	const digest = channelText(input.digest, 64);
+	if (revision < 1 || authorityRevision < 1 || !/^[a-f0-9]{64}$/.test(digest))
+		throw new Error("Invalid channel proposal binding.");
+	const terms = parseChannelSetupInput({
+		requestId: input.requestId,
+		channelId: input.channelId,
+		expectedRevision: revision - 1,
+		adapter: input.adapter,
+		destination: input.destination,
+		capabilities: input.capabilities,
+		expiresAt: input.expiresAt,
+	});
+	return {
+		requestId: terms.requestId,
+		channelId: terms.channelId,
+		revision,
+		adapter: terms.adapter,
+		destination: terms.destination,
+		capabilities: terms.capabilities,
+		expiresAt: terms.expiresAt,
+		installationId: input.installationId === null ? null : channelText(input.installationId),
+		session: "default",
+		creator: parseMissionCreator(input.creator),
+		authorityRevision,
+		digest,
+	};
 }
 
 /** Reads a bounded object at channel protocol and protected-file boundaries. */

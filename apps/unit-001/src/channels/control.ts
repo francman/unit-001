@@ -33,12 +33,14 @@ export async function handleChannelCommand(
 	adapters: readonly ChannelAdapter[],
 	setupAdapters: readonly ChannelSetupAdapter[],
 	now: () => number,
+	options: { signal?: AbortSignal } = {},
 ) {
 	if (command.operation === "setup" || command.operation === "reconcile")
 		return {
 			operation: command.operation,
 			outcome: await runChannelSetup(command.channelId, store, readAuthority, setupAdapters, now, {
 				reconcile: command.operation === "reconcile",
+				signal: options.signal,
 			}),
 		};
 	const authority = await readAuthority();

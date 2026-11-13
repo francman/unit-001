@@ -1,6 +1,6 @@
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Report } from "@earendil-works/pi-durable";
@@ -226,6 +226,7 @@ async function run(
 				name: runtime.managed?.name ?? "agent",
 				models,
 				model: choice,
+				channelCredentialsDirectory: join(directory, "channels"),
 				mission:
 					runtime.managed === undefined
 						? { kind: "developer-local", directory, session: options.session }
@@ -288,6 +289,7 @@ async function control(
 				| "maintenance-enter"
 				| "maintenance-release"
 				| "memory"
+				| "channels"
 				| "mission";
 		}
 	>,
@@ -306,6 +308,13 @@ async function control(
 					command.options.session,
 					runtime.platform,
 				);
+	if (command.kind === "channels") {
+		const response = await requestService(endpoint, { type: "channels", request: { operation: "status" } }, signal);
+		if (response.type === "error") throw new ConfigurationError(response.message);
+		if (response.type !== "channels") throw new Error("Unexpected channel response.");
+		runtime.stdout.write(`${JSON.stringify(response.result)}\n`);
+		return 0;
+	}
 	if (command.kind === "mission") {
 		const request = async (request: MissionRequest): Promise<MissionView> => {
 			const response = await requestService(endpoint, { type: "mission", request }, signal);
@@ -497,6 +506,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				command.kind !== "cancel" &&
 				command.kind !== "service-status" &&
 				command.kind !== "memory" &&
+				command.kind !== "channels" &&
 				command.kind !== "mission" &&
 				!(command.kind === "run" && argv.length === 0 && runtime.interactive)
 			)
@@ -530,6 +540,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 			command.kind === "maintenance-enter" ||
 			command.kind === "maintenance-release" ||
 			command.kind === "memory" ||
+			command.kind === "channels" ||
 			command.kind === "mission"
 		)
 			code = await control(command, runtime, signal);

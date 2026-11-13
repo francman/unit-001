@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { open, rename, rm } from "node:fs/promises";
+import { type FileHandle, open, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { type MissionLocation, missionAuthorityPath, readMissionAuthority } from "../missions/authority.ts";
 import { type MissionAuthority, parseMissionCreator } from "../missions/contract.ts";
@@ -13,7 +13,9 @@ import {
 	channelInteger,
 	channelObject,
 	channelText,
+	parseChannelSetupInput,
 } from "./contract.ts";
+import { channelRequestDigest } from "./registry.ts";
 
 export type ChannelGrant = {
 	id: string;
@@ -23,6 +25,8 @@ export type ChannelGrant = {
 	adapter: string;
 	destination: string;
 	capabilities: ChannelCapability[];
+	approvedAt: number;
+	approvedBy: { kind: "creator" | "administrator"; uid: number };
 };
 
 export type ChannelAuthority = {
@@ -48,7 +52,7 @@ export async function readChannelAuthority(location: MissionLocation): Promise<{
 } | null> {
 	const creator = await readMissionAuthority(location);
 	if (!creator) return null;
-	let file;
+	let file: FileHandle;
 	try {
 		file = await open(
 			channelAuthorityPath(location),
@@ -149,6 +153,9 @@ export function parseChannelAuthority(value: unknown): ChannelAuthority {
 			const grant = channelObject(value);
 			const digest = channelText(grant.digest, 64);
 			if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error("Invalid channel grant digest.");
+			const actor = channelObject(grant.approvedBy);
+			if (actor.kind !== "creator" && actor.kind !== "administrator")
+				throw new Error("Invalid channel grant issuer.");
 			return {
 				id: channelText(grant.id),
 				requestId: channelText(grant.requestId),
@@ -157,9 +164,58 @@ export function parseChannelAuthority(value: unknown): ChannelAuthority {
 				adapter: channelText(grant.adapter),
 				destination: channelText(grant.destination),
 				capabilities: capabilities(grant.capabilities),
+				approvedAt: channelInteger(grant.approvedAt),
+				approvedBy: { kind: actor.kind, uid: channelInteger(actor.uid) },
 			};
 		}),
 	};
+}
+
+/** Builds one exact receipt for a protected writer; this function alone grants no filesystem authority. */
+export function issueChannelGrant(
+	request: ChannelRequest,
+	authority: { creator: MissionAuthority; channels: ChannelAuthority | null },
+	expiresAt: number,
+	actorUid: number,
+	now: number,
+): ChannelAuthority {
+	const policy = authority.channels;
+	if (!policy) throw new Error("Configure the channel ceiling before granting setup.");
+	const input = parseChannelSetupInput({
+		requestId: request.requestId,
+		channelId: request.channelId,
+		expectedRevision: request.revision - 1,
+		adapter: request.adapter,
+		destination: request.destination,
+		capabilities: request.capabilities,
+		expiresAt: request.expiresAt,
+	});
+	if (channelRequestDigest(input, authority.creator) !== request.digest)
+		throw new Error("Channel request digest changed.");
+	const previous = policy.grants.find(
+		(grant) =>
+			grant.requestId === request.requestId && grant.digest === request.digest && grant.expiresAt === expiresAt,
+	);
+	const grant: ChannelGrant = previous ?? {
+		id: randomUUID(),
+		requestId: request.requestId,
+		digest: request.digest,
+		expiresAt: channelInteger(expiresAt),
+		adapter: request.adapter,
+		destination: request.destination,
+		capabilities: request.capabilities,
+		approvedAt: channelInteger(now),
+		approvedBy: {
+			kind: actorUid === authority.creator.creator.uid ? "creator" : "administrator",
+			uid: channelInteger(actorUid),
+		},
+	};
+	const candidate = { ...policy, grants: [grant] };
+	if (!matchingChannelGrant(request, { ...authority, channels: candidate }, now))
+		throw new Error("Channel grant exceeds current creator authority.");
+	const grants = policy.grants.filter((item) => item.requestId !== request.requestId);
+	if (grants.length >= 32) throw new Error("Channel grant capacity reached.");
+	return { ...policy, grants: [...grants, grant] };
 }
 
 /** Requires exact current creator, request, destination and permission binding before every setup effect. */

@@ -72,6 +72,7 @@ export function channelExtension(
 						adapters,
 						setupAdapters,
 						() => api.now(),
+						{ signal: context.abortSignal },
 					);
 					return { output: [{ type: "text", text: JSON.stringify(result) }] };
 				},

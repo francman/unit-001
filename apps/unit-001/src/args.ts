@@ -25,6 +25,7 @@ export interface AttachOptions extends ServiceOptions {
 }
 
 export type Command =
+	| { readonly kind: "channels"; readonly options: ServiceOptions }
 	| { readonly kind: "mission"; readonly command: MissionCommand; readonly options: ServiceOptions }
 	| {
 			readonly kind: "memory";
@@ -72,6 +73,7 @@ export const USAGE = `Usage: agent [options]
        agent cancel [options]            abort its current run
        agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]
        agent mission [status|setup|draft|propose|creator|approve] [options]
+       agent channels [status] [options] show available adapters and observed channel state
 
 Starts the agent. Its conversations persist, so a restarted process resumes unfinished work.
 
@@ -194,6 +196,10 @@ export function parseArguments(argv: readonly string[]): Command {
 	);
 	if (alias !== undefined) return parseArguments([alias.invocation, ...argv.slice(1)]);
 	if (first === "help") return { kind: "help" };
+	if (first === "channels") {
+		const parsed = parseServiceCommand("service-status", argv.slice(argv[1] === "status" ? 2 : 1));
+		return parsed.kind === "service-status" ? { kind: "channels", options: parsed.options } : parsed;
+	}
 	if (first === "inspect") {
 		if (argv[1] !== "os") throw new UsageError("Usage: agent inspect os [options]");
 		return parseServiceCommand("send", ["inspect os", ...argv.slice(2)]);

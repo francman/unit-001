@@ -8,7 +8,7 @@ Telegram needs an existing management bot with Bot Management Mode enabled in Bo
 
 ## Current integration boundary
 
-The core exports `channelExtension`, `handleChannelCommand`, protected channel authority helpers and the real Telegram HTTP client/setup adapter. Tests install them into the existing owner and reopen real SQLite. Default application registration, installed administrator commands and secure interactive bootstrap are the remaining integration slice. No live account has been enabled or delivery tested. [#56](https://github.com/francman/unit-001/issues/56) tracks that work; messaging delivery remains [#40](https://github.com/francman/unit-001/issues/40).
+The default owner registers channel tools and the real Telegram setup adapter. `agent channels status` reads adapter capabilities and observed setup state through the running owner, without a provider call. Installed `sudo NAME channels policy|approve|revoke|telegram-bootstrap` commands use the selected release's fixed authority helper. Policy and bootstrap inputs must be protected regular files; tokens never belong in command arguments or conversation. No live account has been enabled or delivery tested. [#56](https://github.com/francman/unit-001/issues/56) tracks setup acceptance; messaging delivery remains [#40](https://github.com/francman/unit-001/issues/40).
 
 ## Records and authority
 
@@ -30,6 +30,6 @@ The setup journal commits an attempt before external work. After interruption, n
 
 ## Verification
 
-Focused tests cover two adapter contracts, request conflicts, stale revisions, wrong principals, grant expiry/revocation/disable, protected file/symlink permissions, actual current-UID managed-write denial, restart reconciliation, SQLite reopen and faux model tools. Local HTTP tests exercise the real Telegram request paths and response parsing, wrong bot identity, bounded batches and secret-redacted errors. These checks use no external credentials, paid models or GitHub Actions. Native Linux root issuance and installed terminal bootstrap require separate integration acceptance before release.
+Focused tests cover two adapter contracts, request conflicts, stale revisions, wrong principals, grant expiry/revocation/disable, protected file/symlink permissions, actual current-UID managed-write denial, restart reconciliation, SQLite reopen and faux model tools. Local HTTP tests exercise the real Telegram request paths and response parsing, wrong bot identity, bounded batches and secret-redacted errors. A disposable Ubuntu fixture verifies actual root issuance, service-UID bootstrap, exact replay and credential permissions. Owner tests verify setup cancellation drains before storage closes. These checks use no external credentials, paid models or GitHub Actions. Native systemd lifecycle and installed terminal acceptance remain required before release.
 
 Primary protocol references: [managed-bot creator workflow](https://core.telegram.org/bots/features#managed-bots), [Bot API token methods](https://core.telegram.org/bots/api#getmanagedbottoken), [user-only lower-level creation](https://core.telegram.org/api/bots/managed-bots).

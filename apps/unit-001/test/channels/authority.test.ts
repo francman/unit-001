@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	channelAuthorityPath,
+	issueChannelGrant,
 	matchingChannelGrant,
 	readChannelAuthority,
 	writeChannelAuthority,
@@ -20,6 +21,28 @@ afterEach(async () => {
 });
 
 describe("channel authority", () => {
+	it("#56 binds issuer retries to exact terms and rejects grants beyond the protected ceiling or request expiry", () => {
+		const fixture = grantFixture();
+		const issued = issueChannelGrant(fixture.request, fixture, 3500, 0, 1100);
+		const receipt = issued.grants.find((grant) => grant.requestId === fixture.request.requestId);
+		expect(receipt).toMatchObject({ expiresAt: 3500, digest: fixture.request.digest });
+		const retried = issueChannelGrant(fixture.request, { ...fixture, channels: issued }, 3500, 0, 1200);
+		expect(retried.grants).toEqual(issued.grants);
+		expect(() => issueChannelGrant(fixture.request, fixture, 6000, 0, 1100)).toThrow("exceeds");
+		expect(() =>
+			issueChannelGrant({ ...fixture.request, destination: "unexpected" }, fixture, 3500, 0, 1100),
+		).toThrow("digest");
+		expect(() =>
+			issueChannelGrant(
+				fixture.request,
+				{ ...fixture, channels: { ...fixture.channels, ceiling: [] } },
+				3500,
+				0,
+				1100,
+			),
+		).toThrow("exceeds");
+	});
+
 	it("requires exact current creator, installation, request, permissions and expiry", () => {
 		const fixture = grantFixture();
 		expect(matchingChannelGrant(fixture.request, fixture, 1000)?.id).toBe("grant-1");

@@ -54,6 +54,8 @@ export function grantFixture() {
 				adapter: "telegram",
 				destination: "42",
 				capabilities: ["notify"],
+				approvedAt: 1000,
+				approvedBy: { kind: "creator", uid: process.getuid?.() ?? 0 },
 			},
 		],
 	};

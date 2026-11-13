@@ -4,6 +4,8 @@ import { createConnection, createServer, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
+import { type ChannelCommand, type ChannelResult, parseChannelCommand } from "./channels/control.ts";
+import { parseChannelResult } from "./channels/wire.ts";
 import { type CommandInterpretation, parseCommandInterpretation } from "./commands/interpretation.ts";
 import { ConfigurationError, UsageError } from "./errors.ts";
 import {
@@ -22,6 +24,7 @@ import { parseServiceEvent, type ServiceView, serviceView } from "./service-view
 export type { ServiceEvent, ServiceView } from "./service-view.ts";
 
 export type ServiceRequest =
+	| { readonly type: "channels"; readonly request: ChannelCommand }
 	| { readonly type: "resolve-command"; readonly input: string; readonly surface: "cli" | "slash" }
 	| { readonly type: "mission"; readonly request: MissionRequest }
 	| { readonly type: "memory"; readonly request: MemoryRequest }
@@ -33,6 +36,7 @@ export type MaintenanceRequest =
 	| { readonly type: "maintenance-release"; readonly operationId: string };
 
 export type ServiceResponse =
+	| { readonly type: "channels"; readonly result: ChannelResult }
 	| { readonly type: "command-suggestions"; readonly result: CommandInterpretation }
 	| { readonly type: "mission"; readonly result: MissionView }
 	| { readonly type: "memory"; readonly result: MemoryResult }
@@ -374,6 +378,7 @@ async function handleRequest(
 		value.type !== "cancel" &&
 		value.type !== "memory" &&
 		value.type !== "mission" &&
+		value.type !== "channels" &&
 		value.type !== "resolve-command"
 	)
 		throw new UsageError("This operation requires the administrator endpoint.");
@@ -396,6 +401,10 @@ async function handleRequest(
 				AbortSignal.any([disconnected, AbortSignal.timeout(9000)]),
 			),
 		};
+	}
+	if (value.type === "channels") {
+		if (!("request" in value)) throw new UsageError("Missing channel request.");
+		return { type: "channels", result: await agent.channels(parseChannelCommand(value.request), BACKGROUND_CONTEXT) };
 	}
 	if (value.type === "mission") {
 		if (!("request" in value)) throw new UsageError("Missing mission request.");
@@ -461,6 +470,8 @@ function parseResponse(wire: string): ServiceResponse {
 	const value: unknown = JSON.parse(wire);
 	// A failed or different local service must not be mistaken for a valid reply.
 	if (typeof value === "object" && value !== null && "type" in value) {
+		if (value.type === "channels" && "result" in value)
+			return { type: "channels", result: parseChannelResult(value.result) };
 		if (value.type === "command-suggestions" && "result" in value)
 			return { type: "command-suggestions", result: parseCommandInterpretation(value.result) };
 		if (value.type === "mission" && "result" in value)

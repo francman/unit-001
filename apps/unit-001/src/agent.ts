@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import type { Context } from "@earendil-works/chord/context";
 import { Type } from "@earendil-works/pi-ai";
@@ -33,6 +34,8 @@ import {
 	rememberMemory,
 	scheduleMemoryConsolidation,
 } from "unit-memory";
+import type { ChannelCommand, ChannelResult } from "./channels/control.ts";
+import { ChannelOwner, defaultChannelHost } from "./channels/owner.ts";
 import type { CommandSurface } from "./commands/catalog.ts";
 import { HostFactEntry, isOperatingSystemQuestion } from "./commands/facts.ts";
 import { type CommandInterpretation, type InterpretationUsage, interpretCommand } from "./commands/interpretation.ts";
@@ -55,6 +58,8 @@ export interface AgentOptions {
 	readonly models: Models;
 	readonly model: ModelChoice | null;
 	readonly mission?: MissionLocation;
+	/** Private host-selected channel credential directory; no credential value enters agent configuration. */
+	readonly channelCredentialsDirectory?: string;
 	/** The working directory tools run in. */
 	readonly cwd: string;
 	readonly platform?: NodeJS.Platform;
@@ -88,6 +93,7 @@ export class Agent {
 	readonly #runtime: () => RuntimeFacts;
 	readonly #memory: MemoryService;
 	readonly #mission: MissionControl;
+	readonly #channels: ChannelOwner;
 	readonly #configuration: "configured" | "unconfigured";
 	readonly #models: Models;
 	readonly #model: ModelChoice | null;
@@ -105,6 +111,7 @@ export class Agent {
 		runtime: () => RuntimeFacts,
 		memory: MemoryService,
 		mission: MissionControl,
+		channels: ChannelOwner,
 		configuration: "configured" | "unconfigured",
 		models: Models,
 		model: ModelChoice | null,
@@ -117,6 +124,7 @@ export class Agent {
 		this.#runtime = runtime;
 		this.#memory = memory;
 		this.#mission = mission;
+		this.#channels = channels;
 		this.#configuration = configuration;
 		this.#models = models;
 		this.#model = model;
@@ -128,12 +136,22 @@ export class Agent {
 		const runtime = createRuntimeFacts(name, options.model);
 		const memory = createMemoryExtension();
 		const registry = createRegistry();
+		const missionLocation = options.mission ?? {
+			kind: "developer-local" as const,
+			directory: options.cwd,
+			session: "default",
+		};
+		const channels = defaultChannelHost(
+			missionLocation,
+			options.channelCredentialsDirectory ?? join(options.cwd, ".unit-channels"),
+		);
 		registry.install(CodingTools);
 		if ((options.platform ?? process.platform) === "win32") {
 			registry.install(defineExtension({ name: "powershell", tools: [createPowerShellTool()] }));
 		}
 		registry.install(orientationExtension(runtime));
 		registry.install(introspectionExtension());
+		registry.install(channels.extension);
 		registry.install(memory.extension);
 		registry.install(MissionFoundation);
 		let mission!: MissionControl;
@@ -182,18 +200,14 @@ export class Agent {
 				return (await tx.doc(MaintenanceDoc)).current.state === "held";
 			}, context);
 			const inhibited = options.startup?.kind === "inhibited" || held;
-			mission = new MissionControl(
-				harness,
-				options.mission ?? { kind: "developer-local", directory: options.cwd, session: "default" },
-				[
-					...new Set(
-						registry
-							.snapshot()
-							.tools()
-							.map((item) => item.tool.name),
-					),
-				],
-			);
+			mission = new MissionControl(harness, missionLocation, [
+				...new Set(
+					registry
+						.snapshot()
+						.tools()
+						.map((item) => item.tool.name),
+				),
+			]);
 			if (!inhibited) await mission.initialize(context);
 			const legacy = (await harness.snapshot(MissionDoc, context))?.current ?? null;
 			const pending = options.model === null ? await harness.inspect(context) : undefined;
@@ -217,6 +231,7 @@ export class Agent {
 				runtime,
 				memory,
 				mission,
+				new ChannelOwner(harness, channels),
 				options.model === null ? "unconfigured" : "configured",
 				options.models,
 				options.model,
@@ -388,6 +403,7 @@ export class Agent {
 	}
 
 	async close(context: Context): Promise<void> {
+		await this.#channels.drain();
 		for (const controller of this.#interpretations.keys()) controller.abort();
 		await Promise.all(this.#interpretations.values());
 		try {
@@ -468,6 +484,12 @@ export class Agent {
 		return this.#mission.handle(request, context);
 	}
 
+	/** Inspects channels or resumes exact creator-granted setup without granting permission or opening another writer. */
+	channels(request: ChannelCommand, context: Context): Promise<ChannelResult> {
+		if (request.operation !== "status") this.requireActive();
+		return this.#channels.request(request, context);
+	}
+
 	/** Reports whether the conversation has an unfinished foreground run. */
 	async status(context: Context): Promise<{
 		readonly busy: boolean;
@@ -501,6 +523,7 @@ export class Agent {
 		}, context);
 		const deadline = performance.now() + timeoutMs;
 		for (const controller of this.#interpretations.keys()) controller.abort();
+		this.#channels.abort();
 		for (;;) {
 			const inspection = await this.#harness.inspect(context);
 			const legacy = (await this.#harness.snapshot(MissionDoc, context))?.current ?? null;
@@ -509,7 +532,8 @@ export class Agent {
 					(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
 				) &&
 				inspection.submissions.length === 0 &&
-				this.#interpretations.size === 0
+				this.#interpretations.size === 0 &&
+				this.#channels.pending === 0
 			) {
 				return { type: "maintenance", protocol: 1, state: "held", operationId, result: "drained" };
 			}
