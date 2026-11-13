@@ -38,6 +38,7 @@ describe("deterministic OS introspection", () => {
 			kernel: { release: "6.8.0-example" },
 		});
 		expect(renderOperatingSystemFacts(facts)).toContain("Ubuntu 24.04.3 LTS");
+		expect(renderOperatingSystemFacts(facts)).toContain("Sources: kernel node:os; userland /etc/os-release");
 		expect(renderOperatingSystemFacts(facts)).toContain("physical-host and container identity are unknown");
 	});
 
@@ -53,7 +54,7 @@ describe("deterministic OS introspection", () => {
 		expect(() => parseOsRelease('NAME="first""second"\n')).toThrow("quoting");
 		expect(() => parseOsRelease("NAME=Linux\nBAD=$(id)\n")).toThrow();
 		expect(() => parseOsRelease("NAME=\u001b[31mLinux")).toThrow();
-		expect(() => parseOsRelease("NAME=" + "x".repeat(17000))).toThrow();
+		expect(() => parseOsRelease(`NAME=${"x".repeat(17000)}`)).toThrow();
 	});
 
 	it("accepts an intentional protected relative symlink, denies writable metadata and reports limits/missing", async () => {
