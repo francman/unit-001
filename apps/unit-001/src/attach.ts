@@ -3,6 +3,9 @@ import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import { ATTACH_HELP as HELP } from "./attach-help.ts";
+import { commandCatalog } from "./commands/catalog.ts";
+import { isOperatingSystemQuestion } from "./commands/facts.ts";
+import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
 import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
 import { sanitizeTerminalText } from "./render.ts";
@@ -98,7 +101,7 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 	const onLine = (line: string) => {
 		if (local.signal.aborted) return;
 		flush();
-		const text = line.trim();
+		let text = line.trim();
 		const runMemory = (request: MemoryRequest) => {
 			void requestService(endpoint, { type: "memory", request }, local.signal).then(
 				(response) => {
@@ -118,6 +121,38 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 			if (text.toLowerCase() === "yes") runMemory({ operation: "forget", ...pending, confirmed: true });
 			else err("Forget cancelled.\n");
 			return;
+		}
+		if (text.startsWith("/")) {
+			const resolved = resolveLocalCommand(text, "slash");
+			if (resolved.kind === "exact") text = `/${resolved.text}`;
+			else {
+				if (resolved.kind === "suggestions") err(`${describeCommandSuggestions(resolved.commands, "slash")}\n`);
+				else if (text.length <= 256)
+					void requestService(
+						endpoint,
+						{ type: "resolve-command", input: text, surface: "slash" },
+						local.signal,
+					).then(
+						(response) => {
+							if (local.signal.aborted) return;
+							if (response.type !== "command-suggestions") {
+								err("Command suggestions unavailable. Use /help.\n");
+								return;
+							}
+							const commands = commandCatalog("slash").filter((command) =>
+								response.result.commandIds.includes(command.id),
+							);
+							err(
+								`${commands.length === 0 ? response.result.explanation : describeCommandSuggestions(commands, "slash")}\n`,
+							);
+						},
+						() => {
+							if (!local.signal.aborted) err("Command suggestions unavailable. Use /help.\n");
+						},
+					);
+				else err("Unknown command. Use /help.\n");
+				return;
+			}
 		}
 		if (text === "/exit" || text === "/detach") {
 			detach();
@@ -169,7 +204,7 @@ export async function runAttach(endpoint: string, terminal: Terminal, signal: Ab
 				err(`Memory: ${describeError(error)}\n`);
 			}
 		} else if (text === "/cancel") cancel();
-		else if (text.startsWith("/")) err(`Unknown command. ${HELP}\n`);
+		else if (text.startsWith("/") && !isOperatingSystemQuestion(text)) err(`Unknown command. ${HELP}\n`);
 		else if (text !== "") {
 			if (sending) {
 				err(
@@ -329,7 +364,7 @@ class AttachedOutput {
 				this.finish();
 			} else {
 				this.finish();
-				this.#terminal.out(`${entry.role}> ${text}\n`);
+				this.#terminal.out(`${entry.role}${entry.source === "host" ? " (host)" : ""}> ${text}\n`);
 			}
 			if (entry.truncated) this.#terminal.err("[Entry truncated; this view is not the complete answer.]\n");
 			this.#lastEntryId = entry.id;

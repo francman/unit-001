@@ -16,6 +16,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
+import { commandCatalog } from "../src/commands/catalog.ts";
 import type { ServiceView } from "../src/service.ts";
 import type { TerminalInputResult, TerminalState } from "../src/terminal-controller.ts";
 import { DEFAULT_APP_KEYBINDINGS, RichAttachView, runRichAttach } from "../src/terminal-ui.ts";
@@ -81,6 +82,7 @@ function launch() {
 		submit: vi.fn((_text: string): TerminalInputResult => ({ status: "submitted", requestId: "r1" })),
 		cancel: vi.fn(),
 		detach: vi.fn(),
+		dismissSuggestions: vi.fn(),
 	};
 	const view = new RichAttachView(tui, "default", actions, { colorMode: "monochrome" });
 	tui.setLayoutRoot(view);
@@ -96,6 +98,34 @@ function launch() {
 }
 
 describe("rich service terminal", () => {
+	it.each([
+		[80, 24],
+		[40, 12],
+	])("selects suggestions into the editor without executing at %ix%i (#59)", (columns, rows) => {
+		const app = launch();
+		try {
+			app.terminal.columns = columns;
+			app.terminal.rows = rows;
+			app.terminal.resize();
+			const suggestions = commandCatalog("slash").filter((command) =>
+				["memory", "memory.forget"].includes(command.id),
+			);
+			app.update(base, { suggestions });
+			expect(app.screen().join("\n")).toContain("Did you mean?");
+			expect(app.screen().every((line) => visibleWidth(line) <= columns)).toBe(true);
+			app.terminal.input("\x1b[B");
+			app.terminal.input("\r");
+			expect(app.view.editor.getText()).toBe("/memory forget");
+			expect(app.actions.submit).not.toHaveBeenCalled();
+			expect(app.actions.dismissSuggestions).toHaveBeenCalledOnce();
+			app.update(base, { suggesting: true });
+			app.terminal.input("\x1b");
+			expect(app.actions.dismissSuggestions).toHaveBeenCalledTimes(2);
+			expect(app.actions.cancel).not.toHaveBeenCalled();
+		} finally {
+			app.tui.stop();
+		}
+	});
 	it("labels the composer and shows typing immediately without submitting", () => {
 		// #36: real typing feedback and a named composer are acceptance requirements, not just action results.
 		const app = launch();

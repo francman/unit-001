@@ -68,13 +68,17 @@ describe("runRepl", () => {
 		expect(io.out()).toBe("Paris.\n");
 	});
 
-	it("handles /help, unknown commands, and blank lines without asking the model", async () => {
+	it("handles /help, local command suggestions, and blank lines without asking the model (#59)", async () => {
 		const agent = await launch([]);
-		const io = terminal("\n   \n/help\n/nope arg\n/exit\n");
+		const infer = vi.spyOn(agent, "resolveCommand");
+		const submit = vi.spyOn(agent, "submit");
+		const io = terminal("\n   \n/help\n/memroy\n/exit\n");
 		expect(await runRepl(agent, io.terminal, signal())).toBe(0);
 		expect(io.out()).toBe("");
 		expect(io.err()).toContain("Commands: /help");
-		expect(io.err()).toContain("Unknown command /nope.");
+		expect(io.err()).toContain("Did you mean:");
+		expect(infer).not.toHaveBeenCalled();
+		expect(submit).not.toHaveBeenCalled();
 	});
 
 	// #21: local status must not submit another model request or pollute answer stdout.
