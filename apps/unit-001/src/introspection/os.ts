@@ -79,7 +79,7 @@ export function renderOperatingSystemFacts(facts: OperatingSystemFacts): string 
 					.filter(Boolean)
 					.join(" "))
 			: `Userland OS unavailable (${facts.userland.reason})`;
-	return `${system}. Platform: ${facts.platform}; architecture: ${facts.architecture}. Kernel: ${facts.kernel.name} ${facts.kernel.release}.\nObserved ${new Date(facts.observedAt).toISOString()} in the current process namespace; physical-host and container identity are unknown.`;
+	return `${system}. Platform: ${facts.platform}; architecture: ${facts.architecture}. Kernel: ${facts.kernel.name} ${facts.kernel.release}.\nSources: kernel ${facts.kernel.source}; userland ${facts.userland.source}. Observed ${new Date(facts.observedAt).toISOString()} in the current process namespace; physical-host and container identity are unknown.`;
 }
 
 /** Parses only os-release assignments and selected public metadata, without expansion or executable shell syntax. */
