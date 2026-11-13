@@ -309,6 +309,8 @@ export class RichAttachView extends VStack {
 					return { consume: true };
 				}
 			}
+			// Editing abandons the old query so a later Enter cannot replace the new draft.
+			this.#actions.dismissSuggestions?.();
 		}
 		if (this.#keys.matches(data, "unit.attach.detach")) {
 			this.#actions.detach();

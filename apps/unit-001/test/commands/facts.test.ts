@@ -123,6 +123,16 @@ describe("deterministic host facts", () => {
 		expect(calls()).toBe(0);
 	});
 
+	it("rejects a new interpretation once closing starts (#59)", async () => {
+		const { agent, calls } = await launch(true);
+		const closing = agent.close(context);
+		await expect(agent.resolveCommand("xyzzy", "cli", context, new AbortController().signal)).rejects.toThrow(
+			"closing",
+		);
+		await closing;
+		expect(calls()).toBe(0);
+	});
+
 	it("installs the shared OS inspection tool for normal model work (#57)", async () => {
 		const { agent, faux } = await launch(true);
 		let observed = "";

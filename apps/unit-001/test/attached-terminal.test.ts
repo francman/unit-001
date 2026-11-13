@@ -55,6 +55,13 @@ describe.skipIf(process.platform === "win32")("attached chat in a real terminal"
 		await app.text("/memroy");
 		await app.key("Enter");
 		await app.waitFor("Did you mean?");
+		await app.text("x");
+		await expect.poll(async () => await app.screen()).not.toContain("Did you mean?");
+		await app.waitFor("/memroyx");
+		await app.key("C-u");
+		await app.text("/memroy");
+		await app.key("Enter");
+		await app.waitFor("Did you mean?");
 		await app.key("Escape");
 		await expect.poll(async () => await app.screen()).not.toContain("Did you mean?");
 		await app.key("C-d");

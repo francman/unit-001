@@ -64,6 +64,7 @@ describe("bounded command interpretation", () => {
 		{ stage: "execute", commandIds: ["status"], explanation: "", usage: null },
 		{ stage: "model", commandIds: ["shell"], explanation: "", usage: null },
 		{ stage: "model", commandIds: ["status"], explanation: "\u001b[2J", usage: null },
+		{ stage: "model", commandIds: ["status"], explanation: "\u202eSpoof", usage: null },
 		{ stage: "model", commandIds: [], explanation: "", usage: { observedAt: -1 } },
 	])("rejects malformed owner suggestion frames (#59)", (frame) => {
 		expect(() => parseCommandInterpretation(frame)).toThrow();
@@ -73,6 +74,7 @@ describe("bounded command interpretation", () => {
 		fauxAssistantMessage(fauxText("not JSON")),
 		fauxAssistantMessage(fauxText('{"commandIds":["rm -rf /"],"explanation":"execute"}')),
 		fauxAssistantMessage(fauxText('{"commandIds":["status"],"explanation":null}')),
+		fauxAssistantMessage(fauxText('{"commandIds":["status"],"explanation":"\u202eSpoof"}')),
 		fauxAssistantMessage(fauxToolCall("bash", { command: "touch /tmp/never" }), { stopReason: "toolUse" }),
 	])("rejects malformed or executable model output without retry (#59)", async (response) => {
 		const { models, faux } = configured();

@@ -24,6 +24,24 @@ describe("local command resolution", () => {
 		});
 	});
 
+	it("passes long exact command operands through without inference (#59)", () => {
+		const body = "saved detail ".repeat(100);
+		expect(resolveLocalCommand(`/memory remember ${body}`, "slash")).toMatchObject({
+			kind: "exact",
+			command: { id: "memory.remember" },
+			text: `memory remember ${body.trim()}`,
+		});
+		expect(resolveLocalCommand(`/brain remember ${body}`, "slash")).toMatchObject({
+			kind: "exact",
+			command: { id: "memory" },
+			text: `memory remember ${body.trim()}`,
+		});
+	});
+
+	it("does not use private operands to rank unknown commands (#59)", () => {
+		expect(resolveLocalCommand("xyzzy save delete", "slash")).toEqual(resolveLocalCommand("xyzzy", "slash"));
+	});
+
 	it("ranks spelling and vocabulary suggestions deterministically without executing (#59)", () => {
 		for (const input of ["/memroy", "/memories"]) {
 			const result = resolveLocalCommand(input, "slash");
