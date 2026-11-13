@@ -4,6 +4,7 @@ import { createConnection, createServer, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
+import { type CommandInterpretation, parseCommandInterpretation } from "./commands/interpretation.ts";
 import { ConfigurationError, UsageError } from "./errors.ts";
 import {
 	authorizeManagedMaintenance,
@@ -21,6 +22,7 @@ import { parseServiceEvent, type ServiceView, serviceView } from "./service-view
 export type { ServiceEvent, ServiceView } from "./service-view.ts";
 
 export type ServiceRequest =
+	| { readonly type: "resolve-command"; readonly input: string; readonly surface: "cli" | "slash" }
 	| { readonly type: "mission"; readonly request: MissionRequest }
 	| { readonly type: "memory"; readonly request: MemoryRequest }
 	| { readonly type: "send"; readonly prompt: string; readonly requestId?: string }
@@ -31,6 +33,7 @@ export type MaintenanceRequest =
 	| { readonly type: "maintenance-release"; readonly operationId: string };
 
 export type ServiceResponse =
+	| { readonly type: "command-suggestions"; readonly result: CommandInterpretation }
 	| { readonly type: "mission"; readonly result: MissionView }
 	| { readonly type: "memory"; readonly result: MemoryResult }
 	| MaintenanceResult
@@ -125,7 +128,10 @@ export async function runService(
 					void streamViews(agent, socket, version, installationId).catch(() => socket.destroy());
 					return;
 				}
-				void handleRequest(agent, version, installationId, value, access).then(
+				// Suggestions are disposable; admitted mission work must survive client disconnection.
+				const disconnected = new AbortController();
+				socket.once("close", () => disconnected.abort());
+				void handleRequest(agent, version, installationId, value, access, disconnected.signal).then(
 					(response) => writeResponse(socket, response),
 					(error: unknown) =>
 						writeResponse(socket, {
@@ -356,6 +362,7 @@ async function handleRequest(
 	installationId: string | null,
 	value: unknown,
 	access: "administrator" | "operator",
+	disconnected: AbortSignal,
 ): Promise<ServiceResponse> {
 	// Local wire input is untrusted even when the socket is restricted to its owner.
 	if (typeof value !== "object" || value === null || !("type" in value))
@@ -366,9 +373,30 @@ async function handleRequest(
 		value.type !== "send" &&
 		value.type !== "cancel" &&
 		value.type !== "memory" &&
-		value.type !== "mission"
+		value.type !== "mission" &&
+		value.type !== "resolve-command"
 	)
 		throw new UsageError("This operation requires the administrator endpoint.");
+	if (value.type === "resolve-command") {
+		if (
+			!("input" in value) ||
+			typeof value.input !== "string" ||
+			value.input.length === 0 ||
+			value.input.length > 256 ||
+			!("surface" in value) ||
+			(value.surface !== "cli" && value.surface !== "slash")
+		)
+			throw new UsageError("Invalid command interpretation request.");
+		return {
+			type: "command-suggestions",
+			result: await agent.resolveCommand(
+				value.input,
+				value.surface,
+				BACKGROUND_CONTEXT,
+				AbortSignal.any([disconnected, AbortSignal.timeout(9000)]),
+			),
+		};
+	}
 	if (value.type === "mission") {
 		if (!("request" in value)) throw new UsageError("Missing mission request.");
 		const request = parseMissionRequest(value.request);
@@ -433,6 +461,8 @@ function parseResponse(wire: string): ServiceResponse {
 	const value: unknown = JSON.parse(wire);
 	// A failed or different local service must not be mistaken for a valid reply.
 	if (typeof value === "object" && value !== null && "type" in value) {
+		if (value.type === "command-suggestions" && "result" in value)
+			return { type: "command-suggestions", result: parseCommandInterpretation(value.result) };
 		if (value.type === "mission" && "result" in value)
 			return { type: "mission", result: parseMissionView(value.result) };
 		if (value.type === "memory" && "result" in value)

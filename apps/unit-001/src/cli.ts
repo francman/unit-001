@@ -9,6 +9,9 @@ import { ProcessTerminal } from "@earendil-works/pi-tui";
 import { Agent } from "./agent.ts";
 import { type Command, parseArguments, USAGE } from "./args.ts";
 import { runAttach } from "./attach.ts";
+import { commandCatalog } from "./commands/catalog.ts";
+import { isOperatingSystemQuestion } from "./commands/facts.ts";
+import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
 import { FileCredentialStore } from "./credentials.ts";
 import { ConfigurationError, UsageError } from "./errors.ts";
 import { acquireSessionLock } from "./lock.ts";
@@ -195,18 +198,18 @@ async function run(
 	const file = sessionFile(directory, options.session, runtime.platform);
 	const endpoint =
 		command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
+	let prompt = command.kind === "run" ? command.options.print : undefined;
+	if (prompt === "-") prompt = (await readAll(runtime.stdin)).trim();
+	if (prompt === "") throw new UsageError("The prompt is empty.");
 	const { models, choice } = await (command.kind === "serve" ||
-		(command.kind === "run" && command.options.print === undefined)
+		(command.kind === "run" && command.options.print === undefined) ||
+		(prompt !== undefined && isOperatingSystemQuestion(prompt))
 		? createOwnerModels
 		: createConfiguredModels)(
 		runtime.env,
 		options.model ?? (runtime.env.UNIT_001_MODEL || (await readDefaultModel(directory))),
 		credentialStore(directory, runtime),
 	);
-
-	let prompt = command.kind === "run" ? command.options.print : undefined;
-	if (prompt === "-") prompt = (await readAll(runtime.stdin)).trim();
-	if (prompt === "") throw new UsageError("The prompt is empty.");
 
 	const terminal = terminalFor(runtime);
 	if (choice === null)
@@ -535,9 +538,33 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 	} catch (error) {
 		if (signal.aborted && !serving) return 130;
 		if (error instanceof UsageError) {
+			const local = resolveLocalCommand(argv.join(" "), "cli");
+			let suggestions = local.kind === "suggestions" ? local.commands : [];
+			if (local.kind === "unresolved" && argv.length > 0 && !argv[0].startsWith("-")) {
+				// An unresolved invocation may ask an existing owner; it never opens a provider or owner of its own.
+				try {
+					const endpoint =
+						runtime.managed?.access === "operator"
+							? operatorEndpoint(runtime.managed.id, "default")
+							: serviceEndpoint(resolveDirectory(undefined, runtime), "default", runtime.platform);
+					const response = await requestService(
+						endpoint,
+						{ type: "resolve-command", input: argv[0].slice(0, 256), surface: "cli" },
+						signal,
+					);
+					if (response.type === "command-suggestions")
+						suggestions = commandCatalog("cli").filter((command) =>
+							response.result.commandIds.includes(command.id),
+						);
+				} catch {
+					/* Ordinary usage remains available when no owner can interpret the command. */
+				}
+			}
 			runtime.stderr.write(
 				`${runtime.managed?.name ?? "agent"}: ${error.message.replaceAll("Usage: agent", `Usage: ${runtime.managed?.name ?? "agent"}`)}\nRun ${runtime.managed?.name ?? "agent"} --help for usage.\n`,
 			);
+			if (suggestions.length > 0)
+				runtime.stderr.write(`${sanitizeTerminalText(describeCommandSuggestions(suggestions, "cli"))}\n`);
 			return 2;
 		}
 		const message = error instanceof Error ? error.message : String(error);

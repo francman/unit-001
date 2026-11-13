@@ -9,7 +9,7 @@ export function introspectionExtension(): Extension {
 		name: "unit.introspection",
 		sections: [
 			section(
-				"preamble",
+				"unit_introspection",
 				() =>
 					"For operating-system or environment questions use unit_inspect_os and report its current observed facts. Kernel release is not distribution version. Scope is this process namespace; do not claim physical-host or container knowledge that is unavailable. Never infer OS from your model identity or an installation's name.",
 				{ tag: false },

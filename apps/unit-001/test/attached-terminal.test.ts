@@ -37,6 +37,30 @@ async function requests(app: TerminalSession): Promise<{ type: string; prompt?: 
 }
 
 describe.skipIf(process.platform === "win32")("attached chat in a real terminal", { timeout: 20_000 }, () => {
+	it.each([
+		[80, 24],
+		[40, 12],
+	])("suggests, selects and cancels without executing at %ix%i (#59)", async (columns, rows) => {
+		const app = await attached();
+		await app.tmux("resize-window", "-t", "setup", "-x", String(columns), "-y", String(rows));
+		await app.text("/memroy");
+		await app.key("Enter");
+		await app.waitFor("Did you mean?");
+		await app.key("Down");
+		await app.key("Up");
+		await app.key("Enter");
+		await app.waitFor("/memory");
+		expect((await requests(app)).map((request) => request.type)).toEqual(["watch", "mission"]);
+		await app.key("C-u");
+		await app.text("/memroy");
+		await app.key("Enter");
+		await app.waitFor("Did you mean?");
+		await app.key("Escape");
+		await expect.poll(async () => await app.screen()).not.toContain("Did you mean?");
+		await app.key("C-d");
+		await app.restored(0);
+		expect((await requests(app)).map((request) => request.type)).toEqual(["watch", "mission"]);
+	});
 	it("opens the rich owner client for a bare managed command without reading credentials", async () => {
 		const app = new TerminalSession(
 			await mkdtemp("/tmp/unit-bare-"),

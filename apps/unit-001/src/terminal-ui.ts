@@ -34,12 +34,20 @@ declare module "@earendil-works/pi-tui" {
 	interface Keybindings {
 		"unit.attach.cancel": true;
 		"unit.attach.detach": true;
+		"unit.commands.next": true;
+		"unit.commands.previous": true;
+		"unit.commands.choose": true;
+		"unit.commands.dismiss": true;
 	}
 }
 
 export const DEFAULT_APP_KEYBINDINGS = {
 	"unit.attach.cancel": { defaultKeys: "ctrl+c", description: "Cancel busy work; detach when idle" },
 	"unit.attach.detach": { defaultKeys: "ctrl+d", description: "Detach without cancelling work" },
+	"unit.commands.next": { defaultKeys: "down", description: "Select next command suggestion" },
+	"unit.commands.previous": { defaultKeys: "up", description: "Select previous command suggestion" },
+	"unit.commands.choose": { defaultKeys: "enter", description: "Copy selected command into the editor" },
+	"unit.commands.dismiss": { defaultKeys: "escape", description: "Dismiss command suggestions" },
 } as const;
 
 export interface RichAttachOptions {
@@ -50,7 +58,8 @@ export interface RichAttachOptions {
 	readonly missionSetup?: (signal: AbortSignal) => Promise<number>;
 }
 
-type Actions = Pick<TerminalController, "submit" | "cancel" | "detach">;
+type Actions = Pick<TerminalController, "submit" | "cancel" | "detach"> &
+	Partial<Pick<TerminalController, "dismissSuggestions">>;
 
 const MAX_DRAFT_BYTES = 16_384;
 const PASTE_START = "\x1b[200~";
@@ -129,6 +138,7 @@ async function runRichConversation(
 			return { status: "command" };
 		},
 		cancel: () => controller.cancel(),
+		dismissSuggestions: () => controller.dismissSuggestions(),
 		detach: () => (closeUnavailable === undefined ? controller.detach() : closeUnavailable()),
 	};
 	const view = new RichAttachView(tui, session, actions, options);
@@ -193,6 +203,7 @@ export class RichAttachView extends VStack {
 	#pasteBaseBytes = 0;
 	#discardPaste = false;
 	#inputNotice = "";
+	#selectedSuggestion = 0;
 	#state: TerminalState = { connection: "connecting", sending: false, cancelling: false, notices: [] };
 
 	constructor(tui: TuiAltScreen, session: string, actions: Actions, options: RichAttachOptions = {}) {
@@ -243,6 +254,12 @@ export class RichAttachView extends VStack {
 		this.scroll = new ScrollView(this.transcript, { follow: "end", primary: true, scrollbar: "auto" });
 		this.addChild(this.#header, { basis: 2, minSize: 1, shrink: 0 });
 		this.addChild(this.scroll, { basis: 0, grow: 1, minSize: 1 });
+		this.addChild(new StatusLines((width) => this.suggestionLines(width)), {
+			basis: "auto",
+			maxSize: 4,
+			shrink: 0,
+			visible: () => (this.#state.suggestions?.length ?? 0) > 0 || this.#state.suggesting === true,
+		});
 		this.addChild(this.editor, {
 			basis: "auto",
 			minSize: 3,
@@ -256,6 +273,7 @@ export class RichAttachView extends VStack {
 
 	/** Applies a bounded owner snapshot without changing the draft or cursor. */
 	update(state: TerminalState): void {
+		if (state.suggestions !== this.#state.suggestions) this.#selectedSuggestion = 0;
 		const changed =
 			state.view !== this.#state.view ||
 			state.notices !== this.#state.notices ||
@@ -269,6 +287,29 @@ export class RichAttachView extends VStack {
 	/** Handles configurable application actions before the focused editor consumes ordinary input. */
 	handleGlobalInput(data: string): TuiInputListenerResult {
 		if (isKeyRelease(data)) return { consume: true };
+		const suggestions = this.#state.suggestions;
+		if ((suggestions?.length ?? 0) > 0 || this.#state.suggesting) {
+			if (this.#keys.matches(data, "unit.commands.dismiss")) {
+				this.#actions.dismissSuggestions?.();
+				return { consume: true };
+			}
+			if (suggestions !== undefined && suggestions.length > 0) {
+				if (this.#keys.matches(data, "unit.commands.next") || this.#keys.matches(data, "unit.commands.previous")) {
+					this.#selectedSuggestion =
+						(this.#selectedSuggestion +
+							(this.#keys.matches(data, "unit.commands.next") ? 1 : suggestions.length - 1)) %
+						suggestions.length;
+					this.#tui.requestRender();
+					return { consume: true };
+				}
+				if (this.#keys.matches(data, "unit.commands.choose")) {
+					this.editor.setText(`/${suggestions[this.#selectedSuggestion].invocation}`);
+					this.#actions.dismissSuggestions?.();
+					this.#tui.requestRender();
+					return { consume: true };
+				}
+			}
+		}
 		if (this.#keys.matches(data, "unit.attach.detach")) {
 			this.#actions.detach();
 			return { consume: true };
@@ -314,6 +355,19 @@ export class RichAttachView extends VStack {
 			return { consume: true };
 		}
 		return undefined;
+	}
+
+	private suggestionLines(width: number): string[] {
+		if (this.#state.suggesting) return [this.#theme.muted(" Resolving command… Esc cancels")];
+		return [
+			this.#theme.muted(" Did you mean? Enter edits · Esc cancels"),
+			...(this.#state.suggestions ?? []).map((command, index) =>
+				truncateToWidth(
+					`${index === this.#selectedSuggestion ? " >" : "  "} /${command.invocation} · ${command.summary}`,
+					width,
+				),
+			),
+		];
 	}
 
 	private rejectInput(): void {
@@ -440,7 +494,9 @@ export class RichAttachView extends VStack {
 						new Text(
 							entry.role === "user"
 								? this.#theme.user("YOU")
-								: this.#theme.accent(label(view.name).toUpperCase()),
+								: this.#theme.accent(
+										`${label(view.name).toUpperCase()}${entry.source === "host" ? " · HOST" : ""}`,
+									),
 							1,
 							0,
 						),
