@@ -93,6 +93,7 @@ export class Agent {
 	readonly #model: ModelChoice | null;
 	readonly #interpretations = new Map<AbortController, Promise<void>>();
 	#inhibited: boolean;
+	#closing = false;
 	/** True when a run was unfinished at open; it resumes only when execution is not inhibited. */
 	readonly interrupted: boolean;
 
@@ -388,6 +389,7 @@ export class Agent {
 	}
 
 	async close(context: Context): Promise<void> {
+		this.#closing = true;
 		for (const controller of this.#interpretations.keys()) controller.abort();
 		await Promise.all(this.#interpretations.values());
 		try {
@@ -546,6 +548,7 @@ export class Agent {
 	}
 
 	private requireActive(): void {
+		if (this.#closing) throw new Error("Agent is closing.");
 		if (this.#inhibited) throw new Error("Service execution is inhibited for maintenance.");
 	}
 }

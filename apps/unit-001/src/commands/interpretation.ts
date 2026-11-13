@@ -35,7 +35,7 @@ export function parseCommandInterpretation(value: unknown): CommandInterpretatio
 		!("explanation" in value) ||
 		typeof value.explanation !== "string" ||
 		value.explanation.length > 240 ||
-		/[\x00-\x1f\x7f-\x9f]/.test(value.explanation) ||
+		/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(value.explanation) ||
 		!("usage" in value)
 	)
 		throw new Error("Invalid command suggestions.");
@@ -168,7 +168,7 @@ export async function interpretCommand(
 			!("explanation" in value) ||
 			typeof value.explanation !== "string" ||
 			value.explanation.length > 240 ||
-			/[\x00-\x1f\x7f-\x9f]/.test(value.explanation) ||
+			/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(value.explanation) ||
 			!value.commandIds.every(
 				(id: unknown) => typeof id === "string" && catalog.some((command) => command.id === id),
 			)

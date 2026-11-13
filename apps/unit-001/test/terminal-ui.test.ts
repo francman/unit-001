@@ -126,6 +126,19 @@ describe("rich service terminal", () => {
 			app.tui.stop();
 		}
 	});
+	it("dismisses stale suggestions when editing the draft (#59)", () => {
+		const app = launch();
+		try {
+			app.view.editor.setText("/memroy");
+			app.update(base, { suggestions: commandCatalog("slash").filter((command) => command.id === "memory") });
+			app.terminal.input(" changed");
+			expect(app.actions.dismissSuggestions).toHaveBeenCalledOnce();
+			expect(app.view.editor.getText()).toContain("changed");
+			expect(app.actions.submit).not.toHaveBeenCalled();
+		} finally {
+			app.tui.stop();
+		}
+	});
 	it("labels the composer and shows typing immediately without submitting", () => {
 		// #36: real typing feedback and a named composer are acceptance requirements, not just action results.
 		const app = launch();

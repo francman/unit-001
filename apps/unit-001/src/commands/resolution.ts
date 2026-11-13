@@ -9,7 +9,7 @@ export type LocalCommandResolution =
 /** Resolves command vocabulary only; canonical text must still pass the ordinary command parser. */
 export function resolveLocalCommand(input: string, surface: CommandSurface): LocalCommandResolution {
 	const text = input.trim().replace(/^\//, "");
-	if (text === "" || text.length > 512) return { kind: "unresolved" };
+	if (text === "") return { kind: "unresolved" };
 	const catalog = commandCatalog(surface);
 	for (const command of [...catalog].sort((left, right) => right.invocation.length - left.invocation.length)) {
 		for (const spelling of [command.invocation, ...command.aliases]) {
@@ -17,8 +17,9 @@ export function resolveLocalCommand(input: string, surface: CommandSurface): Loc
 				return { kind: "exact", command, text: command.invocation + text.slice(spelling.length) };
 		}
 	}
+	if (text.length > 512) return { kind: "unresolved" };
 	// Operands never influence local ranking; a private query or memory body is not command vocabulary.
-	const words = text.toLowerCase().split(/\s+/).slice(0, 6);
+	const words = text.toLowerCase().split(/\s+/, 1);
 	const phrase = words.join(" ");
 	const ranked = catalog
 		.map((command) => {
