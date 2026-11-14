@@ -111,6 +111,9 @@ export async function interpretCommand(
 		explanation: "No local command match. Model suggestions require a configured running owner.",
 		usage: null,
 	};
+	const token = input.trim().replace(/^\//, "").split(/\s+/, 1)[0];
+	// Only command vocabulary may cross the provider boundary; paths and pasted credentials stay local.
+	if (!/^[a-z][a-z0-9-]{1,31}$/i.test(token) || /^sk-/i.test(token)) return unavailable;
 	if (choice === null || input.length > 256 || input.includes("\n") || input.startsWith("-")) return unavailable;
 	const model = models.getModel(choice.provider, choice.modelId);
 	if (model === undefined) return unavailable;
@@ -136,7 +139,7 @@ export async function interpretCommand(
 			model,
 			{
 				systemPrompt,
-				messages: [{ role: "user", content: input.replace(/^\//, "").split(/\s+/, 1)[0], timestamp: Date.now() }],
+				messages: [{ role: "user", content: token, timestamp: Date.now() }],
 			},
 			{
 				maxTokens: 192,

@@ -180,9 +180,7 @@ export async function runService(
 					directory.gid !== process.getgid?.() ||
 					(directory.mode & 0o777) !== 0o750
 				)
-					throw new ConfigurationError(
-						"Operator runtime directory must belong to the service account with mode 0750.",
-					);
+					throw new ConfigurationError("Operator runtime directory must belong to the service account with mode 0750.");
 				await unlink(operatorPath).catch((error: NodeJS.ErrnoException) => {
 					if (error.code !== "ENOENT") throw error;
 				});
@@ -346,12 +344,11 @@ export function requestService(
 		);
 		socket.on("data", (chunk: string) => {
 			buffer += chunk;
-			if (Buffer.byteLength(buffer) > MAX_RESPONSE_BYTES)
-				return finish(new Error("Service response exceeds 1 MiB."));
+			if (Buffer.byteLength(buffer) > MAX_RESPONSE_BYTES) return finish(new Error("Service response exceeds 1 MiB."));
 			const newline = buffer.indexOf("\n");
 			if (newline === -1) return;
 			try {
-				finish(undefined, parseResponse(buffer.slice(0, newline)));
+				finish(undefined, parseServiceResponse(buffer.slice(0, newline)));
 			} catch (error) {
 				finish(error);
 			}
@@ -466,7 +463,8 @@ function writeResponse(socket: Socket, response: ServiceResponse): void {
 	);
 }
 
-function parseResponse(wire: string): ServiceResponse {
+/** Validates a bounded response from a local or authenticated remote owner. */
+export function parseServiceResponse(wire: string): ServiceResponse {
 	const value: unknown = JSON.parse(wire);
 	// A failed or different local service must not be mistaken for a valid reply.
 	if (typeof value === "object" && value !== null && "type" in value) {

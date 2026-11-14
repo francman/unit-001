@@ -213,7 +213,7 @@ export function issueChannelGrant(
 	const candidate = { ...policy, grants: [grant] };
 	if (!matchingChannelGrant(request, { ...authority, channels: candidate }, now))
 		throw new Error("Channel grant exceeds current creator authority.");
-	const grants = policy.grants.filter((item) => item.requestId !== request.requestId);
+	const grants = policy.grants.filter((item) => item.expiresAt > now && item.requestId !== request.requestId);
 	if (grants.length >= 32) throw new Error("Channel grant capacity reached.");
 	return { ...policy, grants: [...grants, grant] };
 }

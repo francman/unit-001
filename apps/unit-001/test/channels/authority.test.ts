@@ -21,6 +21,18 @@ afterEach(async () => {
 });
 
 describe("channel authority", () => {
+	it("#56 reclaims expired grants before enforcing the bounded approval capacity", () => {
+		const fixture = grantFixture();
+		fixture.channels.grants = Array.from({ length: 32 }, (_, index) => ({
+			...fixture.channels.grants[0],
+			requestId: `expired-${index}`,
+			expiresAt: 1000,
+		}));
+		const issued = issueChannelGrant(fixture.request, fixture, 3500, 0, 1100);
+		expect(issued.grants).toHaveLength(1);
+		expect(issued.grants[0].requestId).toBe(fixture.request.requestId);
+	});
+
 	it("#56 binds issuer retries to exact terms and rejects grants beyond the protected ceiling or request expiry", () => {
 		const fixture = grantFixture();
 		const issued = issueChannelGrant(fixture.request, fixture, 3500, 0, 1100);

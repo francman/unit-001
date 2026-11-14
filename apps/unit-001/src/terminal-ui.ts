@@ -23,8 +23,10 @@ import {
 import type { Agent } from "./agent.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import type { ServiceView } from "./service.ts";
+import type { ServiceClient } from "./service-client.ts";
 import {
 	createForegroundTerminalController,
+	createServiceTerminalController,
 	createTerminalController,
 	type TerminalController,
 	type TerminalState,
@@ -81,6 +83,22 @@ export async function runRichAttach(
 	);
 }
 
+/** Uses the existing rich terminal for an authenticated remote service client. */
+export async function runRichServiceAttach(
+	client: ServiceClient,
+	terminal: Terminal,
+	signal: AbortSignal,
+	options: RichAttachOptions = {},
+): Promise<number> {
+	return runRichConversation(
+		client.session,
+		terminal,
+		signal,
+		(onChange) => createServiceTerminalController(client, onChange, signal),
+		options,
+	);
+}
+
 /** Renders the existing foreground owner without opening another database or creating a service. */
 export async function runRichForeground(
 	agent: Agent,
@@ -116,22 +134,23 @@ async function runRichConversation(
 		submit: (text) => {
 			const result = controller.submit(text);
 			if (result.status !== "mission-setup") return result;
-			if (options.missionSetup === undefined) return controller.submit("/mission");
+			const missionSetup = options.missionSetup;
+			if (missionSetup === undefined) return controller.submit("/mission");
 			if (missionFlow !== undefined) return { status: "rejected" };
 			missionFlow = (async () => {
 				await terminal.drainInput(200, 25);
 				tui.stop();
 				try {
-					await options.missionSetup!(AbortSignal.any([signal, flowAbort.signal]));
+					await missionSetup(AbortSignal.any([signal, flowAbort.signal]));
 				} catch (error) {
 					terminal.write(
 						`Mission setup: ${sanitizeTerminalText(error instanceof Error ? error.message : String(error))}\r\n`,
 					);
 				} finally {
 					missionFlow = undefined;
-					if (!signal.aborted && !flowAbort.signal.aborted && controller.state.connection === "attached") {
+					if (!signal.aborted && !flowAbort.signal.aborted) {
 						tui.start();
-						controller.submit("/mission");
+						if (controller.state.connection === "attached") controller.submit("/mission");
 					}
 				}
 			})();
@@ -170,6 +189,8 @@ async function runRichConversation(
 			await terminal.drainInput(1000);
 		} finally {
 			tui.stop();
+			for (const id of controller.state.unresolvedRequestIds ?? [])
+				terminal.write(`Unconfirmed request ID ${id}; inspect persisted work before an explicit retry.\n`);
 		}
 	}
 	return result;
@@ -267,6 +288,20 @@ export class RichAttachView extends VStack {
 			shrink: 1,
 			visible: () => this.#state.connection !== "failed",
 		});
+		this.addChild(
+			new StatusLines((width) => {
+				const ids = this.#state.unresolvedRequestIds ?? [];
+				const id = ids.at(-1) ?? "";
+				return [
+					this.#theme.warning(
+						width < 64
+							? `ID ${id}`
+							: `Unconfirmed request ${id}${ids.length > 1 ? ` (+${ids.length - 1}; /status lists all)` : ""}`,
+					),
+				];
+			}),
+			{ basis: 1, minSize: 1, shrink: 0, visible: () => (this.#state.unresolvedRequestIds?.length ?? 0) > 0 },
+		);
 		this.addChild(this.#footer, { basis: 2, minSize: 1, shrink: 0 });
 		this.update(this.#state);
 	}
@@ -303,7 +338,11 @@ export class RichAttachView extends VStack {
 					return { consume: true };
 				}
 				if (this.#keys.matches(data, "unit.commands.choose")) {
-					this.editor.setText(`/${suggestions[this.#selectedSuggestion].invocation}`);
+					const operands = this.editor
+						.getExpandedText()
+						.trimStart()
+						.replace(/^\/\S*/, "");
+					this.editor.setText(`/${suggestions[this.#selectedSuggestion].invocation}${operands}`);
 					this.#actions.dismissSuggestions?.();
 					this.#tui.requestRender();
 					return { consume: true };
