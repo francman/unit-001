@@ -35,7 +35,7 @@ Muse's security article describes a separate runtime cell, host-side credential 
 
 ## Coding-ready first implementation
 
-The source descriptions below refer to the November 9 review baseline. Mission formation subsequently merged in PR #53; implementation must inspect the current contract and extend it rather than recreate the historical foundation. This publication does not claim an autonomous decision loop is deployed.
+The source descriptions below refer to the November 9 review baseline. Mission formation subsequently merged in PR #58; implementation must inspect the current contract and extend it rather than recreate the historical foundation. This publication does not claim an autonomous decision loop is deployed.
 
 Reuse existing `apps/unit-001/src/missions/state.ts` and its version-1 `unit.mission` document. It currently supplies a nonexecuting foundation, not a running autonomous controller in `Agent.open`. Do not create another mission store or call the existing holder a completed autonomy feature.
 

@@ -42,7 +42,7 @@ OpenClaw's pinned [license](https://github.com/openclaw/openclaw/blob/f947b3caf5
 
 ## Coding definition and delivery order
 
-The source descriptions below refer to the November 9 review baseline. Mission formation subsequently merged in PR #53; implementation must inspect the current contract and extend it rather than recreate the historical foundation. This publication does not claim an autonomous decision loop is deployed.
+The source descriptions below refer to the November 9 review baseline. Mission formation subsequently merged in PR #58; implementation must inspect the current contract and extend it rather than recreate the historical foundation. This publication does not claim an autonomous decision loop is deployed.
 
 The three recommended slices are one mission mechanism, not three new runtimes. Existing anchors: app `Agent.open`/`submit`/`status`, owner IPC in `src/service.ts`, observed runtime facts in `src/orientation.ts`, and unit-memory's public Durable document/task integration. `src/missions/state.ts` already defines version-1 `unit.mission`, activation identity, bounded policy fields and a nonexecuting deadline-holder task. `Agent.open` does not install that foundation or run mission decisions. Reuse it; do not create a second mission document. #14 must approve the ownership decision: one installation mission belongs to its configured owner session; arbitrary conversation/session names do not create independent installation-wide authority.
 

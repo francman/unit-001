@@ -8,7 +8,7 @@ Start with **hosted streaming speech-to-text → the agent's existing owner → 
 
 Keep the microphone and playback on the human's device. The 512 MB VPS should coordinate bounded streams, final transcripts and receipts—not load a resident speech model by default. Begin with push-to-talk and final-transcript submission. Add continuous listening and interruption only after the basic authority and delivery tests pass.
 
-Voice is an authenticated mission interface. It never grants authority from a speaker's sound, a transcript, or the word “sudo.” the agent's mission continues when the audio client disconnects. Use the same mission approvals, durable owner and cost ledger as other interfaces.
+Voice is an authenticated mission interface. It never grants authority from a speaker's sound, a transcript, or the word “sudo.” The agent's mission continues when the audio client disconnects. Use the same mission approvals, durable owner and cost ledger as other interfaces.
 
 ## Shortlist from current primary sources
 
