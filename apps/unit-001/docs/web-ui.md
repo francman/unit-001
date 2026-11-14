@@ -4,6 +4,8 @@ The browser workspace attaches to the existing agent owner. It does not create a
 
 This slice is a prototype library and browser fixture, not an installed service. There is no launch command, public listener, deployment, or production authentication bootstrap yet. Private access is the default design pending the operator's access choice.
 
+The reviewed browser source is preserved in `web/`. Its `bootstrap.ts` displays an honest connection-pending screen; `preview.ts` supplies developer-only synthetic data for browser acceptance. No web assets are packaged by the current release builder. Future production packaging must use an explicit asset allowlist that excludes `preview.ts`, its bundle, and all fixture controls.
+
 ## Access boundary
 
 The gateway must run as an authorized operator, ideally a dedicated account with only the installation's operator group. Its configuration selects exactly one installation/session/socket; HTTP requests cannot select another agent. A protected administrator provisioning step must supply that socket and a freshly generated random pairing secret. The eventual launcher must resolve the managed operator endpoint rather than accept a private administrator socket from browser input. Root setup and Linux account proof remain release gates.
