@@ -33,7 +33,13 @@ import {
 	rememberMemory,
 	scheduleMemoryConsolidation,
 } from "unit-memory";
+import type { CommandSurface } from "./commands/catalog.ts";
+import { HostFactEntry, isOperatingSystemQuestion } from "./commands/facts.ts";
+import { type CommandInterpretation, type InterpretationUsage, interpretCommand } from "./commands/interpretation.ts";
+import { resolveLocalCommand } from "./commands/resolution.ts";
 import { ConfigurationError } from "./errors.ts";
+import { introspectionExtension } from "./introspection/extension.ts";
+import { operatingSystemFacts, renderOperatingSystemFacts } from "./introspection/os.ts";
 import { MaintenanceDoc, type MaintenanceResult, type MaintenanceState, validateOperationId } from "./maintenance.ts";
 import { type MemoryRequest, type MemoryResult, parseMemoryRequest } from "./memory-control.ts";
 import type { MissionLocation } from "./missions/authority.ts";
@@ -65,6 +71,7 @@ export type Reply =
 type Message = { readonly role?: string; readonly content?: unknown };
 
 const MemoryOperatorEntry = defineEntry<{ operation: "remember"; content: string }>("unit.memory.operator");
+const CommandInterpretationEntry = defineEntry<{ usage: InterpretationUsage }>("unit.command.interpretation");
 
 function textOf(message: Message | undefined): string | undefined {
 	if (message?.role !== "assistant" || !Array.isArray(message.content)) return undefined;
@@ -82,7 +89,11 @@ export class Agent {
 	readonly #memory: MemoryService;
 	readonly #mission: MissionControl;
 	readonly #configuration: "configured" | "unconfigured";
+	readonly #models: Models;
+	readonly #model: ModelChoice | null;
+	readonly #interpretations = new Map<AbortController, Promise<void>>();
 	#inhibited: boolean;
+	#closing = false;
 	/** True when a run was unfinished at open; it resumes only when execution is not inhibited. */
 	readonly interrupted: boolean;
 
@@ -96,6 +107,8 @@ export class Agent {
 		memory: MemoryService,
 		mission: MissionControl,
 		configuration: "configured" | "unconfigured",
+		models: Models,
+		model: ModelChoice | null,
 	) {
 		this.name = name;
 		this.#harness = harness;
@@ -106,6 +119,8 @@ export class Agent {
 		this.#memory = memory;
 		this.#mission = mission;
 		this.#configuration = configuration;
+		this.#models = models;
+		this.#model = model;
 	}
 
 	/** Opens the session, resuming unfinished work only outside startup inhibition and persistent maintenance holds. */
@@ -119,6 +134,7 @@ export class Agent {
 			registry.install(defineExtension({ name: "powershell", tools: [createPowerShellTool()] }));
 		}
 		registry.install(orientationExtension(runtime));
+		registry.install(introspectionExtension());
 		registry.install(memory.extension);
 		registry.install(MissionFoundation);
 		let mission!: MissionControl;
@@ -203,6 +219,8 @@ export class Agent {
 				memory,
 				mission,
 				options.model === null ? "unconfigured" : "configured",
+				options.models,
+				options.model,
 			);
 		} catch (error) {
 			await harness.close(context).catch(() => {});
@@ -240,6 +258,10 @@ export class Agent {
 
 	/** Submits a prompt and waits for its answer. */
 	async ask(text: string, context: Context, options: { readonly requestId?: string } = {}): Promise<Reply> {
+		if (options.requestId !== undefined || isOperatingSystemQuestion(text)) {
+			const factual = await this.hostFactReply(text, context, options.requestId);
+			if (factual !== undefined) return { status: "answered", text: factual };
+		}
 		const settled = await (await this.submit(text, context, options)).wait(context);
 		if (settled.status === "done" && settled.type === "input") {
 			const entry = await this.#root.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
@@ -253,6 +275,82 @@ export class Agent {
 					? settled.detail
 					: JSON.stringify(settled.detail);
 		return { status: "failed", reason, ...(detail === undefined ? {} : { detail }) };
+	}
+
+	private async hostFactReply(text: string, context: Context, requestId?: string): Promise<string | undefined> {
+		const recognized = isOperatingSystemQuestion(text);
+		// Collect outside the storage transaction; retry receipts remain authoritative over this observation.
+		const facts = recognized ? await operatingSystemFacts() : undefined;
+		return this.#root.commit(async (tx) => {
+			if (requestId !== undefined) {
+				const previous = await tx.submissionByRequest(this.#root.id, requestId);
+				if (previous !== undefined) {
+					if (previous.type !== "write" || previous.status !== "done") return undefined;
+					const entry = await tx.entry(HostFactEntry, previous.entry);
+					if (entry === undefined) return undefined;
+					if (entry.data.input !== text) throw new Error("Host request ID conflicts with the original input.");
+					return entry.data.text;
+				}
+			}
+			if (facts === undefined) return undefined;
+			this.requireActive();
+			if ((await tx.doc(MaintenanceDoc)).current.state === "held")
+				throw new Error("Service is held for maintenance.");
+			const answer = renderOperatingSystemFacts(facts);
+			await tx.appendEntry(HostFactEntry, this.#root.id, { data: { role: "user", text, input: text, facts: null } });
+			const entry = await tx.appendEntry(HostFactEntry, this.#root.id, {
+				data: { role: "assistant", text: answer, input: text, facts },
+			});
+			// Display-only admission intentionally avoids submit()/wait(), which resume suspended scheduler work.
+			await tx.createSubmission({
+				conversationId: this.#root.id,
+				type: "write",
+				status: "done",
+				entry: entry.id,
+				...(requestId === undefined ? {} : { requestId }),
+			});
+			return answer;
+		}, context);
+	}
+
+	/** Suggests existing commands without coding tools or execution; only unresolved input can use the configured model. */
+	async resolveCommand(
+		input: string,
+		surface: CommandSurface,
+		context: Context,
+		signal: AbortSignal,
+	): Promise<CommandInterpretation> {
+		if (resolveLocalCommand(input, surface).kind !== "unresolved")
+			return interpretCommand(input, surface, this.#models, this.#model, signal);
+		this.requireActive();
+		const controller = new AbortController();
+		let finish = () => {};
+		const done = new Promise<void>((resolve) => {
+			finish = resolve;
+		});
+		// Register before the first await so maintenance cannot declare an in-flight request drained.
+		this.#interpretations.set(controller, done);
+		try {
+			if ((await this.#harness.snapshot(MaintenanceDoc, context))?.current.state === "held")
+				throw new Error("Service is held for maintenance.");
+			const result = await interpretCommand(
+				input,
+				surface,
+				this.#models,
+				this.#model,
+				AbortSignal.any([signal, controller.signal]),
+			);
+			const usage = result.usage;
+			if (usage !== null)
+				await this.#root.commit(
+					(tx) => tx.appendEntry(CommandInterpretationEntry, this.#root.id, { data: { usage } }),
+					context,
+				);
+			return result;
+		} finally {
+			this.#interpretations.delete(controller);
+			finish();
+		}
 	}
 
 	/** Waits for the conversation to go idle, and returns the answer a resumed run ended with, if it ended in one. */
@@ -291,6 +389,9 @@ export class Agent {
 	}
 
 	async close(context: Context): Promise<void> {
+		this.#closing = true;
+		for (const controller of this.#interpretations.keys()) controller.abort();
+		await Promise.all(this.#interpretations.values());
 		try {
 			await this.#harness.close(context);
 		} finally {
@@ -401,6 +502,7 @@ export class Agent {
 			document.current = { protocol: 1, state: "held", operationId };
 		}, context);
 		const deadline = performance.now() + timeoutMs;
+		for (const controller of this.#interpretations.keys()) controller.abort();
 		for (;;) {
 			const inspection = await this.#harness.inspect(context);
 			const legacy = (await this.#harness.snapshot(MissionDoc, context))?.current ?? null;
@@ -408,7 +510,8 @@ export class Agent {
 				inspection.tasks.every(
 					(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
 				) &&
-				inspection.submissions.length === 0
+				inspection.submissions.length === 0 &&
+				this.#interpretations.size === 0
 			) {
 				return { type: "maintenance", protocol: 1, state: "held", operationId, result: "drained" };
 			}
@@ -445,6 +548,7 @@ export class Agent {
 	}
 
 	private requireActive(): void {
+		if (this.#closing) throw new Error("Agent is closing.");
 		if (this.#inhibited) throw new Error("Service execution is inhibited for maintenance.");
 	}
 }

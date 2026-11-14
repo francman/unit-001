@@ -8,6 +8,7 @@ export const MANAGED_MISSION_ACTIONS = [
 	"edit",
 	"bash",
 	"unit_status",
+	"unit_inspect_os",
 	"remember",
 	"recall",
 	"forget",

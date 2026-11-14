@@ -6,6 +6,7 @@ import {
 	ToolResultEntry,
 	type UsageState,
 } from "@earendil-works/pi-durable";
+import { HostFactEntry } from "./commands/facts.ts";
 
 type TextContent = string | readonly { readonly type: string; readonly text?: string }[];
 
@@ -35,6 +36,7 @@ export interface ServiceView extends ServiceIdentity {
 		readonly role: "user" | "assistant";
 		readonly text: string;
 		readonly truncated: boolean;
+		readonly source?: "host";
 	}[];
 	readonly busy: boolean;
 	readonly text: string;
@@ -56,6 +58,16 @@ export function serviceView(view: ConversationView, identity: ServiceIdentity): 
 	const tools = new Map<string, ServiceView["tools"][number]>();
 	const results = new Map<number, ServiceView["tools"][number]>();
 	for (const entry of view.entries.slice(-20)) {
+		if (HostFactEntry.is(entry)) {
+			entries.push({
+				id: entry.id,
+				role: entry.data.role,
+				text: entry.data.text.slice(0, 4096),
+				truncated: entry.data.text.length > 4096,
+				source: "host",
+			});
+			continue;
+		}
 		const result = ToolResultEntry.is(entry) ? entry.model?.[0] : undefined;
 		if (result?.role === "toolResult") {
 			const tool: ServiceView["tools"][number] = {
@@ -219,6 +231,7 @@ export function parseServiceEvent(wire: string): ServiceEvent {
 			(entry.role !== "user" && entry.role !== "assistant") ||
 			typeof entry.text !== "string" ||
 			entry.text.length > 4096 ||
+			(entry.source !== undefined && entry.source !== "host") ||
 			typeof entry.truncated !== "boolean"
 		)
 			throw new Error("Invalid service transcript.");

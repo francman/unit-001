@@ -98,6 +98,40 @@ const signal = () => new AbortController().signal;
 const reply = (text: string) => fauxAssistantMessage([fauxText(text)]);
 
 describe.skipIf(process.platform === "win32")("headless local service", () => {
+	it("cancels disposable command inference when its client disconnects (#59)", async () => {
+		const service = await launch([]);
+		let started = () => {};
+		let cancelled = false;
+		const entered = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		vi.spyOn(service.agent, "resolveCommand").mockImplementation(async (_input, _surface, _context, signal) => {
+			started();
+			await new Promise<void>((resolve) =>
+				signal.addEventListener(
+					"abort",
+					() => {
+						cancelled = true;
+						resolve();
+					},
+					{ once: true },
+				),
+			);
+			return { stage: "unavailable", commandIds: [], explanation: "Cancelled", usage: null };
+		});
+		const controller = new AbortController();
+		const request = requestService(
+			service.path,
+			{ type: "resolve-command", input: "xyzzy", surface: "cli" },
+			controller.signal,
+		);
+		const rejection = expect(request).rejects.toThrow();
+		await entered;
+		controller.abort();
+		await rejection;
+		await expect.poll(() => cancelled, { timeout: 1000 }).toBe(true);
+		expect(service.faux.state.callCount).toBe(0);
+	});
 	it.each([
 		{ configuration: undefined, provider: "faux", modelId: "faux-1", valid: true },
 		{ configuration: "configured", provider: "faux", modelId: "faux-1", valid: true },

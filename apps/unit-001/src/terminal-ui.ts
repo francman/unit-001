@@ -36,12 +36,20 @@ declare module "@earendil-works/pi-tui" {
 	interface Keybindings {
 		"unit.attach.cancel": true;
 		"unit.attach.detach": true;
+		"unit.commands.next": true;
+		"unit.commands.previous": true;
+		"unit.commands.choose": true;
+		"unit.commands.dismiss": true;
 	}
 }
 
 export const DEFAULT_APP_KEYBINDINGS = {
 	"unit.attach.cancel": { defaultKeys: "ctrl+c", description: "Cancel busy work; detach when idle" },
 	"unit.attach.detach": { defaultKeys: "ctrl+d", description: "Detach without cancelling work" },
+	"unit.commands.next": { defaultKeys: "down", description: "Select next command suggestion" },
+	"unit.commands.previous": { defaultKeys: "up", description: "Select previous command suggestion" },
+	"unit.commands.choose": { defaultKeys: "enter", description: "Copy selected command into the editor" },
+	"unit.commands.dismiss": { defaultKeys: "escape", description: "Dismiss command suggestions" },
 } as const;
 
 export interface RichAttachOptions {
@@ -52,7 +60,8 @@ export interface RichAttachOptions {
 	readonly missionSetup?: (signal: AbortSignal) => Promise<number>;
 }
 
-type Actions = Pick<TerminalController, "submit" | "cancel" | "detach">;
+type Actions = Pick<TerminalController, "submit" | "cancel" | "detach"> &
+	Partial<Pick<TerminalController, "dismissSuggestions">>;
 
 const MAX_DRAFT_BYTES = 16_384;
 const PASTE_START = "\x1b[200~";
@@ -148,6 +157,7 @@ async function runRichConversation(
 			return { status: "command" };
 		},
 		cancel: () => controller.cancel(),
+		dismissSuggestions: () => controller.dismissSuggestions(),
 		detach: () => (closeUnavailable === undefined ? controller.detach() : closeUnavailable()),
 	};
 	const view = new RichAttachView(tui, session, actions, options);
@@ -214,6 +224,7 @@ export class RichAttachView extends VStack {
 	#pasteBaseBytes = 0;
 	#discardPaste = false;
 	#inputNotice = "";
+	#selectedSuggestion = 0;
 	#state: TerminalState = { connection: "connecting", sending: false, cancelling: false, notices: [] };
 
 	constructor(tui: TuiAltScreen, session: string, actions: Actions, options: RichAttachOptions = {}) {
@@ -264,6 +275,12 @@ export class RichAttachView extends VStack {
 		this.scroll = new ScrollView(this.transcript, { follow: "end", primary: true, scrollbar: "auto" });
 		this.addChild(this.#header, { basis: 2, minSize: 1, shrink: 0 });
 		this.addChild(this.scroll, { basis: 0, grow: 1, minSize: 1 });
+		this.addChild(new StatusLines((width) => this.suggestionLines(width)), {
+			basis: "auto",
+			maxSize: 4,
+			shrink: 0,
+			visible: () => (this.#state.suggestions?.length ?? 0) > 0 || this.#state.suggesting === true,
+		});
 		this.addChild(this.editor, {
 			basis: "auto",
 			minSize: 3,
@@ -291,6 +308,7 @@ export class RichAttachView extends VStack {
 
 	/** Applies a bounded owner snapshot without changing the draft or cursor. */
 	update(state: TerminalState): void {
+		if (state.suggestions !== this.#state.suggestions) this.#selectedSuggestion = 0;
 		const changed =
 			state.view !== this.#state.view ||
 			state.notices !== this.#state.notices ||
@@ -304,6 +322,35 @@ export class RichAttachView extends VStack {
 	/** Handles configurable application actions before the focused editor consumes ordinary input. */
 	handleGlobalInput(data: string): TuiInputListenerResult {
 		if (isKeyRelease(data)) return { consume: true };
+		const suggestions = this.#state.suggestions;
+		if ((suggestions?.length ?? 0) > 0 || this.#state.suggesting) {
+			if (this.#keys.matches(data, "unit.commands.dismiss")) {
+				this.#actions.dismissSuggestions?.();
+				return { consume: true };
+			}
+			if (suggestions !== undefined && suggestions.length > 0) {
+				if (this.#keys.matches(data, "unit.commands.next") || this.#keys.matches(data, "unit.commands.previous")) {
+					this.#selectedSuggestion =
+						(this.#selectedSuggestion +
+							(this.#keys.matches(data, "unit.commands.next") ? 1 : suggestions.length - 1)) %
+						suggestions.length;
+					this.#tui.requestRender();
+					return { consume: true };
+				}
+				if (this.#keys.matches(data, "unit.commands.choose")) {
+					const operands = this.editor
+						.getExpandedText()
+						.trimStart()
+						.replace(/^\/\S*/, "");
+					this.editor.setText(`/${suggestions[this.#selectedSuggestion].invocation}${operands}`);
+					this.#actions.dismissSuggestions?.();
+					this.#tui.requestRender();
+					return { consume: true };
+				}
+			}
+			// Editing abandons the old query so a later Enter cannot replace the new draft.
+			this.#actions.dismissSuggestions?.();
+		}
 		if (this.#keys.matches(data, "unit.attach.detach")) {
 			this.#actions.detach();
 			return { consume: true };
@@ -351,6 +398,19 @@ export class RichAttachView extends VStack {
 		return undefined;
 	}
 
+	private suggestionLines(width: number): string[] {
+		if (this.#state.suggesting) return [this.#theme.muted(" Resolving command… Esc cancels")];
+		return [
+			this.#theme.muted(" Did you mean? Enter edits · Esc cancels"),
+			...(this.#state.suggestions ?? []).map((command, index) =>
+				truncateToWidth(
+					`${index === this.#selectedSuggestion ? " >" : "  "} /${command.invocation} · ${command.summary}`,
+					width,
+				),
+			),
+		];
+	}
+
 	private rejectInput(): void {
 		this.#inputNotice = "Input exceeds 16 KiB; existing draft preserved.";
 		this.updateTranscript(this.#state.view);
@@ -377,7 +437,8 @@ export class RichAttachView extends VStack {
 						: this.#state.sending
 							? "sending"
 							: "ready";
-		const model = view?.model == null ? "model unknown" : `${label(view.model.provider)}/${label(view.model.modelId)}`;
+		const model =
+			view?.model == null ? "model unknown" : `${label(view.model.provider)}/${label(view.model.modelId)}`;
 		const brand = width >= 64 ? "unit-001  ·  " : "";
 		const title = truncateToWidth(`${brand}${name}  /  ${this.#session}`, Math.max(1, width - activity.length - 2));
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(title) - activity.length));
@@ -401,7 +462,9 @@ export class RichAttachView extends VStack {
 		if (this.#state.connection === "failed")
 			return [
 				this.#theme.muted("Run the command above, then reopen."),
-				this.#theme.muted(`${this.keyHint("unit.attach.cancel")} exit · ${this.keyHint("unit.attach.detach")} exit`),
+				this.#theme.muted(
+					`${this.keyHint("unit.attach.cancel")} exit · ${this.keyHint("unit.attach.detach")} exit`,
+				),
 			];
 		const usage = this.#state.view?.usage;
 		const close = this.#ownership === "foreground" ? "exit" : "detach";
@@ -413,7 +476,9 @@ export class RichAttachView extends VStack {
 			const cost =
 				usage == null || usage.cost.kind === "unknown" ? "cost unknown" : `~$${usage.cost.usd.toFixed(4)} est`;
 			const cancel =
-				this.#state.connection === "attached" && (this.#state.view?.busy || this.#state.sending) ? "cancel" : "exit";
+				this.#state.connection === "attached" && (this.#state.view?.busy || this.#state.sending)
+					? "cancel"
+					: "exit";
 			return [
 				this.#theme.muted(`${this.keyHint("tui.input.submit")} send · ${tokens} · ${cost}`),
 				this.#theme.muted(
@@ -468,7 +533,11 @@ export class RichAttachView extends VStack {
 					const card = new Container();
 					card.addChild(
 						new Text(
-							entry.role === "user" ? this.#theme.user("YOU") : this.#theme.accent(label(view.name).toUpperCase()),
+							entry.role === "user"
+								? this.#theme.user("YOU")
+								: this.#theme.accent(
+										`${label(view.name).toUpperCase()}${entry.source === "host" ? " · HOST" : ""}`,
+									),
 							1,
 							0,
 						),
@@ -484,7 +553,8 @@ export class RichAttachView extends VStack {
 			}
 			const last = view.entries.at(-1);
 			const committed =
-				last?.role === "assistant" && (last.text === view.text || (last.truncated && view.text.startsWith(last.text)));
+				last?.role === "assistant" &&
+				(last.text === view.text || (last.truncated && view.text.startsWith(last.text)));
 			const live = committed ? "" : sanitizeTerminalText(view.text);
 			if (live !== this.#liveText) {
 				this.#live.setText(live);
@@ -493,9 +563,11 @@ export class RichAttachView extends VStack {
 			if (live !== "") {
 				this.transcript.addChild(new Text(this.#theme.accent(`${label(view.name).toUpperCase()}  ·  LIVE`), 1, 0));
 				this.transcript.addChild(this.#live);
-				if (view.textTruncated) this.transcript.addChild(new Text(this.#theme.warning("[Live text truncated]"), 1, 0));
+				if (view.textTruncated)
+					this.transcript.addChild(new Text(this.#theme.warning("[Live text truncated]"), 1, 0));
 			}
-			for (const tool of view.tools) this.transcript.addChild(new ToolCard(label(tool.name), tool.status, this.#theme));
+			for (const tool of view.tools)
+				this.transcript.addChild(new ToolCard(label(tool.name), tool.status, this.#theme));
 			if (view.entries.length === 0 && live === "")
 				this.transcript.addChild(new WelcomePanel(this.#theme, this.#ownership));
 		}
@@ -505,7 +577,9 @@ export class RichAttachView extends VStack {
 			const style = error ? this.#theme.error : this.#theme.muted;
 			// Retry IDs matter after an uncertain failure, not on every successful submission.
 			const text = notice.text.startsWith("Submitting request ") ? "Request submitted." : notice.text;
-			this.transcript.addChild(new Text(style(`${error ? "Error" : "Notice"} · ${sanitizeTerminalText(text)}`), 1, 0));
+			this.transcript.addChild(
+				new Text(style(`${error ? "Error" : "Notice"} · ${sanitizeTerminalText(text)}`), 1, 0),
+			);
 		}
 		if (this.#inputNotice !== "") this.transcript.addChild(new Text(this.#theme.warning(this.#inputNotice), 1, 0));
 	}

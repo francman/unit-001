@@ -1,3 +1,4 @@
+import { commandCatalog } from "./commands/catalog.ts";
 import { UsageError } from "./errors.ts";
 import { memoryCommand } from "./memory-control.ts";
 import { type MissionCommand, parseMissionCommand } from "./missions/command.ts";
@@ -191,6 +192,15 @@ function parseServiceCommand(
 /** Parses the command line, without the node and script entries. Throws `UsageError` on anything unrecognized. */
 export function parseArguments(argv: readonly string[]): Command {
 	const first = argv[0];
+	const alias = commandCatalog("cli").find(
+		(command) => !command.invocation.includes(" ") && command.aliases.includes(first),
+	);
+	if (alias !== undefined) return parseArguments([alias.invocation, ...argv.slice(1)]);
+	if (first === "help") return { kind: "help" };
+	if (first === "inspect") {
+		if (argv[1] !== "os") throw new UsageError("Usage: agent inspect os [options]");
+		return parseServiceCommand("send", ["inspect os", ...argv.slice(2)]);
+	}
 	if (first === "remote") return { kind: "remote", command: parseRemoteArguments(argv.slice(1)) };
 	if (first === "mission") {
 		try {

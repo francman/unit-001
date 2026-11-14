@@ -9,6 +9,9 @@ import { ProcessTerminal } from "@earendil-works/pi-tui";
 import { Agent } from "./agent.ts";
 import { type Command, parseArguments, USAGE } from "./args.ts";
 import { runAttach } from "./attach.ts";
+import { commandCatalog } from "./commands/catalog.ts";
+import { isOperatingSystemQuestion } from "./commands/facts.ts";
+import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
 import { FileCredentialStore } from "./credentials.ts";
 import { ConfigurationError, UsageError } from "./errors.ts";
 import { acquireSessionLock } from "./lock.ts";
@@ -194,19 +197,20 @@ async function run(
 	const options = command.options;
 	const directory = resolveDirectory(options.dataDir, runtime);
 	const file = sessionFile(directory, options.session, runtime.platform);
-	const endpoint = command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
+	const endpoint =
+		command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
+	let prompt = command.kind === "run" ? command.options.print : undefined;
+	if (prompt === "-") prompt = (await readAll(runtime.stdin)).trim();
+	if (prompt === "") throw new UsageError("The prompt is empty.");
 	const { models, choice } = await (command.kind === "serve" ||
-		(command.kind === "run" && command.options.print === undefined)
+		(command.kind === "run" && command.options.print === undefined) ||
+		(prompt !== undefined && isOperatingSystemQuestion(prompt))
 		? createOwnerModels
 		: createConfiguredModels)(
 		runtime.env,
 		options.model ?? (runtime.env.UNIT_001_MODEL || (await readDefaultModel(directory))),
 		credentialStore(directory, runtime),
 	);
-
-	let prompt = command.kind === "run" ? command.options.print : undefined;
-	if (prompt === "-") prompt = (await readAll(runtime.stdin)).trim();
-	if (prompt === "") throw new UsageError("The prompt is empty.");
 
 	const terminal = terminalFor(runtime);
 	if (choice === null)
@@ -298,7 +302,11 @@ async function control(
 	const endpoint =
 		runtime.managed?.access === "operator"
 			? operatorEndpoint(runtime.managed.id, command.options.session)
-			: serviceEndpoint(resolveDirectory(command.options.dataDir, runtime), command.options.session, runtime.platform);
+			: serviceEndpoint(
+					resolveDirectory(command.options.dataDir, runtime),
+					command.options.session,
+					runtime.platform,
+				);
 	if (command.kind === "mission") {
 		const request = async (request: MissionRequest): Promise<MissionView> => {
 			const response = await requestService(endpoint, { type: "mission", request }, signal);
@@ -381,7 +389,8 @@ async function control(
 		let request: MemoryRequest;
 		if (command.request.operation === "confirm-forget") {
 			if (!command.yes) {
-				if (!runtime.interactive) throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
+				if (!runtime.interactive)
+					throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
 				const readline = createInterface({ input: runtime.stdin, output: runtime.stdout });
 				try {
 					const answer = await readline.question(
@@ -493,7 +502,8 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		}
 		if (runtime.managed?.access === "operator") {
 			if (command.kind === "status") {
-				if (command.dataDir !== undefined) throw new UsageError("Operator clients cannot change their data directory.");
+				if (command.dataDir !== undefined)
+					throw new UsageError("Operator clients cannot change their data directory.");
 				return control({ kind: "service-status", options: { session: "default" } }, runtime, signal);
 			}
 			if (
@@ -506,7 +516,10 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				!(command.kind === "run" && argv.length === 0 && runtime.interactive)
 			)
 				throw new ConfigurationError("This operation requires the administrator command.");
-			if (command.kind === "mission" && (command.command.action === "creator" || command.command.action === "approve"))
+			if (
+				command.kind === "mission" &&
+				(command.command.action === "creator" || command.command.action === "approve")
+			)
 				throw new ConfigurationError("Mission creator and approval changes require the administrator command.");
 			if (command.kind !== "run" && command.options.dataDir !== undefined)
 				throw new UsageError("Operator clients cannot change their data directory.");
@@ -540,9 +553,38 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 	} catch (error) {
 		if (signal.aborted && !serving) return 130;
 		if (error instanceof UsageError) {
+			const local = resolveLocalCommand(argv.join(" "), "cli");
+			let suggestions = local.kind === "suggestions" ? local.commands : [];
+			if (
+				local.kind === "unresolved" &&
+				argv.length > 0 &&
+				!argv[0].startsWith("-") &&
+				!argv.some((argument) => /^(?:--session|--data-dir)(?:=|$)/.test(argument))
+			) {
+				// An unresolved invocation may ask an existing owner; it never opens a provider or owner of its own.
+				try {
+					const endpoint =
+						runtime.managed?.access === "operator"
+							? operatorEndpoint(runtime.managed.id, "default")
+							: serviceEndpoint(resolveDirectory(undefined, runtime), "default", runtime.platform);
+					const response = await requestService(
+						endpoint,
+						{ type: "resolve-command", input: argv[0].slice(0, 256), surface: "cli" },
+						signal,
+					);
+					if (response.type === "command-suggestions")
+						suggestions = commandCatalog("cli").filter((command) =>
+							response.result.commandIds.includes(command.id),
+						);
+				} catch {
+					/* Ordinary usage remains available when no owner can interpret the command. */
+				}
+			}
 			runtime.stderr.write(
 				`${runtime.managed?.name ?? "agent"}: ${error.message.replaceAll("Usage: agent", `Usage: ${runtime.managed?.name ?? "agent"}`)}\nRun ${runtime.managed?.name ?? "agent"} --help for usage.\n`,
 			);
+			if (suggestions.length > 0)
+				runtime.stderr.write(`${sanitizeTerminalText(describeCommandSuggestions(suggestions, "cli"))}\n`);
 			return 2;
 		}
 		const message = error instanceof Error ? error.message : String(error);

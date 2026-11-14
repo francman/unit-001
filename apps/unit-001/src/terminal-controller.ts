@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
 import { ATTACH_HELP } from "./attach-help.ts";
+import { type CommandDefinition, commandCatalog } from "./commands/catalog.ts";
+import { isOperatingSystemQuestion } from "./commands/facts.ts";
+import type { CommandInterpretation } from "./commands/interpretation.ts";
+import { resolveLocalCommand } from "./commands/resolution.ts";
 import { describeMemory, type MemoryRequest, type MemoryResult, memoryCommand } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
@@ -23,6 +27,8 @@ export interface TerminalState {
 	readonly sending: boolean;
 	readonly cancelling: boolean;
 	readonly notices: readonly TerminalNotice[];
+	readonly suggestions?: readonly CommandDefinition[];
+	readonly suggesting?: boolean;
 	readonly unresolvedRequestIds?: readonly string[];
 }
 
@@ -40,6 +46,7 @@ export interface TerminalController {
 	submit(text: string): TerminalInputResult;
 	cancel(): void;
 	detach(): void;
+	dismissSuggestions(): void;
 }
 
 /** Connects a terminal controller without opening storage or creating another agent owner. */
@@ -93,6 +100,12 @@ export function createServiceTerminalController(
 				const response = await client.request({ type: "mission", request }, signal);
 				if (response.type === "error") throw new Error(response.message);
 				if (response.type !== "mission") throw new Error("Unexpected mission response.");
+				return response.result;
+			},
+			async resolveCommand(input, signal) {
+				const response = await client.request({ type: "resolve-command", input, surface: "slash" }, signal);
+				if (response.type === "error") throw new Error(response.message);
+				if (response.type !== "command-suggestions") throw new Error("Unexpected command suggestions.");
 				return response.result;
 			},
 		},
@@ -155,6 +168,7 @@ export function createForegroundTerminalController(
 				signal.throwIfAborted();
 				return agent.mission(request, BACKGROUND_CONTEXT);
 			},
+			resolveCommand: (input, signal) => agent.resolveCommand(input, "slash", BACKGROUND_CONTEXT, signal),
 		},
 		onChange,
 		signal,
@@ -175,6 +189,7 @@ interface ConversationTransport {
 	memory(request: MemoryRequest, signal: AbortSignal): Promise<MemoryResult>;
 	runtime(signal: AbortSignal): Promise<RuntimeFacts>;
 	mission(request: MissionRequest, signal: AbortSignal): Promise<MissionView>;
+	resolveCommand(input: string, signal: AbortSignal): Promise<CommandInterpretation>;
 }
 
 const HELP = `${ATTACH_HELP}\nDefault rich controls: PageUp/PageDown scroll; Ctrl+Shift+F searches the displayed transcript when forwarded by the terminal; Enter/Shift+Enter moves between matches; Esc closes search.\nUsage covers conversation-model estimates, excluding tool/subagent costs and subscription billing.`;
@@ -198,6 +213,7 @@ class OwnerTerminalController implements TerminalController {
 	#finished = false;
 	#startup: ReturnType<typeof setTimeout> | undefined;
 	#forget: { readonly id: string; readonly requestId: string } | undefined;
+	#interpretation: AbortController | undefined;
 
 	constructor(transport: ConversationTransport, onChange: (state: TerminalState) => void, signal: AbortSignal) {
 		this.#transport = transport;
@@ -226,13 +242,23 @@ class OwnerTerminalController implements TerminalController {
 
 	submit(input: string): TerminalInputResult {
 		if (this.#finished) return { status: "rejected" };
-		const text = input.trim();
+		let text = input.trim();
 		if (this.#forget !== undefined) {
 			const pending = this.#forget;
 			this.#forget = undefined;
 			if (text.toLowerCase() === "yes") void this.#memory({ operation: "forget", ...pending, confirmed: true });
 			else this.#notice("Forget cancelled.");
 			return { status: "command" };
+		}
+		this.dismissSuggestions();
+		if (text.startsWith("/")) {
+			const resolved = resolveLocalCommand(text, "slash");
+			if (resolved.kind === "exact") text = `/${resolved.text}`;
+			else {
+				if (resolved.kind === "suggestions") this.#showSuggestions(resolved.commands);
+				else void this.#suggest(text);
+				return { status: "rejected" };
+			}
 		}
 		if (text === "/exit" || text === "/detach") {
 			this.detach();
@@ -281,7 +307,7 @@ class OwnerTerminalController implements TerminalController {
 			this.cancel();
 			return { status: "command" };
 		}
-		if (text.startsWith("/")) {
+		if (text.startsWith("/") && !isOperatingSystemQuestion(text)) {
 			this.#notice(`Unknown command. ${this.#transport.ownership === "attached" ? HELP : FOREGROUND_HELP}`);
 			return { status: "rejected" };
 		}
@@ -320,6 +346,50 @@ class OwnerTerminalController implements TerminalController {
 		this.#notice(`Submitting request ${requestId}; retry with this --request-id after a disconnect.`);
 		void this.#send(text, requestId);
 		return { status: "submitted", requestId };
+	}
+
+	/** Cancels only auxiliary interpretation and removes its suggestions; conversation work is unaffected. */
+	dismissSuggestions(): void {
+		this.#interpretation?.abort();
+		this.#interpretation = undefined;
+		if (this.#state.suggestions === undefined && !this.#state.suggesting) return;
+		this.#state = { ...this.#state, suggestions: undefined, suggesting: false };
+		this.#publish();
+	}
+
+	#showSuggestions(commands: readonly CommandDefinition[]): void {
+		this.#state = { ...this.#state, suggestions: commands, suggesting: false };
+		this.#publish();
+	}
+
+	async #suggest(input: string): Promise<void> {
+		if (input.length > 256 || this.#state.connection !== "attached") {
+			this.#notice("Unknown command. Use /help for available commands.");
+			return;
+		}
+		const pending = new AbortController();
+		this.#interpretation = pending;
+		this.#state = { ...this.#state, suggesting: true };
+		this.#publish();
+		try {
+			const result = await this.#transport.resolveCommand(
+				input,
+				AbortSignal.any([pending.signal, this.#local.signal]),
+			);
+			if (pending.signal.aborted || this.#finished) return;
+			const commands = commandCatalog("slash").filter((command) => result.commandIds.includes(command.id));
+			if (commands.length > 0) this.#showSuggestions(commands);
+			else this.#notice(result.explanation);
+		} catch (error) {
+			if (!pending.signal.aborted && !this.#finished)
+				this.#notice(`Command suggestions unavailable: ${describeError(error)}. Use /help.`);
+		} finally {
+			if (this.#interpretation === pending) {
+				this.#interpretation = undefined;
+				this.#state = { ...this.#state, suggesting: false };
+				this.#publish();
+			}
+		}
 	}
 
 	cancel(): void {
@@ -384,7 +454,10 @@ class OwnerTerminalController implements TerminalController {
 			if (this.#finished) return;
 			// The watch is authoritative for transcript output; never duplicate an answer from the send reply.
 			if (reply.status === "failed")
-				this.#notice(`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`, "error");
+				this.#notice(
+					`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`,
+					"error",
+				);
 		} catch (error) {
 			if (error instanceof OwnerRequestError) this.#acknowledge(requestId);
 			if (!this.#finished) this.#notice(`Send failed; retry request ${requestId}: ${describeError(error)}`, "error");
@@ -419,10 +492,16 @@ class OwnerTerminalController implements TerminalController {
 				return;
 			}
 			if ((this.#state.unresolvedRequestIds?.length ?? 0) >= 8) {
-				this.#notice("Eight requests have unconfirmed outcomes. Inspect persisted work before sending more.", "error");
+				this.#notice(
+					"Eight requests have unconfirmed outcomes. Inspect persisted work before sending more.",
+					"error",
+				);
 				return;
 			}
-			this.#state = { ...this.#state, unresolvedRequestIds: [...(this.#state.unresolvedRequestIds ?? []), requestId] };
+			this.#state = {
+				...this.#state,
+				unresolvedRequestIds: [...(this.#state.unresolvedRequestIds ?? []), requestId],
+			};
 			this.#publish();
 		}
 		try {

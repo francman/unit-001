@@ -116,6 +116,43 @@ async function connect(owner: Awaited<ReturnType<typeof server>>) {
 }
 
 describe.skipIf(process.platform === "win32")("owner terminal controller", () => {
+	it("keeps aliases and spelling suggestions local and never sends guessed writes (#59)", async () => {
+		const owner = await server();
+		const { controller } = await connect(owner);
+		expect(controller.submit("/memroy")).toEqual({ status: "rejected" });
+		expect(controller.state.suggestions?.[0].id).toBe("memory");
+		expect(owner.requests).toEqual([{ type: "watch" }]);
+		controller.dismissSuggestions();
+		expect(controller.state.suggestions).toBeUndefined();
+		owner.respond((request, socket) => {
+			if (request.type === "memory") socket.end('{"type":"error","message":"Fixture memory stats"}\n');
+		});
+		expect(controller.submit("/brain")).toEqual({ status: "command" });
+		await expect.poll(() => owner.requests.filter((request) => request.type === "memory").length).toBe(1);
+		expect(owner.requests.some((request) => request.type === "send" || request.type === "resolve-command")).toBe(
+			false,
+		);
+	});
+
+	it("asks only for unresolved commands and ignores a cancelled suggestion response (#59)", async () => {
+		const owner = await server();
+		let pending: Socket | undefined;
+		owner.respond((request, socket) => {
+			if (request.type === "resolve-command") pending = socket;
+		});
+		const { controller } = await connect(owner);
+		controller.submit("/xyzzy");
+		await expect.poll(() => pending !== undefined).toBe(true);
+		expect(controller.state.suggesting).toBe(true);
+		controller.dismissSuggestions();
+		pending?.end(
+			'{"type":"command-suggestions","result":{"stage":"model","commandIds":["memory.forget"],"explanation":"Try this","usage":null}}\n',
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(controller.state.suggestions).toBeUndefined();
+		expect(controller.state.sending).toBe(false);
+		expect(owner.requests.some((request) => request.type === "send")).toBe(false);
+	});
 	it("offers guided mission setup without admitting a model prompt", async () => {
 		// #14: setup shares the terminal editor; status probes stay read-only and tolerate an older owner.
 		const owner = await server();
