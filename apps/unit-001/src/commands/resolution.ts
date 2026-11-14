@@ -8,7 +8,7 @@ export type LocalCommandResolution =
 
 /** Resolves command vocabulary only; canonical text must still pass the ordinary command parser. */
 export function resolveLocalCommand(input: string, surface: CommandSurface): LocalCommandResolution {
-	const text = input.trim().replace(/^\//, "");
+	const text = input.trim().replace(/^\//, "").trimStart();
 	if (text === "") return { kind: "unresolved" };
 	const catalog = commandCatalog(surface);
 	for (const command of [...catalog].sort((left, right) => right.invocation.length - left.invocation.length)) {

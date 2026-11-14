@@ -55,6 +55,32 @@ const signal = new AbortController().signal;
 
 describe("main", () => {
 	it.skipIf(process.platform === "win32")(
+		"does not infer against a different explicit session or directory (#59)",
+		async () => {
+			const directory = join(home, "data");
+			await mkdir(join(directory, "control"), { recursive: true });
+			const requests: unknown[] = [];
+			const server = createServer((socket) =>
+				socket.once("data", (data) => {
+					requests.push(JSON.parse(String(data)));
+					socket.end(`${JSON.stringify({ type: "error", message: "Unexpected default owner" })}\n`);
+				}),
+			);
+			await new Promise<void>((resolve) =>
+				server.listen(serviceEndpoint(directory, "default", process.platform), resolve),
+			);
+			try {
+				for (const options of [["--session", "work"], ["--data-dir", join(home, "other")], ["--session=work"]]) {
+					const run = runtime({});
+					expect(await main(["xyzzy", ...options], run.runtime, signal)).toBe(2);
+				}
+				expect(requests).toEqual([]);
+			} finally {
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+			}
+		},
+	);
+	it.skipIf(process.platform === "win32")(
 		"#8 uses the running owner for memory and requires explicit script forget confirmation",
 		async () => {
 			const directory = join(home, "data");

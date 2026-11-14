@@ -2,6 +2,7 @@ import { commandCatalog } from "./commands/catalog.ts";
 import { UsageError } from "./errors.ts";
 import { memoryCommand } from "./memory-control.ts";
 import { type MissionCommand, parseMissionCommand } from "./missions/command.ts";
+import { parseRemoteArguments, type RemoteCommand } from "./remote/args.ts";
 
 export const DEFAULT_SESSION = "default";
 
@@ -25,6 +26,7 @@ export interface AttachOptions extends ServiceOptions {
 }
 
 export type Command =
+	| { readonly kind: "remote"; readonly command: RemoteCommand }
 	| { readonly kind: "mission"; readonly command: MissionCommand; readonly options: ServiceOptions }
 	| {
 			readonly kind: "memory";
@@ -70,6 +72,7 @@ export const USAGE = `Usage: agent [options]
        agent send <prompt> [options]     ask the running service (optional --request-id for safe retries)
        agent service-status [options]    inspect the running service
        agent cancel [options]            abort its current run
+       agent remote --help               connect this terminal to a named remote installation
        agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]
        agent mission [status|setup|draft|propose|creator|approve] [options]
 
@@ -198,6 +201,7 @@ export function parseArguments(argv: readonly string[]): Command {
 		if (argv[1] !== "os") throw new UsageError("Usage: agent inspect os [options]");
 		return parseServiceCommand("send", ["inspect os", ...argv.slice(2)]);
 	}
+	if (first === "remote") return { kind: "remote", command: parseRemoteArguments(argv.slice(1)) };
 	if (first === "mission") {
 		try {
 			const { command, ...options } = parseMissionCommand(argv.slice(1));

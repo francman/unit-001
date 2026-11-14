@@ -15,6 +15,14 @@ function configured() {
 }
 
 describe("bounded command interpretation", () => {
+	it.each(["/", "/Users/me/private.md", "/sk-private-secret", "/ "])(
+		"keeps non-command input local: %s (#59)",
+		async (input) => {
+			const { models, faux } = configured();
+			expect((await interpretCommand(input, "cli", models, choice, signal)).stage).not.toBe("model");
+			expect(faux.state.callCount).toBe(0);
+		},
+	);
 	it("never calls a model for exact aliases or local spelling/semantic matches (#59)", async () => {
 		const { models, faux } = configured();
 		for (const input of ["brain", "memroy", "memories", "status"])

@@ -1,6 +1,6 @@
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Report } from "@earendil-works/pi-durable";
@@ -29,6 +29,7 @@ import {
 import { runMissionSetup } from "./missions/setup.ts";
 import { credentialsFile, dataDirectory, sessionFile } from "./paths.ts";
 import { createConfiguredModels, createModelsFor, createOwnerModels } from "./provider.ts";
+import { runRemoteCommand } from "./remote/cli.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import { runPrint, runRepl, type Terminal } from "./repl.ts";
 import {
@@ -465,6 +466,20 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		serving = command.kind === "serve";
 		foreground = command.kind === "run" && command.options.print === undefined && runtime.interactive;
 		if (signal.aborted) return serving ? 0 : 130;
+		if (command.kind === "remote")
+			return await runRemoteCommand(
+				command.command,
+				{
+					directory: join(
+						dataDirectory({ platform: runtime.platform, env: runtime.env, home: runtime.home }),
+						"remotes",
+					),
+					terminal: terminalFor(runtime),
+					richTerminal: richTerminalFor(runtime),
+					colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+				},
+				signal,
+			);
 		if (command.kind === "help") {
 			const usage =
 				runtime.managed?.access === "operator"
@@ -540,7 +555,12 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		if (error instanceof UsageError) {
 			const local = resolveLocalCommand(argv.join(" "), "cli");
 			let suggestions = local.kind === "suggestions" ? local.commands : [];
-			if (local.kind === "unresolved" && argv.length > 0 && !argv[0].startsWith("-")) {
+			if (
+				local.kind === "unresolved" &&
+				argv.length > 0 &&
+				!argv[0].startsWith("-") &&
+				!argv.some((argument) => /^(?:--session|--data-dir)(?:=|$)/.test(argument))
+			) {
 				// An unresolved invocation may ask an existing owner; it never opens a provider or owner of its own.
 				try {
 					const endpoint =

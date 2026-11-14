@@ -1,6 +1,5 @@
 // Controls an attached terminal through the single storage owner's bounded local protocol.
 import { randomUUID } from "node:crypto";
-import { basename } from "node:path";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
 import { ATTACH_HELP } from "./attach-help.ts";
@@ -12,7 +11,8 @@ import { describeMemory, type MemoryRequest, type MemoryResult, memoryCommand } 
 import { describeMission } from "./missions/command.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import type { RuntimeFacts } from "./orientation.ts";
-import { requestService, type ServiceView, watchService } from "./service.ts";
+import type { ServiceView } from "./service.ts";
+import { localServiceClient, type ServiceClient } from "./service-client.ts";
 import { serviceView } from "./service-view.ts";
 
 export interface TerminalNotice {
@@ -29,6 +29,7 @@ export interface TerminalState {
 	readonly notices: readonly TerminalNotice[];
 	readonly suggestions?: readonly CommandDefinition[];
 	readonly suggesting?: boolean;
+	readonly unresolvedRequestIds?: readonly string[];
 }
 
 /** A rejected input must stay in the editor; commands and admitted sends may clear it. */
@@ -54,45 +55,55 @@ export function createTerminalController(
 	onChange: (state: TerminalState) => void,
 	signal: AbortSignal,
 ): TerminalController {
+	return createServiceTerminalController(localServiceClient(endpoint), onChange, signal);
+}
+
+/** Attaches the same terminal controller to a local or authenticated remote owner. */
+export function createServiceTerminalController(
+	client: ServiceClient,
+	onChange: (state: TerminalState) => void,
+	signal: AbortSignal,
+): TerminalController {
 	return new OwnerTerminalController(
 		{
-			session: basename(endpoint, ".sock"),
+			session: client.session,
+			ownerSession: client.ownerSession,
 			ownership: "attached",
-			watch: (listener, signal) => watchService(endpoint, listener, signal),
+			watch: (listener, signal, connecting) =>
+				client.watch((event) => {
+					if (event.type === "view") listener(event.view);
+					else connecting(event.message);
+				}, signal),
 			async send(prompt, requestId, signal) {
-				const response = await requestService(endpoint, { type: "send", prompt, requestId }, signal);
-				if (response.type === "error") throw new Error(response.message);
+				const response = await client.request({ type: "send", prompt, requestId }, signal);
+				if (response.type === "error") throw new OwnerRequestError(response.message);
 				if (response.type !== "reply") throw new Error("The service returned an unexpected send response.");
 				return response.reply;
 			},
 			async cancel(signal) {
-				const response = await requestService(endpoint, { type: "cancel" }, signal);
+				const response = await client.request({ type: "cancel" }, signal);
 				if (response.type === "error") throw new Error(response.message);
 			},
 			async memory(request, signal) {
-				const response = await requestService(endpoint, { type: "memory", request }, signal);
-				if (response.type === "error") throw new Error(response.message);
+				const response = await client.request({ type: "memory", request }, signal);
+				if (response.type === "error") throw new OwnerRequestError(response.message);
 				if (response.type !== "memory") throw new Error("Unexpected memory response.");
 				return response.result;
 			},
 			async runtime(signal) {
-				const response = await requestService(endpoint, { type: "status" }, signal);
+				const response = await client.request({ type: "status" }, signal);
 				if (response.type === "error") throw new Error(response.message);
 				if (response.type !== "status") throw new Error("Unexpected status response.");
 				return response.runtime;
 			},
 			async mission(request, signal) {
-				const response = await requestService(endpoint, { type: "mission", request }, signal);
+				const response = await client.request({ type: "mission", request }, signal);
 				if (response.type === "error") throw new Error(response.message);
 				if (response.type !== "mission") throw new Error("Unexpected mission response.");
 				return response.result;
 			},
 			async resolveCommand(input, signal) {
-				const response = await requestService(
-					endpoint,
-					{ type: "resolve-command", input, surface: "slash" },
-					signal,
-				);
+				const response = await client.request({ type: "resolve-command", input, surface: "slash" }, signal);
 				if (response.type === "error") throw new Error(response.message);
 				if (response.type !== "command-suggestions") throw new Error("Unexpected command suggestions.");
 				return response.result;
@@ -114,6 +125,7 @@ export function createForegroundTerminalController(
 	return new OwnerTerminalController(
 		{
 			session,
+			ownerSession: session,
 			ownership: "foreground",
 			async watch(listener, signal) {
 				const { context, cancel } = withCancel(BACKGROUND_CONTEXT);
@@ -165,8 +177,13 @@ export function createForegroundTerminalController(
 
 interface ConversationTransport {
 	readonly session: string;
+	readonly ownerSession: string;
 	readonly ownership: "attached" | "foreground";
-	watch(listener: (view: ServiceView) => void, signal: AbortSignal): Promise<void>;
+	watch(
+		listener: (view: ServiceView) => void,
+		signal: AbortSignal,
+		connecting: (message: string) => void,
+	): Promise<void>;
 	send(prompt: string, requestId: string, signal: AbortSignal): Promise<Reply>;
 	cancel(signal: AbortSignal): Promise<void>;
 	memory(request: MemoryRequest, signal: AbortSignal): Promise<MemoryResult>;
@@ -179,6 +196,9 @@ const HELP = `${ATTACH_HELP}\nDefault rich controls: PageUp/PageDown scroll; Ctr
 const FOREGROUND_HELP =
 	"/help /status /mission [setup] /memory [stats|recall <query>|remember <text>|forget <id>|sleep] /cancel /exit. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
 const MAX_INPUT_BYTES = 16_384;
+
+// A wire error acknowledges the request; transport failures leave its outcome unknown.
+class OwnerRequestError extends Error {}
 
 class OwnerTerminalController implements TerminalController {
 	readonly closed: Promise<number>;
@@ -249,11 +269,15 @@ class OwnerTerminalController implements TerminalController {
 			return { status: "command" };
 		}
 		if (text === "/status") {
+			if (this.#state.unresolvedRequestIds?.length)
+				this.#notice(
+					`Unconfirmed requests: ${this.#state.unresolvedRequestIds.join(", ")}. Inspect persisted work before retrying.`,
+				);
 			const view = this.#state.view;
 			this.#notice(
 				view === undefined
 					? "Connecting to the service."
-					: `${view.name}: ${view.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${view.pid}; version ${view.version}.`,
+					: `${this.#state.connection === "attached" ? "" : "Last observed (disconnected): "}${view.name}: ${view.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${view.pid}; version ${view.version}.`,
 			);
 			void this.#status();
 			return { status: "command" };
@@ -298,6 +322,13 @@ class OwnerTerminalController implements TerminalController {
 			);
 			return { status: "rejected" };
 		}
+		if ((this.#state.unresolvedRequestIds?.length ?? 0) >= 8) {
+			this.#notice(
+				"Eight requests have unconfirmed outcomes. Detach to retain their IDs and inspect the owner before submitting more.",
+				"error",
+			);
+			return { status: "rejected" };
+		}
 		if (Buffer.byteLength(text) > MAX_INPUT_BYTES) {
 			this.#notice("Prompt exceeds 16 KiB; it was not submitted.");
 			return { status: "rejected" };
@@ -307,7 +338,11 @@ class OwnerTerminalController implements TerminalController {
 			this.#notice("Encoded prompt exceeds 64 KiB; it was not submitted.");
 			return { status: "rejected" };
 		}
-		this.#state = { ...this.#state, sending: true };
+		this.#state = {
+			...this.#state,
+			sending: true,
+			unresolvedRequestIds: [...(this.#state.unresolvedRequestIds ?? []), requestId],
+		};
 		this.#notice(`Submitting request ${requestId}; retry with this --request-id after a disconnect.`);
 		void this.#send(text, requestId);
 		return { status: "submitted", requestId };
@@ -386,14 +421,24 @@ class OwnerTerminalController implements TerminalController {
 
 	async #observe(): Promise<void> {
 		try {
-			await this.#transport.watch((view) => {
-				const first = this.#state.connection === "connecting";
-				clearTimeout(this.#startup);
-				this.#state = { ...this.#state, connection: "attached", view };
-				this.#publish();
-				if (this.#cancelAfterAdmission && view.busy) this.cancel();
-				if (first && this.#transport.session === "default") void this.#mission(true);
-			}, this.#local.signal);
+			await this.#transport.watch(
+				(view) => {
+					const first = this.#state.view === undefined;
+					clearTimeout(this.#startup);
+					this.#state = { ...this.#state, connection: "attached", view };
+					this.#publish();
+					if (this.#cancelAfterAdmission && view.busy) this.cancel();
+					if (first && this.#transport.ownerSession === "default") void this.#mission(true);
+				},
+				this.#local.signal,
+				(message) => {
+					clearTimeout(this.#startup);
+					this.#cancelAfterAdmission = false;
+					this.#forget = undefined;
+					this.#state = { ...this.#state, connection: "connecting" };
+					this.#notice(message);
+				},
+			);
 			if (!this.#finished) this.#finish("detached", 0);
 		} catch (error) {
 			if (this.#finished) return;
@@ -405,6 +450,7 @@ class OwnerTerminalController implements TerminalController {
 	async #send(text: string, requestId: string): Promise<void> {
 		try {
 			const reply = await this.#transport.send(text, requestId, this.#local.signal);
+			this.#acknowledge(requestId);
 			if (this.#finished) return;
 			// The watch is authoritative for transcript output; never duplicate an answer from the send reply.
 			if (reply.status === "failed")
@@ -413,8 +459,8 @@ class OwnerTerminalController implements TerminalController {
 					"error",
 				);
 		} catch (error) {
-			if (!this.#finished)
-				this.#notice(`Send failed: ${describeError(error)}; retry request ${requestId}.`, "error");
+			if (error instanceof OwnerRequestError) this.#acknowledge(requestId);
+			if (!this.#finished) this.#notice(`Send failed; retry request ${requestId}: ${describeError(error)}`, "error");
 		} finally {
 			this.#cancelAfterAdmission = false;
 			if (!this.#finished) {
@@ -439,8 +485,28 @@ class OwnerTerminalController implements TerminalController {
 	}
 
 	async #memory(request: MemoryRequest): Promise<void> {
+		const requestId = "requestId" in request ? request.requestId : undefined;
+		if (requestId !== undefined) {
+			if (this.#state.connection !== "attached") {
+				this.#notice("Not attached; the memory request was not sent.");
+				return;
+			}
+			if ((this.#state.unresolvedRequestIds?.length ?? 0) >= 8) {
+				this.#notice(
+					"Eight requests have unconfirmed outcomes. Inspect persisted work before sending more.",
+					"error",
+				);
+				return;
+			}
+			this.#state = {
+				...this.#state,
+				unresolvedRequestIds: [...(this.#state.unresolvedRequestIds ?? []), requestId],
+			};
+			this.#publish();
+		}
 		try {
 			const result = await this.#transport.memory(request, this.#local.signal);
+			if (requestId !== undefined) this.#acknowledge(requestId);
 			if (!this.#finished) {
 				if (result.operation === "recall") {
 					if (result.records.length === 0) this.#notice(describeMemory(result));
@@ -455,8 +521,17 @@ class OwnerTerminalController implements TerminalController {
 				} else this.#notice(describeMemory(result));
 			}
 		} catch (error) {
+			if (requestId !== undefined && error instanceof OwnerRequestError) this.#acknowledge(requestId);
 			if (!this.#finished) this.#notice(`Memory: ${describeError(error)}`, "error");
 		}
+	}
+
+	#acknowledge(requestId: string): void {
+		this.#state = {
+			...this.#state,
+			unresolvedRequestIds: this.#state.unresolvedRequestIds?.filter((id) => id !== requestId),
+		};
+		this.#publish();
 	}
 
 	async #status(): Promise<void> {

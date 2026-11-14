@@ -189,6 +189,15 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		effect: "read",
 	},
 	{
+		id: "remote",
+		surfaces: ["cli"],
+		invocation: "remote",
+		summary: "Manage SSH profiles and connect to a remote owner",
+		aliases: [],
+		keywords: ["ssh", "connection", "profile"],
+		effect: "write",
+	},
+	{
 		id: "send",
 		surfaces: ["cli"],
 		invocation: "send",

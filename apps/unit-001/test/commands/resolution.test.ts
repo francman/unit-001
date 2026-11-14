@@ -4,6 +4,10 @@ import { commandCatalog } from "../../src/commands/catalog.ts";
 import { describeCommandSuggestions, resolveLocalCommand } from "../../src/commands/resolution.ts";
 
 describe("local command resolution", () => {
+	it("ignores whitespace after slash without arbitrary suggestions (#59)", () => {
+		expect(resolveLocalCommand("/ ", "slash")).toEqual({ kind: "unresolved" });
+		expect(resolveLocalCommand("/ xyzzy", "slash")).toEqual({ kind: "unresolved" });
+	});
 	it("resolves brain locally and leaves operands to the normal parser (#59)", () => {
 		expect(resolveLocalCommand("/brain", "slash")).toMatchObject({
 			kind: "exact",

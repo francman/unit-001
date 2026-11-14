@@ -12,9 +12,9 @@ Ordinary conversation remains ordinary conversation. Only explicit CLI command i
 
 ## Catalog and trust
 
-`commands/catalog.ts` owns typed IDs, interface availability, canonical invocations, aliases, help summaries and effect classifications. Remote command definitions join this catalog through their typed export. Local ranking is deterministic and versioned; neither model output nor user input creates a command definition.
+`commands/catalog.ts` owns typed IDs, interface availability, canonical invocations, aliases, help summaries and effect classifications. The `remote` entry leads to the existing SSH profile parser. Local ranking is deterministic and versioned; neither model output nor user input creates a command definition.
 
-The inference request contains bounded unknown command text and the available public catalog only: no history, credentials, private files, tool definitions or arbitrary command execution. One response may identify existing command IDs and a short explanation. Reject tool calls, unknown IDs, malformed output and oversized responses. No retries. A timeout ends interpretation. Record observed request usage separately from conversation usage; unavailable billing remains unknown.
+The inference request contains one bounded command-shaped token and the available public catalog only: no operands, paths, history, credentials, private files, tool definitions or arbitrary command execution. Explicit CLI session or data-directory overrides keep unresolved commands local rather than asking a different owner. One response may identify existing command IDs and a short explanation. Reject tool calls, unknown IDs, malformed output and oversized responses. No retries. A timeout ends interpretation. Record observed request usage separately from conversation usage; unavailable billing remains unknown.
 
 CLI and terminal suggestions show canonical commands. Choosing a suggestion puts that command in the editor; submitting it still runs the normal parser, authorization and confirmation. Privileged commands remain administrator operations. No shell command string is constructed.
 
