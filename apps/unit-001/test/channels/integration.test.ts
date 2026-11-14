@@ -7,11 +7,13 @@ import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Agent } from "../../src/agent.ts";
 import { ChannelCredentials } from "../../src/channels/credentials.ts";
 import { channelExtension } from "../../src/channels/extension.ts";
+import { ChannelDoc } from "../../src/channels/registry.ts";
 import { type ChannelStore, runChannelSetup } from "../../src/channels/setup.ts";
 import { TELEGRAM_ADAPTER, TelegramClient } from "../../src/channels/telegram.ts";
 import { telegramSetupAdapter } from "../../src/channels/telegram-setup.ts";
@@ -36,6 +38,87 @@ afterEach(async () => {
 });
 
 describe("channel integration", () => {
+	it("#56 cancels and joins model-invoked setup before owner storage closes", async () => {
+		const fixture = grantFixture();
+		fixture.request.expiresAt = Date.now() + 60000;
+		fixture.channels.grants[0].expiresAt = fixture.request.expiresAt;
+		const database = join(directory, "model-close.sqlite");
+		const seed = await Harness.open(
+			await openNodeSqliteStorage(database),
+			{ registry: createRegistry(), models: createModels() },
+			BACKGROUND_CONTEXT,
+		);
+		await seed.commit(async (tx) => Object.assign(await tx.doc(ChannelDoc), fixture.state), BACKGROUND_CONTEXT);
+		await seed.close(BACKGROUND_CONTEXT);
+		let started = () => {};
+		const running = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		let observedAbort = () => {};
+		const abortObserved = new Promise<void>((resolve) => {
+			observedAbort = resolve;
+		});
+		let releaseCleanup = () => {};
+		const cleanup = new Promise<void>((resolve) => {
+			releaseCleanup = resolve;
+		});
+		const adapter = {
+			id: "telegram",
+			prepare: async (_request: unknown, authorized: () => Promise<void>, signal?: AbortSignal) => {
+				await authorized();
+				started();
+				return new Promise<never>((_resolve, reject) => {
+					signal?.addEventListener(
+						"abort",
+						() => {
+							observedAbort();
+							void cleanup.then(() => reject(new Error("cancelled")));
+						},
+						{ once: true },
+					);
+				});
+			},
+		};
+		const faux = fauxProvider();
+		faux.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("unit_channel_setup", { channelId: "creator", operation: "setup" }),
+				{ stopReason: "toolUse" },
+			),
+		]);
+		const models = createModels();
+		models.setProvider(faux.provider);
+		const agent = await Agent.open(
+			{
+				models,
+				model: { provider: "faux", modelId: "faux-1" },
+				cwd: directory,
+				storage: await openNodeSqliteStorage(database),
+				extensions: [channelExtension([TELEGRAM_ADAPTER], async () => fixture, [adapter])],
+			},
+			BACKGROUND_CONTEXT,
+		);
+		agents.push(agent);
+		const asking = expect(agent.ask("Resume the approved setup.", BACKGROUND_CONTEXT)).rejects.toThrow(
+			"Harness is closed",
+		);
+		await running;
+		let closed = false;
+		const closing = agent.close(BACKGROUND_CONTEXT).then(() => {
+			closed = true;
+		});
+		try {
+			await abortObserved;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(closed).toBe(false);
+		} finally {
+			releaseCleanup();
+		}
+		await closing;
+		await asking;
+		expect(closed).toBe(true);
+	});
+
 	it("records a model setup proposal, preserves it across SQLite reopen and reports current grant absence", async () => {
 		const fixture = grantFixture();
 		const extension = channelExtension([TELEGRAM_ADAPTER], async () => ({
