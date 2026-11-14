@@ -227,6 +227,7 @@ async function run(
 				name: runtime.managed?.name ?? "agent",
 				models,
 				model: choice,
+				channelCredentialsDirectory: join(directory, "channels"),
 				mission:
 					runtime.managed === undefined
 						? { kind: "developer-local", directory, session: options.session }
@@ -289,6 +290,7 @@ async function control(
 				| "maintenance-enter"
 				| "maintenance-release"
 				| "memory"
+				| "channels"
 				| "mission";
 		}
 	>,
@@ -307,6 +309,24 @@ async function control(
 					command.options.session,
 					runtime.platform,
 				);
+	if (command.kind === "channels") {
+		const response = await requestService(endpoint, { type: "channels", request: { operation: "status" } }, signal);
+		if (response.type === "error") throw new ConfigurationError(response.message);
+		if (response.type !== "channels") throw new Error("Unexpected channel response.");
+		const result = response.result;
+		if (result.operation !== "status") throw new Error("Unexpected channel status operation.");
+		const lines = [
+			`Available adapters: ${result.view.available.map((adapter) => `${adapter.id} (${adapter.capabilities.join(", ")})`).join("; ") || "none"}`,
+			...result.view.channels.map(
+				(channel) =>
+					`${channel.request.channelId}: ${channel.outcome.kind}${channel.outcome.kind === "awaiting_creator" ? ` (${channel.outcome.step})` : ""}; ${channel.request.adapter} destination ${channel.request.destination}`,
+			),
+		];
+		if (!result.view.channels.length) lines.push("No channels configured.");
+		lines.push(`Observed: ${new Date(result.observedAt).toISOString()}`);
+		runtime.stdout.write(`${sanitizeTerminalText(lines.join("\n"))}\n`);
+		return 0;
+	}
 	if (command.kind === "mission") {
 		const request = async (request: MissionRequest): Promise<MissionView> => {
 			const response = await requestService(endpoint, { type: "mission", request }, signal);
@@ -512,6 +532,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				command.kind !== "cancel" &&
 				command.kind !== "service-status" &&
 				command.kind !== "memory" &&
+				command.kind !== "channels" &&
 				command.kind !== "mission" &&
 				!(command.kind === "run" && argv.length === 0 && runtime.interactive)
 			)
@@ -545,6 +566,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 			command.kind === "maintenance-enter" ||
 			command.kind === "maintenance-release" ||
 			command.kind === "memory" ||
+			command.kind === "channels" ||
 			command.kind === "mission"
 		)
 			code = await control(command, runtime, signal);

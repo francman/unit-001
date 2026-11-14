@@ -25,6 +25,21 @@ export async function dispatchAgent(id, expectedName, args, context) {
 	if (!service && expectedName !== record.name)
 		throw new Error("This agent command was renamed; use its current name.");
 	const action = args[0];
+	if (!service && action === "channels" && ["policy", "approve", "revoke", "telegram-bootstrap"].includes(args[1])) {
+		if (context.uid !== 0)
+			throw new Error(
+				`Run sudo ${record.name} channels ${args[1]}; channel authority requires the host administrator.`,
+			);
+		if (args.some((argument) => argument === "--id" || argument.startsWith("--id=")))
+			throw new Error("A named channel command cannot change installation identity.");
+		const release = await context.release(installationPaths(id, context.root).current);
+		return context.run(
+			join(release, "runtime/bin/node"),
+			[join(release, "deploy/channels.mjs"), ...args.slice(1), "--id", id],
+			false,
+			context.administratorOrigin ?? {},
+		);
+	}
 	if (!service && action === "mission" && ["creator", "approve"].includes(args[1])) {
 		if (context.uid !== 0)
 			throw new Error(

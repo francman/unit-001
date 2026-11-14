@@ -74,6 +74,12 @@ test("#36 bundled terminal design resolves its setup guide inside the signed doc
 		readFileSync(join(directory, "docs/missions/verification.md")),
 		readFileSync(new URL("../docs/missions/verification.md", import.meta.url)),
 	);
+	// #56: exact creator-grant and private bootstrap instructions ship with the managed commands.
+	assert.deepEqual(
+		readFileSync(join(directory, "docs/channels.md")),
+		readFileSync(new URL("../docs/channels.md", import.meta.url)),
+	);
+	assert.match(readFileSync(join(directory, "SHA256SUMS"), "utf8"), /\.\/docs\/channels\.md/);
 });
 
 test("#16 Linux archives exclude macOS extended attributes and AppleDouble companions", () => {

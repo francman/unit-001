@@ -252,6 +252,7 @@ export function writeReleaseDocumentation(stage) {
 		"memory/reference-practices.md",
 		"missions/design.md",
 		"missions/verification.md",
+		"channels.md",
 		"latency.md",
 		"lightsail.md",
 		"terminal.md",
