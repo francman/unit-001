@@ -1,16 +1,16 @@
-# Bob should report costs from receipts, not model guesses
+# The agent should report costs from receipts, not model guesses
 
-Research proposal for [#42](https://github.com/francman/unit-001/issues/42), reviewed 2026-11-09. Research is in progress; this document describes implementation work that has not shipped. Related: organization integration [#41](https://github.com/francman/unit-001/issues/41), mission controls #17, operational inspection #26, security posture #44 and voice #45.
+Research proposal for [#42](https://github.com/francman/unit-001/issues/42), reviewed 2026-11-09. This reviewed research defines implementation work that has not shipped. Related: organization integration [#41](https://github.com/francman/unit-001/issues/41), mission controls #17, operational inspection #26, security posture #44 and voice #45.
 
 ## Decision in under one minute
 
-Build a small, private accounting ledger inside Bob's existing owner process. Reuse Pi's usage types, Durable document families and telemetry; do not install a dashboard server or proxy on the 512 MB VPS. Expose one read-only `unit_metrics` tool and matching `bob metrics` command. Bob can then answer questions about cost, uptime and work from the same recorded facts the human sees.
+Build a small, private accounting ledger inside the agent's existing owner process. Reuse Pi's usage types, Durable document families and telemetry; do not install a dashboard server or proxy on the 512 MB VPS. Expose one read-only `unit_metrics` tool and matching `agent metrics` command. The agent can then answer questions about cost, uptime and work from the same recorded facts the human sees.
 
 Keep **provider-reported charges**, **API-price estimates**, **subscription allocation** and **configured hosting expenses** distinct. Missing receipts are unknown, never free. A subscription's public API-equivalent usage is not its bill. Start recording before advertising monthly coverage; old aggregate totals cannot reconstruct a complete month.
 
 Implement receipts and reporting first, provider reconciliation second, and budget enforcement in the mission-controller slice. The remaining design risk is write latency: reliable attempt receipts add commits. Preserve the existing latency gates and measure that cost before release.
 
-Illustrative answer, not Bob's actual spending: “For November in UTC, I recorded $8.40 in provider-reported charges and $0.70 in estimates. Two interrupted requests lack final receipts. Hosting is configured at $3.50/month; subscription allocation is unknown. I cannot give an invoice-complete total.”
+Illustrative answer, not the agent's actual spending: “For November in UTC, I recorded $8.40 in provider-reported charges and $0.70 in estimates. Two interrupted requests lack final receipts. Hosting is configured at $3.50/month; subscription allocation is unknown. I cannot give an invoice-complete total.”
 
 ## Existing building blocks and the actual gaps
 
@@ -29,14 +29,14 @@ Source inspection included the installed package exports/types under `node_modul
 
 Main-branch pins below may include unreleased work. These are source-verified patterns, not production capacity claims.
 
-| Reference | Useful behavior | Decision for Bob |
+| Reference | Useful behavior | Decision for the agent |
 |---|---|---|
 | [OMP stats](https://github.com/can1357/oh-my-pi/blob/c899a8a1695e50983830e70ccacad962b629d0e5/packages/stats/README.md) and [request-time pricing](https://github.com/can1357/oh-my-pi/blob/c899a8a1695e50983830e70ccacad962b629d0e5/packages/catalog/src/models.ts) | Incremental local ingestion, atomic cursors/aggregates, hourly rollups; subscription usage is explicitly API-equivalent, unpriced models are N/A. Prices use the request timestamp. | Adopt incremental rollups and frozen pricing provenance. Do not import its Bun/React dashboard and second runtime. |
 | [OpenClaw usage](https://github.com/openclaw/openclaw/blob/6580679f718148c883b457da6a71f25e267e1bfc/docs/concepts/usage-tracking.md) | Separates account quotas/billing from session estimates, preserves unknown account attribution, reports stale/partial aggregates, supports explicit calendar time zones. | Adopt its separation and coverage labels. Avoid scraping browser session cookies or requesting broad billing credentials by default. |
 | [Hermes usage persistence](https://github.com/NousResearch/hermes-agent/blob/9d97823a9bd19fcfb188fb2133be49b826de9c37/hermes_state_usage.py) | Records actual and estimated costs, pricing version, active model/billing route and auxiliary tasks. Avoids charging a whole mixed-model session to its initial model. Coalesces background writes. | Adopt per-call attribution and auxiliary accounting. Do not treat its best-effort in-memory write queue as crash-complete accounting. |
 | [Paperclip reporting](https://github.com/paperclipai/paperclip/blob/02bfe71a6bbd7c5676cb7e72778b361c5bc72765/docs/guides/agent-developer/cost-reporting.md), [cost schema](https://github.com/paperclipai/paperclip/blob/02bfe71a6bbd7c5676cb7e72778b361c5bc72765/packages/db/src/schema/cost_events.ts), [finance schema](https://github.com/paperclipai/paperclip/blob/02bfe71a6bbd7c5676cb7e72778b361c5bc72765/packages/db/src/schema/finance_events.ts) | Distinguishes usage/cost events from finance entries, stores idempotency and provider request IDs, retains unpriced/accounting-pending records and supports organization attribution. | Adopt receipt identity and incomplete-cost reporting. Export existing receipts through the organization adapter once, rather than recording a second charge for an export. Keep infrastructure charges separate. |
 | [Langfuse cost tracking](https://langfuse.com/docs/observability/features/token-and-cost-tracking) | Provider/ingested costs take precedence over inferred costs; usage types support audio/cache; stored costs are not silently changed by later price updates. | Adopt the data contract. Optional remote export later; no mandatory hosted account or local stack. |
-| [LiteLLM spend tracking](https://docs.litellm.ai/docs/proxy/cost_tracking) | Cross-provider spend attribution and explicit cost-map/billing reconciliation. | Support external gateway receipts if already used. Do not require an additional proxy, database or auth boundary merely to meter Bob. |
+| [LiteLLM spend tracking](https://docs.litellm.ai/docs/proxy/cost_tracking) | Cross-provider spend attribution and explicit cost-map/billing reconciliation. | Support external gateway receipts if already used. Do not require an additional proxy, database or auth boundary merely to meter the agent. |
 | [OpenTelemetry GenAI conventions](https://github.com/open-telemetry/semantic-conventions-genai/tree/e6658f14c9d9ea0760825f029cb82e7673f48fab/docs/gen-ai) | Standard vocabulary for agent/tool/model operations and token/latency observations. Conventions remain evolving. | Translate existing Pi telemetry at an optional exporter boundary. Version the mapping; do not couple billing correctness to trace sampling or a collector. |
 
 OMP, OpenClaw, Hermes and Paperclip report MIT licenses at these pins; preserve notices if copying substantial code/prompts. OTel conventions are Apache-2.0. The recommendation reuses patterns, not their source. No comparative performance benchmarks were run.
@@ -96,7 +96,7 @@ If accounting cannot persist a new start, do not issue the provider call. If per
 
 Deferred submission/poll operations refer to one original charge identity. Pending polls do not repeatedly add cumulative usage; terminal or provider-reconciled final usage settles that identity. An abort/error can still have chargeable observed usage. Provider SDK-internal retries may not expose every physical attempt; record that limitation and reconcile rather than inventing costs.
 
-A crash after transmission can leave the provider charging an operation whose final receipt never arrived. Reopen converts unfinished attempts to `receipt_missing`; it must not replay work merely to recover accounting. Import a late provider receipt idempotently when available. Provider account totals alone cannot assign a missing charge to Bob when the credential is shared.
+A crash after transmission can leave the provider charging an operation whose final receipt never arrived. Reopen converts unfinished attempts to `receipt_missing`; it must not replay work merely to recover accounting. Import a late provider receipt idempotently when available. Provider account totals alone cannot assign a missing charge to the agent when the credential is shared.
 
 Session documents fit existing public transactions. For installation-wide reporting, owners must aggregate **every registered session's own** receipts through owner IPC or read-only closed-session access, including explicit incomplete/unreachable sessions. Count origin receipt IDs once across forks and child-agent exports. Do not copy ancestral spend into a fork. No client opens SQLite, and no second writer opens a live conversation database. If future simultaneous independent session owners require a central installation ledger, implement one dedicated owner endpoint first rather than sharing mutable documents across processes.
 
@@ -106,9 +106,9 @@ Persist UTC instants. “This month” defaults to UTC, matching an explicit res
 
 UTC daily rollups answer UTC queries directly. A non-UTC range reads complete interior UTC days plus exact boundary receipts; bound/paginate this work. A partial projection answers with an observed known subtotal and a coverage warning. Historical assistant entries can backfill recorded message usage/timestamps; old aggregate compaction totals and lost auth/pricing provenance remain unattributed, not retroactively guessed.
 
-### What Bob and its human can read
+### What the agent and its human can read
 
-`unit_metrics` and `bob metrics --month YYYY-MM --json` share one owner report. Add a compact `/metrics` terminal view after the same report works. Normal authorized operators can read it without sudo; billing credentials, allocation policy, exports and budget changes remain administrative. Bob must call the tool for present-tense operational/cost questions and explain missing data; recalled prose is not accounting evidence.
+`unit_metrics` and `agent metrics --month YYYY-MM --json` share one owner report. Add a compact `/metrics` terminal view after the same report works. Normal authorized operators can read it without sudo; billing credentials, allocation policy, exports and budget changes remain administrative. The agent must call the tool for present-tense operational/cost questions and explain missing data; recalled prose is not accounting evidence.
 
 Every report includes `schemaVersion`, `observedAt`, period bounds/timezone, installation/session scope, included/excluded work, source/revision references, freshness, and coverage `complete | partial | unavailable`. Money is grouped by provenance, currency and billing mode. Shared observation metadata can later be extracted for the security report; do not create a generic facts service now.
 

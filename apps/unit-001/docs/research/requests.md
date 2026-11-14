@@ -29,7 +29,7 @@ The [report index](README.md) links recommendations and coding definitions. The 
 
 ## Mission agreement — #14
 
-Bob must pursue a persisted mission without another prompt, with execution, verification and reassessment separated from process supervision. On first configured startup, the creator may be a human, an elder/parent agent or an authenticated organization principal. Provider setup does not establish mission authority. No approved mission means no autonomous execution; ordinary authorized conversation can still help draft one.
+The agent must pursue a persisted mission without another prompt, with execution, verification and reassessment separated from process supervision. On first configured startup, the creator may be a human, an elder/parent agent or an authenticated organization principal. Provider setup does not establish mission authority. No approved mission means no autonomous execution; ordinary authorized conversation can still help draft one.
 
 Administrator-owned policy binds the creator and maximum authority. The agreement records the exact goal, scope, actions, budgets, approval boundary, success evidence and review cadence. Approval targets an exact revision. Restart resumes the agreement or pending handshake; amendment and creator handoff invalidate stale decisions. Parent creation/delegation and uncertain external effects need stable receipts and reconciliation. Headless parent handshakes must not require a terminal.
 
@@ -41,7 +41,7 @@ Tests must cover restart, pause, stop, deadlines, unavailable creators, stale ap
 
 Authorized operators use help/version, terminal attach, send/cancel, runtime status and memory inspection/edits without sudo. Forget keeps confirmation. Setup, sign-in/logout and credentials, configuration, identity, permissions, service lifecycle, updates and uninstall remain privileged.
 
-Operators retain Bob's coding tools and agent-owned file authority. This is command authorization, not a model/tool sandbox. Direct credential/settings/database access and the private administration socket remain protected. Unrelated users and other installations' operators must be denied. Keep one database owner and avoid broad sudoers rules.
+Operators retain the agent's coding tools and agent-owned file authority. This is command authorization, not a model/tool sandbox. Direct credential/settings/database access and the private administration socket remain protected. Unrelated users and other installations' operators must be denied. Keep one database owner and avoid broad sudoers rules.
 
 Acceptance includes real user/group isolation, normal terminal interaction, retained coding tools through a faux provider, native install, the actual published 0.0.6 updater migration, rollback/recovery and deployed normal-user checks. Existing installations need an explicit operator grant and fresh login. Removing group membership does not instantly revoke already-running processes or connected clients. One-time service-policy migration must be explicit and administrator-controlled, not hidden in help or an automatic restart.
 
@@ -71,7 +71,7 @@ The proposed first slice has one organization binding per installation, not a un
 
 ## Facts and costs — #42
 
-Bob must answer operational questions from recorded facts, including monthly cost, rather than guessing from model identity or conversation text. Compare OMP, OpenClaw, Hermes, Paperclip and relevant observability tools using primary sources.
+The agent must answer operational questions from recorded facts, including monthly cost, rather than guessing from model identity or conversation text. Compare OMP, OpenClaw, Hermes, Paperclip and relevant observability tools using primary sources.
 
 Distinguish provider-reported charges, estimates, missing coverage, subscriptions and optional hosting/tool expenses. Attribute tokens, runtime, mission/task outcomes, failures and retries across parent agents and organizations without duplicate charges. Define calendar/month boundaries, pricing provenance and stale/unknown values; missing is not zero and estimated cost is not guaranteed billing.
 

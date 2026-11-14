@@ -1,4 +1,4 @@
-# Simplify repeated workflows while preserving Bob’s behavior
+# Simplify repeated workflows while preserving the agent’s behavior
 
 **Recommendation:** use small refactors, not a rewrite. First bypass a redundant memory-maintenance phase for new work. Then share terminal command and cancellation state across the rich and plain interfaces. Finally separate initial installation orchestration from reusable installation primitives, preserving the deployed updater’s fixed helper inventory.
 
