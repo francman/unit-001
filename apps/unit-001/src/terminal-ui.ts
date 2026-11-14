@@ -23,8 +23,10 @@ import {
 import type { Agent } from "./agent.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import type { ServiceView } from "./service.ts";
+import type { ServiceClient } from "./service-client.ts";
 import {
 	createForegroundTerminalController,
+	createServiceTerminalController,
 	createTerminalController,
 	type TerminalController,
 	type TerminalState,
@@ -72,6 +74,22 @@ export async function runRichAttach(
 	);
 }
 
+/** Uses the existing rich terminal for an authenticated remote service client. */
+export async function runRichServiceAttach(
+	client: ServiceClient,
+	terminal: Terminal,
+	signal: AbortSignal,
+	options: RichAttachOptions = {},
+): Promise<number> {
+	return runRichConversation(
+		client.session,
+		terminal,
+		signal,
+		(onChange) => createServiceTerminalController(client, onChange, signal),
+		options,
+	);
+}
+
 /** Renders the existing foreground owner without opening another database or creating a service. */
 export async function runRichForeground(
 	agent: Agent,
@@ -107,22 +125,23 @@ async function runRichConversation(
 		submit: (text) => {
 			const result = controller.submit(text);
 			if (result.status !== "mission-setup") return result;
-			if (options.missionSetup === undefined) return controller.submit("/mission");
+			const missionSetup = options.missionSetup;
+			if (missionSetup === undefined) return controller.submit("/mission");
 			if (missionFlow !== undefined) return { status: "rejected" };
 			missionFlow = (async () => {
 				await terminal.drainInput(200, 25);
 				tui.stop();
 				try {
-					await options.missionSetup!(AbortSignal.any([signal, flowAbort.signal]));
+					await missionSetup(AbortSignal.any([signal, flowAbort.signal]));
 				} catch (error) {
 					terminal.write(
 						`Mission setup: ${sanitizeTerminalText(error instanceof Error ? error.message : String(error))}\r\n`,
 					);
 				} finally {
 					missionFlow = undefined;
-					if (!signal.aborted && !flowAbort.signal.aborted && controller.state.connection === "attached") {
+					if (!signal.aborted && !flowAbort.signal.aborted) {
 						tui.start();
-						controller.submit("/mission");
+						if (controller.state.connection === "attached") controller.submit("/mission");
 					}
 				}
 			})();
@@ -160,6 +179,8 @@ async function runRichConversation(
 			await terminal.drainInput(1000);
 		} finally {
 			tui.stop();
+			for (const id of controller.state.unresolvedRequestIds ?? [])
+				terminal.write(`Unconfirmed request ID ${id}; inspect persisted work before an explicit retry.\n`);
 		}
 	}
 	return result;
@@ -250,6 +271,20 @@ export class RichAttachView extends VStack {
 			shrink: 1,
 			visible: () => this.#state.connection !== "failed",
 		});
+		this.addChild(
+			new StatusLines((width) => {
+				const ids = this.#state.unresolvedRequestIds ?? [];
+				const id = ids.at(-1) ?? "";
+				return [
+					this.#theme.warning(
+						width < 64
+							? `ID ${id}`
+							: `Unconfirmed request ${id}${ids.length > 1 ? ` (+${ids.length - 1}; /status lists all)` : ""}`,
+					),
+				];
+			}),
+			{ basis: 1, minSize: 1, shrink: 0, visible: () => (this.#state.unresolvedRequestIds?.length ?? 0) > 0 },
+		);
 		this.addChild(this.#footer, { basis: 2, minSize: 1, shrink: 0 });
 		this.update(this.#state);
 	}
@@ -342,8 +377,7 @@ export class RichAttachView extends VStack {
 						: this.#state.sending
 							? "sending"
 							: "ready";
-		const model =
-			view?.model == null ? "model unknown" : `${label(view.model.provider)}/${label(view.model.modelId)}`;
+		const model = view?.model == null ? "model unknown" : `${label(view.model.provider)}/${label(view.model.modelId)}`;
 		const brand = width >= 64 ? "unit-001  ·  " : "";
 		const title = truncateToWidth(`${brand}${name}  /  ${this.#session}`, Math.max(1, width - activity.length - 2));
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(title) - activity.length));
@@ -367,9 +401,7 @@ export class RichAttachView extends VStack {
 		if (this.#state.connection === "failed")
 			return [
 				this.#theme.muted("Run the command above, then reopen."),
-				this.#theme.muted(
-					`${this.keyHint("unit.attach.cancel")} exit · ${this.keyHint("unit.attach.detach")} exit`,
-				),
+				this.#theme.muted(`${this.keyHint("unit.attach.cancel")} exit · ${this.keyHint("unit.attach.detach")} exit`),
 			];
 		const usage = this.#state.view?.usage;
 		const close = this.#ownership === "foreground" ? "exit" : "detach";
@@ -381,9 +413,7 @@ export class RichAttachView extends VStack {
 			const cost =
 				usage == null || usage.cost.kind === "unknown" ? "cost unknown" : `~$${usage.cost.usd.toFixed(4)} est`;
 			const cancel =
-				this.#state.connection === "attached" && (this.#state.view?.busy || this.#state.sending)
-					? "cancel"
-					: "exit";
+				this.#state.connection === "attached" && (this.#state.view?.busy || this.#state.sending) ? "cancel" : "exit";
 			return [
 				this.#theme.muted(`${this.keyHint("tui.input.submit")} send · ${tokens} · ${cost}`),
 				this.#theme.muted(
@@ -438,9 +468,7 @@ export class RichAttachView extends VStack {
 					const card = new Container();
 					card.addChild(
 						new Text(
-							entry.role === "user"
-								? this.#theme.user("YOU")
-								: this.#theme.accent(label(view.name).toUpperCase()),
+							entry.role === "user" ? this.#theme.user("YOU") : this.#theme.accent(label(view.name).toUpperCase()),
 							1,
 							0,
 						),
@@ -456,8 +484,7 @@ export class RichAttachView extends VStack {
 			}
 			const last = view.entries.at(-1);
 			const committed =
-				last?.role === "assistant" &&
-				(last.text === view.text || (last.truncated && view.text.startsWith(last.text)));
+				last?.role === "assistant" && (last.text === view.text || (last.truncated && view.text.startsWith(last.text)));
 			const live = committed ? "" : sanitizeTerminalText(view.text);
 			if (live !== this.#liveText) {
 				this.#live.setText(live);
@@ -466,11 +493,9 @@ export class RichAttachView extends VStack {
 			if (live !== "") {
 				this.transcript.addChild(new Text(this.#theme.accent(`${label(view.name).toUpperCase()}  ·  LIVE`), 1, 0));
 				this.transcript.addChild(this.#live);
-				if (view.textTruncated)
-					this.transcript.addChild(new Text(this.#theme.warning("[Live text truncated]"), 1, 0));
+				if (view.textTruncated) this.transcript.addChild(new Text(this.#theme.warning("[Live text truncated]"), 1, 0));
 			}
-			for (const tool of view.tools)
-				this.transcript.addChild(new ToolCard(label(tool.name), tool.status, this.#theme));
+			for (const tool of view.tools) this.transcript.addChild(new ToolCard(label(tool.name), tool.status, this.#theme));
 			if (view.entries.length === 0 && live === "")
 				this.transcript.addChild(new WelcomePanel(this.#theme, this.#ownership));
 		}
@@ -480,9 +505,7 @@ export class RichAttachView extends VStack {
 			const style = error ? this.#theme.error : this.#theme.muted;
 			// Retry IDs matter after an uncertain failure, not on every successful submission.
 			const text = notice.text.startsWith("Submitting request ") ? "Request submitted." : notice.text;
-			this.transcript.addChild(
-				new Text(style(`${error ? "Error" : "Notice"} · ${sanitizeTerminalText(text)}`), 1, 0),
-			);
+			this.transcript.addChild(new Text(style(`${error ? "Error" : "Notice"} · ${sanitizeTerminalText(text)}`), 1, 0));
 		}
 		if (this.#inputNotice !== "") this.transcript.addChild(new Text(this.#theme.warning(this.#inputNotice), 1, 0));
 	}

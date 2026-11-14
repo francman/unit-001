@@ -17,8 +17,9 @@ import {
 } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { ServiceView } from "../src/service.ts";
+import type { ServiceClient, ServiceClientEvent } from "../src/service-client.ts";
 import type { TerminalInputResult, TerminalState } from "../src/terminal-controller.ts";
-import { DEFAULT_APP_KEYBINDINGS, RichAttachView, runRichAttach } from "../src/terminal-ui.ts";
+import { DEFAULT_APP_KEYBINDINGS, RichAttachView, runRichAttach, runRichServiceAttach } from "../src/terminal-ui.ts";
 
 class FakeTerminal implements Terminal {
 	columns = 80;
@@ -29,6 +30,7 @@ class FakeTerminal implements Terminal {
 	stopped = false;
 	events: string[] = [];
 	start(input: (data: string) => void, resize: () => void): void {
+		this.stopped = false;
 		this.input = input;
 		this.resize = resize;
 	}
@@ -96,6 +98,60 @@ function launch() {
 }
 
 describe("rich service terminal", () => {
+	it("#55 restarts the editor when mission setup ends during a remote reconnect", async () => {
+		const terminal = new FakeTerminal();
+		const abort = new AbortController();
+		const setup = Promise.withResolvers<number>();
+		const missionSetup = vi.fn(() => setup.promise);
+		let observe: (event: ServiceClientEvent) => void = () => {};
+		const client: ServiceClient = {
+			session: "default@fixture",
+			ownerSession: "default",
+			async request() {
+				return { type: "error", message: "Unsupported mission" };
+			},
+			async watch(listener, signal) {
+				observe = listener;
+				listener({ type: "view", view: base });
+				await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+			},
+		};
+		const running = runRichServiceAttach(client, terminal, abort.signal, { missionSetup });
+		try {
+			terminal.input("/mission setup");
+			terminal.input("\r");
+			await expect.poll(() => missionSetup.mock.calls.length).toBe(1);
+			expect(terminal.stopped).toBe(true);
+			observe({ type: "connecting", message: "Remote reconnecting" });
+			setup.resolve(130);
+			await expect.poll(() => terminal.stopped).toBe(false);
+			observe({ type: "view", view: base });
+			terminal.input("\x04");
+			expect(await running).toBe(0);
+		} finally {
+			setup.resolve(130);
+			abort.abort();
+			await running;
+		}
+	});
+	it("#55 keeps an unconfirmed request ID visible at narrow widths despite rolling notices", () => {
+		const app = launch();
+		const id = "aa49e3de-4cb1-4caf-9b98-26e4c399c12d";
+		try {
+			app.terminal.columns = 40;
+			app.terminal.rows = 12;
+			app.terminal.resize();
+			app.update(base, {
+				unresolvedRequestIds: [id],
+				notices: Array.from({ length: 8 }, () => ({ kind: "info" as const, text: "Reconnecting view" })),
+			});
+			expect(app.screen().join("\n")).toContain(`ID ${id}`);
+			expect(app.screen().at(-2)).toContain("cost unknown");
+			expect(app.screen().at(-1)).toContain("detach");
+		} finally {
+			app.tui.stop();
+		}
+	});
 	it("labels the composer and shows typing immediately without submitting", () => {
 		// #36: real typing feedback and a named composer are acceptance requirements, not just action results.
 		const app = launch();
