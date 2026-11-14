@@ -54,7 +54,14 @@ describe("channel integration", () => {
 		const running = new Promise<void>((resolve) => {
 			started = resolve;
 		});
-		let aborted = false;
+		let observedAbort = () => {};
+		const abortObserved = new Promise<void>((resolve) => {
+			observedAbort = resolve;
+		});
+		let releaseCleanup = () => {};
+		const cleanup = new Promise<void>((resolve) => {
+			releaseCleanup = resolve;
+		});
 		const adapter = {
 			id: "telegram",
 			prepare: async (_request: unknown, authorized: () => Promise<void>, signal?: AbortSignal) => {
@@ -64,8 +71,8 @@ describe("channel integration", () => {
 					signal?.addEventListener(
 						"abort",
 						() => {
-							aborted = true;
-							reject(new Error("cancelled"));
+							observedAbort();
+							void cleanup.then(() => reject(new Error("cancelled")));
 						},
 						{ once: true },
 					);
@@ -92,11 +99,24 @@ describe("channel integration", () => {
 			BACKGROUND_CONTEXT,
 		);
 		agents.push(agent);
-		const asking = agent.ask("Resume the approved setup.", BACKGROUND_CONTEXT).catch(() => undefined);
+		const asking = expect(agent.ask("Resume the approved setup.", BACKGROUND_CONTEXT)).rejects.toThrow(
+			"Harness is closed",
+		);
 		await running;
-		await agent.close(BACKGROUND_CONTEXT);
+		let closed = false;
+		const closing = agent.close(BACKGROUND_CONTEXT).then(() => {
+			closed = true;
+		});
+		try {
+			await abortObserved;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(closed).toBe(false);
+		} finally {
+			releaseCleanup();
+		}
+		await closing;
 		await asking;
-		expect(aborted).toBe(true);
+		expect(closed).toBe(true);
 	});
 
 	it("records a model setup proposal, preserves it across SQLite reopen and reports current grant absence", async () => {
