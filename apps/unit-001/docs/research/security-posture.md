@@ -1,0 +1,107 @@
+# Agent security posture and factual self-report
+
+**Recommended default:** a dedicated, nonroot autonomous mission owner operated by explicitly trusted humans/elder agents/organization principals. Ordinary authorized mission work, coding tools and memory edits remain sudo-free. Security/configuration, identity/access, lifecycle and updates remain administrator operations. This is a trusted-execution profile, **not a sandbox against malicious model output**.
+
+Ship a small read-only posture report first, then remove automatic child-process credential inheritance and enforce new integration/mission admission boundaries. Do not add a confirmation to every tool call or claim that a model can certify its own security. The current highest exposure is concrete: a shell child inherits the owner's provider environment, and coding tools can read or change files owned by that account, including credentials and settings.
+
+Research/design for [#44](https://github.com/francman/unit-001/issues/44), 2026-11-09. This is not an implementation or production attestation. Source reviewed through `edf7503a58ab3ea47f99578c96e27b3a6d1e9d1e` (PR43 operator migration fix). This source assessment predates the 0.0.7 production rollout and did not inspect live VPS configuration. Release coordination subsequently verified 0.0.7 deployment and permission/terminal acceptance under [PR #43](https://github.com/francman/unit-001/pull/43). Current posture still requires fresh host observations; this historical release evidence does not supply them.
+
+## Observed baseline, with its actual limits
+
+| Control or exposure | Source evidence reviewed | What can honestly be said |
+|---|---|---|
+| Dedicated service identity and private data | `deploy/installation.mjs`, `deploy/unit-001.service` | Managed installation creates a dedicated account, state/workspace mode 0700 and credentials/settings writes mode 0600. This excludes unrelated direct clients, not tools running as that same account. Source mode expectations do not prove a particular host currently matches them. |
+| Local operator versus administrator access | `deploy/agent-command.mjs`, `src/named.ts`, `src/cli.ts`, `src/service.ts` | Root-owned records/wrappers choose fixed installation paths. Per-installation group permits the public operator socket; private socket and DB remain under private state. Server operator allowlist excludes maintenance/admin frames. Group removal does not instantly revoke already logged-in processes or connected clients. |
+| Service hardening | `deploy/unit-001.service` | Template specifies nonroot identity, UMask 0077, NoNewPrivileges, ProtectSystem=strict, ProtectHome, PrivateTmp, constrained state write path, and cgroup lifecycle handling. It does not set an egress allowlist, MemoryMax, TasksMax or a mission spend cap. Those properties must be observed on the running host before a report calls them applied. |
+| Tool authority and environment | `src/agent.ts`; public `packages/durable/src/tools/index.ts`, `tools/bash.ts`, `env/node.ts` | Agent installs default read/write/edit/bash tools and NodeExecutionEnv. Bash preparation sets inheritEnv=true; Node merges process.env into the child. There is no app-specific child environment filter or filesystem/network sandbox. Optional shell timeout is not a mandatory global work limit. |
+| Owner configuration | `src/settings.ts`, `src/credentials.ts`, `deploy/agent-command.mjs` | Credential/settings writes are atomic and private. Root CLI launches allowlist provider environment keys and clear loader injection variables in wrappers. The systemd service itself receives its root-owned EnvironmentFile, and the owner can read those values. Scrubbing children reduces accidental leakage; it cannot hide credentials from a compromised owner process or same-UID file tools. |
+| Memory provenance | `packages/unit-memory/src/injection.ts`, `extension.ts`; `src/agent.ts` | Retrieved memory is explicitly labeled untrusted evidence; host input provenance distinguishes human/mission/tool statements. This is useful context handling, not a guarantee that the model ignores injection. Memory never establishes creator authority or privileged policy. Forget excludes recall, not immutable history or secure erasure. |
+| Update integrity and recovery | `deploy/update-trust.mjs`, `update.mjs`, `update-activation.mjs`, `src/maintenance.ts` | Pinned TUF trust, signature/expiry/version checks, bounded downloads, redirect restrictions, archive validation, protected metadata, inhibited readiness and durable recovery exist. Initial installer authenticity still depends on the trusted download channel; a checksum shipped beside an installer alone is not independent authenticity. Explicit rollback is different from automatic downgrade. |
+| Runtime/mission facts | `src/orientation.ts`, `src/missions/state.ts`, `src/agent.ts` | unit_status reports observed owner PID/start/uptime/model. The mission foundation defines a nonexecuting holder and bounds, but Agent.open does not install an autonomous decision loop or first-start agreement. Stored policy fields alone do not enforce future autonomous behavior. |
+| Resource and spend completeness | Existing latency benches; #42 assessment | Response work is benchmarked, but a 10,000-record fixture is not a 512 MB deployment guarantee. Retained shell/child CLIs can spend outside Models instrumentation. Missing provider usage or uninstrumented child work must remain uncovered/unknown, never zero or a hard billing guarantee. |
+
+Independent acceptance already proves specific code paths: real Linux A/B/outsider UID isolation, direct private-file/socket denial, protected path replacement denial, actual PTY behavior, retained coding-tool writes, confirmed memory edits and active cancellation. The actual published 0.0.6 migration and rollback fixture subsequently passed native acceptance for the exact PR #43 source before Actions was disabled. These tests are not proof that a running host is uncompromised. Future changed behavior requires standalone disposable-host acceptance; GitHub Actions must not be used.
+
+## Threat model and maximum impact
+
+Assets are provider/integration credentials, sessions/memory, workspace and external data, mission authority/approval receipts, update trust, and root-owned installation/lifecycle policy. Principals are host administrator, dedicated owner process, trusted local operator, authenticated human/elder/organization creator, provider/integration service, and unauthenticated/untrusted content producers.
+
+Assume the host administrator, verified publisher, owner code and explicitly installed extensions are trusted. Treat model output, web/email/group content, tool results and remembered statements as attacker-influenced input. A trusted operator deliberately delegates code execution as the agent account; an injected model can misuse the same authority. Today its practical impact includes destroying agent-owned state, reading credentials, consuming host resources and using reachable networks/credentials. Root policy and another installation's private account remain separate OS boundaries, subject to actual host permissions and kernel security. No report should promise containment of a malicious owner, protection from root compromise or complete inference billing coverage.
+
+For future organization/peer adapters, a name/session ID is routing, not authentication. Bind verified source account/tenant/sender to a provisioned principal and delegated scope. Never convert a bot message, parent claim or remembered instruction into a human creator's authority. Preserve audit/correlation identity and limits through delegation. #14/#17/#40/#41 own those contracts.
+
+## Low-burden controls in priority order
+
+1. **Factual posture and explicit profile.** Report enforced facts and residual exposure without blocking ordinary approved work. Clearly distinguish current runtime observation, protected configuration evidence and unavailable checks. No overall “secure” score.
+2. **Child environment hygiene without removing tools.** Build the same coding tool set from public tool factories, using createBashTool/createPowerShellTool prepare callbacks to set inheritEnv=false and an explicit essentials environment. Provider keys, refresh tokens, update credentials and loader/startup variables do not automatically pass to children. Preserve normal git, Node and tool use with explicit essentials from the trusted host: executable search path, home/workspace, locale and required platform values. Define SSH agent sockets, proxy settings and project credential forwarding separately; do not copy every environment key because a project needs one. Integration-specific credentials are explicitly scoped at setup; a selected task grant is reused silently. The report names forwarded credential classes and remaining reachable stores without printing values. This is leak reduction, not isolation: same-UID tools can still read auth.json, model-provided arguments or source code can carry secrets, and model-controlled code can use intentionally granted credentials. inheritEnv=false does not block those paths.
+3. **Host-enforced admission for new external operations.** Bind mission agreement/approval to principal, installation, exact revision and action/destination, with expiry and replay receipts. Existing approved mission actions run silently. Ask once when adding an integration/authority grant, expanding authority or reaching an irreversible exception outside the agreement. Keep sudo administration separate and preserve current forget confirmation. Do not substitute a shell regex denylist for these boundaries.
+4. **Contain resource and integration blast radius.** Reuse durable deadlines/action/concurrency limits and recorded cost coverage; evaluate concrete MemoryMax/TasksMax settings on the target before enabling them. Prefer scoped service credentials and outbound-only adapters. Browser/remote executor isolation is a separately approved profile under #39/#41, not a claimed property of today's owner. New untrusted network listeners need explicit authentication/tenant limits; never expose the local operator socket as an Internet API.
+5. **Preserve recovery and supply-chain checks.** Keep signed updates, stopped intent, inhibited readiness and verified rollback. Audit only selected verified release metadata in the fast report; expensive file hashing is optional bounded background work with visible coverage. A signed update can still contain bugs, and expiry is not proof that installed code was altered.
+
+No new security daemon, hosted dashboard, secret-scanning model call or blanket approval wizard is needed. Do not change accepted coding-tool functionality or silently impose an OS sandbox in this proposal.
+
+## Authoritative self-report contract
+
+Proposed new `src/security/posture.ts` collects deterministic facts; `checks.ts` owns a small fixed check registry. Reuse #42's observation metadata when both features actually share it; initially a small app type is sufficient, with no facts framework. Existing `orientationExtension` and owner IPC provide integration points. Do not have the LLM inspect secret contents or interpret arbitrary shell output as authority.
+
+```ts
+type CheckStatus = "pass" | "warn" | "fail" | "unknown";
+type EvidenceSource =
+  { kind: "owner_runtime"; measuredAt: number } |
+  { kind: "protected_configuration"; measuredAt: number; collectorVersion: string } |
+  { kind: "unavailable"; reason: string };
+type PostureCheck = {
+  id: string;
+  checkVersion: number;
+  status: CheckStatus;
+  scope: "process" | "installation" | "integration";
+  evidence: EvidenceSource;
+  freshness: "current" | "stale";
+  summary: string;
+  remediation: string | null;
+};
+type PostureReport = {
+  schemaVersion: 1;
+  observedAt: number;
+  installationId: string | null;
+  sourceVersion: string;
+  profile: "trusted_operator_execution";
+  coverage: "complete_for_selected_checks" | "partial" | "unavailable";
+  excluded: string[];
+  checks: PostureCheck[];
+};
+```
+
+“Complete” applies only to the finite selected checks, never all security. Initial checks: effective nonroot identity; Linux NoNewPrivs/capability facts when readable; private path owner/mode/type; expected operator socket/dir and private socket access class; enabled tool/env-inheritance profile; mission agreement/execution support; cached update state/expiry/last verified update facts; and available resource-limit configuration. Display intentional trusted tool access as an explicit warning/exposure, not a fabricated failed authentication check.
+
+Safe initial collection: process facts, lstat on known installation paths, bounded `/proc/self/status` and a protected collector receipt if present. Validate each known path against its expected installation shape: selected-release symlinks are root-controlled and intentional, so a blanket rejection of every symlink would be incorrect. Never enumerate the whole filesystem, read credential values, hash secret files, fetch a threat feed, probe ports or make a provider request. Unsupported OS, inaccessible root configuration or stale receipts produce unknown/stale with a reason. A template file alone is configuration evidence, not an observed kernel control. The report does not install fixes.
+
+Expose proposed `Agent.posture(context)`, service `{type:"posture"}` on authorized operator/private endpoints, a safe-replay `unit_posture` tool, CLI `agent security status [--json]`, and `/security` in the existing TUI. Normal users need no sudo. Unknown security subcommands and path arguments must not fall into an administrator operation. Model guidance asks the tool for fresh facts before answering a current security question; historical transcript output stays timestamped and cannot become a fresh attestation.
+
+Optional future privileged collection uses `sudo agent security collect` to write a root-owned, installation-bound, versioned receipt under `/etc/unit-001/agents/ID/posture/`; the owner checks regular-file ownership, ancestry, size, installation ID and age. It reports systemd configuration and other root-visible facts only. It is not remote cryptographic attestation, and a root-compromised host can forge it. Missing privileged collection must not prompt for sudo during a normal report. Root collection/refresh is a separately reviewed administrative action.
+
+## Persistence, freshness, recovery and limits
+
+First slice can be read-only with no new Durable document or mutation. Report schema starts at 1; source 0.0.7 upgrades do not create a grant, change tools or enable integrations. Later store only accepted profile/version acknowledgements and references to audit receipts if needed; do not duplicate credentials or full transcripts. Reject unsupported evidence versions as unknown. An interrupted report can safely retry because no action or authority changes.
+
+Suggested initial engineering bounds: 32 checks, 32 KiB response, known-file reads individually bounded, 500 ms collection deadline and 60-second owner cache. Those are proposed acceptance targets, not measured SLOs. Timeouts return partial facts; a normal status/model request must never wait for deep verification. Root receipts include measuredAt and a proposed 10-minute freshness window; report age honestly across restart/clock uncertainty. Use monotonic elapsed time for process-local cache expiry and wall timestamps for evidence presentation. Do not persist a process-local “pass” across restart as though rechecked.
+
+Never log raw environment values, credentials, full commands, private messages or arbitrary findings payloads. Retain stable check IDs, code version, source/receipt references and bounded remediation. Existing immutable transcript history can already contain sensitive tool output; redaction reduces display risk but does not erase it or contain adversarial encoding. Backups preserve sensitive state and need the same ownership/retention discipline. Stop/kill/uninstall semantics remain existing explicit controls; uninstall deliberately retains data, so it is not a data purge or credential revocation.
+
+## Ordered implementation and acceptance
+
+1. **#44 report-only slice.** Implement fixed metadata/proc checks and truthful profile/unknown semantics. Add owner tool/IPC/CLI projections with no secret contents, provider requests or security mutations. Tests use synthetic markers and mock facts, plus actual nonroot Linux permissions; verify unauthorized/cross-installation report access is denied. Actual 80×24 and 40×12 PTYs show warnings/unknowns, resize, JSON/script cleanliness and no sudo prompt. Keep root checks and existing latency gates.
+2. **#44 child-env slice.** Preserve read/write/edit/bash/PowerShell tool availability using public factories. Synthetic provider secrets and BASH_ENV/loader markers must not reach child processes; explicit task-scoped essentials still work. Prove direct same-UID file access remains possible and report that residual exposure. Restart/actual packaged Linux checks must cover retained tools, cancellation and resource measurements. No real key is used.
+3. **#14/#17/#40/#41 admission slice.** Implement agreed mission revision, creator/delegation context, integration grants and bound approval receipts in their canonical contracts. Test wrong sender/tenant/room, stale revision, duplicate/conflicting decision, crash before/after commit, revoked grants, group injection, parent/child limits and unknown external effects. Generic shell access remains the trusted profile's residual boundary; do not claim adapter allowlists constrain arbitrary shell egress.
+4. **Optional root facts/isolation/resource slice.** Only after explicit design review: validate protected collector receipt provenance/freshness, target memory/task limits, browser/remote execution boundaries and complete tool credential paths. Standalone native acceptance must test installation, real published upgrade/rollback and shutdown; production acceptance verifies the running UID, socket/file modes and applied properties without secrets or paid calls.
+
+## Primary-source comparisons
+
+- [OWASP Agentic Applications 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/) motivates checking goal hijack, tool/identity misuse, poisoned context, inter-agent trust and resource/cascading failures. Use it as a threat checklist, not a compliance badge or an LLM security score. [OWASP's current LLM guidance release](https://genai.owasp.org/2026/09/01/owasp-genai-security-project-unveils-2026-top-10-for-llm-applications-new-agent-control-standard-and-sponsors-as-community-tops-30000-members/) confirms 2026 guidance; avoid presenting old 2025 labels as the current taxonomy.
+- [NIST AI 600-1](https://www.nist.gov/publications/artificial-intelligence-risk-management-framework-generative-artificial-intelligence) supports documented risk/evidence and evaluation. Its [agent identity concept paper](https://www.nccoe.nist.gov/publications/other/accelerating-adoption-software-and-ai-agent-identity-and-authorization-concept) and [September 2026 comments](https://www.nist.gov/news-events/news/2026/09/comments-software-and-agentic-ai-identity-concept-paper) are evolving work, not a mandatory finalized agent authorization standard. Adopt explicit identity, scoped delegation and evidence; avoid a new governance bureaucracy.
+- [OpenClaw SECURITY, pinned f947](https://github.com/openclaw/openclaw/blob/f947b3caf5d0fb04c780205dfeff509d87cd2527/SECURITY.md) explicitly treats operators sharing an agent as one trust boundary and session IDs as routing. Adapt that honesty and deterministic audit findings; do not import the gateway or assume its memory files establish authority.
+- [Hermes SECURITY, pinned 3b421578588243f920886e6fe79a6faa87ea026e](https://github.com/NousResearch/hermes-agent/blob/3b421578588243f920886e6fe79a6faa87ea026e/SECURITY.md) distinguishes environment scrubbing/approval heuristics from OS containment and warns that sandboxing only one execution path is incomplete. Adapt child-env hygiene and explicit isolation coverage. Do not claim a terminal-only sandbox contains file tools, plugins or the owner process.
+- [Meta Muse security architecture](https://muse.ai/blog/security-and-safety-for-ai-agents-our-approach-with-muse) describes a separate runtime cell and host-side credential, permission and egress services. Adapt the separation of authority from model-controlled work; an extra reviewing LLM in the same process is not that boundary. This is a proprietary architecture description, not copied source or measured evidence for a 512 MB agent deployment. Defer a full VM stack to a separately designed isolation profile.
+- [Paperclip authentication, pinned 02bfe71a6bbd7c5676cb7e72778b361c5bc72765](https://github.com/paperclipai/paperclip/blob/02bfe71a6bbd7c5676cb7e72778b361c5bc72765/docs/api/authentication.md) separates short-lived agent/run credentials from board operator sessions and company boundaries. Adapt explicit principal/scope and tenant checks under #41, not its trusted-local unauthenticated mode for remote agent access.
+
+No claim here establishes absence of compromise, adversarial-model containment, secret-free historical transcripts, global cost enforcement or current live VPS hardening. Those limits should remain visible in the shipped self-report rather than hidden in a footnote.
