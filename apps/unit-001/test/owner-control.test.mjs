@@ -1,11 +1,28 @@
 // Exercises the provider-free private control transport against real local sockets.
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { controlRequest, readOwnerControl } from "../deploy/control.mjs";
+
+test("#18 control entry point executes through the installation's current symlink", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "unit-owner-entry-"));
+	try {
+		const entry = join(directory, "control.mjs");
+		await symlink(fileURLToPath(new URL("../deploy/control.mjs", import.meta.url)), entry);
+		const result = spawnSync(process.execPath, [entry, "invalid-id", "1000", "service-status"], {
+			encoding: "utf8",
+		});
+		assert.notEqual(result.status, 0);
+		assert.match(result.stderr, /installation account|Invalid owner control installation identity/);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
 
 async function withOwner(listener, verify) {
 	const directory = await mkdtemp(join(tmpdir(), "unit-owner-control-"));
