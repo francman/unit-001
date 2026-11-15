@@ -104,17 +104,20 @@ def verify_case(monochrome):
 
 
 if __name__ == "__main__":
-    ci = (
-        os.environ.get("GITHUB_ACTIONS") == "true"
-        and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
-        and os.environ.get("UNIT_001_DISPOSABLE_CI") == "1"
-    )
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        raise SystemExit("GitHub Actions is prohibited.")
+    standalone = os.environ.get("UNIT_001_STANDALONE_ACCEPTANCE") == "1"
+    if standalone:
+        subprocess.run([
+            os.environ["UNIT_001_ACCEPTANCE_NODE"],
+            os.path.join(os.path.dirname(__file__), "disposable-host.mjs"),
+        ], check=True)
     container = (
         os.environ.get("UNIT_001_DISPOSABLE_CONTAINER") == "1"
         and os.path.isfile("/.dockerenv")
         and platform.node() == "unit-001-vps-acceptance"
     )
-    if os.geteuid() != 0 or platform.system() != "Linux" or not (ci or container):
+    if os.geteuid() != 0 or platform.system() != "Linux" or not (container or standalone):
         raise SystemExit("Requires the explicitly authorized disposable Linux root acceptance host.")
     verify_case(False)
     verify_case(True)

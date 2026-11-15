@@ -21,7 +21,7 @@ Download the public Linux archive from the [stable download channel](distributio
 
 ```bash
 tar -xzf unit-001-linux-x64.tar.gz
-cd unit-001-0.0.7-linux-x64
+cd unit-001-0.0.8-linux-x64
 sudo ./install.sh
 ```
 
@@ -129,7 +129,7 @@ Rollback requires code that understands the stored documents and task checkpoint
 
 ## Scope
 
-Named installations, submitted work, lifecycle controls, session memory and the independent update infrastructure are implemented. Published bundles configure host trust automatically. See [memory commands](memory.md) for inspection, capture, recall and confirmed forgetting. Autonomous mission decisions remain separate work in #14–#17. Old singleton installations are not automatically migrated. Source execution has no managed-system administrative behavior.
+Named installations, submitted work, lifecycle controls, session memory and the independent update infrastructure are implemented. Published bundles configure host trust automatically. See [memory commands](memory.md) for inspection, capture, recall and confirmed forgetting. The bounded executor supports explicitly approved, file-verifiable work; continuous work selection under the agent's enduring mission remains #72. Old singleton installations are not automatically migrated. Source execution has no managed-system administrative behavior.
 
 ## Standalone verification
 
@@ -168,11 +168,13 @@ npm audit signatures --omit=dev
 
 Review findings; do not automatically rewrite dependencies to make an audit green. Environment/SSH changes still need their relevant Rust, public execution-environment, native daemon and default-shell fixtures. Unavailable platforms remain a visible coverage gap. A future non-Actions scheduler must run on a separate trusted build machine, with bounded commands and failure reporting. Do not add a CI runner to the production VPS or re-enable Actions for security checks.
 
-### Native acceptance is not simulated Docker proof
+### Standalone Ubuntu/systemd acceptance
 
-The existing named disposable Docker path proves Linux UID, coding-tool and PTY behavior but deliberately skips published-old migration and signed-update/crash fixtures. Those scripts currently require an explicitly guarded native Ubuntu24/systemd host. DockerDesktop on the development machine is ARM with x64 emulation; no full-native local VM path is established. Do not spoof `GITHUB_ACTIONS` or other runner markers to bypass a guard.
+The named disposable Docker path proves Linux UID, coding-tool and PTY behavior but deliberately skips published-old migration and signed-update/crash fixtures. The standalone path instead requires root on an isolated Ubuntu 24.04 x64 host with systemd as PID 1 and a protected, boot-bound authorization marker. It refuses existing installations and releases. See the [0.0.8 qualification procedure](releases/0.0.8.md). Never spoof runner markers; these entry points reject GitHub Actions.
 
-A standalone replacement needs an isolated disposable Linuxx64/systemd host, explicit local authorization and refusal of any existing installation, with the same real migration/recovery assertions. Evaluate an existing Docker/systemd container or separate small VM first; review guard changes before execution. No new software, daemon, account or third-party service is installed by this policy. Until actual proof exists, acceptance requiring those mechanisms remains pending. Previously collected native evidence remains historical evidence for its exact source SHA, not proof of later changes.
+A full-system x86-64 guest has its own target kernel and systemd, unlike a userland-emulated container. It can exercise actual published-updater migration, closed-state rollback, process crashes and boot dependencies. Record the image origin/hash, guest OS/kernel/systemd, exact source/payload and results. CPU emulation and instruction-counted guest clocks must be disclosed; their timings do not establish native CPU performance or small-host capacity. A failed assertion remains a failed assertion, and production timeout values remain unchanged.
+
+Use a separately provisioned disposable guest, never the production VPS. Historical evidence qualifies its exact source and payload only. Physical-host sizing and capacity remain separate work in #64.
 
 ### Build and publish without Actions
 

@@ -27,18 +27,10 @@ import {
 } from "../deploy/update-activation.mjs";
 import { fetchUpdate } from "../deploy/update-trust.mjs";
 import { writeReleaseArchive, writeReleaseChecksums, writeUpdateBootstrap } from "./build-release.mjs";
+import { requireDisposableHost } from "./disposable-host.mjs";
 import { generateRepositoryKeys, prepareRepository } from "./update-repository.mjs";
 
-if (
-	process.platform !== "linux" ||
-	process.arch !== "x64" ||
-	process.getuid() !== 0 ||
-	process.env.GITHUB_ACTIONS !== "true" ||
-	process.env.RUNNER_ENVIRONMENT !== "github-hosted" ||
-	process.env.UNIT_001_DISPOSABLE_CI !== "1" ||
-	execFileSync("ps", ["-p", "1", "-o", "comm="], { encoding: "utf8" }).trim() !== "systemd"
-)
-	throw new Error("Requires explicit disposable GitHub-hosted Ubuntu/systemd acceptance authorization.");
+requireDisposableHost();
 
 const [sourceArgument, id, mode] = process.argv.slice(2);
 assert.ok(
@@ -167,7 +159,7 @@ try {
 	assert.equal(existsSync(`/etc/systemd/system/${stagedInstallation.unit}`), false);
 	assert.equal(spawnSync("getent", ["passwd", staged.account], { timeout: 10000 }).status, 2);
 	if (publishedEntry) {
-		assert.equal(baseline, "0.0.6");
+		assert.ok(baseline === "0.0.6" || baseline === "0.0.7");
 		const oldCore = join(updatePaths(id).cores, baseline);
 		const fixtureAssets = join(work, "published-assets");
 		mkdirSync(fixtureAssets);
@@ -187,8 +179,10 @@ try {
 import { readFileSync } from "node:fs";
 import { runUpdate } from ${JSON.stringify(pathToFileURL(join(oldCore, "lib/update.mjs")).href)};
 import { createUpdateContext } from ${JSON.stringify(pathToFileURL(join(oldCore, "lib/update-activation.mjs")).href)};
+import { createUpdateContext as createFixtureContext } from ${JSON.stringify(new URL("../deploy/update-activation.mjs", import.meta.url).href)};
 const assets = new Map(JSON.parse(readFileSync(${JSON.stringify(assetManifest)}, "utf8")));
-const context = { ...createUpdateContext(), async fetch(url, init) {
+// Actual sockets and UIDs; omit the legacy application's heavy CLI import from each control probe.
+const context = { ...createUpdateContext(), control: createFixtureContext().control, async fetch(url, init) {
   assert.equal(new URL(url).origin, "https://github.com");
   assert.equal(init.headers.Authorization, undefined);
   const route = new URL(url).pathname.match(/^\\/francman\\/unit-001-releases\\/releases\\/download\\/([^/]+)\\/([^/]+)$/);
@@ -199,7 +193,7 @@ const context = { ...createUpdateContext(), async fetch(url, init) {
 const result = await runUpdate(["apply", "--id", ${JSON.stringify(id)}], context);
 assert.equal(result.status, "updated");
 assert.equal(result.version, ${JSON.stringify(version)});
-console.log("Installed published 0.0.6 updater verified and activated the signed candidate.");
+console.log("Installed published ${baseline} updater verified and activated the signed candidate.");
 `,
 			{ mode: 0o600 },
 		);
@@ -212,7 +206,7 @@ console.log("Installed published 0.0.6 updater verified and activated the signed
 			writeFileSync(policyPaths.trustRoot, rootBytes);
 			execFileSync(join(oldCore, "runtime/bin/node"), [entry], { stdio: "inherit", timeout: 180000 });
 			assert.deepEqual(readFileSync(installationPaths(id).unitFile), originalUnit);
-			assert.equal(existsSync(`/run/unit-001-${id}`), false);
+			assert.equal(existsSync(`/run/unit-001-${id}`), baseline !== "0.0.6");
 		} finally {
 			writeFileSync(policyPaths.trustRoot, originalRoot);
 			rmSync(policyPaths.cache, { recursive: true, force: true });
@@ -239,6 +233,14 @@ console.log("Installed published 0.0.6 updater verified and activated the signed
 			);
 		assert.equal(packagedStatus().installedVersion, version);
 		assert.equal(packagedStatus().runningVersion, version);
+		const applicationNode = join(installationPaths(id).current, "runtime/bin/node");
+		chmodSync(applicationNode, 0o000);
+		try {
+			// The running owner remains observable through the independent core's own runtime and private client.
+			assert.equal(packagedStatus().runningVersion, version);
+		} finally {
+			chmodSync(applicationNode, 0o755);
+		}
 		// #18: state produced after commit must survive code rollback; restoring the pre-update backup would lose it.
 		const marker = `/var/lib/unit-001/agents/${id}/workspace/post-update-evidence`;
 		execFileSync("runuser", ["-u", record.account, "--", "tee", marker], {
@@ -320,7 +322,7 @@ console.log("Installed published 0.0.6 updater verified and activated the signed
 		console.log(
 			"Managed public download/bootstrap, signed update, current-state rollback, and SIGKILL/startup-dependency recovery passed (real systemd; no GitHub credentials, reboot or model requests).",
 		);
-	} else console.log("Published updater migration retained the legacy unit and a healthy private owner.");
+	} else console.log("Published updater migration retained its existing unit and a healthy private owner.");
 } catch (error) {
 	console.error(`Native update acceptance failed: ${error.message}`);
 	const paths = updatePaths(id),

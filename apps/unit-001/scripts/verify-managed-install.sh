@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 # Exercises real named installations only on an explicitly disposable Ubuntu runner or test container.
 set -euo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH
+# The published baseline predates explicit parent-directory modes; retain its ordinary installer umask.
+umask 022
 
 fail() { printf 'managed acceptance: %s\n' "$*" >&2; exit 1; }
 [[ $# == 1 ]] || fail 'Usage: verify-managed-install.sh EXTRACTED_RELEASE_DIRECTORY'
-if [[ ${UNIT_001_DISPOSABLE_CONTAINER:-} == 1 ]]; then
+[[ ${GITHUB_ACTIONS:-} != true ]] || fail 'GitHub Actions is prohibited.'
+if [[ ${UNIT_001_STANDALONE_ACCEPTANCE:-} == 1 ]]; then
+  "$1/runtime/bin/node" "$(dirname -- "${BASH_SOURCE[0]}")/disposable-host.mjs"
+elif [[ ${UNIT_001_DISPOSABLE_CONTAINER:-} == 1 ]]; then
   [[ -f /.dockerenv && $(hostname) == unit-001-vps-acceptance ]] || fail 'Requires the explicitly named disposable Docker acceptance container.'
 else
-  [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted && ${UNIT_001_DISPOSABLE_CI:-} == 1 && ${RUNNER_OS:-} == Linux && ${RUNNER_ARCH:-} == X64 ]] || fail 'Requires explicit disposable GitHub-hosted CI authorization.'
+  fail 'Requires explicit standalone authorization or the named disposable Docker acceptance container.'
 fi
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 && $EUID == 0 ]] || fail 'Requires root on Linux x64.'
 # shellcheck source=/dev/null
@@ -20,11 +28,9 @@ for directory in /opt /usr/local /usr/local/bin; do
   chown root:root "$directory"
   chmod go-w "$directory"
 done
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export PATH
-unset NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH
 release=$(cd -- "$1" && pwd -P)
 node="$release/runtime/bin/node"
+export UNIT_001_ACCEPTANCE_NODE="$node"
 [[ -x $node && -f $release/install.sh ]] || fail 'Expected a complete extracted Linux release.'
 version=$(cat "$release/VERSION")
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || fail 'Invalid release version.'
@@ -104,12 +110,14 @@ stopped() {
 }
 
 # #33: The real published owner must migrate through signed activation before testing fresh installs.
-if [[ ${UNIT_001_DISPOSABLE_CONTAINER:-} != 1 ]]; then
+if [[ ${UNIT_001_STANDALONE_ACCEPTANCE:-} == 1 && $version == 0.0.8 ]]; then
+  "$node" "$(dirname -- "${BASH_SOURCE[0]}")/verify-published-current.mjs" "$release"
+elif [[ ${UNIT_001_DISPOSABLE_CONTAINER:-} != 1 ]]; then
   "$node" "$(dirname -- "${BASH_SOURCE[0]}")/verify-operator-migration.mjs" "$release"
 fi
 
 # #19: default/custom commands must own independent accounts, state and services.
-bash "$release/install.sh"
+(umask 077; bash "$release/install.sh")
 first=$("$node" "$work/check.mjs" find agent)
 owned+=("$first")
 # #23: unrelated accounts cannot occupy the management lock's protected parent.
@@ -188,7 +196,7 @@ printf 'retained\n' > "$work/marker.fixture"
 install -o "$first_account" -g "$first_account" -m 600 "$work/marker.fixture" "/var/lib/unit-001/agents/$first/workspace/ci-marker"
 cp "/var/lib/unit-001/agents/$first/auth.json" "$work/auth.before"
 cp "/etc/unit-001/agents/$first/environment" "$work/environment.before"
-if [[ ${UNIT_001_DISPOSABLE_CONTAINER:-} != 1 && -f $release/updater/lib/update.mjs ]]; then
+if [[ ( ${UNIT_001_STANDALONE_ACCEPTANCE:-} == 1 || ${UNIT_001_DISPOSABLE_CONTAINER:-} != 1 ) && -f $release/updater/lib/update.mjs ]]; then
   "$node" "$(dirname -- "${BASH_SOURCE[0]}")/verify-managed-updates.mjs" "$release" "$first"
   cmp "$work/auth.before" "/var/lib/unit-001/agents/$first/auth.json"
   cmp "$work/environment.before" "/etc/unit-001/agents/$first/environment"

@@ -2,7 +2,7 @@
 
 unit-001 is a named, always-on AI agent with its own identity, memory, tools and operator interfaces. Its mission is its enduring purpose, agreed with its creator. It pursues that purpose through tasks and retains conversations and unfinished work across restarts.
 
-**Available now:** persistent conversations and memory, a rich terminal interface, named Ubuntu services, provider setup and signed automatic updates. Maintainer feed renewal still needs an installed schedule. Source also includes mission agreements, remote SSH sessions and creator-authorized channel setup. The autonomous mission execution loop and browser workspace are in development; they are not shipped in the current download.
+**Version 0.0.8 includes:** persistent conversations and memory, rich terminal and paired browser interfaces, remote SSH sessions, named Ubuntu services, provider setup, signed updates, introspection and creator-authorized channel setup. Bounded work has durable controls and file-verifiable results. Continuous purpose-driven planning remains unfinished; maintainer feed renewal still needs an installed schedule. Check [published releases](https://github.com/francman/unit-001-releases/releases) for download availability.
 
 ## Install and connect
 
@@ -14,6 +14,7 @@ sudo agent setup                 # provider, credentials and model
 agent                            # interactive terminal
 agent memory stats
 agent status
+agent web                        # paired browser workspace on private loopback
 ```
 
 Reconnect SSH after installation to refresh operator access. Routine commands need no sudo; security, configuration and lifecycle changes do. Choose another name with `sudo ./install.sh --name NAME`.
