@@ -179,8 +179,10 @@ try {
 import { readFileSync } from "node:fs";
 import { runUpdate } from ${JSON.stringify(pathToFileURL(join(oldCore, "lib/update.mjs")).href)};
 import { createUpdateContext } from ${JSON.stringify(pathToFileURL(join(oldCore, "lib/update-activation.mjs")).href)};
+import { createUpdateContext as createFixtureContext } from ${JSON.stringify(new URL("../deploy/update-activation.mjs", import.meta.url).href)};
 const assets = new Map(JSON.parse(readFileSync(${JSON.stringify(assetManifest)}, "utf8")));
-const context = { ...createUpdateContext(), async fetch(url, init) {
+// Actual sockets and UIDs; omit the legacy application's heavy CLI import from each control probe.
+const context = { ...createUpdateContext(), control: createFixtureContext().control, async fetch(url, init) {
   assert.equal(new URL(url).origin, "https://github.com");
   assert.equal(init.headers.Authorization, undefined);
   const route = new URL(url).pathname.match(/^\\/francman\\/unit-001-releases\\/releases\\/download\\/([^/]+)\\/([^/]+)$/);

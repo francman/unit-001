@@ -411,7 +411,6 @@ export function createUpdateContext(root = "/") {
 		executingModule: fileURLToPath(import.meta.url),
 		run,
 		control(record, args, timeoutMs = args[0] === "maintenance-enter" ? 35000 : 2000) {
-			const paths = installationPaths(record.id, root);
 			return JSON.parse(
 				run(
 					"runuser",
@@ -422,11 +421,10 @@ export function createUpdateContext(root = "/") {
 						"timeout",
 						"--signal=KILL",
 						`${Math.max(1, timeoutMs) / 1000}s`,
-						join(paths.current, "runtime/bin/node"),
-						join(paths.current, "app/dist/named.js"),
+						process.execPath,
+						fileURLToPath(new URL("./control.mjs", import.meta.url)),
 						record.id,
-						record.name,
-						`/var/lib/unit-001/agents/${record.id}`,
+						String(Math.max(1, Math.floor(timeoutMs))),
 						...args,
 					],
 					true,

@@ -39,9 +39,9 @@ while (performance.now() < deadline) {
 			"--signal=KILL",
 			`${remaining / 1_000}s`,
 			join(paths.current, "runtime/bin/node"),
-			join(paths.management, "agent-command.mjs"),
+			join(paths.current, "deploy/control.mjs"),
 			id,
-			record.name,
+			String(Math.max(1, Math.floor(remaining))),
 			"service-status",
 		]);
 		const response = JSON.parse(wire);

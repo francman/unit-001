@@ -5,13 +5,17 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { setTimeout } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	installationPaths,
 	listInstallations,
 	readInstallation,
 	removeUnusedRelease,
+	withManagementLock,
+	writeInstallation,
 } from "../deploy/installation.mjs";
+import { createUpdateContext } from "../deploy/update-activation.mjs";
 import { requireDisposableHost } from "./disposable-host.mjs";
 
 requireDisposableHost();
@@ -75,7 +79,7 @@ try {
 	}
 	const retained = ["auth.json", "settings.json"].map((file) => [file, readFileSync(join(paths.state, file))]);
 	execFileSync(`/usr/local/bin/${name}`, ["update", "disable"], { stdio: "inherit", timeout: 30000 });
-	execFileSync(`/usr/local/bin/${name}`, ["start", "--yes"], { stdio: "inherit", timeout: 60000 });
+	await startPublishedOwner(readInstallation(owned.id));
 	const verify = fileURLToPath(new URL("./verify-managed-updates.mjs", import.meta.url));
 	execFileSync(node, [verify, source, owned.id, "--published-entry-only"], { stdio: "inherit", timeout: 360000 });
 	assert.equal(readInstallation(owned.id).releaseVersion, "0.0.8");
@@ -119,7 +123,7 @@ assert.deepEqual(await rollbackUpdate(readInstallation(${JSON.stringify(owned.id
 		stdio: "inherit",
 		timeout: 120000,
 	});
-	execFileSync(`/usr/local/bin/${name}`, ["start", "--yes"], { stdio: "inherit", timeout: 60000 });
+	await startPublishedOwner(readInstallation(owned.id));
 	execFileSync(node, [verify, source, owned.id, "--published-entry-only"], { stdio: "inherit", timeout: 360000 });
 	assert.equal(readInstallation(owned.id).releaseVersion, "0.0.8");
 	// The candidate now owns the actual service: exercise its update, rollback and crash recovery too.
@@ -149,4 +153,36 @@ assert.deepEqual(await rollbackUpdate(readInstallation(${JSON.stringify(owned.id
 		rmSync(installationPaths(owned.id).config, { recursive: true });
 	}
 	rmSync(work, { recursive: true, force: true });
+}
+
+async function startPublishedOwner(record) {
+	// The old CLI loads every provider inside its 2s status deadline. Use real bounded IPC for this slow guest only.
+	const context = createUpdateContext();
+	await withManagementLock(async () => {
+		writeInstallation({ ...readInstallation(record.id), desiredState: "running" });
+		context.run("systemctl", ["enable", "--now", installationPaths(record.id).unit]);
+		const deadline = performance.now() + 30000;
+		let failure;
+		do {
+			try {
+				const status = context.control(record, ["service-status"], 2000);
+				const pid = Number(
+					context.run(
+						"systemctl",
+						["show", "--property=MainPID", "--value", installationPaths(record.id).unit],
+						true,
+					),
+				);
+				assert.equal(status.version, "0.0.7");
+				assert.equal(status.installationId, record.id);
+				assert.equal(status.pid, pid);
+				assert.equal(status.inhibited, false);
+				return;
+			} catch (error) {
+				failure = error;
+			}
+			await setTimeout(100);
+		} while (performance.now() < deadline);
+		throw failure;
+	});
 }
