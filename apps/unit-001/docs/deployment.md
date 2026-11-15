@@ -7,13 +7,13 @@ For Lightsail, follow the [VPS guide](lightsail.md) and run `bash check-vps.sh` 
 1. [Download](distribution.md), extract, and run `sudo ./install.sh`. Add `--name bob` to name the agent Bob; the default is `agent`.
 2. Run `sudo agent setup` to select a provider/model, sign in or enter a key, and start the service.
 3. Reconnect SSH to refresh the new operator group. For an existing installation, run `sudo agent stop`, `sudo agent operator add USER`, then `sudo agent start` first.
-4. Use `agent` for the terminal interface, `agent send "your task"` for scripts, `agent status` for runtime facts, and `agent memory stats` for memory.
+4. Use `agent` for the terminal interface, `agent web` for a paired private browser workspace, `agent send "your task"` for scripts, `agent status` for runtime facts, and `agent memory stats` for memory.
 5. Use `sudo agent stop`, `kill`, or `uninstall` for service administration. Confirmation defaults to No; automation uses `sudo -n` with `--yes`.
 
 Each installation has its own account and private state. Stop/kill persists until explicit start; uninstall retains data and credentials.
 
 Memory edits need no sudo; forgetting still asks for confirmation. Configuration, credentials, identity, access and updates require sudo. Operators retain the agent's coding-tool file authority; this is not a tool sandbox.
 
-Public signed bundles include verification keys and update settings automatically. Updates preserve stopped intent. Autonomous mission decisions remain separate work.
+Public signed bundles include verification keys and update settings automatically. Updates preserve stopped intent. Bounded work requires explicit creator authority; continuous work selection under an enduring mission remains unfinished. See the [purpose and work contract](missions/purpose.md).
 
 See [operations](operations.md) for configuration, rename, upgrades, and recovery.

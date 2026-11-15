@@ -87,6 +87,11 @@ test("#36 bundled terminal design resolves its setup guide inside the signed doc
 		readFileSync(join(directory, "docs/missions/verification.md")),
 		readFileSync(new URL("../docs/missions/verification.md", import.meta.url)),
 	);
+	for (const name of ["execution.md", "controls.md"])
+		assert.deepEqual(
+			readFileSync(join(directory, "docs/missions", name)),
+			readFileSync(new URL(`../docs/missions/${name}`, import.meta.url)),
+		);
 	// #56: exact creator-grant and private bootstrap instructions ship with the managed commands.
 	assert.deepEqual(
 		readFileSync(join(directory, "docs/channels.md")),

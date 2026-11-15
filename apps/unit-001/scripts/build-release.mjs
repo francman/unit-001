@@ -253,6 +253,10 @@ export function writeReleaseDocumentation(stage) {
 		"memory/reference-practices.md",
 		"missions/design.md",
 		"missions/verification.md",
+		"missions/execution.md",
+		"missions/controls.md",
+		"missions/controls-review.md",
+		"missions/purpose.md",
 		"channels.md",
 		"latency.md",
 		"lightsail.md",
@@ -265,6 +269,7 @@ export function writeReleaseDocumentation(stage) {
 		"maintainer-renewal.md",
 		"distribution.md",
 		"web-ui.md",
+		"releases/0.0.8.md",
 	]) {
 		mkdirSync(dirname(join(stage, "docs", name)), { recursive: true });
 		cpSync(join(repository, "apps/unit-001/docs", name), join(stage, "docs", name));

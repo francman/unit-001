@@ -19,19 +19,20 @@ import time
 
 
 def require_disposable():
-    ci = (
-        os.environ.get("GITHUB_ACTIONS") == "true"
-        and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
-        and os.environ.get("UNIT_001_DISPOSABLE_CI") == "1"
-        and os.environ.get("RUNNER_OS") == "Linux"
-        and os.environ.get("RUNNER_ARCH") == "X64"
-    )
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        raise SystemExit("GitHub Actions is prohibited.")
+    standalone = os.environ.get("UNIT_001_STANDALONE_ACCEPTANCE") == "1"
+    if standalone:
+        subprocess.run([
+            os.environ["UNIT_001_ACCEPTANCE_NODE"],
+            str(Path(__file__).with_name("disposable-host.mjs")),
+        ], check=True)
     container = (
         os.environ.get("UNIT_001_DISPOSABLE_CONTAINER") == "1"
         and Path("/.dockerenv").is_file()
         and platform.node() == "unit-001-vps-acceptance"
     )
-    if os.geteuid() != 0 or platform.system() != "Linux" or platform.machine() != "x86_64" or not (ci or container):
+    if os.geteuid() != 0 or platform.system() != "Linux" or platform.machine() != "x86_64" or not (container or standalone):
         raise SystemExit("Requires the explicitly authorized disposable Linux x64 root host.")
     release_os = dict(line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines() if "=" in line)
     if release_os.get("ID", "").strip('"') != "ubuntu" or release_os.get("VERSION_ID", "").strip('"') != "24.04":
