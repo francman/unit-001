@@ -15,7 +15,7 @@ npm ci --ignore-scripts
 node apps/unit-001/scripts/build-release.mjs --out .artifacts/unit-001-release
 ```
 
-The builder hydrates Pi model data, compiles the app and required Pi packages, installs locked production dependencies without lifecycle scripts, and bundles a pinned Node 24 runtime. It verifies Node's checksum and hashes the complete payload. This development build stays unconfigured. Public production builds also pass `--update-root /secure/root.json`; the trusted local maintainer supplies that approved public metadata. The installer then configures public updates without asking users for keys or credentials. See [continuous updates](updates.md) for maintainer setup and recovery.
+The builder restores reviewed Pi model data from the public release pinned by `apps/unit-001/model-data-pin.json`, compiles the app and required Pi packages, installs locked production dependencies without lifecycle scripts, and bundles a pinned Node 24 runtime. It verifies the archive and Node checksums and hashes the complete payload. This development build stays unconfigured. Public production builds also pass `--update-root /secure/root.json`; the trusted local maintainer supplies that approved public metadata. The installer then configures public updates without asking users for keys or credentials. See [continuous updates](updates.md) for maintainer setup and recovery.
 
 Download the public Linux archive from the [stable download channel](distribution.md). For the current app version:
 
@@ -146,7 +146,7 @@ Named installations, submitted work, lifecycle controls, session memory and the 
 | Installer, service policy or updater | Packaging and recovery tests plus real disposable Ubuntu24/systemd published-old migration, crash, rollback and recovery acceptance |
 | Public release | Exact clean merged-main SHA, packaged Ubuntu runtime smoke, signed TUF/source/hash/freshness checks, anonymous download equality and safe production acceptance |
 
-Run commands from a separate clean checkout. Hydrate dependencies with `npm ci --ignore-scripts`; build prerequisites when tests need built output. Use specific test files or the repository's non-e2e `./test.sh`, never an unbounded full Vitest invocation. Keep faux providers and avoid paid test calls. App-focused examples:
+Run commands from a separate clean checkout. Install dependencies with `npm ci --ignore-scripts`; restore the reviewed model data with `node apps/unit-001/scripts/hydrate-model-data.mjs`, then use `npm run build:offline` when tests need built output. The Unit pin combines exact published 0.0.7 models with one explicitly allowed historical Fireworks identity from an immutable upstream catalog. Released entries remain unchanged; every input is content-verified. This preserves existing fixtures without claiming removed provider models are still available. A stale pin must be reviewed rather than silently refreshed from live catalogs. Both public artifact endpoints must remain available; an unavailable artifact stops hydration. `--archive PATH` reuses a verified release download, but the historical catalog still downloads. Use specific test files or the repository's non-e2e `./test.sh`, never an unbounded full Vitest invocation. Keep faux providers and avoid paid test calls. App-focused examples:
 
 ```bash
 npm run check
@@ -155,7 +155,7 @@ cd apps/unit-001
 node ../../node_modules/vitest/dist/cli.js --run test/operator-client.test.ts
 ```
 
-Choose tests for the actual change; these examples do not replace the full relevant acceptance set. Run each changed test file. Existing package/app bench scripts retain their original thresholds. Do not silently raise a gate, skip checks, weaken permissions or label unavailable proof passed. Record exact source SHA, commands, results and gaps in the PR. Upstream model-catalog issue #35 remains unresolved; disabling hosted CI does not fix it.
+Choose tests for the actual change; these examples do not replace the full relevant acceptance set. Run each changed test file. Existing package/app bench scripts retain their original thresholds. Do not silently raise a gate, skip checks, weaken permissions or label unavailable proof passed. Record exact source SHA, commands, results and gaps in the PR. The Unit-owned hydration path addresses #35 without modifying upstream tests or catalog definitions; upstream's live `npm run build` remains live and can drift.
 
 ### Security coverage after disabling Actions
 
@@ -191,4 +191,4 @@ node apps/unit-001/scripts/update-repository.mjs publish \
 
 Never upload the offline root private key or persist a broad personal token. Serialize publication, inspect remote state before retrying, preserve immutable asset identity and publish freshness last through the existing tool. Verify the bundle anonymously against TUF and compare immutable/latest/local bytes before normal signed production activation. Preserve settings, credentials, name, UUID and running/stopped intent; make no paid model requests for deployment checks.
 
-Metadata renewal is also standalone. Timestamp expiry remains 48 hours; no replacement automatic renewal schedule is established. [Updates](updates.md) gives the manual renewal commands and recovery rules. Do not confuse a healthy running agent with a fresh downloadable update feed.
+Metadata renewal is also standalone. Timestamp expiry remains 48 hours. The [publisher service and timer](maintainer-renewal.md) still need a trusted host and scoped publishing credential; no automatic schedule is installed. [Updates](updates.md) gives the recovery rules. Do not confuse a healthy running agent with a fresh downloadable update feed.

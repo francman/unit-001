@@ -29,6 +29,7 @@ function createRepository() {
 	write(cwd, "src/core.ts", "export const core = 1;\n");
 	write(cwd, "src/other.ts", "export const other = 1;\n");
 	write(cwd, "package-lock.json", "{}\n");
+	write(cwd, "README.md", "Upstream Pi reference\n");
 	git(cwd, "add", "-A");
 	git(cwd, "commit", "-q", "-m", "baseline");
 	git(cwd, "checkout", "-q", "-b", "work");
@@ -109,6 +110,29 @@ describe("findViolations", () => {
 		write(cwd, "src/core.ts", "export const core = 3;\n");
 		commit(cwd, "edit upstream");
 		assert.deepEqual(run(cwd).violations, [{ status: "M", path: "src/core.ts" }]);
+	});
+
+	// #10: the product landing page is the explicit documentation exception, not permission to change upstream code.
+	it("accepts a modified product README only with the documentation exception", () => {
+		const cwd = fresh();
+		write(cwd, "README.md", "# unit-001\n");
+		commit(cwd, "describe the product");
+		assert.deepEqual(run(cwd).violations, []);
+		assert.deepEqual(run(cwd, { allowlist: [] }).violations, [{ status: "M", path: "README.md" }]);
+	});
+
+	// #10: changing the product description must not authorize deleting its upstream reference or replacing it with a link.
+	it("rejects README deletion and file-type replacement", () => {
+		const deleted = fresh();
+		git(deleted, "rm", "README.md");
+		commit(deleted, "delete README");
+		assert.deepEqual(run(deleted).violations, [{ status: "D", path: "README.md" }]);
+		const retyped = fresh();
+		write(retyped, "README.md", "src/core.ts");
+		const blob = git(retyped, "hash-object", "-w", "README.md").trim();
+		git(retyped, "update-index", "--cacheinfo", `120000,${blob},README.md`);
+		git(retyped, "commit", "-q", "-m", "replace README type");
+		assert.deepEqual(run(retyped).violations, [{ status: "T", path: "README.md" }]);
 	});
 
 	it("ignores upstream commits that landed after the branch point", () => {

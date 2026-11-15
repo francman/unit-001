@@ -1,8 +1,9 @@
 name: Unit upstream guard
 
-# Tenet: unit-001 never modifies Pi Durable or any other upstream file; it only adds files.
+# Tenet: unit-001 keeps upstream Pi implementation unchanged and owns its product README.
 # Compares the branch against earendil-works/pi (the `upstream-pi` remote) and fails on any modified, deleted, or
-# retyped upstream path. package-lock.json is the one allowed exception. See .github/scripts/unit-upstream-guard.mjs.
+# retyped upstream path. README modifications and package-lock.json are explicit exceptions.
+# See .github/scripts/unit-upstream-guard.mjs. This workflow remains disabled with all Actions.
 
 on:
   push:
