@@ -53,6 +53,17 @@ export class MissionAdmission {
 		try {
 			const authority = await readMissionAuthority(this.#location);
 			const agreement = execution.agreement;
+			const intent = authority?.executionIntent;
+			if (
+				intent &&
+				(intent.action === "pause" ||
+					intent.action === "stop" ||
+					intent.missionId !== agreement.missionId ||
+					intent.agreementDigest !== agreement.digest ||
+					intent.agreementRevision !== agreement.revision ||
+					intent.authorityRevision !== authority?.revision)
+			)
+				return false;
 			return (
 				authority !== null &&
 				agreement.terms.policy.deadlineAt > this.#now() &&

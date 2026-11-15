@@ -75,7 +75,7 @@ export const USAGE = `Usage: agent [options]
        agent cancel [options]            abort its current run
        agent remote --help               connect this terminal to a named remote installation
        agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]
-       agent mission [status|setup|draft|propose|creator|approve] [options]
+       agent mission [status|setup|draft|propose|creator|approve|start|pause|resume|stop] [options]
        agent channels [status] [options] show available adapters and observed channel state
 
 Starts the agent. Its conversations persist, so a restarted process resumes unfinished work.

@@ -53,7 +53,7 @@ it("keeps mission drafting, status and memory available without registering a fa
 			[...MANAGED_MISSION_ACTIONS, "unit_channels", "unit_channel_request_setup", "unit_channel_setup"].sort(),
 		);
 	expect(saved.stage).toBe("awaiting_creator");
-	expect(saved.execution).toBe("not-implemented");
+	expect(saved.execution).toBe("not-started");
 	await expect(agent.ask("Do not admit a request", context)).rejects.toThrow("No provider is configured");
 	expect((await agent.status(context)).busy).toBe(false);
 	await agent.memory({ operation: "remember", requestId: "local", content: "Local memory remains usable" }, context);

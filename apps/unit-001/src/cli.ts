@@ -344,7 +344,20 @@ async function control(
 				runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb",
 			);
 		let operation: MissionRequest;
-		if (input.action === "draft" || input.action === "creator") {
+		if (
+			input.action === "start" ||
+			input.action === "pause" ||
+			input.action === "resume" ||
+			input.action === "stop"
+		) {
+			const view = await request({ operation: "status" });
+			operation = {
+				operation: "control-local",
+				action: input.action,
+				expectedPolicyRevision: input.policyRevision ?? view.runtime?.policyRevision ?? 0,
+				requestId: input.requestId,
+			};
+		} else if (input.action === "draft" || input.action === "creator") {
 			const path = resolve(runtime.cwd, input.file);
 			const info = await lstat(path);
 			if (!info.isFile() || info.isSymbolicLink() || info.size > 32768)
@@ -539,7 +552,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				throw new ConfigurationError("This operation requires the administrator command.");
 			if (
 				command.kind === "mission" &&
-				(command.command.action === "creator" || command.command.action === "approve")
+				["creator", "approve", "start", "pause", "resume", "stop"].includes(command.command.action)
 			)
 				throw new ConfigurationError("Mission creator and approval changes require the administrator command.");
 			if (command.kind !== "run" && command.options.dataDir !== undefined)

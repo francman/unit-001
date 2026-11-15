@@ -122,6 +122,8 @@ export class MissionControl {
 
 	/** Commits one revision-checked draft operation or an approval already issued by its authenticated authority. */
 	async handle(request: MissionRequest, context: Context): Promise<MissionView> {
+		if (request.operation === "control-local" || request.operation === "reconcile-execution")
+			throw new Error("Mission execution changes belong to its runtime owner.");
 		if (this.#location.session !== "default")
 			throw new Error("Mission formation belongs to the default owner session.");
 		if (request.operation === "status") return this.inspect(context);

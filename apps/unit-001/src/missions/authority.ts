@@ -8,6 +8,7 @@ import {
 	type MissionAuthority,
 	type MissionCeiling,
 	type MissionDraftTerms,
+	type MissionExecutionIntent,
 	type MissionTerms,
 	missingMissionTerms,
 	missionNumber,
@@ -236,6 +237,41 @@ export function parseMissionAuthority(value: unknown): MissionAuthority {
 		creator,
 		ceiling: parseMissionCeiling(input.ceiling),
 		approvals: input.approvals.map(parseMissionApproval),
+		...(input.executionIntent === undefined
+			? {}
+			: { executionIntent: parseMissionExecutionIntent(input.executionIntent) }),
+	};
+}
+
+/** Validates the latest protected lifecycle intent, never accepting it from an ordinary owner-wire frame. */
+export function parseMissionExecutionIntent(value: unknown): MissionExecutionIntent {
+	const input = missionObject(value);
+	if (input.action !== "start" && input.action !== "pause" && input.action !== "resume" && input.action !== "stop")
+		throw new Error("Unknown mission lifecycle intent.");
+	const sequence = missionNumber(input.sequence);
+	const agreementRevision = missionNumber(input.agreementRevision);
+	const authorityRevision = missionNumber(input.authorityRevision);
+	const expectedPolicyRevision = missionNumber(input.expectedPolicyRevision);
+	const agreementDigest = missionText(input.agreementDigest, 64);
+	const requestId = missionText(input.requestId);
+	if (
+		!requestId.trim() ||
+		![sequence, agreementRevision, authorityRevision].every((number) => Number.isSafeInteger(number) && number > 0) ||
+		!Number.isSafeInteger(expectedPolicyRevision) ||
+		expectedPolicyRevision < 0 ||
+		!/^[a-f0-9]{64}$/.test(agreementDigest)
+	)
+		throw new Error("Invalid mission lifecycle binding.");
+	return {
+		requestId,
+		sequence,
+		missionId: missionText(input.missionId),
+		agreementRevision,
+		agreementDigest,
+		authorityRevision,
+		expectedPolicyRevision,
+		action: input.action,
+		issuedAt: missionNumber(input.issuedAt),
 	};
 }
 

@@ -91,7 +91,7 @@ export async function runMissionSetup(
 					step: 1,
 					title: "Form your mission",
 					description: notice,
-					detail: [`State: ${view.stage.replaceAll("_", " ")}`, "Execution: not implemented."],
+					detail: [`State: ${view.stage.replaceAll("_", " ")}`, `Execution: ${view.execution}.`],
 				},
 				[
 					...FIELDS.map((field) => ({ id: field.key, label: field.label })),

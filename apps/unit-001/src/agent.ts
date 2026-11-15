@@ -50,6 +50,7 @@ import type { MissionLocation } from "./missions/authority.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import { MissionControl } from "./missions/control.ts";
 import { missionController } from "./missions/controller.ts";
+import { MissionOwner } from "./missions/owner.ts";
 import { isMissionHoldTask, MissionDoc, MissionFoundation } from "./missions/state.ts";
 import { createRuntimeFacts, orientationExtension, type RuntimeFacts } from "./orientation.ts";
 import type { ModelChoice } from "./provider.ts";
@@ -94,7 +95,7 @@ export class Agent {
 	readonly #root: Conversation;
 	readonly #runtime: () => RuntimeFacts;
 	readonly #memory: MemoryService;
-	readonly #mission: MissionControl;
+	readonly #mission: MissionOwner;
 	readonly #channels: ChannelOwner;
 	readonly #configuration: "configured" | "unconfigured";
 	readonly #models: Models;
@@ -113,7 +114,7 @@ export class Agent {
 		inhibited: boolean,
 		runtime: () => RuntimeFacts,
 		memory: MemoryService,
-		mission: MissionControl,
+		mission: MissionOwner,
 		channels: ChannelOwner,
 		configuration: "configured" | "unconfigured",
 		models: Models,
@@ -160,7 +161,7 @@ export class Agent {
 		registry.install(memory.extension);
 		registry.install(MissionFoundation);
 		registry.install(missionExecution.extension);
-		let mission!: MissionControl;
+		let mission!: MissionOwner;
 		registry.install(
 			defineExtension({
 				name: "unit.mission.inspection",
@@ -207,7 +208,7 @@ export class Agent {
 				return (await tx.doc(MaintenanceDoc)).current.state === "held";
 			}, context);
 			const inhibited = options.startup?.kind === "inhibited" || held;
-			mission = new MissionControl(harness, missionLocation, [
+			const formation = new MissionControl(harness, missionLocation, [
 				...new Set(
 					registry
 						.snapshot()
@@ -215,6 +216,16 @@ export class Agent {
 						.map((item) => item.tool.name),
 				),
 			]);
+			mission = new MissionOwner(
+				harness,
+				formation,
+				missionLocation,
+				registry,
+				missionAdmission,
+				missionExecution,
+				options.model,
+				options.cwd,
+			);
 			if (!inhibited) await mission.initialize(context);
 			const legacy = (await harness.snapshot(MissionDoc, context))?.current ?? null;
 			const pending = options.model === null ? await harness.inspect(context) : undefined;

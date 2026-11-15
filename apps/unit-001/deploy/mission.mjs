@@ -28,11 +28,18 @@ const { values, positionals } = parseArgs({
 		revision: { type: "string" },
 		digest: { type: "string" },
 		"request-id": { type: "string" },
+		"policy-revision": { type: "string" },
 		json: { type: "boolean" },
 	},
 });
-if (!values.id || positionals.length !== 1 || !["creator", "approve"].includes(positionals[0]))
-	throw new Error("Usage: NAME mission creator --file FILE | approve --revision N --digest SHA256 [--request-id ID]");
+if (
+	!values.id ||
+	positionals.length !== 1 ||
+	!["creator", "approve", "start", "pause", "resume", "stop"].includes(positionals[0])
+)
+	throw new Error(
+		"Usage: NAME mission creator --file FILE | approve --revision N --digest SHA256 | start|pause|resume|stop [--policy-revision N] [--request-id ID]",
+	);
 const record = readInstallation(values.id);
 const location = { kind: "managed", installationId: record.id, session: "default" };
 const actorUid = process.env.SUDO_UID === undefined ? 0 : Number(process.env.SUDO_UID);
@@ -52,6 +59,64 @@ await withManagementLock(async () => {
 		throw new Error("Recover the incomplete update before changing mission authority.");
 	const view = await owner({ operation: "status" });
 	const previous = await readMissionAuthority(location);
+	if (["start", "pause", "resume", "stop"].includes(positionals[0])) {
+		if (values.file || values.revision || values.digest || previous === null || !view.formation.agreement)
+			throw new Error(
+				"Approve the mission before changing execution; lifecycle commands do not accept formation fields.",
+			);
+		const requestId = values["request-id"] ?? randomUUID();
+		if (!requestId.trim() || Buffer.byteLength(requestId) > 200)
+			throw new Error("Mission lifecycle request ID must fit 200 bytes.");
+		const retry = previous.executionIntent?.requestId === requestId ? previous.executionIntent : undefined;
+		const expectedPolicyRevision =
+			values["policy-revision"] === undefined
+				? (retry?.expectedPolicyRevision ?? view.runtime?.policyRevision ?? 0)
+				: Number(values["policy-revision"]);
+		if (!Number.isSafeInteger(expectedPolicyRevision) || expectedPolicyRevision < 0)
+			throw new Error("Mission policy revision must be a nonnegative integer.");
+		if (retry) {
+			if (retry.action !== positionals[0] || retry.expectedPolicyRevision !== expectedPolicyRevision)
+				throw new Error("Conflicting mission lifecycle request ID.");
+		} else {
+			if ((view.runtime?.policyRevision ?? 0) !== expectedPolicyRevision)
+				throw new Error("Stale mission policy revision.");
+			if (positionals[0] === "start" ? view.runtime != null : view.runtime == null && positionals[0] !== "stop")
+				throw new Error(
+					positionals[0] === "start" ? "A mission execution already exists." : "No mission execution exists.",
+				);
+			if (positionals[0] === "pause" && (view.execution === "stopped" || view.execution === "completed"))
+				throw new Error("A terminal mission cannot be paused or restarted.");
+			if (positionals[0] === "resume" && view.execution !== "paused")
+				throw new Error("Only a paused mission can resume.");
+			const agreement = view.formation.agreement;
+			await writeMissionAuthority(location, {
+				...previous,
+				executionIntent: {
+					requestId,
+					sequence: (previous.executionIntent?.sequence ?? 0) + 1,
+					missionId: agreement.missionId,
+					agreementRevision: agreement.revision,
+					agreementDigest: agreement.digest,
+					authorityRevision: previous.revision,
+					expectedPolicyRevision,
+					action: positionals[0],
+					issuedAt: Date.now(),
+				},
+			});
+		}
+		try {
+			const result = await owner({ operation: "reconcile-execution", requestId });
+			process.stdout.write(`${JSON.stringify({ status: result.execution, runtime: result.runtime ?? null })}\n`);
+		} catch (error) {
+			process.stderr.write(
+				`Mission intent saved; reconciliation is pending. Retry with --request-id ${requestId}. ${error.message}\n`,
+			);
+			process.exitCode = 1;
+		}
+		return;
+	}
+	if (values["policy-revision"] !== undefined)
+		throw new Error("Policy revision belongs to mission lifecycle commands.");
 	if (positionals[0] === "creator") {
 		if (!values.file || values.revision || values.digest || values["request-id"])
 			throw new Error("Creator configuration requires one --file.");

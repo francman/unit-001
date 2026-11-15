@@ -9,6 +9,7 @@ export type MissionCommand =
 	| { action: "draft"; file: string; revision: number; requestId: string; json: boolean }
 	| { action: "propose"; revision: number; requestId: string; json: boolean }
 	| { action: "approve"; revision: number; digest: string; requestId: string; json: boolean }
+	| { action: "start" | "pause" | "resume" | "stop"; policyRevision?: number; requestId: string; json: boolean }
 	| { action: "creator"; file: string; json: boolean };
 
 /** Parses the concrete mission client interface; only the primary owner session is supported. */
@@ -27,7 +28,11 @@ export function parseMissionCommand(args: readonly string[]): {
 			json = true;
 			continue;
 		}
-		if (!["--file", "--revision", "--digest", "--request-id", "--session", "--data-dir"].includes(flag))
+		if (
+			!["--file", "--revision", "--policy-revision", "--digest", "--request-id", "--session", "--data-dir"].includes(
+				flag,
+			)
+		)
 			throw new Error(`Unknown mission option: ${flag}`);
 		const value = args[++index];
 		if (!value || values.has(flag)) throw new Error(`Mission option ${flag} needs one value.`);
@@ -43,6 +48,19 @@ export function parseMissionCommand(args: readonly string[]): {
 		if ([...values.keys()].some((key) => !["--session", "--data-dir", ...allowed].includes(key)))
 			throw new Error(`Unexpected ${action} mission option.`);
 	};
+	if (action === "start" || action === "pause" || action === "resume" || action === "stop") {
+		unexpected(["--policy-revision", "--request-id"]);
+		const policyRevision = values.has("--policy-revision") ? Number(values.get("--policy-revision")) : undefined;
+		if (policyRevision !== undefined && (!Number.isSafeInteger(policyRevision) || policyRevision < 0))
+			throw new Error("Mission policy revision must be a nonnegative integer.");
+		const requestId = values.get("--request-id") ?? randomUUID();
+		if (!requestId.trim() || Buffer.byteLength(requestId) > 200)
+			throw new Error("Mission request ID must fit 200 bytes.");
+		return {
+			command: { action, ...(policyRevision === undefined ? {} : { policyRevision }), requestId, json },
+			...location,
+		};
+	}
 	if (action === "status") {
 		unexpected([]);
 		return { command: { action, json }, ...location };
@@ -59,7 +77,7 @@ export function parseMissionCommand(args: readonly string[]): {
 		return { command: { action, file, json }, ...location };
 	}
 	if (action !== "draft" && action !== "propose" && action !== "approve")
-		throw new Error("Mission expects status, setup, draft, propose, creator or approve.");
+		throw new Error("Mission expects status, setup, draft, propose, creator, approve, start, pause, resume or stop.");
 	unexpected(
 		action === "draft"
 			? ["--file", "--revision", "--request-id"]
@@ -94,7 +112,7 @@ export function describeMission(view: MissionView): string {
 	const terms = draft?.terms ?? agreement?.terms;
 	const field = (value: string) => sanitizeTerminalText(value).replace(/\s+/g, " ").trim();
 	const lines = [
-		`Mission: ${view.stage.replaceAll("_", " ")}. Execution is not implemented.`,
+		`Mission: ${view.stage.replaceAll("_", " ")}. Execution: ${view.execution}.`,
 		`Authority: ${view.authority}${view.creator ? `; ${view.creator.kind} ${view.creator.id}` : "; creator not configured"}.`,
 	];
 	if (agreement)
@@ -102,6 +120,18 @@ export function describeMission(view: MissionView): string {
 			`Agreement revision ${agreement.revision}: ${view.agreementValid ? "verified receipt" : "authority expired, changed or awaiting reconciliation"}.`,
 		);
 	if (view.authorityError) lines.push(`Authority error: ${field(view.authorityError)}`);
+	if (view.runtime) {
+		const runtime = view.runtime;
+		lines.push(
+			`Policy revision ${runtime.policyRevision}; execution revision ${runtime.revision}.`,
+			`Work: ${runtime.cycles} cycles, ${runtime.requests} request attempts, ${runtime.retries} retries, ${runtime.noProgress} consecutive steps without verified progress.`,
+			`Estimated model cost: ${runtime.estimatedCost}; reserved: ${runtime.reservedCost}; unknown requests: ${runtime.unknownRequests}; unpriced responses: ${runtime.unpricedResponses}; uncertain tools: ${runtime.uncertainTools}.`,
+		);
+		if (runtime.blocker) lines.push(`Reason: ${field(runtime.blocker)}.`);
+		if (runtime.nextWakeAt !== null) lines.push(`Next wake: ${new Date(runtime.nextWakeAt).toISOString()}.`);
+		for (const item of runtime.evidence)
+			lines.push(`${item.accepted ? "Verified" : "Unverified"}: ${field(item.criterion)}; ${field(item.detail)}`);
+	}
 	if (draft)
 		lines.push(`Draft revision ${draft.revision}: ${draft.status}.`, `Digest: ${draft.digest ?? "not proposed"}`);
 	if (terms) {
