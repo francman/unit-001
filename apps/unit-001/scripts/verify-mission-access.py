@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""#14: Check real managed creator approvals only inside an explicitly disposable Linux container."""
+"""#14/#17: Check managed formation/lifecycle with distinct UIDs in a disposable Linux container."""
+import hashlib
 import errno
 import json
 import os
@@ -54,6 +55,7 @@ def save(path, value, mode=0o644):
 
 require_disposable()
 release = Path(sys.argv[1]).resolve()
+execution = len(sys.argv) > 2 and sys.argv[2] == "execution"
 node = str(release / "runtime/bin/node")
 named = str(release / "app/dist/named.js")
 entry = str(release / "deploy/mission.mjs")
@@ -90,11 +92,11 @@ def admin(*arguments, actor="um-human", success=True):
 
 
 def start_owner():
-    process = subprocess.Popen([node, str(release / "app/test/fixtures/mission-managed-owner.mjs")],
+    process = subprocess.Popen([node, str(release / ("app/test/fixtures/mission-execution-owner.mjs" if execution else "app/test/fixtures/mission-managed-owner.mjs"))],
                                cwd="/", env={"PATH": "/usr/bin:/bin"}, preexec_fn=identity(account),
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     for _ in range(150):
-        if (state / "control/default.sock").exists():
+        if (state / "owner-ready").exists() and (state / "owner-ready").read_text() == str(process.pid):
             return process
         if process.poll() is not None:
             raise AssertionError(process.communicate())
@@ -142,7 +144,7 @@ try:
         admin(*arguments, actor=user)
         admin(*arguments, actor=user)
         agreed = client("status", "--json", user=user)
-        assert agreed["agreementValid"] is True and agreed["execution"] == "not-implemented"
+        assert agreed["agreementValid"] is True and agreed["execution"] == "not-started"
         assert agreed["formation"]["agreement"]["approval"]["approvedBy"] == {"kind": "local-creator", "uid": uid}
         assert authority.stat().st_uid == 0 and authority.stat().st_mode & 0o022 == 0
         before = authority.read_bytes()
@@ -164,13 +166,91 @@ try:
                                       json.dumps({"type": "mission", "request": request})], account))
         assert response["type"] == "error", response
         assert authority.read_bytes() == protected
+    if execution:
+        save(creator_file, {"creator": {"kind": "human", "id": "execution-creator", "uid": 1811}, "ceiling": {
+            "allowedTools": ["write"], "maxCycles": 8, "maxRequests": 10, "maxRetries": 4,
+            "maxConsecutiveNoProgress": 8, "maxDurationMs": 600000}})
+        admin("creator", "--file", str(creator_file))
+        save(terms_file, {"objective": "Write verified proof", "scope": "Disposable workspace", "successCriteria": [
+            "sha256:" + hashlib.sha256(b"proof").hexdigest() + ":proof.txt"], "approvalBoundary": [], "reviewEveryMs": 30000,
+            "policy": {"allowedTools": ["write"], "maxCycles": 8, "maxRequests": 10, "maxRetries": 4,
+                       "maxConsecutiveNoProgress": 8, "deadlineAt": int(time.time() * 1000) + 300000}})
+        saved = client("draft", "--file", str(terms_file), "--revision", str(revision), "--request-id", "execute-draft", "--json")
+        revision = saved["formation"]["draft"]["revision"]
+        proposed = client("propose", "--revision", str(revision), "--request-id", "execute-propose", "--json")
+        digest = proposed["formation"]["draft"]["digest"]
+        admin("approve", "--revision", str(revision), "--digest", digest)
+        for action in ["start", "pause", "resume", "stop"]:
+            client(action, user="um-human", success=False)
+        (state / "workspace/retry-once").write_text("retry")
+        admin("start", "--request-id", "S1", "--policy-revision", "0")
+
+        def requested(count):
+            for _ in range(2000):
+                marker = state / "workspace/request-count"
+                if marker.exists() and int(marker.read_text()) >= count:
+                    return
+                time.sleep(0.02)
+            raise AssertionError("Mission provider fixture did not dispatch")
+
+        requested(1)
+        sleeping = client("status", "--json")
+        assert sleeping["execution"] == "waiting", sleeping
+        deadline = sleeping["runtime"]["nextWakeAt"]
+        assert deadline > int(time.time() * 1000)
+        # The actual session lock rejects a second process before any competing SQLite owner is opened.
+        invoke([node, str(release / "app/test/fixtures/mission-execution-owner.mjs")], account, False)
+        process.kill()
+        assert process.wait(timeout=20) == -signal.SIGKILL
+        process = start_owner()
+        restored = client("status", "--json")
+        assert restored["runtime"]["nextWakeAt"] == deadline
+        assert restored["runtime"]["requests"] == 1
+        time.sleep(0.2)
+        assert int((state / "workspace/request-count").read_text()) == 1
+        requested(2)
+        paused = json.loads(admin("pause", "--request-id", "P1", "--policy-revision", "1"))
+        assert paused["status"] == "paused" and paused["runtime"]["unknownRequests"] == 0
+        admin("pause", "--request-id", "P1", "--policy-revision", "1")
+        admin("resume", "--request-id", "R1", "--policy-revision", "2")
+        requested(3)
+        paused = json.loads(admin("pause", "--request-id", "P2", "--policy-revision", "3"))
+        assert paused["runtime"]["requests"] == 3
+        protected = authority.read_bytes()
+        admin("resume", "--request-id", "R1", success=False)
+        admin("resume", "--request-id", "R1", "--policy-revision", "2", success=False)
+        assert authority.read_bytes() == protected
+        for request in [{"operation": "control-local", "action": "resume", "expectedPolicyRevision": 4, "requestId": "forged"},
+                        {"operation": "reconcile-execution", "requestId": "forged"}]:
+            response = json.loads(invoke(["python3", str(wire_script), str(state / "control/default.sock"),
+                                         json.dumps({"type": "mission", "request": request})], account))
+            assert response["type"] == "error", response
+            assert authority.read_bytes() == protected
+        operator = runtime / "default.sock"
+        response = json.loads(invoke(["python3", str(wire_script), str(operator), json.dumps({"type": "mission", "request": {
+            "operation": "reconcile-execution", "requestId": "P2"}})], "um-human"))
+        assert response["type"] == "error", response
+        creator = json.loads(creator_file.read_text())
+        creator["creator"]["id"] = "replacement-creator"
+        save(creator_file, creator)
+        admin("creator", "--file", str(creator_file))
+        stopped = json.loads(admin("stop", "--request-id", "revoked-stop", "--policy-revision", "4"))
+        assert stopped["status"] == "stopped" and stopped["runtime"]["intentSequence"] == 5
+        assert client("status", "--json")["agreementValid"] is False
+        admin("resume", "--request-id", "revive", "--policy-revision", "5", success=False)
+        assert not (state / "workspace/proof.txt").exists()
     before = client("status", "--json")
     process.send_signal(signal.SIGTERM)
     assert process.wait(timeout=20) == 0
     process = start_owner()
     after = client("status", "--json")
-    assert after["formation"] == before["formation"] and after["agreementValid"] is True
-    print("managed human/elder/organization creator approval, replay, UID denial and owner restart passed")
+    assert after["formation"] == before["formation"] and after["agreementValid"] is (not execution)
+    if execution:
+        assert after["execution"] == "stopped" and after["runtime"] == {**before["runtime"], "observedAt": after["runtime"]["observedAt"]}
+        assert int((state / "workspace/request-count").read_text()) == 3
+        print("managed lifecycle, SIGKILL/persisted-wake/no-polling, sole owner, replay/revocation/stop/reopen and distinct UID denial passed")
+    else:
+        print("managed human/elder/organization creator approval, replay, UID denial and owner restart passed")
 finally:
     process.send_signal(signal.SIGTERM)
     try:

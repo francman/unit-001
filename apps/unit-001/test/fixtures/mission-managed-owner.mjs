@@ -1,8 +1,10 @@
 // #14: Runs the actual provider-free managed owner in a disposable Linux permission fixture.
+import { writeFile } from "node:fs/promises";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { Agent } from "../../dist/agent.js";
+import { acquireSessionLock } from "../../dist/lock.js";
 import { operatorEndpoint, runService, serviceEndpoint } from "../../dist/service.js";
 
 globalThis.fetch = async () => {
@@ -12,6 +14,7 @@ const id = "11111111-1111-4111-8111-111111111111";
 const state = `/var/lib/unit-001/agents/${id}`;
 const shutdown = new AbortController();
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => shutdown.abort());
+const release = await acquireSessionLock(`${state}/default.sqlite.lock`);
 const agent = await Agent.open(
 	{
 		storage: await openNodeSqliteStorage(`${state}/default.sqlite`),
@@ -28,11 +31,14 @@ try {
 		agent,
 		serviceEndpoint(state, "default", "linux"),
 		"mission-fixture",
-		(text) => process.stdout.write(text),
+		async () => {
+			await writeFile(`${state}/owner-ready`, String(process.pid));
+		},
 		shutdown.signal,
 		id,
 		operatorEndpoint(id, "default"),
 	);
 } finally {
 	await agent.close(context);
+	await release();
 }

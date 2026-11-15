@@ -209,7 +209,7 @@ export async function startMissionExecution(
 			"Executable missions support only the reviewed built-in action catalog; custom or spawning tools require separate admission support.",
 		);
 	if (state.current !== null) throw new Error("A legacy mission must be resolved before starting executable work.");
-	const stub = { agreement };
+	const stub = { agreement, intent: intent ? { requestId: intent.requestId, sequence: intent.sequence } : null };
 	if (!(await admission.authorized(stub))) throw new Error("Mission authority is invalid or expired.");
 	const tools = registry
 		.snapshot()

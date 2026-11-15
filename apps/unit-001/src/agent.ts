@@ -226,7 +226,7 @@ export class Agent {
 				options.model,
 				options.cwd,
 			);
-			if (!inhibited) await mission.initialize(context);
+			await mission.initialize(context);
 			const legacy = (await harness.snapshot(MissionDoc, context))?.current ?? null;
 			const pending = options.model === null ? await harness.inspect(context) : undefined;
 			const canSchedule =
@@ -236,6 +236,7 @@ export class Agent {
 						(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
 					));
 			if (!inhibited && canSchedule) {
+				await mission.initialize(context, "permitted");
 				await root.commit((tx) => reconcileMemoryTasks(tx, root.id, Date.now()), context);
 				memory.recall.prepare(await harness.snapshot(MemoryDoc, context));
 				harness.resume();
@@ -583,8 +584,10 @@ export class Agent {
 				inspection.tasks.every(
 					(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
 				))
-		)
+		) {
+			await this.#mission.initialize(context, "permitted");
 			this.#harness.resume();
+		}
 		return { type: "maintenance", protocol: 1, state: "open", operationId: null };
 	}
 

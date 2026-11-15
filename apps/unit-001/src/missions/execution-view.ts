@@ -5,6 +5,9 @@ import type { MissionEvidence, MissionExecution } from "./execution-state.ts";
 export type MissionExecutionView = {
 	missionId: string;
 	objective: string;
+	agreementRevision: number;
+	agreementDigest: string;
+	intentSequence: number;
 	revision: number;
 	policyRevision: number;
 	controller: number;
@@ -30,6 +33,9 @@ export function missionExecutionView(current: MissionExecution, now: number): Mi
 	return {
 		missionId: current.agreement.missionId,
 		objective: current.agreement.terms.objective,
+		agreementRevision: current.agreement.revision,
+		agreementDigest: current.agreement.digest,
+		intentSequence: current.intent?.sequence ?? 0,
 		revision: current.revision,
 		policyRevision: current.policyRevision,
 		controller: current.controller,
@@ -73,6 +79,8 @@ export function parseMissionExecutionView(value: unknown): MissionExecutionView 
 	const counts = [
 		"revision",
 		"policyRevision",
+		"agreementRevision",
+		"intentSequence",
 		"controller",
 		"conversation",
 		"cycles",
@@ -107,6 +115,9 @@ export function parseMissionExecutionView(value: unknown): MissionExecutionView 
 	return {
 		missionId: missionText(input.missionId),
 		objective: missionText(input.objective, 4096),
+		agreementRevision: numbers.agreementRevision,
+		agreementDigest: missionText(input.agreementDigest, 64),
+		intentSequence: numbers.intentSequence,
 		revision: numbers.revision,
 		policyRevision: numbers.policyRevision,
 		controller: numbers.controller,

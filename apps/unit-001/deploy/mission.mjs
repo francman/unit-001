@@ -64,6 +64,8 @@ await withManagementLock(async () => {
 			throw new Error(
 				"Approve the mission before changing execution; lifecycle commands do not accept formation fields.",
 			);
+		if (values["request-id"] !== undefined && values["policy-revision"] === undefined)
+			throw new Error("An explicit lifecycle request ID requires --policy-revision N for safe retries.");
 		const requestId = values["request-id"] ?? randomUUID();
 		if (!requestId.trim() || Buffer.byteLength(requestId) > 200)
 			throw new Error("Mission lifecycle request ID must fit 200 bytes.");
@@ -88,12 +90,19 @@ await withManagementLock(async () => {
 				throw new Error("A terminal mission cannot be paused or restarted.");
 			if (positionals[0] === "resume" && view.execution !== "paused")
 				throw new Error("Only a paused mission can resume.");
-			const agreement = view.formation.agreement;
+			const agreement =
+				(positionals[0] === "pause" || positionals[0] === "stop") && view.runtime
+					? {
+							missionId: view.runtime.missionId,
+							revision: view.runtime.agreementRevision,
+							digest: view.runtime.agreementDigest,
+						}
+					: view.formation.agreement;
 			await writeMissionAuthority(location, {
 				...previous,
 				executionIntent: {
 					requestId,
-					sequence: (previous.executionIntent?.sequence ?? 0) + 1,
+					sequence: Math.max(previous.executionIntent?.sequence ?? 0, view.runtime?.intentSequence ?? 0) + 1,
 					missionId: agreement.missionId,
 					agreementRevision: agreement.revision,
 					agreementDigest: agreement.digest,
@@ -109,7 +118,7 @@ await withManagementLock(async () => {
 			process.stdout.write(`${JSON.stringify({ status: result.execution, runtime: result.runtime ?? null })}\n`);
 		} catch (error) {
 			process.stderr.write(
-				`Mission intent saved; reconciliation is pending. Retry with --request-id ${requestId}. ${error.message}\n`,
+				`Mission intent saved; reconciliation is pending. Retry with --request-id ${requestId} --policy-revision ${expectedPolicyRevision}. ${error.message}\n`,
 			);
 			process.exitCode = 1;
 		}
@@ -171,6 +180,7 @@ await withManagementLock(async () => {
 			creator,
 			ceiling,
 			approvals: [],
+			...(previous?.executionIntent ? { executionIntent: previous.executionIntent } : {}),
 		};
 		await writeMissionAuthority(location, authority);
 		process.stdout.write(
@@ -195,10 +205,12 @@ await withManagementLock(async () => {
 	if (retry) {
 		if (retry.revision !== revision || retry.digest !== values.digest)
 			throw new Error("Conflicting approval request ID.");
-		await owner({ operation: "reconcile", receiptId: retry.receiptId });
-		process.stdout.write(`${JSON.stringify({ status: "agreed", receipt: retry, execution: "not-implemented" })}\n`);
+		const result = await owner({ operation: "reconcile", receiptId: retry.receiptId });
+		process.stdout.write(`${JSON.stringify({ status: "agreed", receipt: retry, execution: result.execution })}\n`);
 		return;
 	}
+	if (view.runtime && view.execution !== "stopped" && view.execution !== "completed")
+		throw new Error("Stop the existing mission execution before approving an amendment.");
 	if (!draft || draft.status !== "proposed" || draft.revision !== revision || draft.digest !== values.digest)
 		throw new Error("Stale mission proposal; inspect its current revision and digest.");
 	const terms = validateMissionTerms(draft.terms, previous, MANAGED_MISSION_ACTIONS, Date.now());
@@ -221,8 +233,8 @@ await withManagementLock(async () => {
 	const active = previous.approvals.find((item) => item.receiptId === view.formation.agreement?.approval.receiptId);
 	await writeMissionAuthority(location, { ...previous, approvals: active ? [active, receipt] : [receipt] });
 	try {
-		await owner({ operation: "reconcile", receiptId: receipt.receiptId });
-		process.stdout.write(`${JSON.stringify({ status: "agreed", receipt, execution: "not-implemented" })}\n`);
+		const result = await owner({ operation: "reconcile", receiptId: receipt.receiptId });
+		process.stdout.write(`${JSON.stringify({ status: "agreed", receipt, execution: result.execution })}\n`);
 	} catch (error) {
 		process.stderr.write(
 			`Approval receipt ${receipt.receiptId} saved; owner reconciliation is pending. Retry with --request-id ${requestId}. ${error.message}\n`,

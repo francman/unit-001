@@ -53,6 +53,8 @@ export function parseMissionCommand(args: readonly string[]): {
 		const policyRevision = values.has("--policy-revision") ? Number(values.get("--policy-revision")) : undefined;
 		if (policyRevision !== undefined && (!Number.isSafeInteger(policyRevision) || policyRevision < 0))
 			throw new Error("Mission policy revision must be a nonnegative integer.");
+		if (values.has("--request-id") && policyRevision === undefined)
+			throw new Error("An explicit lifecycle request ID requires --policy-revision N for safe retries.");
 		const requestId = values.get("--request-id") ?? randomUUID();
 		if (!requestId.trim() || Buffer.byteLength(requestId) > 200)
 			throw new Error("Mission request ID must fit 200 bytes.");

@@ -20,6 +20,7 @@ import {
 	missingMissionTerms,
 	parseMissionDraftTerms,
 } from "./contract.ts";
+import { MissionExecutionDoc } from "./execution-state.ts";
 import { MissionDoc } from "./state.ts";
 
 /** Owns one session's mission formation; it contains no controller, model request or execution admission. */
@@ -143,10 +144,21 @@ export class MissionControl {
 				creator: request.creator,
 				ceiling: request.ceiling,
 				approvals: [],
+				...(prior?.executionIntent ? { executionIntent: prior.executionIntent } : {}),
 			});
 			return this.inspect(context);
 		}
 		const authority = await readMissionAuthority(this.#location);
+		if (request.operation === "approve-local" || request.operation === "reconcile") {
+			const current = (await this.#harness.snapshot(MissionExecutionDoc, context))?.current;
+			const agreement = (await this.#harness.snapshot(MissionDoc, context))?.formation.agreement;
+			const retry =
+				request.operation === "reconcile"
+					? agreement?.approval.receiptId === request.receiptId
+					: agreement?.approval.requestId === request.requestId;
+			if (!retry && current && current.state.status !== "stopped" && current.state.status !== "completed")
+				throw new Error("Stop the existing mission execution before approving an amendment.");
+		}
 		if (request.operation === "approve-local") {
 			if (this.#location.kind !== "developer-local" || authority === null)
 				throw new Error("Managed approval requires an exact administrator receipt.");

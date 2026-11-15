@@ -23,6 +23,7 @@ export class MissionOwner {
 	readonly #model: ModelChoice | null;
 	readonly #cwd: string;
 	#tail: Promise<unknown> = Promise.resolve();
+	#scheduling: "inhibited" | "permitted" = "inhibited";
 
 	constructor(
 		harness: Harness,
@@ -45,16 +46,14 @@ export class MissionOwner {
 	}
 
 	/** Replays only the latest protected intent after restart; agreement alone never starts execution. */
-	async initialize(context: Context): Promise<void> {
+	async initialize(context: Context, scheduling: "inhibited" | "permitted" = "inhibited"): Promise<void> {
+		this.#scheduling = scheduling;
 		await this.#formation.initialize(context);
 		if (this.#location.session !== "default") return;
 		const authority = await readMissionAuthority(this.#location).catch(() => null);
 		if (authority?.executionIntent) {
 			try {
-				await this.handle(
-					{ operation: "reconcile-execution", requestId: authority.executionIntent.requestId },
-					context,
-				);
+				await this.reconcile(authority.executionIntent.requestId, context, scheduling);
 			} catch {
 				/* Invalid, expired or unresolved intent keeps its admission gates closed; owner inspection remains available. */
 			}
@@ -75,13 +74,11 @@ export class MissionOwner {
 	/** Routes formation normally and serializes exact protected lifecycle requests through the same owner. */
 	async handle(request: MissionRequest, context: Context): Promise<MissionView> {
 		if (request.operation === "status") return this.inspect(context);
-		if (request.operation !== "control-local" && request.operation !== "reconcile-execution") {
-			await this.#formation.handle(request, context);
-			return this.inspect(context);
-		}
 		const work = this.#tail.then(async () => {
-			if (request.operation === "control-local") await this.issueLocal(request, context);
-			await this.reconcile(request.requestId, context);
+			if (request.operation === "control-local" || request.operation === "reconcile-execution") {
+				if (request.operation === "control-local") await this.issueLocal(request, context);
+				await this.reconcile(request.requestId, context, this.#scheduling);
+			} else await this.#formation.handle(request, context);
 			return this.inspect(context);
 		});
 		this.#tail = work.catch(() => {});
@@ -95,7 +92,11 @@ export class MissionOwner {
 		if (this.#location.kind !== "developer-local")
 			throw new Error("Managed mission lifecycle changes require the administrator command.");
 		const authority = await readMissionAuthority(this.#location);
-		const agreement = (await this.#harness.snapshot(MissionDoc, context))?.formation.agreement;
+		const current = (await this.#harness.snapshot(MissionExecutionDoc, context))?.current;
+		const agreement =
+			(request.action === "pause" || request.action === "stop") && current
+				? current.agreement
+				: (await this.#harness.snapshot(MissionDoc, context))?.formation.agreement;
 		if (!authority || !agreement) throw new Error("Configure and approve the mission before changing its execution.");
 		const previous = authority.executionIntent;
 		if (previous?.requestId === request.requestId) {
@@ -103,7 +104,6 @@ export class MissionOwner {
 				throw new Error("Conflicting mission lifecycle request ID.");
 			return;
 		}
-		const current = (await this.#harness.snapshot(MissionExecutionDoc, context))?.current;
 		if ((current?.policyRevision ?? 0) !== request.expectedPolicyRevision)
 			throw new Error("Stale mission policy revision.");
 		if (request.action === "start" ? current != null : current == null && request.action !== "stop")
@@ -118,7 +118,7 @@ export class MissionOwner {
 			...authority,
 			executionIntent: {
 				requestId: request.requestId,
-				sequence: (previous?.sequence ?? 0) + 1,
+				sequence: Math.max(previous?.sequence ?? 0, current?.intent?.sequence ?? 0) + 1,
 				missionId: agreement.missionId,
 				agreementRevision: agreement.revision,
 				agreementDigest: agreement.digest,
@@ -130,10 +130,15 @@ export class MissionOwner {
 		});
 	}
 
-	private async reconcile(requestId: string, context: Context): Promise<void> {
+	private async reconcile(requestId: string, context: Context, scheduling: "inhibited" | "permitted"): Promise<void> {
 		const authority = await readMissionAuthority(this.#location);
 		const intent = authority?.executionIntent;
-		const agreement = (await this.#harness.snapshot(MissionDoc, context))?.formation.agreement;
+		const current = (await this.#harness.snapshot(MissionExecutionDoc, context))?.current;
+		const restrictive = intent?.action === "pause" || intent?.action === "stop";
+		const agreement =
+			restrictive && current
+				? current.agreement
+				: (await this.#harness.snapshot(MissionDoc, context))?.formation.agreement;
 		if (
 			!authority ||
 			!intent ||
@@ -143,19 +148,21 @@ export class MissionOwner {
 			intent.agreementRevision !== agreement.revision ||
 			intent.agreementDigest !== agreement.digest ||
 			intent.authorityRevision !== authority.revision ||
-			!matchingApproval(
-				authority,
-				agreement.approval.receiptId,
-				agreement.missionId,
-				agreement.revision,
-				agreement.terms,
-			)
+			(!restrictive &&
+				!matchingApproval(
+					authority,
+					agreement.approval.receiptId,
+					agreement.missionId,
+					agreement.revision,
+					agreement.terms,
+				))
 		)
 			throw new Error("Mission lifecycle intent does not match its current protected agreement.");
-		const current = (await this.#harness.snapshot(MissionExecutionDoc, context))?.current;
+		// Startup may close admission before scheduling is permitted; opening intent remains pending.
+		if (!restrictive && scheduling === "inhibited") throw new Error("Mission scheduling is inhibited.");
 		if (current?.intent?.sequence === intent.sequence && current.intent.requestId === requestId) {
 			if (current.state.status === "paused" || current.state.status === "stopped")
-				await this.drain(current, context);
+				await this.drain(current, context, scheduling);
 			return;
 		}
 		if (current?.intent && current.intent.sequence >= intent.sequence)
@@ -186,18 +193,20 @@ export class MissionOwner {
 				const saved = (await tx.doc(MissionExecutionDoc)).current!;
 				if (saved.policyRevision !== intent.expectedPolicyRevision)
 					throw new Error("Stale mission policy revision.");
-				saved.state = { status: intent.action === "pause" ? "paused" : "stopped" };
+				if (saved.state.status !== "completed")
+					saved.state = { status: intent.action === "pause" ? "paused" : "stopped" };
 				saved.policyRevision++;
 				saved.revision++;
 				saved.intent = { requestId, sequence: intent.sequence };
 			}, context);
-			await this.drain(current, context);
+			await this.drain(current, context, scheduling);
 			return;
 		}
 		if (current.state.status !== "paused") throw new Error("Only a paused mission can resume.");
-		await this.drain(current, context);
+		await this.drain(current, context, scheduling);
 		const settled = (await this.#harness.snapshot(MissionExecutionDoc, context))!.current!;
-		if (!(await this.#admission.authorized(settled))) throw new Error("Mission approval is invalid or expired.");
+		if (!(await this.#admission.authorized({ ...settled, intent: { requestId, sequence: intent.sequence } })))
+			throw new Error("Mission approval is invalid or expired.");
 		if (settled.pendingTools.length !== 0 || settled.unknownRequests !== 0) {
 			const evidence = await verifyMissionFiles(agreement.terms.successCriteria, this.#cwd, Date.now());
 			if (!evidence.every((item) => item.accepted))
@@ -219,8 +228,13 @@ export class MissionOwner {
 		this.#harness.resume();
 	}
 
-	private async drain(current: MissionExecution, context: Context): Promise<void> {
+	private async drain(
+		current: MissionExecution,
+		context: Context,
+		scheduling: "inhibited" | "permitted",
+	): Promise<void> {
 		await this.#harness.abortTask(current.controller, context);
+		if (scheduling === "inhibited") return;
 		const conversation = await this.#harness.conversation(current.conversation, context);
 		if (!conversation) throw new Error("Mission execution conversation is unavailable.");
 		await conversation.abort(context, { background: true });

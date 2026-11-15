@@ -38,3 +38,11 @@ Use the published bundled Linux Node in a network-disabled Linux amd64 container
 Stage the current compiled app and `deploy/mission.mjs` with the verified runtime/dependencies in a separate disposable payload. Put `test/fixtures/mission-managed-owner.mjs` at its matching `app/test/fixtures` location. Run `scripts/verify-mission-access.py PAYLOAD` only in a fresh Ubuntu 24.04 amd64 container, with networking disabled, hostname `unit-001-mission-acceptance`, and `UNIT_001_DISPOSABLE_CONTAINER=1`.
 
 The script requires root inside that container and refuses existing installations. It creates only fixture users/state there, runs the real provider-free owner and root metadata command, checks approval/replay/private-frame denials, and restarts the owner. Destroy the container afterward. Never run this account-creation test on an existing host or the VPS.
+
+## Lifecycle and process recovery acceptance
+
+November 15 source acceptance additionally covers revision-bound start/pause/resume/stop, revoked creator stop, delayed request replay, managed intent migration, amendment rejection, background drainage, all cumulative work/spend counters, inhibited ordinary work and held maintenance. See [review traces](controls-review.md).
+
+For the extended Linux trace, stage `test/fixtures/mission-execution-owner.mjs` alongside the formation fixture and run the same guarded script as `python3 scripts/verify-mission-access.py PAYLOAD execution`. Both fixtures acquire the production SQLite session lock. The extended fixture uses an abortable local faux provider and forbids network access. The driver kills the owner with SIGKILL during a persisted retry, reopens it, checks the unchanged wake deadline and no polling, observes automatic wake, rejects a second owner, then exercises actual privileged lifecycle commands and stopped reopen under separate UIDs.
+
+The Python driver supervises this fixture process; it does not boot systemd. Native systemd crash/logout/reboot and install/update/rollback qualification remains an explicit deployment gate. The published-reader round trip above remains formation-only; an old release without mission admission is not qualified to run an executable mission ledger.
