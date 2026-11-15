@@ -1,8 +1,8 @@
-# Checkpointed mission execution
+# Checkpointed bounded work
 
-The execution engine can take several bounded steps from one agreed assignment. Each step uses a durable synthetic input, executes only approved tool names, and checks actual files before continuing. An assistant saying “done” cannot complete a mission.
+The execution engine can take several bounded steps from one agreed assignment. Each step uses a durable synthetic input, executes only approved tool names, and checks actual files before continuing. An assistant saying “done” cannot prove the work is complete. Completing this assignment does not complete the agent's enduring mission. The current schema still combines purpose and work terms; the [purpose and work contract](purpose.md) defines the required separation and continuous-planning gap.
 
-The engine does not automatically start existing agreements. [Draft lifecycle controls](controls.md) add protected activation and inspection; their remaining release gates and real supervised-process acceptance remain #16 and #17. The normal conversation and existing nonexecuting mission holder keep their behavior.
+The engine does not automatically start existing agreements. [Bounded-work controls](controls.md) provide protected activation and inspection. Native supervised-process qualification remains #16. The normal conversation and existing nonexecuting mission holder keep their behavior.
 
 The first verifier accepts an exact criterion such as `sha256:EXPECTED_HEX_DIGEST:reports/result.txt`. The creator approves that literal requirement with the mission terms. Unsupported prose criteria or additional approval rules block before spending model tokens. This deliberately supports verifiable artifact work first; it does not interpret arbitrary goals as proof.
 
@@ -18,7 +18,7 @@ Executable missions accept only the reviewed built-in action catalog. Spawn-capa
 
 ## Persistence and interruption
 
-`unit.mission.execution` is a separate version-one session document. It preserves the formation document and legacy task schema. One activation atomically creates one controller and its task-owned execution conversation. Every cycle saves its stable request ID and submission in the same commit. Reopening observes that submission rather than admitting another.
+`unit.mission.execution` is a separate version-two session document with an explicit version-one migration. It preserves the formation document and legacy task schema. One activation atomically creates one controller and its task-owned execution conversation. Every cycle saves its stable request ID and submission in the same commit. Reopening observes that submission rather than admitting another.
 
 Tool intent is recorded before execution. Successful completion and known pre-dispatch rejections settle it. Failed or interrupted effects stay uncertain: the verifier may accept independently observable completion, otherwise the engine blocks rather than repeating an uncertain action. This includes an ordinary tool failure whose partial effects cannot be proved absent. An explicit controller abort closes mission intent before owned work finishes draining. Task termination alone is not mission success; the execution document and evidence are authoritative.
 
@@ -28,4 +28,4 @@ File observations reject escaping paths, symlinks, directories, changing files a
 
 Focused faux-provider tests use real SQLite and the real coding write tool. They cover two autonomous verified steps, false completion, finite cycles and requests, receipt revocation, maintenance sleeps across reopen, interrupted request recovery, pause during dispatch, racing activation, explicit abort and verifier boundaries. No paid provider calls are used.
 
-Before enabling installed-agent execution, #17 must add a protected, revision-bound lifecycle intent and owner controls; ordinary operator messages must not start work. #16 must prove process kill/restart, persisted wakeup and single-owner behavior under supervision. Research/ticket delivery remains #27. New verifiers need explicit host semantics and tests; model judgment does not silently become verification.
+Protected, revision-bound execution intent and owner controls are implemented; ordinary operator messages cannot start work. Real process-kill, persisted-wakeup and single-owner fixtures pass, while native systemd installation/update/rollback qualification remains #16. Research/ticket delivery remains #27. Continuous purpose-driven planning requires the separate purpose/work model above. New verifiers need explicit host semantics and tests; model judgment does not silently become verification.

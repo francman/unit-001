@@ -1,5 +1,7 @@
 # Durable mission contract
 
+The [purpose and work contract](purpose.md) supersedes this document's original treatment of a mission as a finite executable job. A mission is the agent's enduring purpose. The lifecycle, counters, deadline and completion evidence described below currently belong to the bounded-work implementation. Completing or suspending that work does not complete or suspend the purpose. The runtime has not yet separated continuous purpose-driven planning from bounded work; this document remains a record of the existing implementation and its security requirements.
+
 The first-start slice forms a saved mission agreement with an authenticated creator. A person, elder agent, or organization can supply the goal, scope, evidence requirements, limits and approval boundary through the terminal or local headless commands. Approval records exact terms; it does not start autonomous execution. The bounded controller is implemented under [#15](https://github.com/francman/unit-001/issues/15); [execution](execution.md) and [controls](controls.md) describe the current source behavior.
 
 This contract advances [#14](https://github.com/francman/unit-001/issues/14) and guides [#15](https://github.com/francman/unit-001/issues/15) and [#17](https://github.com/francman/unit-001/issues/17). Formation, bounded execution and local lifecycle controls are implemented in source. Broader verifier types, new mission replacement, research planning and native supervised installation qualification remain separate work.
