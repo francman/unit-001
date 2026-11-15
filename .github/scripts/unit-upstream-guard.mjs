@@ -1,11 +1,11 @@
 // Fails when a commit range modifies, deletes, or retypes a file that exists in the upstream-pi baseline.
-// unit-001 only adds files; the one allowed exception is the lockfile, which npm rewrites when workspaces change.
+// Unit owns its product README; npm also rewrites the lockfile when workspaces change. Upstream code stays unchanged.
 // Usage: node .github/scripts/unit-upstream-guard.mjs [--upstream upstream-pi/main] [--head HEAD] [--allow path]...
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 export const DEFAULT_UPSTREAM = "upstream-pi/main";
-export const DEFAULT_ALLOWLIST = ["package-lock.json"];
+export const DEFAULT_ALLOWLIST = ["package-lock.json", "README.md"];
 
 function git(cwd, args) {
 	return execFileSync("git", args, {
@@ -41,7 +41,7 @@ export function findViolations({
 	for (let index = 0; index + 1 < fields.length; index += 2) {
 		const status = fields[index];
 		const path = fields[index + 1];
-		if (status === "A" || allowed.has(path)) continue;
+		if (status === "A" || (allowed.has(path) && (path !== "README.md" || status === "M"))) continue;
 		violations.push({ status, path });
 	}
 	return { base, violations };

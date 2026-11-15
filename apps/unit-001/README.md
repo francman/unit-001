@@ -11,7 +11,7 @@ The launcher resumes interrupted runs and retains session memory. Autonomous mis
 
 ## Design tenets
 
-- **Keep upstream Pi unchanged.** Build on Pi Durable through its public APIs. Unit-specific work belongs in `apps/unit-*` and `packages/unit-*`; never modify upstream files. The upstream guard enforces this, with `package-lock.json` as the sole exception. Raise missing capabilities upstream instead of patching Pi locally.
+- **Keep upstream Pi implementation unchanged.** Build on Pi Durable through its public APIs. Unit-specific work belongs in `apps/unit-*` and `packages/unit-*`. The upstream guard permits only the root product README and dependency lockfile as exceptions; it still rejects upstream implementation edits. The original Pi README is preserved in the root README's collapsed reference. Raise missing capabilities upstream instead of patching Pi locally.
 - **Keep response latency minimal.** Keep recall, prompt assembly, hooks, and checkpoint commits within measured latency budgets. Run slow work, such as memory extraction and consolidation, in resumable background tasks so it does not delay responses.
 
 The upstream guard and checkpoint/request-preparation benchmark budgets are in place. Memory recall uses an in-process lexical index; extraction and consolidation run as durable background tasks.
@@ -35,7 +35,7 @@ sudo agent stop                 # asks for confirmation
 sudo -n agent stop --yes        # no action or sudo prompt; fails if unauthorized
 ```
 
-A new sudo installation grants its caller operator access; reconnect SSH to refresh groups. Existing installations need `sudo agent operator add USER` once. Normal commands and memory edits need no sudo; configuration, credentials, access, identity, lifecycle and updates remain privileged. Operators retain Bob's coding-tool file authority; see [access and its limits](docs/operations.md#operator-access-and-sudo).
+A new sudo installation grants its caller operator access; reconnect SSH to refresh groups. Existing installations need `sudo agent operator add USER` once. Normal commands and memory edits need no sudo; configuration, credentials, access, identity, lifecycle and updates remain privileged. Operators retain the agent's coding-tool file authority; see [access and its limits](docs/operations.md#operator-access-and-sudo).
 
 `kill` immediately terminates the owned service and its tools. `uninstall` removes the installation's software while preserving its data and account. Both ask for confirmation and accept `--yes`. Stopped agents remain stopped until an explicit `start`; confirmation never silently succeeds without a terminal. See [operations](docs/operations.md) for rename, removal, and recovery.
 
@@ -79,7 +79,8 @@ Exit codes: 0 success, 1 failed run or configuration problem, 2 usage error, 130
 
 ```bash
 npm ci --ignore-scripts
-npm run build
+node apps/unit-001/scripts/hydrate-model-data.mjs
+npm run build:offline
 npm run build --workspace apps/unit-001      # tsc to dist/
 npm run typecheck --workspace apps/unit-001
 node apps/unit-001/dist/bin.js --help
@@ -89,3 +90,17 @@ node apps/unit-001/dist/bin.js -p "what changed?"
 Source execution also supports interactive chat, provider login, `--session`, and piped prompts with `-p -`. It uses the current directory and Pi Durable's coding tools; Windows additionally has PowerShell. `/help` lists chat commands and Ctrl+C stops a run. Source use has no managed installation to rename or uninstall. No global `u1` or `unit-001` command aliases are installed.
 
 The tests use Pi's faux provider and real SQLite, including process-kill recovery, named installation isolation, and lifecycle operations with mocked system commands. See [AGENTS.md](../../AGENTS.md) for the permitted test commands.
+
+Unit verification combines exact model data from a reviewed public release with one explicitly allowed historical Fireworks identity from an immutable upstream catalog, pinned in `model-data-pin.json`; it never regenerates model types from moving catalogs. `hydrate-model-data.mjs --archive PATH` reuses a verified release download; the historical catalog still downloads. This pin preserves existing fixtures, not a guarantee that a provider still serves every listed model. Updating it requires a reviewed pin change and all existing checks.
+
+## Layout and upstream updates
+
+`apps/unit-001` contains the launcher, operator interfaces, deployment and update infrastructure. `packages/unit-*` contains Unit-owned reusable packages, including memory. `reference/` holds local research checkouts; keep them out of Git through `.git/info/exclude`.
+
+Fetch upstream with `git fetch upstream-pi --tags`. Review an upstream release tag and merge that tag into an isolated integration branch; do not track upstream's moving main branch. Keep Unit changes within the owned paths above. If dependency metadata conflicts, preserve the reviewed exact versions and regenerate `package-lock.json` with `npm install --package-lock-only --ignore-scripts`; review the result rather than hand-editing lock entries.
+
+Before accepting an upstream release, check every persisted document version and registered task checkpoint against stored sessions. Add explicit migrations where needed, then verify SQLite reopen, interrupted-task recovery and the release's declared reader compatibility. Run the full checks and relevant local tests; Actions remains disabled. A passing build alone does not prove stored work can resume.
+
+## Design attribution
+
+The memory design draws on [Mnemosyne](https://github.com/mnemosyne-oss/mnemosyne) and [omp's mnemopi](https://github.com/can1357/oh-my-pi/tree/88a69582c755bd000e8dc0290981fc787a4f400c/packages/mnemopi) TypeScript adaptation. Both are MIT-licensed; their tiering, recall and consolidation patterns informed Unit's implementation rather than replacing Pi Durable's storage. See the [port specification](docs/memory/port-spec.md) for source provenance and differences, and [reference practices](docs/memory/reference-practices.md) for later comparisons.

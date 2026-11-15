@@ -1,0 +1,25 @@
+# Install only on a separate trusted publisher host, never the agent VPS or an Actions runner.
+[Unit]
+Description=Renew unit-001 signed public update metadata
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=unit-publisher
+Group=unit-publisher
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=GH_CONFIG_DIR=/var/lib/unit-001-publisher/gh
+EnvironmentFile=/etc/unit-001-publisher/credential
+ExecStart=/opt/unit-001-publisher/current/apps/unit-001/scripts/renew-update-metadata.sh /etc/unit-001-publisher/root.json /etc/unit-001-publisher/online-keys /var/lib/unit-001-publisher
+UMask=0077
+TimeoutStartSec=20min
+KillMode=control-group
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/unit-001-publisher
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=1G
