@@ -45,9 +45,11 @@ import { introspectionExtension } from "./introspection/extension.ts";
 import { operatingSystemFacts, renderOperatingSystemFacts } from "./introspection/os.ts";
 import { MaintenanceDoc, type MaintenanceResult, type MaintenanceState, validateOperationId } from "./maintenance.ts";
 import { type MemoryRequest, type MemoryResult, parseMemoryRequest } from "./memory-control.ts";
+import { MissionAdmission } from "./missions/admission.ts";
 import type { MissionLocation } from "./missions/authority.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import { MissionControl } from "./missions/control.ts";
+import { missionController } from "./missions/controller.ts";
 import { isMissionHoldTask, MissionDoc, MissionFoundation } from "./missions/state.ts";
 import { createRuntimeFacts, orientationExtension, type RuntimeFacts } from "./orientation.ts";
 import type { ModelChoice } from "./provider.ts";
@@ -142,6 +144,8 @@ export class Agent {
 			directory: options.cwd,
 			session: "default",
 		};
+		const missionAdmission = new MissionAdmission(missionLocation);
+		const missionExecution = missionController(missionAdmission, options.cwd);
 		const channels = defaultChannelHost(
 			missionLocation,
 			options.channelCredentialsDirectory ?? join(options.cwd, ".unit-channels"),
@@ -155,6 +159,7 @@ export class Agent {
 		registry.install(channels.extension);
 		registry.install(memory.extension);
 		registry.install(MissionFoundation);
+		registry.install(missionExecution.extension);
 		let mission!: MissionControl;
 		registry.install(
 			defineExtension({
@@ -178,7 +183,7 @@ export class Agent {
 		const harness = await Harness.open(
 			options.storage,
 			{
-				models: options.models,
+				models: missionAdmission.models(options.models),
 				registry,
 				env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? options.cwd }),
 				...(options.onReport === undefined ? {} : { onReport: options.onReport }),
@@ -186,6 +191,7 @@ export class Agent {
 			context,
 		);
 		try {
+			await missionAdmission.bind(harness, context);
 			const root = await harness.root(context, { agent: options.model === null ? {} : { model: options.model } });
 			// The model is stored with the session; this launch's choice wins, so changing provider keys never strands it.
 			const stored = (await root.agent(context)).model;
