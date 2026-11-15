@@ -20,6 +20,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { Metadata } from "@tufjs/models";
+import { hydratePinnedModelData } from "./hydrate-model-data.mjs";
 
 export const NODE_RELEASE = {
 	version: "24.22.2",
@@ -261,15 +262,24 @@ export function writeReleaseDocumentation(stage) {
 		"terminal-assessment-others.md",
 		"setup-experience.md",
 		"updates.md",
+		"maintainer-renewal.md",
 		"distribution.md",
+		"web-ui.md",
 	]) {
 		mkdirSync(dirname(join(stage, "docs", name)), { recursive: true });
 		cpSync(join(repository, "apps/unit-001/docs", name), join(stage, "docs", name));
 	}
 }
 
+/** Packages only the reviewed browser entry, stylesheet and document, excluding synthetic fixtures. */
+export function writeWebAssets(app) {
+	mkdirSync(join(app, "web-dist"));
+	for (const asset of ["index.html", "bootstrap.js", "style.css"])
+		cpSync(join(repository, "apps/unit-001/web-dist", asset), join(app, "web-dist", asset));
+}
+
 /** Builds the archive without publishing, installing a service, or changing upstream sources. */
-export function buildRelease(out, options = {}) {
+export async function buildRelease(out, options = {}) {
 	const sourceManifest = JSON.parse(readFileSync(join(repository, "apps/unit-001/package.json"), "utf8"));
 	if (options.version !== undefined) sourceManifest.version = options.version;
 	if (!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(sourceManifest.version)) throw new Error("Invalid release version");
@@ -281,7 +291,7 @@ export function buildRelease(out, options = {}) {
 	mkdirSync(output, { recursive: true });
 	const scratch = mkdtempSync(join(output, ".build-"));
 	try {
-		npm(["run", "hydrate-model-data", "--workspace", "packages/ai"]);
+		const modelData = await hydratePinnedModelData();
 		for (const name of checkoutPackages) {
 			npm(["run", name === "ai" ? "build:offline" : "build", "--workspace", `packages/${name}`]);
 		}
@@ -290,6 +300,7 @@ export function buildRelease(out, options = {}) {
 		const app = join(stage, "app");
 		mkdirSync(app, { recursive: true });
 		cpSync(join(repository, "apps/unit-001/dist"), join(app, "dist"), { recursive: true });
+		writeWebAssets(app);
 		cpSync(join(repository, "LICENSE"), join(stage, "LICENSE"));
 		const dependencies = installDependencies(app, sourceManifest);
 		copyNodeRuntime(stage, scratch);
@@ -308,7 +319,7 @@ export function buildRelease(out, options = {}) {
 		const modelManifest = readFileSync(join(repository, "packages/ai/src/providers/data/.manifest.json"));
 		writeFileSync(
 			join(stage, "release.json"),
-			`${JSON.stringify({ version: sourceManifest.version, platform: "linux-x64", node: NODE_RELEASE, source: { commit: source, dirty }, compatibility: JSON.parse(readFileSync(join(stage, "deploy/release-compatibility.json"), "utf8")), modelDataManifestSha256: createHash("sha256").update(modelManifest).digest("hex"), dependencies }, null, "\t")}\n`,
+			`${JSON.stringify({ version: sourceManifest.version, platform: "linux-x64", node: NODE_RELEASE, source: { commit: source, dirty }, compatibility: JSON.parse(readFileSync(join(stage, "deploy/release-compatibility.json"), "utf8")), modelData, modelDataManifestSha256: createHash("sha256").update(modelManifest).digest("hex"), dependencies }, null, "\t")}\n`,
 		);
 		writeReleaseChecksums(stage);
 		execFileSync(process.execPath, [join(app, "dist/bin.js"), "--help"], { cwd: scratch, stdio: "inherit" });
@@ -373,5 +384,5 @@ if (process.argv[1] !== undefined && pathToFileURL(resolve(process.argv[1])).hre
 		console.log(
 			"Usage: node apps/unit-001/scripts/build-release.mjs [--out <directory>] [--version <fixture-version>] [--update-root <public-root.json>]\nBuild prerequisites: Node/npm, curl, tar, installed checkout dependencies, and network access.\nHydrates Pi model data, builds app and Pi dependencies, then emits a Linux x64 archive with Node and a locked production install. Public production releases require an approved public update root and the source manifest version.",
 		);
-	else buildRelease(values.out, { version: values.version, updateRoot: values["update-root"] });
+	else await buildRelease(values.out, { version: values.version, updateRoot: values["update-root"] });
 }

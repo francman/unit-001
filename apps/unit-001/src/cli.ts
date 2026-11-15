@@ -44,6 +44,7 @@ import {
 import { readDefaultModel, saveDefaultModel } from "./settings.ts";
 import { runSetup } from "./setup.ts";
 import { runRichAttach, runRichForeground } from "./terminal-ui.ts";
+import { runWebWorkspace } from "./web/launcher.ts";
 
 /** What the CLI reads from its process, so tests can run it against fakes. */
 export interface ManagedIdentity {
@@ -350,7 +351,20 @@ async function control(
 				runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb",
 			);
 		let operation: MissionRequest;
-		if (input.action === "draft" || input.action === "creator") {
+		if (
+			input.action === "start" ||
+			input.action === "pause" ||
+			input.action === "resume" ||
+			input.action === "stop"
+		) {
+			const view = await request({ operation: "status" });
+			operation = {
+				operation: "control-local",
+				action: input.action,
+				expectedPolicyRevision: input.policyRevision ?? view.policyRevision ?? view.runtime?.policyRevision ?? 0,
+				requestId: input.requestId,
+			};
+		} else if (input.action === "draft" || input.action === "creator") {
 			const path = resolve(runtime.cwd, input.file);
 			const info = await lstat(path);
 			if (!info.isFile() || info.isSymbolicLink() || info.size > 32768)
@@ -539,16 +553,34 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				command.kind !== "channels" &&
 				command.kind !== "mission" &&
 				command.kind !== "inspection" &&
+				command.kind !== "web" &&
 				!(command.kind === "run" && argv.length === 0 && runtime.interactive)
 			)
 				throw new ConfigurationError("This operation requires the administrator command.");
-			if (command.kind === "mission" && (command.command.action === "creator" || command.command.action === "approve"))
+			if (
+				command.kind === "mission" &&
+				["creator", "approve", "start", "pause", "resume", "stop"].includes(command.command.action)
+			)
 				throw new ConfigurationError("Mission creator and approval changes require the administrator command.");
 			if (command.kind !== "run" && command.options.dataDir !== undefined)
 				throw new UsageError("Operator clients cannot change their data directory.");
 		}
 		let code: number;
-		if (command.kind === "setup") code = await setup(command, runtime, signal);
+		if (command.kind === "web") {
+			if (!runtime.interactive)
+				throw new UsageError("Web pairing requires an operator terminal; pairing codes must not enter logs.");
+			if (runtime.managed !== undefined && runtime.managed.access !== "operator")
+				throw new ConfigurationError("Run the web command as an authorized operator without sudo.");
+			const endpoint =
+				runtime.managed === undefined
+					? serviceEndpoint(
+							resolveDirectory(command.options.dataDir, runtime),
+							command.options.session,
+							runtime.platform,
+						)
+					: operatorEndpoint(runtime.managed.id, command.options.session);
+			code = await runWebWorkspace(endpoint, command.port, (text) => void runtime.stdout.write(text), signal);
+		} else if (command.kind === "setup") code = await setup(command, runtime, signal);
 		else if (command.kind === "run" && argv.length === 0 && runtime.managed !== undefined && runtime.interactive) {
 			// The normal installed entry is a client; explicit foreground flags retain their existing owner semantics.
 			try {

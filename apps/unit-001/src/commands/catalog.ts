@@ -13,7 +13,7 @@ export interface CommandDefinition {
 }
 
 /** Version of the declared aliases and deterministic ranking rules. */
-export const COMMAND_CATALOG_VERSION = 1;
+export const COMMAND_CATALOG_VERSION = 2;
 
 /** Commands available in the shipped application; definitions never confer execution authority. */
 export const COMMANDS: readonly CommandDefinition[] = [
@@ -152,6 +152,22 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		keywords: ["approval"],
 		effect: "administrator",
 	},
+	...(
+		[
+			["start", "Start the exact approved mission"],
+			["pause", "Pause and drain mission-owned work"],
+			["resume", "Resume a paused mission within its existing limits"],
+			["stop", "Stop mission execution without stopping the owner"],
+		] as const
+	).map(([action, summary]) => ({
+		id: `mission.${action}`,
+		surfaces: ["cli"] as const,
+		invocation: `mission ${action}`,
+		summary,
+		aliases: [],
+		keywords: ["mission", action],
+		effect: "administrator" as const,
+	})),
 	{
 		id: "setup",
 		surfaces: ["cli"],

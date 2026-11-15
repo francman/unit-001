@@ -54,6 +54,7 @@ import type { MissionLocation } from "./missions/authority.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import { MissionControl } from "./missions/control.ts";
 import { missionController } from "./missions/controller.ts";
+import { MissionOwner } from "./missions/owner.ts";
 import { isMissionHoldTask, MissionDoc, MissionFoundation } from "./missions/state.ts";
 import { createRuntimeFacts, orientationExtension, type RuntimeFacts } from "./orientation.ts";
 import type { ModelChoice } from "./provider.ts";
@@ -98,7 +99,7 @@ export class Agent {
 	readonly #root: Conversation;
 	readonly #runtime: () => RuntimeFacts;
 	readonly #memory: MemoryService;
-	readonly #mission: MissionControl;
+	readonly #mission: MissionOwner;
 	readonly #channels: ChannelOwner;
 	readonly #configuration: "configured" | "unconfigured";
 	readonly #models: Models;
@@ -118,7 +119,7 @@ export class Agent {
 		inhibited: boolean,
 		runtime: () => RuntimeFacts,
 		memory: MemoryService,
-		mission: MissionControl,
+		mission: MissionOwner,
 		channels: ChannelOwner,
 		configuration: "configured" | "unconfigured",
 		models: Models,
@@ -169,7 +170,7 @@ export class Agent {
 		registry.install(memory.extension);
 		registry.install(MissionFoundation);
 		registry.install(missionExecution.extension);
-		let mission!: MissionControl;
+		let mission!: MissionOwner;
 		registry.install(
 			defineExtension({
 				name: "unit.mission.inspection",
@@ -216,7 +217,7 @@ export class Agent {
 				return (await tx.doc(MaintenanceDoc)).current.state === "held";
 			}, context);
 			const inhibited = options.startup?.kind === "inhibited" || held;
-			mission = new MissionControl(harness, missionLocation, [
+			const formation = new MissionControl(harness, missionLocation, [
 				...new Set(
 					registry
 						.snapshot()
@@ -224,7 +225,17 @@ export class Agent {
 						.map((item) => item.tool.name),
 				),
 			]);
-			if (!inhibited) await mission.initialize(context);
+			mission = new MissionOwner(
+				harness,
+				formation,
+				missionLocation,
+				registry,
+				missionAdmission,
+				missionExecution,
+				options.model,
+				options.cwd,
+			);
+			await mission.initialize(context);
 			const channelOwner = new ChannelOwner(harness, channels);
 			const inspectionHost = {
 				harness,
@@ -246,6 +257,7 @@ export class Agent {
 				(pending.submissions.length === 0 &&
 					pending.tasks.every((task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy)));
 			if (!inhibited && canSchedule) {
+				await mission.initialize(context, "permitted");
 				await root.commit((tx) => reconcileMemoryTasks(tx, root.id, Date.now()), context);
 				memory.recall.prepare(await harness.snapshot(MemoryDoc, context));
 				harness.resume();
@@ -588,9 +600,13 @@ export class Agent {
 		if (
 			inspection === undefined ||
 			(inspection.submissions.length === 0 &&
-				inspection.tasks.every((task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy)))
-		)
+				inspection.tasks.every(
+					(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
+				))
+		) {
+			await this.#mission.initialize(context, "permitted");
 			this.#harness.resume();
+		}
 		return { type: "maintenance", protocol: 1, state: "open", operationId: null };
 	}
 

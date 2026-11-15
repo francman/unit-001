@@ -12,10 +12,34 @@ import {
 	parseMissionCreator,
 	parseMissionDraftTerms,
 } from "./contract.ts";
+import { parseMissionExecutionView } from "./execution-view.ts";
 
 /** Validates owner commands without accepting caller-supplied managed approval or authenticated principal claims. */
 export function parseMissionRequest(value: unknown): MissionRequest {
 	const input = missionObject(value);
+	if (input.operation === "reconcile-execution") {
+		if (Object.keys(input).some((key) => key !== "operation" && key !== "requestId"))
+			throw new Error("Unknown mission command field.");
+		const requestId = missionText(input.requestId);
+		if (!requestId.trim()) throw new Error("Mission changes need a request ID.");
+		return { operation: "reconcile-execution", requestId };
+	}
+	if (input.operation === "control-local") {
+		if (
+			Object.keys(input).some((key) => !["operation", "action", "expectedPolicyRevision", "requestId"].includes(key))
+		)
+			throw new Error("Unknown mission command field.");
+		if (input.action !== "start" && input.action !== "pause" && input.action !== "resume" && input.action !== "stop")
+			throw new Error("Unknown mission lifecycle action.");
+		const requestId = missionText(input.requestId);
+		if (!requestId.trim()) throw new Error("Mission changes need a request ID.");
+		return {
+			operation: "control-local",
+			action: input.action,
+			expectedPolicyRevision: revision(input.expectedPolicyRevision, 0),
+			requestId,
+		};
+	}
 	const fields =
 		input.operation === "status"
 			? ["operation"]
@@ -66,8 +90,26 @@ export function parseMissionView(value: unknown): MissionView {
 		input.authority !== "invalid"
 	)
 		throw new Error("Invalid mission authority projection.");
-	if (input.execution !== "not-implemented" || typeof input.agreementValid !== "boolean")
+	if (
+		(input.execution !== "not-implemented" &&
+			input.execution !== "not-started" &&
+			input.execution !== "ready" &&
+			input.execution !== "running" &&
+			input.execution !== "waiting" &&
+			input.execution !== "paused" &&
+			input.execution !== "blocked" &&
+			input.execution !== "completed" &&
+			input.execution !== "stopped") ||
+		typeof input.agreementValid !== "boolean"
+	)
 		throw new Error("Invalid mission execution projection.");
+	const runtime =
+		input.runtime === undefined || input.runtime === null ? null : parseMissionExecutionView(input.runtime);
+	if (
+		(runtime !== null && runtime.status !== input.execution) ||
+		(runtime === null && input.execution !== "not-implemented" && input.execution !== "not-started")
+	)
+		throw new Error("Mission runtime does not match its execution projection.");
 	const formation = missionObject(input.formation);
 	const draft = formation.draft === null ? null : parseDraft(formation.draft);
 	const agreement = formation.agreement === null ? null : parseAgreement(formation.agreement);
@@ -92,7 +134,9 @@ export function parseMissionView(value: unknown): MissionView {
 		authority: input.authority,
 		agreementValid: input.agreementValid,
 		missing: missionTextList(input.missing, 32, 200),
-		execution: "not-implemented",
+		execution: input.execution,
+		...(input.runtime === undefined ? {} : { runtime }),
+		...(input.policyRevision === undefined ? {} : { policyRevision: revision(input.policyRevision, 0) }),
 		tools: missionTextList(input.tools, 128, 100),
 	};
 }

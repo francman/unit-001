@@ -10,7 +10,9 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
 	createRegistry,
+	defineDoc,
 	defineExtension,
+	defineTask,
 	defineTool,
 	Harness,
 	hook,
@@ -20,13 +22,15 @@ import {
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MaintenanceDoc } from "../../src/maintenance.ts";
 import { MissionAdmission } from "../../src/missions/admission.ts";
+import * as authorityModule from "../../src/missions/authority.ts";
 import { readMissionAuthority, writeMissionAuthority } from "../../src/missions/authority.ts";
 import { MissionControl } from "../../src/missions/control.ts";
 import { missionController, startMissionExecution } from "../../src/missions/controller.ts";
-import { MissionExecutionDoc } from "../../src/missions/execution-state.ts";
+import { type MissionExecution, MissionExecutionDoc } from "../../src/missions/execution-state.ts";
+import { MissionOwner } from "../../src/missions/owner.ts";
 import { MissionFoundation } from "../../src/missions/state.ts";
 
 let directory: string;
@@ -38,6 +42,7 @@ beforeEach(async () => {
 	now = 1_000;
 });
 afterEach(async () => {
+	vi.restoreAllMocks();
 	for (const harness of opened.splice(0)) await harness.close(context);
 	await rm(directory, { recursive: true, force: true });
 });
@@ -89,7 +94,9 @@ async function launch(responses: Parameters<ReturnType<typeof fauxProvider>["set
 	await admission.bind(harness, context);
 	opened.push(harness);
 	const control = new MissionControl(harness, location, ["write", "read", "bash"], () => now);
-	return { harness, admission, engine, registry, faux, reports, control, location };
+	const owner = new MissionOwner(harness, control, location, registry, admission, engine, model, directory);
+	await owner.initialize(context, "permitted");
+	return { harness, admission, engine, registry, faux, reports, control, location, owner };
 }
 
 async function agree(host: Awaited<ReturnType<typeof launch>>, criteria: string[], policy = {}) {
@@ -500,5 +507,231 @@ describe("checkpointed mission controller", () => {
 		expect(result.unpricedResponses).toBe(1);
 		expect(result.reservedCost).toBeCloseTo(0.21);
 		expect(host.faux.state.callCount).toBe(1);
+	});
+	// #17: A managed migration or rewritten authority must never inherit host-engine admission.
+	it("requires a managed exact intent receipt, including a migrated version-one ledger", async () => {
+		const first = await launch();
+		await agree(first, [criterion("missing.txt", "proof")]);
+		await startMissionExecution(first.harness, first.engine, first.admission, first.registry, model, context);
+		const saved = (await first.harness.snapshot(MissionExecutionDoc, context))!.current!;
+		const { intent: _intent, ...legacyExecution } = saved;
+		const legacy = defineDoc<{ current: Omit<MissionExecution, "intent"> | null }>({
+			...MissionExecutionDoc.definition,
+			version: 1,
+			migrate: undefined,
+			initial: () => ({ current: null }),
+		});
+		const migration = await Harness.open(
+			await openNodeSqliteStorage(join(directory, "migration.sqlite")),
+			{ models: createModels(), registry: first.registry },
+			context,
+		);
+		opened.push(migration);
+		await migration.commit(async (tx) => {
+			(await tx.doc(legacy)).current = legacyExecution;
+		}, context);
+		await migration.close(context);
+		opened.splice(opened.indexOf(migration), 1);
+		const reopened = await Harness.open(
+			await openNodeSqliteStorage(join(directory, "migration.sqlite")),
+			{ models: createModels(), registry: first.registry },
+			context,
+		);
+		opened.push(reopened);
+		const migrated = (await reopened.snapshot(MissionExecutionDoc, context))!.current!;
+		expect(migrated).toEqual({ ...legacyExecution, intent: null });
+		const managed = new MissionAdmission(
+			{ kind: "managed", installationId: "11111111-1111-4111-8111-111111111111", session: "default" },
+			() => now,
+		);
+		const authority = (await readMissionAuthority(first.location))!;
+		// Isolate intent admission from the protected-file/UID boundary covered by the Linux helper fixture.
+		const read = vi.spyOn(authorityModule, "readMissionAuthority").mockResolvedValue(authority);
+		expect(await managed.authorized(migrated)).toBe(false);
+		const intent = {
+			requestId: "start",
+			sequence: 1,
+			missionId: saved.agreement.missionId,
+			agreementRevision: saved.agreement.revision,
+			agreementDigest: saved.agreement.digest,
+			authorityRevision: authority.revision,
+			expectedPolicyRevision: 0,
+			action: "start" as const,
+			issuedAt: now,
+		};
+		read.mockResolvedValue({ ...authority, executionIntent: intent });
+		expect(await managed.authorized(migrated)).toBe(false);
+		const authenticated = { ...migrated, intent: { requestId: "start", sequence: 1 } };
+		expect(await managed.authorized(authenticated)).toBe(true);
+		for (const change of [
+			{ requestId: "forged" },
+			{ sequence: 2 },
+			{ agreementDigest: "0".repeat(64) },
+			{ authorityRevision: 2 },
+			{ action: "pause" as const },
+		]) {
+			read.mockResolvedValue({ ...authority, executionIntent: { ...intent, ...change } });
+			expect(await managed.authorized(authenticated)).toBe(false);
+		}
+		read.mockResolvedValue({ ...authority, approvals: [], executionIntent: intent });
+		expect(await managed.authorized(authenticated)).toBe(false);
+		now = saved.agreement.terms.policy.deadlineAt;
+		read.mockResolvedValue({ ...authority, executionIntent: intent });
+		expect(await managed.authorized(authenticated)).toBe(false);
+	});
+
+	// #17: Pause closes admission, aborts a live tool and crosses its background ownership boundary.
+	it("drains an actual tool and its owned background task before acknowledging pause", async () => {
+		let started!: () => void;
+		const running = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		let background: TaskId | undefined;
+		let toolAborted = false;
+		let backgroundAborted = false;
+		const host = await launch([write("effect.txt", "proof")]);
+		const Background = defineTask<null, { phase: "work" }, null>({
+			name: "fixture.mission.background",
+			version: 1,
+			initial: () => ({ phase: "work" }),
+			phases: {
+				work: async (_task, runtime) => {
+					started();
+					await new Promise((_resolve, reject) =>
+						runtime.signal.addEventListener(
+							"abort",
+							() => {
+								backgroundAborted = true;
+								reject(new Error("drained"));
+							},
+							{ once: true },
+						),
+					);
+				},
+			},
+			abort: (_task, runtime, ctx) =>
+				runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
+		});
+		host.registry.uninstall(CodingTools);
+		host.registry.install(
+			defineExtension({
+				name: "fixture.mission.tool",
+				tasks: [Background],
+				tools: [
+					defineTool({
+						name: "write",
+						description: "Hold a fixture tool and its background child.",
+						parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+						execute: async (_args, api, ctx) => {
+							background = await api.commit(async (tx) => {
+								const child = await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } });
+								return tx.createTask(Background, null, {
+									conversationId: child.id,
+									ownership: { kind: "conversation" },
+									background: true,
+								});
+							}, ctx);
+							await new Promise((_resolve, reject) =>
+								ctx.abortSignal!.addEventListener(
+									"abort",
+									() => {
+										toolAborted = true;
+										reject(new Error("drained"));
+									},
+									{ once: true },
+								),
+							);
+							return { output: [] };
+						},
+					}),
+				],
+			}),
+		);
+		await agree(host, [criterion("effect.txt", "proof")]);
+		await host.owner.handle(
+			{ operation: "control-local", action: "start", expectedPolicyRevision: 0, requestId: "start" },
+			context,
+		);
+		await running;
+		const paused = await host.owner.handle(
+			{ operation: "control-local", action: "pause", expectedPolicyRevision: 1, requestId: "pause" },
+			context,
+		);
+		expect(paused.execution).toBe("paused");
+		expect(toolAborted).toBe(true);
+		expect(backgroundAborted).toBe(true);
+		expect((await host.harness.getTask(background!, context))?.state.status).toBe("terminal");
+		expect(paused.runtime?.uncertainTools).toBe(1);
+		await expect(
+			host.owner.handle(
+				{ operation: "control-local", action: "resume", expectedPolicyRevision: 2, requestId: "resume" },
+				context,
+			),
+		).rejects.toThrow("Uncertain mission effects");
+	});
+
+	// #17: New execution scopes retain every finite work/spend counter rather than starting a new budget.
+	it("preserves all cumulative counters across pause, SQLite reopen and resume", async () => {
+		const host = await launch([fauxAssistantMessage([], { stopReason: "error", errorMessage: "retry" })], true);
+		await agree(host, [criterion("missing.txt", "proof")]);
+		await host.owner.handle(
+			{ operation: "control-local", action: "start", expectedPolicyRevision: 0, requestId: "start" },
+			context,
+		);
+		for (let i = 0; i < 500 && (await host.owner.inspect(context)).execution !== "waiting"; i++) await setImmediate();
+		await host.harness.commit(async (tx) => {
+			const current = (await tx.doc(MissionExecutionDoc)).current!;
+			current.estimatedCost = 0.12;
+		}, context);
+		const paused = await host.owner.handle(
+			{ operation: "control-local", action: "pause", expectedPolicyRevision: 1, requestId: "pause" },
+			context,
+		);
+		await host.harness.close(context);
+		opened.splice(opened.indexOf(host.harness), 1);
+		const reopened = await launch([], true);
+		const before = (await reopened.owner.inspect(context)).runtime!;
+		for (const key of [
+			"cycles",
+			"requests",
+			"retries",
+			"noProgress",
+			"estimatedCost",
+			"reservedCost",
+			"unknownRequests",
+			"unpricedResponses",
+			"uncertainTools",
+		] as const)
+			expect(before[key]).toBe(paused.runtime![key]);
+		expect(before).toMatchObject({
+			requests: 1,
+			retries: 1,
+			noProgress: 1,
+			estimatedCost: 0.12,
+			reservedCost: 0.21,
+			unpricedResponses: 1,
+		});
+		await writeFile(join(directory, "missing.txt"), "proof");
+		await reopened.owner.handle(
+			{ operation: "control-local", action: "resume", expectedPolicyRevision: 2, requestId: "resume" },
+			context,
+		);
+		const controller = (await reopened.harness.snapshot(MissionExecutionDoc, context))!.current!.controller;
+		await reopened.harness.waitForTask(controller, context);
+		const after = (await reopened.owner.inspect(context)).runtime!;
+		for (const key of [
+			"cycles",
+			"requests",
+			"retries",
+			"noProgress",
+			"estimatedCost",
+			"reservedCost",
+			"unknownRequests",
+			"unpricedResponses",
+			"uncertainTools",
+		] as const)
+			expect(after[key]).toBe(before[key]);
+		expect(after.status).toBe("completed");
+		expect(reopened.faux.state.callCount).toBe(0);
 	});
 });

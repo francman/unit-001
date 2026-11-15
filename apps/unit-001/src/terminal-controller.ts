@@ -575,7 +575,7 @@ class OwnerTerminalController implements TerminalController {
 			if (initial) {
 				if (!view.agreementValid)
 					this.#notice(
-						"No verified mission agreement. Use /mission setup to form a saved draft; ordinary work remains available. Autonomous execution is not implemented.",
+						"No verified mission agreement. Use /mission setup to form a saved draft; ordinary work remains available. Autonomous execution requires an approved mission and explicit start.",
 					);
 			} else this.#notice(describeMission(view));
 		} catch (error) {

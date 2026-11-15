@@ -79,7 +79,7 @@ test("#14 executes only the selected-release mission module with fixed installat
 
 test("#14 rejects operator authority changes and installation identity overrides before execution", async () => {
 	const operator = await fixture(2001);
-	for (const action of ["creator", "approve"])
+	for (const action of ["creator", "approve", "start", "pause", "resume", "stop"])
 		await assert.rejects(
 			dispatchAgent(operator.record.id, "bob", ["mission", action], operator.context),
 			/host administrator/,
@@ -92,4 +92,16 @@ test("#14 rejects operator authority changes and installation identity overrides
 			/installation identity/,
 		);
 	assert.deepEqual(administrator.calls, []);
+});
+
+test("#17 lifecycle commands execute only the verified privileged metadata client", async () => {
+	const { record, calls, context } = await fixture();
+	for (const action of ["start", "pause", "resume", "stop"])
+		await dispatchAgent(record.id, record.name, ["mission", action, "--policy-revision", "1"], context);
+	assert.equal(calls.length, 4);
+	for (const call of calls) {
+		assert.equal(call[0], "/opt/verified-release/runtime/bin/node");
+		assert.equal(call[1][0], "/opt/verified-release/deploy/mission.mjs");
+		assert.deepEqual(call[1].slice(-2), ["--id", record.id]);
+	}
 });

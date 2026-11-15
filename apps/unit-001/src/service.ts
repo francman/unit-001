@@ -188,7 +188,9 @@ export async function runService(
 					directory.gid !== process.getgid?.() ||
 					(directory.mode & 0o777) !== 0o750
 				)
-					throw new ConfigurationError("Operator runtime directory must belong to the service account with mode 0750.");
+					throw new ConfigurationError(
+						"Operator runtime directory must belong to the service account with mode 0750.",
+					);
 				await unlink(operatorPath).catch((error: NodeJS.ErrnoException) => {
 					if (error.code !== "ENOENT") throw error;
 				});
@@ -352,7 +354,8 @@ export function requestService(
 		);
 		socket.on("data", (chunk: string) => {
 			buffer += chunk;
-			if (Buffer.byteLength(buffer) > MAX_RESPONSE_BYTES) return finish(new Error("Service response exceeds 1 MiB."));
+			if (Buffer.byteLength(buffer) > MAX_RESPONSE_BYTES)
+				return finish(new Error("Service response exceeds 1 MiB."));
 			const newline = buffer.indexOf("\n");
 			if (newline === -1) return;
 			try {
@@ -419,7 +422,13 @@ async function handleRequest(
 	if (value.type === "mission") {
 		if (!("request" in value)) throw new UsageError("Missing mission request.");
 		const request = parseMissionRequest(value.request);
-		if (access === "operator" && (request.operation === "reconcile" || request.operation === "approve-local"))
+		if (
+			access === "operator" &&
+			(request.operation === "reconcile" ||
+				request.operation === "approve-local" ||
+				request.operation === "reconcile-execution" ||
+				request.operation === "control-local")
+		)
 			throw new UsageError("Mission approval requires its administrator authority.");
 		return { type: "mission", result: await agent.mission(request, BACKGROUND_CONTEXT) };
 	}

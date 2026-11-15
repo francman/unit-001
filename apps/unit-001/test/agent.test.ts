@@ -61,7 +61,7 @@ describe("Agent", () => {
 		expect(requestText).toContain("unit-001, the durable agent named bob");
 		expect(requestText).toContain("configured model is faux/faux-1");
 		expect(requestText).toContain("persist in this session across restarts");
-		expect(requestText).toContain("Autonomous mission scheduling is not implemented");
+		expect(requestText).toContain("An agreement alone does not start a mission");
 		expect(requestText).toContain("unit_status");
 	});
 

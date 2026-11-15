@@ -19,8 +19,8 @@
 	],
 	"scripts": {
 		"clean": "shx rm -rf dist",
-		"build": "npm --prefix ../../packages/unit-memory run build && tsc -p tsconfig.build.json",
-		"typecheck": "tsc -p tsconfig.json",
+		"build": "npm --prefix ../../packages/unit-memory run build && tsc -p tsconfig.build.json && node scripts/build-web.mjs",
+		"typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
 		"release:build": "node scripts/build-release.mjs",
 		"test:release": "node --test test/release.test.mjs",
 		"test:management": "node --test test/management.test.mjs test/activation.test.mjs test/mission-management.test.mjs test/channel-management.test.mjs",

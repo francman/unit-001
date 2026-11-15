@@ -1,3 +1,38 @@
+# unit-001
+
+unit-001 is a named, always-on AI agent with its own identity, memory, tools and operator interfaces. It retains conversations and unfinished work across restarts. Its goal is to pursue an agreed mission without needing a new prompt for every step.
+
+**Available now:** persistent conversations and memory, a rich terminal interface, named Ubuntu services, provider setup and signed automatic updates. Maintainer feed renewal still needs an installed schedule. Source also includes mission agreements, remote SSH sessions and creator-authorized channel setup. The autonomous mission execution loop and browser workspace are in development; they are not shipped in the current download.
+
+## Install and connect
+
+The [Linux x64 download](https://github.com/francman/unit-001-releases/releases/latest/download/unit-001-linux-x64.tar.gz) includes its runtime and public update keys. Managed installs target **Ubuntu Server 24.04 LTS**. Extract it, then run:
+
+```bash
+sudo ./install.sh                 # default name: agent
+sudo agent setup                 # provider, credentials and model
+agent                            # interactive terminal
+agent memory stats
+agent status
+```
+
+Reconnect SSH after installation to refresh operator access. Routine commands need no sudo; security, configuration and lifecycle changes do. Choose another name with `sudo ./install.sh --name NAME`.
+
+Read the [deployment guide](apps/unit-001/docs/deployment.md), [commands and access rules](apps/unit-001/docs/operations.md), [memory guide](apps/unit-001/docs/memory.md) and [update/recovery guide](apps/unit-001/docs/updates.md).
+
+## Principles and development
+
+The agent should pursue an agreed mission without repeated prompts, preserve work across failures and ask when it lacks authority. Keep slow work off the response path. Build on upstream public APIs; keep Pi implementation files unchanged.
+
+Unit code lives in `apps/unit-001` and `packages/unit-*`. See the [developer README](apps/unit-001/README.md) for checks, source setup, upstream syncing and attribution. GitHub Actions is disabled; validation and publication run independently.
+
+[Pi Durable](packages/durable) supplies durable execution and storage; unit-001 owns mission control, memory, installation identity, channels and the operator experience. Memory design draws on Mnemosyne and omp's mnemopi. [MIT license](LICENSE).
+
+The preserved reference below describes upstream Pi. Its installation and CI notes apply to that project, not unit-001.
+
+<details>
+<summary>Upstream Pi reference</summary>
+
 <p align="center">
   <a href="https://pi.dev">
     <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
@@ -204,3 +239,5 @@ MIT
   <br /><br />
   <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
 </p>
+
+</details>
