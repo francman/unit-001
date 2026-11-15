@@ -1,4 +1,6 @@
 // Defines bounded mission formation data without granting execution authority.
+
+import type { MissionExecutionView } from "./execution-view.ts";
 import type { MissionPolicy } from "./state.ts";
 
 // The managed Linux host approves only this application's shipped actions, independently of owner-provided text.
@@ -90,6 +92,19 @@ export type MissionAuthority = {
 	creator: MissionCreator;
 	ceiling: MissionCeiling;
 	approvals: MissionApproval[];
+	executionIntent?: MissionExecutionIntent;
+};
+
+export type MissionExecutionIntent = {
+	requestId: string;
+	sequence: number;
+	missionId: string;
+	agreementRevision: number;
+	agreementDigest: string;
+	authorityRevision: number;
+	expectedPolicyRevision: number;
+	action: "start" | "pause" | "resume" | "stop";
+	issuedAt: number;
 };
 
 export type MissionRequest =
@@ -97,6 +112,13 @@ export type MissionRequest =
 	| { operation: "draft"; expectedRevision: number; requestId: string; terms: MissionDraftTerms }
 	| { operation: "propose"; expectedRevision: number; requestId: string }
 	| { operation: "reconcile"; receiptId: string }
+	| { operation: "reconcile-execution"; requestId: string }
+	| {
+			operation: "control-local";
+			action: MissionExecutionIntent["action"];
+			expectedPolicyRevision: number;
+			requestId: string;
+	  }
 	| { operation: "configure-local"; creator: MissionCreator; ceiling: MissionCeiling }
 	| { operation: "approve-local"; expectedRevision: number; digest: string; requestId: string };
 
@@ -108,7 +130,9 @@ export type MissionView = {
 	authorityError: string | null;
 	agreementValid: boolean;
 	missing: string[];
-	execution: "not-implemented";
+	execution: "not-implemented" | "not-started" | MissionExecutionView["status"];
+	runtime?: MissionExecutionView | null;
+	policyRevision?: number;
 	tools: string[];
 };
 

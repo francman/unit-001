@@ -1,8 +1,8 @@
 # Durable mission contract
 
-The first-start slice forms a saved mission agreement with an authenticated creator. A person, elder agent, or organization can supply the goal, scope, evidence requirements, limits and approval boundary through the terminal or local headless commands. Approval records exact terms; it does not start autonomous execution. The controller remains [#15](https://github.com/francman/unit-001/issues/15).
+The first-start slice forms a saved mission agreement with an authenticated creator. A person, elder agent, or organization can supply the goal, scope, evidence requirements, limits and approval boundary through the terminal or local headless commands. Approval records exact terms; it does not start autonomous execution. The bounded controller is implemented under [#15](https://github.com/francman/unit-001/issues/15); [execution](execution.md) and [controls](controls.md) describe the current source behavior.
 
-This contract advances [#14](https://github.com/francman/unit-001/issues/14) and guides [#15](https://github.com/francman/unit-001/issues/15) and [#17](https://github.com/francman/unit-001/issues/17). Formation below is the current slice. Sections describing decisions, execution and verification specify later work.
+This contract advances [#14](https://github.com/francman/unit-001/issues/14) and guides [#15](https://github.com/francman/unit-001/issues/15) and [#17](https://github.com/francman/unit-001/issues/17). Formation, bounded execution and local lifecycle controls are implemented in source. Broader verifier types, new mission replacement, research planning and native supervised installation qualification remain separate work.
 
 See [formation verification and remaining native coverage](verification.md) for the local acceptance procedure and published rollback-reader check.
 
@@ -14,12 +14,12 @@ Managed command privileges follow the existing operator boundary:
 
 | Command | Authority and result |
 |---|---|
-| `bob mission status [--json]` | Authorized operator; shows the draft, exact proposal digest, receipt validity and execution availability. |
-| `bob mission setup` | Authorized operator; guided editor saves each submitted field. |
-| `bob mission draft --file terms.json --revision 0 --request-id draft-1` | Authorized operator; saves partial or complete terms. Later edits use the currently displayed revision. |
-| `bob mission propose --revision 1` | Authorized operator; validates complete terms against the provisioned ceiling and saves their digest. |
-| `sudo bob mission creator --file creator.json` | Administrator; binds a local human, elder or organization principal and finite maximum authority. Changing it invalidates previous approval. |
-| `sudo bob mission approve --revision 1 --digest SHA256 --request-id approval-1` | Administrator; issues a receipt for exactly those terms, then asks the existing owner to reconcile it. |
+| `agent mission status [--json]` | Authorized operator; shows the draft, exact proposal digest, receipt validity and execution availability. |
+| `agent mission setup` | Authorized operator; guided editor saves each submitted field. |
+| `agent mission draft --file terms.json --revision 0 --request-id draft-1` | Authorized operator; saves partial or complete terms. Later edits use the currently displayed revision. |
+| `agent mission propose --revision 1` | Authorized operator; validates complete terms against the provisioned ceiling and saves their digest. |
+| `sudo agent mission creator --file creator.json` | Administrator; binds a local human, elder or organization principal and finite maximum authority. Changing it invalidates previous approval. |
+| `sudo agent mission approve --revision 1 --digest SHA256 --request-id approval-1` | Administrator; issues a receipt for exactly those terms, then asks the existing owner to reconcile it. |
 
 `terms.json` contains `objective`, `scope`, ordered `successCriteria`, `approvalBoundary`, `reviewEveryMs`, and `policy`. Policy requires registered `allowedTools`, positive integer `maxCycles`, `maxRequests`, `maxConsecutiveNoProgress`, nonnegative integer `maxRetries`, and a future `deadlineAt` in epoch milliseconds. Optional `maxEstimatedCost` is an estimate, not a provider billing cap. Empty allowed actions and an empty additional approval boundary are explicit choices; missing required fields never invent allowances.
 
@@ -33,19 +33,19 @@ The root command executes only the selected, verified release's `deploy/mission.
 
 Each receipt binds installation, default session, creator UID and kind, authority revision, mission identity, draft revision and a canonical SHA-256 digest of every approved term. The root command validates finite ceilings and registered action IDs before publishing it atomically. A conversation message, model-claimed identity, memory record, owner document or approval-looking socket request cannot mint that receipt. Coding tools still retain the agent account's file authority; this is command authorization, not an OS sandbox or malicious-model containment claim.
 
-Publishing a receipt precedes the owner's agreement commit. If interrupted, startup reconciles the exact still-current protected receipt, or the administrator retries the same request ID. Changed terms, a stale revision, changed authority or expiry block approval. A pending operator amendment does not change the current agreement; issuing its new protected receipt closes the prior authority immediately. Retained receipt history cannot restore older authority. Proposed terms may need a new deadline after expiry.
+Publishing a receipt precedes the owner's agreement commit. If interrupted, startup reconciles the exact still-current protected receipt, or the administrator retries the same request ID. Changed terms, a stale revision, changed authority or expiry block approval. A pending operator amendment does not change the current agreement. Approval/reconciliation refuses to replace terms while the current execution is nonterminal; stop it first. Creator replacement immediately closes continuation authority while retaining the ability to stop the existing execution. Retained receipt history cannot restore older authority. Proposed terms may need a new deadline after expiry.
 
 ### Stored format and execution boundary
 
 `unit.mission` version 2 preserves the existing version-1 `current` record, IDs, policy, counters, tasks and paused/stopped intent. It adds formation revisions, a partial draft, an agreement and a latest-operation replay receipt in the same session document. A version-1 current record seeds an incomplete draft for review; it never becomes automatically agreed. New formation allocates no controller, holder, execution conversation or scheduled task.
 
-An agreement always reports `execution: not-implemented`. The existing nonexecuting version-1 holder remains registered solely so prior persisted tasks can reopen safely; maintenance recognizes only that exact owned holder. Controller admission, tool enforcement, completion proof, pause/resume and autonomous wakeup remain later slices. Reader compatibility must be verified against the exact published rollback artifact; a generic version-1 document reader is not promised to understand version 2.
+The stored formation agreement retains its historical `execution: not-implemented` marker; it is not the runtime projection. Owner status reports `not-started` until explicit activation, then the persisted execution lifecycle and counters. The separate versioned `unit.mission.execution` ledger implements bounded admission, host file-digest proof and pause/resume/stop. The nonexecuting version-one holder remains registered solely to reopen prior persisted tasks safely. Reader compatibility must be verified against the exact published rollback artifact; a generic version-1 document reader is not promised to understand version 2.
 
 The agent receives an objective, evidence required for success, and operating boundaries. It chooses an action, executes it, verifies the result, and chooses again without requiring another user prompt. Waiting must consume no model requests. A process restart must preserve the objective, limits, pending work, and reasons for waiting or stopping.
 
 ## Existing implementation and boundaries
 
-The working tree already contains a headless service with an owner-only local socket, per-session SQLite ownership, and managed Ubuntu 24.04 x86-64 deployment under systemd. Named installations have stable identities. These provide hosting and submitted work, not autonomous missions. See [deployment](../deployment.md) and [operations](../operations.md).
+The working tree already contains a headless service with an owner-only local socket, per-session SQLite ownership, and managed Ubuntu 24.04 x86-64 deployment under systemd. Named installations have stable identities. The mission controller uses this existing hosting rather than adding another scheduler or service. See [deployment](../deployment.md) and [operations](../operations.md).
 
 Keep those identities separate:
 
@@ -55,11 +55,11 @@ Keep those identities separate:
 
 A mission pause must not stop another mission or the service. A service stop/kill preserves unfinished mission state and prevents the process from restarting until the operator starts it. Restarting the service must not activate a paused or stopped mission. Memory from #3–#9 is supporting evidence; it cannot grant authority or replace the mission record.
 
-## Proposed first-slice decisions
+## Execution decisions
 
-The identity, Session scope, and explicit finite-policy requirements are reviewed for the nonexecuting foundation. These broader decisions require review before #15 enables autonomous execution:
+The identity, Session scope, and explicit finite-policy requirements are reviewed for the nonexecuting foundation. The current executable slice follows these decisions:
 
-| Decision | Proposed contract |
+| Decision | Contract |
 |---|---|
 | Scope | One current mission per Durable Session initially. Different named sessions remain isolated; multiple concurrent missions in one Session are later work. |
 | Ownership | A session-scoped mission document holds current state. A dedicated control conversation owns one background controller task; its execution conversation is task-owned. Ordinary interactive input stays separate. |
@@ -71,7 +71,7 @@ The identity, Session scope, and explicit finite-policy requirements are reviewe
 | Scheduling | Immediate next cycles while progress is possible; persisted deadlines for bounded retry/reassessment; no requests while waiting for input or paused. |
 | Hosting | Reuse the existing managed Ubuntu/systemd deployment. Source execution stays supported without adding other service installers in this slice. |
 
-Choosing concrete numeric limits is part of mission activation, not an implicit repository-wide authorization. Implementations must reject missing or non-finite required limits rather than invent them. The foundation uses a waiting state with reason `execution_support`, which deadline expiry may change to blocked. It offers no lifecycle controls or mission replacement. The broader state transitions and runtime admission policy still require review before executable #15 work.
+Choosing concrete numeric limits is part of mission activation, not an implicit repository-wide authorization. Implementations must reject missing or non-finite required limits rather than invent them. The foundation uses a waiting state with reason `execution_support`, which deadline expiry may change to blocked. It offers no lifecycle controls or mission replacement. The executable ledger and admission policy are specified in [execution](execution.md) and [controls](controls.md).
 
 ## Stored state and revisions
 
@@ -125,7 +125,7 @@ An action already dispatched when pause/stop is committed may still have effects
 
 ## Pause, stop, and maintenance
 
-Operator controls reach the existing owner-only socket. A second CLI must not become another SQLite writer. Controls carry mission identity and expected revision so a delayed command cannot affect a replacement mission silently. Mission command names and wire schemas are to be defined with #17; existing service lifecycle commands retain their meaning.
+Operator controls reach the existing owner-only socket. A second CLI must not become another SQLite writer. Controls carry mission identity and expected revision so a delayed command cannot affect a replacement mission silently. The #17 mission commands use protected administrator intent; ordinary operator sockets cannot reconcile lifecycle changes. Existing service lifecycle commands retain their meaning.
 
 Pause first commits lifecycle intent and advances the policy revision, closing admissions. Then signal the controller/execution scope. Stop additionally marks the mission terminal and reaches all mission-owned work, including background tasks and owned conversations. Unrelated service work must not be cancelled. Resumption creates at most one new controller after the previous scope drains; stale tasks recheck the policy revision before committing new work.
 

@@ -28,11 +28,18 @@ const { values, positionals } = parseArgs({
 		revision: { type: "string" },
 		digest: { type: "string" },
 		"request-id": { type: "string" },
+		"policy-revision": { type: "string" },
 		json: { type: "boolean" },
 	},
 });
-if (!values.id || positionals.length !== 1 || !["creator", "approve"].includes(positionals[0]))
-	throw new Error("Usage: NAME mission creator --file FILE | approve --revision N --digest SHA256 [--request-id ID]");
+if (
+	!values.id ||
+	positionals.length !== 1 ||
+	!["creator", "approve", "start", "pause", "resume", "stop"].includes(positionals[0])
+)
+	throw new Error(
+		"Usage: NAME mission creator --file FILE | approve --revision N --digest SHA256 | start|pause|resume|stop [--policy-revision N] [--request-id ID]",
+	);
 const record = readInstallation(values.id);
 const location = { kind: "managed", installationId: record.id, session: "default" };
 const actorUid = process.env.SUDO_UID === undefined ? 0 : Number(process.env.SUDO_UID);
@@ -52,6 +59,73 @@ await withManagementLock(async () => {
 		throw new Error("Recover the incomplete update before changing mission authority.");
 	const view = await owner({ operation: "status" });
 	const previous = await readMissionAuthority(location);
+	if (["start", "pause", "resume", "stop"].includes(positionals[0])) {
+		if (values.file || values.revision || values.digest || previous === null || !view.formation.agreement)
+			throw new Error(
+				"Approve the mission before changing execution; lifecycle commands do not accept formation fields.",
+			);
+		if (values["request-id"] !== undefined && values["policy-revision"] === undefined)
+			throw new Error("An explicit lifecycle request ID requires --policy-revision N for safe retries.");
+		const requestId = values["request-id"] ?? randomUUID();
+		if (!requestId.trim() || Buffer.byteLength(requestId) > 200)
+			throw new Error("Mission lifecycle request ID must fit 200 bytes.");
+		const retry = previous.executionIntent?.requestId === requestId ? previous.executionIntent : undefined;
+		const expectedPolicyRevision =
+			values["policy-revision"] === undefined
+				? (retry?.expectedPolicyRevision ?? view.policyRevision ?? view.runtime?.policyRevision ?? 0)
+				: Number(values["policy-revision"]);
+		if (!Number.isSafeInteger(expectedPolicyRevision) || expectedPolicyRevision < 0)
+			throw new Error("Mission policy revision must be a nonnegative integer.");
+		if (retry) {
+			if (retry.action !== positionals[0] || retry.expectedPolicyRevision !== expectedPolicyRevision)
+				throw new Error("Conflicting mission lifecycle request ID.");
+		} else {
+			if ((view.policyRevision ?? view.runtime?.policyRevision ?? 0) !== expectedPolicyRevision)
+				throw new Error("Stale mission policy revision.");
+			if (positionals[0] === "start" ? view.runtime != null : view.runtime == null && positionals[0] !== "stop")
+				throw new Error(
+					positionals[0] === "start" ? "A mission execution already exists." : "No mission execution exists.",
+				);
+			if (positionals[0] === "pause" && (view.execution === "stopped" || view.execution === "completed"))
+				throw new Error("A terminal mission cannot be paused or restarted.");
+			if (positionals[0] === "resume" && view.execution !== "paused")
+				throw new Error("Only a paused mission can resume.");
+			const agreement =
+				(positionals[0] === "pause" || positionals[0] === "stop") && view.runtime
+					? {
+							missionId: view.runtime.missionId,
+							revision: view.runtime.agreementRevision,
+							digest: view.runtime.agreementDigest,
+						}
+					: view.formation.agreement;
+			await writeMissionAuthority(location, {
+				...previous,
+				executionIntent: {
+					requestId,
+					sequence: Math.max(previous.executionIntent?.sequence ?? 0, view.runtime?.intentSequence ?? 0) + 1,
+					missionId: agreement.missionId,
+					agreementRevision: agreement.revision,
+					agreementDigest: agreement.digest,
+					authorityRevision: previous.revision,
+					expectedPolicyRevision,
+					action: positionals[0],
+					issuedAt: Date.now(),
+				},
+			});
+		}
+		try {
+			const result = await owner({ operation: "reconcile-execution", requestId });
+			process.stdout.write(`${JSON.stringify({ status: result.execution, runtime: result.runtime ?? null })}\n`);
+		} catch (error) {
+			process.stderr.write(
+				`Mission intent saved; reconciliation is pending. Retry with --request-id ${requestId} --policy-revision ${expectedPolicyRevision}. ${error.message}\n`,
+			);
+			process.exitCode = 1;
+		}
+		return;
+	}
+	if (values["policy-revision"] !== undefined)
+		throw new Error("Policy revision belongs to mission lifecycle commands.");
 	if (positionals[0] === "creator") {
 		if (!values.file || values.revision || values.digest || values["request-id"])
 			throw new Error("Creator configuration requires one --file.");
@@ -106,6 +180,7 @@ await withManagementLock(async () => {
 			creator,
 			ceiling,
 			approvals: [],
+			...(previous?.executionIntent ? { executionIntent: previous.executionIntent } : {}),
 		};
 		await writeMissionAuthority(location, authority);
 		process.stdout.write(
@@ -130,10 +205,12 @@ await withManagementLock(async () => {
 	if (retry) {
 		if (retry.revision !== revision || retry.digest !== values.digest)
 			throw new Error("Conflicting approval request ID.");
-		await owner({ operation: "reconcile", receiptId: retry.receiptId });
-		process.stdout.write(`${JSON.stringify({ status: "agreed", receipt: retry, execution: "not-implemented" })}\n`);
+		const result = await owner({ operation: "reconcile", receiptId: retry.receiptId });
+		process.stdout.write(`${JSON.stringify({ status: "agreed", receipt: retry, execution: result.execution })}\n`);
 		return;
 	}
+	if (view.runtime && view.execution !== "stopped" && view.execution !== "completed")
+		throw new Error("Stop the existing mission execution before approving an amendment.");
 	if (!draft || draft.status !== "proposed" || draft.revision !== revision || draft.digest !== values.digest)
 		throw new Error("Stale mission proposal; inspect its current revision and digest.");
 	const terms = validateMissionTerms(draft.terms, previous, MANAGED_MISSION_ACTIONS, Date.now());
@@ -156,8 +233,8 @@ await withManagementLock(async () => {
 	const active = previous.approvals.find((item) => item.receiptId === view.formation.agreement?.approval.receiptId);
 	await writeMissionAuthority(location, { ...previous, approvals: active ? [active, receipt] : [receipt] });
 	try {
-		await owner({ operation: "reconcile", receiptId: receipt.receiptId });
-		process.stdout.write(`${JSON.stringify({ status: "agreed", receipt, execution: "not-implemented" })}\n`);
+		const result = await owner({ operation: "reconcile", receiptId: receipt.receiptId });
+		process.stdout.write(`${JSON.stringify({ status: "agreed", receipt, execution: result.execution })}\n`);
 	} catch (error) {
 		process.stderr.write(
 			`Approval receipt ${receipt.receiptId} saved; owner reconciliation is pending. Retry with --request-id ${requestId}. ${error.message}\n`,

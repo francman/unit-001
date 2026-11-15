@@ -49,10 +49,31 @@ export class MissionAdmission {
 	}
 
 	/** Checks the current protected receipt before each mission admission, including restored work. */
-	async authorized(execution: Pick<MissionExecution, "agreement">): Promise<boolean> {
+	async authorized(
+		execution: Pick<MissionExecution, "agreement"> & Partial<Pick<MissionExecution, "intent">>,
+	): Promise<boolean> {
 		try {
 			const authority = await readMissionAuthority(this.#location);
 			const agreement = execution.agreement;
+			const intent = authority?.executionIntent;
+			if (
+				this.#location.kind === "managed" &&
+				(!intent ||
+					!execution.intent ||
+					intent.requestId !== execution.intent.requestId ||
+					intent.sequence !== execution.intent.sequence)
+			)
+				return false;
+			if (
+				intent &&
+				(intent.action === "pause" ||
+					intent.action === "stop" ||
+					intent.missionId !== agreement.missionId ||
+					intent.agreementDigest !== agreement.digest ||
+					intent.agreementRevision !== agreement.revision ||
+					intent.authorityRevision !== authority?.revision)
+			)
+				return false;
 			return (
 				authority !== null &&
 				agreement.terms.policy.deadlineAt > this.#now() &&

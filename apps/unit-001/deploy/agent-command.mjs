@@ -40,7 +40,11 @@ export async function dispatchAgent(id, expectedName, args, context) {
 			context.administratorOrigin ?? {},
 		);
 	}
-	if (!service && action === "mission" && ["creator", "approve"].includes(args[1])) {
+	if (
+		!service &&
+		action === "mission" &&
+		["creator", "approve", "start", "pause", "resume", "stop"].includes(args[1])
+	) {
 		if (context.uid !== 0)
 			throw new Error(
 				`Run sudo ${record.name} mission ${args[1]}; mission authority requires the host administrator.`,

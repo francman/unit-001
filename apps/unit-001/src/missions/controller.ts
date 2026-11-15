@@ -11,12 +11,13 @@ import {
 	type Registry,
 	type TaskId,
 	ToolTask,
+	type Tx,
 } from "@earendil-works/pi-durable";
 import { MemoryInputEntry, recordMemoryInput } from "unit-memory";
 import { MaintenanceDoc } from "../maintenance.ts";
 import type { ModelChoice } from "../provider.ts";
 import { MISSION_PROVIDER_PREFIX, type MissionAdmission } from "./admission.ts";
-import { MANAGED_MISSION_ACTIONS } from "./contract.ts";
+import { MANAGED_MISSION_ACTIONS, type MissionExecutionIntent } from "./contract.ts";
 import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts";
 import { MissionDoc } from "./state.ts";
 import { supportedMissionCriteria, verifyMissionFiles } from "./verification.ts";
@@ -196,6 +197,7 @@ export async function startMissionExecution(
 	registry: Registry,
 	model: ModelChoice,
 	context: Context,
+	intent?: MissionExecutionIntent,
 ): Promise<TaskId<null>> {
 	const state = await harness.snapshot(MissionDoc, context);
 	const agreement = state?.formation.agreement;
@@ -207,7 +209,7 @@ export async function startMissionExecution(
 			"Executable missions support only the reviewed built-in action catalog; custom or spawning tools require separate admission support.",
 		);
 	if (state.current !== null) throw new Error("A legacy mission must be resolved before starting executable work.");
-	const stub = { agreement };
+	const stub = { agreement, intent: intent ? { requestId: intent.requestId, sequence: intent.sequence } : null };
 	if (!(await admission.authorized(stub))) throw new Error("Mission authority is invalid or expired.");
 	const tools = registry
 		.snapshot()
@@ -226,27 +228,22 @@ export async function startMissionExecution(
 			throw new Error("Mission agreement changed.");
 		const document = await tx.doc(MissionExecutionDoc);
 		if (document.current !== null) throw new Error("A mission execution already exists.");
-		const control = await tx.createConversation({ ownership: { kind: "ownerless" } });
-		const controller = await tx.createTask(
-			engine.controller,
-			{ missionId: agreement.missionId, revision: 1 },
-			{ conversationId: control.id, ownership: { kind: "conversation" }, background: true },
+		const policyRevision = (intent?.expectedPolicyRevision ?? 0) + 1;
+		const scope = await createExecutionScope(
+			tx,
+			engine,
+			admission,
+			model,
+			agreement.missionId,
+			policyRevision,
+			tools.map((item) => item.tool.name),
 		);
-		const conversation = await tx.createConversation({ ownership: { kind: "task", taskId: controller } });
-		admission.trackConversation(conversation.id);
-		const agent = await tx.doc(AgentDoc, conversation.id);
-		agent.model = model;
-		agent.tools = tools.map((item) => item.tool.name);
-		agent.maxTurns = 1;
-		const providerSession = `${MISSION_PROVIDER_PREFIX}${randomUUID()}`;
-		(await tx.doc(ProviderDoc, conversation.id)).sessionId = providerSession;
 		document.current = {
 			agreement,
-			controller,
-			conversation: conversation.id,
-			providerSession,
+			...scope,
 			revision: 1,
-			policyRevision: 1,
+			policyRevision,
+			intent: intent ? { requestId: intent.requestId, sequence: intent.sequence } : null,
 			cycles: 0,
 			requests: 0,
 			retries: 0,
@@ -261,8 +258,72 @@ export async function startMissionExecution(
 			submission: null,
 			state: { status: "ready" },
 		};
-		return controller;
+		return scope.controller;
 	}, context);
+}
+
+/** Replaces a fully drained paused scope without resetting the mission's work or spend counters. */
+export async function resumeMissionExecution(
+	harness: Harness,
+	engine: ReturnType<typeof missionController>,
+	admission: MissionAdmission,
+	model: ModelChoice,
+	intent: MissionExecutionIntent,
+	context: Context,
+): Promise<void> {
+	await harness.commit(async (tx) => {
+		const current = (await tx.doc(MissionExecutionDoc)).current;
+		if (!current || current.policyRevision !== intent.expectedPolicyRevision || current.state.status !== "paused")
+			throw new Error("Only the exact paused mission can resume.");
+		if (current.unknownRequests !== 0 || current.pendingTools.length !== 0)
+			throw new Error("Uncertain mission effects need reconciliation before resume.");
+		if ((await tx.task(current.controller))?.state.status !== "terminal")
+			throw new Error("The previous mission controller has not drained.");
+		if ((await tx.doc(MaintenanceDoc)).current.state === "held")
+			throw new Error("Maintenance holds mission resumption.");
+		current.policyRevision++;
+		Object.assign(
+			current,
+			await createExecutionScope(
+				tx,
+				engine,
+				admission,
+				model,
+				current.agreement.missionId,
+				current.policyRevision,
+				current.agreement.terms.policy.allowedTools,
+			),
+		);
+		current.intent = { requestId: intent.requestId, sequence: intent.sequence };
+		current.state = { status: "ready" };
+		current.revision++;
+	}, context);
+}
+
+async function createExecutionScope(
+	tx: Tx,
+	engine: ReturnType<typeof missionController>,
+	admission: MissionAdmission,
+	model: ModelChoice,
+	missionId: string,
+	revision: number,
+	tools: string[],
+) {
+	const control = await tx.createConversation({ ownership: { kind: "ownerless" } });
+	const controller = await tx.createTask(
+		engine.controller,
+		{ missionId, revision },
+		{ conversationId: control.id, ownership: { kind: "conversation" }, background: true },
+	);
+	const conversation = await tx.createConversation({ ownership: { kind: "task", taskId: controller } });
+	admission.trackConversation(conversation.id);
+	const agent = await tx.doc(AgentDoc, conversation.id);
+	agent.model = model;
+	agent.tools = tools;
+	agent.maxTurns = 1;
+	const providerSession = `${MISSION_PROVIDER_PREFIX}${randomUUID()}`;
+	(await tx.doc(ProviderDoc, conversation.id)).sessionId = providerSession;
+	return { controller, conversation: conversation.id, providerSession };
 }
 
 function active(execution: MissionExecution): boolean {

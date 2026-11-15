@@ -2,7 +2,7 @@
 
 The execution engine can take several bounded steps from one agreed assignment. Each step uses a durable synthetic input, executes only approved tool names, and checks actual files before continuing. An assistant saying “done” cannot complete a mission.
 
-This source slice registers the engine but does not automatically start existing agreements. Managed activation, operator controls and real supervised-process acceptance remain #16 and #17. The normal conversation and existing nonexecuting mission holder keep their behavior.
+The engine does not automatically start existing agreements. [Draft lifecycle controls](controls.md) add protected activation and inspection; their remaining release gates and real supervised-process acceptance remain #16 and #17. The normal conversation and existing nonexecuting mission holder keep their behavior.
 
 The first verifier accepts an exact criterion such as `sha256:EXPECTED_HEX_DIGEST:reports/result.txt`. The creator approves that literal requirement with the mission terms. Unsupported prose criteria or additional approval rules block before spending model tokens. This deliberately supports verifiable artifact work first; it does not interpret arbitrary goals as proof.
 

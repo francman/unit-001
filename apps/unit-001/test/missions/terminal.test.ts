@@ -30,7 +30,7 @@ describe.skipIf(process.platform === "win32")("mission formation in an actual te
 		await app.waitFor("Form your mission");
 		const menu = await app.waitFor("Ctrl+C cancel");
 		expect(menu).toContain("Search mission fields");
-		expect(menu).toContain("Execution: not implemented");
+		expect(menu).toContain("Execution: not-started");
 		await app.text("Goal");
 		await app.key("Enter");
 		await app.waitFor("Enter continue");

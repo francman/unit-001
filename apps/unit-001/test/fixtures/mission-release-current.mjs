@@ -74,7 +74,7 @@ try {
 			context,
 		);
 		assert.equal(agreed.agreementValid, true);
-		assert.equal(agreed.execution, "not-implemented");
+		assert.equal(agreed.execution, "not-started");
 		await writeFile(`${file}.expected`, JSON.stringify(agreed.formation));
 		await agent.memory(
 			{
@@ -89,7 +89,7 @@ try {
 		const restored = await agent.mission({ operation: "status" }, context);
 		assert.deepEqual(restored.formation, expected);
 		assert.equal(restored.agreementValid, true);
-		assert.equal(restored.execution, "not-implemented");
+		assert.equal(restored.execution, "not-started");
 		const recall = await agent.memory({ operation: "recall", query: "rollback fixture" }, context);
 		assert.equal(recall.operation, "recall");
 		assert.ok(recall.records.some((record) => record.content === "Rollback fixture retains its original evidence"));
