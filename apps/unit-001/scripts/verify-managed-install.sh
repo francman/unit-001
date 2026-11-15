@@ -117,7 +117,7 @@ elif [[ ${UNIT_001_DISPOSABLE_CONTAINER:-} != 1 ]]; then
 fi
 
 # #19: default/custom commands must own independent accounts, state and services.
-bash "$release/install.sh"
+(umask 077; bash "$release/install.sh")
 first=$("$node" "$work/check.mjs" find agent)
 owned+=("$first")
 # #23: unrelated accounts cannot occupy the management lock's protected parent.

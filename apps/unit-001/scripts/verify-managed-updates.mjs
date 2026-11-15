@@ -233,6 +233,14 @@ console.log("Installed published ${baseline} updater verified and activated the 
 			);
 		assert.equal(packagedStatus().installedVersion, version);
 		assert.equal(packagedStatus().runningVersion, version);
+		const applicationNode = join(installationPaths(id).current, "runtime/bin/node");
+		chmodSync(applicationNode, 0o000);
+		try {
+			// The running owner remains observable through the independent core's own runtime and private client.
+			assert.equal(packagedStatus().runningVersion, version);
+		} finally {
+			chmodSync(applicationNode, 0o755);
+		}
 		// #18: state produced after commit must survive code rollback; restoring the pre-update backup would lose it.
 		const marker = `/var/lib/unit-001/agents/${id}/workspace/post-update-evidence`;
 		execFileSync("runuser", ["-u", record.account, "--", "tee", marker], {

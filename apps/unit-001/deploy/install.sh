@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Verifies and installs one complete Linux release; staging never changes host users or services.
 set -euo pipefail
+# Software and traversable parents are public; private state, credentials and scratch paths set explicit modes.
+umask 022
 
 usage() {
   cat <<'EOF'
@@ -74,7 +76,7 @@ verify_tree() {
   (cd -- "$directory" && sha256sum --check --strict --quiet SHA256SUMS) || fail 'Release checksum verification failed.'
 }
 verify_tree "$release"
-for required in VERSION runtime/bin/node app/dist/bin.js app/dist/named.js app/package.json bin/agent deploy/unit-001.service deploy/activate.sh deploy/check-ready.mjs deploy/installation.mjs deploy/agent-command.mjs deploy/lifecycle.mjs; do
+for required in VERSION runtime/bin/node app/dist/bin.js app/dist/named.js app/package.json bin/agent deploy/unit-001.service deploy/activate.sh deploy/check-ready.mjs deploy/control.mjs deploy/installation.mjs deploy/agent-command.mjs deploy/lifecycle.mjs; do
   [[ -f "$release/$required" ]] || fail "Missing release file: $required"
 done
 version=$(cat -- "$release/VERSION")
