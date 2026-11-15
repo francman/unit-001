@@ -9,6 +9,7 @@ export const MANAGED_MISSION_ACTIONS = [
 	"bash",
 	"unit_status",
 	"unit_inspect_os",
+	"unit_inspect",
 	"remember",
 	"recall",
 	"forget",
@@ -158,8 +159,7 @@ export function parseMissionDraftTerms(value: unknown): MissionDraftTerms {
 	if (input.objective !== undefined) result.objective = missionText(input.objective, 4096);
 	if (input.scope !== undefined) result.scope = missionText(input.scope, 4096);
 	if (input.successCriteria !== undefined) result.successCriteria = missionTextList(input.successCriteria, 32, 2000);
-	if (input.approvalBoundary !== undefined)
-		result.approvalBoundary = missionTextList(input.approvalBoundary, 32, 2000);
+	if (input.approvalBoundary !== undefined) result.approvalBoundary = missionTextList(input.approvalBoundary, 32, 2000);
 	if (input.reviewEveryMs !== undefined) result.reviewEveryMs = missionNumber(input.reviewEveryMs);
 	if (input.policy !== undefined) {
 		const policy = missionObject(input.policy);
@@ -174,8 +174,7 @@ export function parseMissionDraftTerms(value: unknown): MissionDraftTerms {
 		if (Object.keys(policy).some((key) => key !== "allowedTools" && !numeric.some((field) => field === key)))
 			throw new Error("Unknown mission limit.");
 		result.policy = {};
-		if (policy.allowedTools !== undefined)
-			result.policy.allowedTools = missionTextList(policy.allowedTools, 128, 100);
+		if (policy.allowedTools !== undefined) result.policy.allowedTools = missionTextList(policy.allowedTools, 128, 100);
 		for (const key of numeric) if (policy[key] !== undefined) result.policy[key] = missionNumber(policy[key]);
 	}
 	return result;

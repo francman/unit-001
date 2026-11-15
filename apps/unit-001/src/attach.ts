@@ -5,6 +5,7 @@ import { ATTACH_HELP as HELP } from "./attach-help.ts";
 import { commandCatalog } from "./commands/catalog.ts";
 import { isOperatingSystemQuestion } from "./commands/facts.ts";
 import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
+import { describeInspection, inspectionText } from "./introspection/command.ts";
 import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
 import { sanitizeTerminalText } from "./render.ts";
@@ -65,8 +66,7 @@ export async function runServiceAttach(
 		const safe = sanitizeTerminalText(text);
 		if (reader?.line !== undefined && reader.line !== "" && !local.signal.aborted) {
 			const combined = pendingNotice + safe;
-			pendingNotice =
-				combined.length > 8192 ? `[Earlier client notices omitted.]\n${combined.slice(-8000)}` : combined;
+			pendingNotice = combined.length > 8192 ? `[Earlier client notices omitted.]\n${combined.slice(-8000)}` : combined;
 			return;
 		}
 		paint(() => {
@@ -204,6 +204,22 @@ export async function runServiceAttach(
 					if (!local.signal.aborted) err(`Mission: ${describeError(error)}\n`);
 				},
 			);
+		} else if ((text === "/inspect" || text.startsWith("/inspect ")) && !isOperatingSystemQuestion(text)) {
+			try {
+				void client.request({ type: "inspection", query: inspectionText(text) }, local.signal).then(
+					(response) => {
+						if (!local.signal.aborted)
+							err(
+								`${response.type === "inspection" ? describeInspection(response.report) : response.type === "error" ? response.message : "Unexpected inspection response."}\n`,
+							);
+					},
+					(error: unknown) => {
+						if (!local.signal.aborted) err(`Inspection: ${describeError(error)}\n`);
+					},
+				);
+			} catch (error) {
+				err(`Inspection: ${describeError(error)}\n`);
+			}
 		} else if (text === "/memory" || text.startsWith("/memory ")) {
 			try {
 				const match = /^\/memory(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/.exec(text);
@@ -223,9 +239,7 @@ export async function runServiceAttach(
 				return;
 			}
 			if (sending) {
-				err(
-					"A submission is pending. Wait, /cancel, or /detach; additional prompts are not queued by this client.\n",
-				);
+				err("A submission is pending. Wait, /cancel, or /detach; additional prompts are not queued by this client.\n");
 				return;
 			}
 			if (Buffer.byteLength(text) > MAX_INPUT_BYTES) {

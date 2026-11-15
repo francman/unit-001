@@ -4,6 +4,7 @@ import type { Agent, Reply } from "./agent.ts";
 import { commandCatalog } from "./commands/catalog.ts";
 import { isOperatingSystemQuestion } from "./commands/facts.ts";
 import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
+import { describeInspection, inspectionText } from "./introspection/command.ts";
 import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
 import { DeltaPrinter, liveText, sanitizeTerminalText, ToolAnnouncer } from "./render.ts";
@@ -184,6 +185,14 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 						);
 				} catch (error) {
 					terminal.err(`Mission: ${error instanceof Error ? error.message : String(error)}\n`);
+				}
+			} else if ((text === "/inspect" || text.startsWith("/inspect ")) && !isOperatingSystemQuestion(text)) {
+				try {
+					terminal.err(
+						`${sanitizeTerminalText(describeInspection(await agent.inspect(inspectionText(text), BACKGROUND_CONTEXT)))}\n`,
+					);
+				} catch (error) {
+					terminal.err(`Inspection: ${error instanceof Error ? error.message : String(error)}\n`);
 				}
 			} else if (text === "/memory" || text.startsWith("/memory ")) {
 				try {

@@ -14,6 +14,7 @@ import { isOperatingSystemQuestion } from "./commands/facts.ts";
 import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
 import { FileCredentialStore } from "./credentials.ts";
 import { ConfigurationError, UsageError } from "./errors.ts";
+import { describeInspection } from "./introspection/command.ts";
 import { acquireSessionLock } from "./lock.ts";
 import { describeStatus, runLogin, runLogout, subscriptionFor } from "./login.ts";
 import { describeMemory, type MemoryRequest } from "./memory-control.ts";
@@ -197,8 +198,7 @@ async function run(
 	const options = command.options;
 	const directory = resolveDirectory(options.dataDir, runtime);
 	const file = sessionFile(directory, options.session, runtime.platform);
-	const endpoint =
-		command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
+	const endpoint = command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
 	let prompt = command.kind === "run" ? command.options.print : undefined;
 	if (prompt === "-") prompt = (await readAll(runtime.stdin)).trim();
 	if (prompt === "") throw new UsageError("The prompt is empty.");
@@ -291,7 +291,8 @@ async function control(
 				| "maintenance-release"
 				| "memory"
 				| "channels"
-				| "mission";
+				| "mission"
+				| "inspection";
 		}
 	>,
 	runtime: Runtime,
@@ -304,11 +305,16 @@ async function control(
 	const endpoint =
 		runtime.managed?.access === "operator"
 			? operatorEndpoint(runtime.managed.id, command.options.session)
-			: serviceEndpoint(
-					resolveDirectory(command.options.dataDir, runtime),
-					command.options.session,
-					runtime.platform,
-				);
+			: serviceEndpoint(resolveDirectory(command.options.dataDir, runtime), command.options.session, runtime.platform);
+	if (command.kind === "inspection") {
+		const response = await requestService(endpoint, { type: "inspection", query: command.query }, signal);
+		if (response.type === "error") throw new ConfigurationError(response.message);
+		if (response.type !== "inspection") throw new Error("Unexpected inspection response.");
+		runtime.stdout.write(
+			`${command.json ? JSON.stringify(response.report) : sanitizeTerminalText(describeInspection(response.report))}\n`,
+		);
+		return 0;
+	}
 	if (command.kind === "channels") {
 		const response = await requestService(endpoint, { type: "channels", request: { operation: "status" } }, signal);
 		if (response.type === "error") throw new ConfigurationError(response.message);
@@ -409,8 +415,7 @@ async function control(
 		let request: MemoryRequest;
 		if (command.request.operation === "confirm-forget") {
 			if (!command.yes) {
-				if (!runtime.interactive)
-					throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
+				if (!runtime.interactive) throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
 				const readline = createInterface({ input: runtime.stdin, output: runtime.stdout });
 				try {
 					const answer = await readline.question(
@@ -522,8 +527,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		}
 		if (runtime.managed?.access === "operator") {
 			if (command.kind === "status") {
-				if (command.dataDir !== undefined)
-					throw new UsageError("Operator clients cannot change their data directory.");
+				if (command.dataDir !== undefined) throw new UsageError("Operator clients cannot change their data directory.");
 				return control({ kind: "service-status", options: { session: "default" } }, runtime, signal);
 			}
 			if (
@@ -534,13 +538,11 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				command.kind !== "memory" &&
 				command.kind !== "channels" &&
 				command.kind !== "mission" &&
+				command.kind !== "inspection" &&
 				!(command.kind === "run" && argv.length === 0 && runtime.interactive)
 			)
 				throw new ConfigurationError("This operation requires the administrator command.");
-			if (
-				command.kind === "mission" &&
-				(command.command.action === "creator" || command.command.action === "approve")
-			)
+			if (command.kind === "mission" && (command.command.action === "creator" || command.command.action === "approve"))
 				throw new ConfigurationError("Mission creator and approval changes require the administrator command.");
 			if (command.kind !== "run" && command.options.dataDir !== undefined)
 				throw new UsageError("Operator clients cannot change their data directory.");
@@ -567,7 +569,8 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 			command.kind === "maintenance-release" ||
 			command.kind === "memory" ||
 			command.kind === "channels" ||
-			command.kind === "mission"
+			command.kind === "mission" ||
+			command.kind === "inspection"
 		)
 			code = await control(command, runtime, signal);
 		else code = await account(command, runtime, signal);
@@ -595,9 +598,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 						signal,
 					);
 					if (response.type === "command-suggestions")
-						suggestions = commandCatalog("cli").filter((command) =>
-							response.result.commandIds.includes(command.id),
-						);
+						suggestions = commandCatalog("cli").filter((command) => response.result.commandIds.includes(command.id));
 				} catch {
 					/* Ordinary usage remains available when no owner can interpret the command. */
 				}

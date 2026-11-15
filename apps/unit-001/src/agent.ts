@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { setTimeout } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import type { Context } from "@earendil-works/chord/context";
 import { Type } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
@@ -41,8 +42,11 @@ import { HostFactEntry, isOperatingSystemQuestion } from "./commands/facts.ts";
 import { type CommandInterpretation, type InterpretationUsage, interpretCommand } from "./commands/interpretation.ts";
 import { resolveLocalCommand } from "./commands/resolution.ts";
 import { ConfigurationError } from "./errors.ts";
+import type { InspectionQuery, InspectionReport } from "./introspection/contract.ts";
 import { introspectionExtension } from "./introspection/extension.ts";
 import { operatingSystemFacts, renderOperatingSystemFacts } from "./introspection/os.ts";
+import { type InspectionReader, ownerInspectionExtension } from "./introspection/owner-extension.ts";
+import { inspectAgent } from "./introspection/report.ts";
 import { MaintenanceDoc, type MaintenanceResult, type MaintenanceState, validateOperationId } from "./maintenance.ts";
 import { type MemoryRequest, type MemoryResult, parseMemoryRequest } from "./memory-control.ts";
 import { MissionAdmission } from "./missions/admission.ts";
@@ -99,6 +103,7 @@ export class Agent {
 	readonly #configuration: "configured" | "unconfigured";
 	readonly #models: Models;
 	readonly #model: ModelChoice | null;
+	readonly #inspect: InspectionReader;
 	readonly #interpretations = new Map<AbortController, Promise<void>>();
 	#inhibited: boolean;
 	#closing = false;
@@ -118,6 +123,7 @@ export class Agent {
 		configuration: "configured" | "unconfigured",
 		models: Models,
 		model: ModelChoice | null,
+		inspect: InspectionReader,
 	) {
 		this.name = name;
 		this.#harness = harness;
@@ -131,6 +137,7 @@ export class Agent {
 		this.#configuration = configuration;
 		this.#models = models;
 		this.#model = model;
+		this.#inspect = inspect;
 	}
 
 	/** Opens the session, resuming unfinished work only outside startup inhibition and persistent maintenance holds. */
@@ -156,6 +163,8 @@ export class Agent {
 		}
 		registry.install(orientationExtension(runtime));
 		registry.install(introspectionExtension());
+		let inspect!: InspectionReader;
+		registry.install(ownerInspectionExtension((query, ctx) => inspect(query, ctx)));
 		registry.install(channels.extension);
 		registry.install(memory.extension);
 		registry.install(MissionFoundation);
@@ -216,14 +225,26 @@ export class Agent {
 				),
 			]);
 			if (!inhibited) await mission.initialize(context);
+			const channelOwner = new ChannelOwner(harness, channels);
+			const inspectionHost = {
+				harness,
+				runtime,
+				mission,
+				channels: channelOwner,
+				tools: registry
+					.snapshot()
+					.tools()
+					.map((item) => item.tool.name),
+				workspace: options.cwd,
+				implementationRoot: fileURLToPath(new URL("../", import.meta.url)),
+			};
+			inspect = (query, ctx) => inspectAgent(query, inspectionHost, ctx);
 			const legacy = (await harness.snapshot(MissionDoc, context))?.current ?? null;
 			const pending = options.model === null ? await harness.inspect(context) : undefined;
 			const canSchedule =
 				pending === undefined ||
 				(pending.submissions.length === 0 &&
-					pending.tasks.every(
-						(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
-					));
+					pending.tasks.every((task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy)));
 			if (!inhibited && canSchedule) {
 				await root.commit((tx) => reconcileMemoryTasks(tx, root.id, Date.now()), context);
 				memory.recall.prepare(await harness.snapshot(MemoryDoc, context));
@@ -238,10 +259,11 @@ export class Agent {
 				runtime,
 				memory,
 				mission,
-				new ChannelOwner(harness, channels),
+				channelOwner,
 				options.model === null ? "unconfigured" : "configured",
 				options.models,
 				options.model,
+				inspect,
 			);
 		} catch (error) {
 			await harness.close(context).catch(() => {});
@@ -261,8 +283,7 @@ export class Agent {
 				`No provider is configured. Run ${this.name} setup (sudo for a managed installation), then restart the owner. Mission drafting remains available without a provider.`,
 			);
 		const id = await this.#root.commit(async (tx) => {
-			if ((await tx.doc(MaintenanceDoc)).current.state === "held")
-				throw new Error("Service is held for maintenance.");
+			if ((await tx.doc(MaintenanceDoc)).current.state === "held") throw new Error("Service is held for maintenance.");
 			const id = await this.#root.submit(tx, {
 				type: "input",
 				content: text,
@@ -315,8 +336,7 @@ export class Agent {
 			}
 			if (facts === undefined) return undefined;
 			this.requireActive();
-			if ((await tx.doc(MaintenanceDoc)).current.state === "held")
-				throw new Error("Service is held for maintenance.");
+			if ((await tx.doc(MaintenanceDoc)).current.state === "held") throw new Error("Service is held for maintenance.");
 			const answer = renderOperatingSystemFacts(facts);
 			await tx.appendEntry(HostFactEntry, this.#root.id, { data: { role: "user", text, input: text, facts: null } });
 			const entry = await tx.appendEntry(HostFactEntry, this.#root.id, {
@@ -443,8 +463,7 @@ export class Agent {
 		}
 		this.requireActive();
 		return this.#root.commit(async (tx) => {
-			if ((await tx.doc(MaintenanceDoc)).current.state === "held")
-				throw new Error("Service is held for maintenance.");
+			if ((await tx.doc(MaintenanceDoc)).current.state === "held") throw new Error("Service is held for maintenance.");
 			const state = await tx.doc(MemoryDoc);
 			if (input.operation === "forget")
 				return {
@@ -569,9 +588,7 @@ export class Agent {
 		if (
 			inspection === undefined ||
 			(inspection.submissions.length === 0 &&
-				inspection.tasks.every(
-					(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
-				))
+				inspection.tasks.every((task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy)))
 		)
 			this.#harness.resume();
 		return { type: "maintenance", protocol: 1, state: "open", operationId: null };
@@ -580,5 +597,10 @@ export class Agent {
 	private requireActive(): void {
 		if (this.#closing) throw new Error("Agent is closing.");
 		if (this.#inhibited) throw new Error("Service execution is inhibited for maintenance.");
+	}
+
+	/** Reads one bounded owner/host report without changing state, resuming work or invoking a provider. */
+	inspect(query: InspectionQuery, context: Context): Promise<InspectionReport> {
+		return this.#inspect(query, context);
 	}
 }
