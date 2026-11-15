@@ -4,10 +4,10 @@ A durable agent built on [Pi Durable](../../packages/durable). Its conversation 
 
 ## Design goals
 
-- **Always on and mission-driven.** Given a mission and operating boundaries, the agent proactively decides what to do next, executes, verifies results, and adapts without waiting for another user prompt. Missions and unfinished work must survive restarts. It asks for input when a decision exceeds its authority or requires missing information.
+- **Always on and mission-driven.** The mission is the agent's enduring purpose, agreed with its creator. The agent proactively chooses tasks toward it, executes, verifies results, and adapts without waiting for another user prompt. A finished task or suspended execution does not end the mission. Purpose and unfinished work survive restarts. The agent asks for input when a decision exceeds its authority or requires missing information.
 - **Simple to download and install.** One public download includes the runtime, dependencies and update verification keys. Users need no GitHub account, download credentials, signing keys or manual trust configuration. Model-provider sign-in remains separate.
 
-The launcher resumes interrupted runs and retains session memory. Autonomous mission execution remains to be built.
+The launcher resumes interrupted runs and retains session memory. Source includes a bounded execution engine; continuous work selection under an enduring mission remains to be built. The [purpose and work contract](docs/missions/purpose.md) defines that distinction and the required correction.
 
 ## Design tenets
 

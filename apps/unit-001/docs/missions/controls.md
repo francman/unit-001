@@ -1,6 +1,8 @@
-# Mission lifecycle controls
+# Current bounded-work controls
 
-An approved mission stays idle until explicitly started. Source commands are:
+The mission is the agent's enduring purpose, not something it starts, pauses or completes. The current implementation exposes bounded-work controls under the historical `mission` command namespace. These commands affect execution, not the saved purpose. Continuous purpose-driven planning and a separate work interface remain unfinished; see the [purpose and work contract](purpose.md).
+
+Existing approved terms do not silently gain execution authority. The current source commands explicitly control the bounded engine:
 
 ```sh
 agent mission status
@@ -12,7 +14,7 @@ sudo agent mission stop
 
 Use the installation's chosen name in place of `agent`. Inspection needs operator access; installed lifecycle changes require sudo. Developer-local source instances use the same commands without sudo because the developer owns that instance's authority. These are source features; availability on an installed machine depends on its release. [Review and recovery evidence](controls-review.md) records the acceptance checks.
 
-Pause closes admissions and drains the mission's requests, tools and background work. Resume creates a fresh controller after drainage and preserves consumed work/spend limits. Stop remains terminal across owner restart. These commands leave the service and ordinary conversations available. Cancelling a conversation and stopping the installed service retain their separate meanings.
+Pause closes admissions and drains the current execution's requests, tools and background work. Resume creates a fresh controller after drainage and preserves consumed work/spend limits. Stop remains terminal for that execution across owner restart. The saved purpose remains. These commands leave the service and ordinary conversations available. Cancelling a conversation and stopping the installed service retain their separate meanings.
 
 Status shows observed evidence, current policy revision, waiting/blocking reason, next wake and consumed allowances. Costs are estimates; reserved, unpriced and interrupted requests remain explicit. The initial engine verifies approved file digests. Unsupported completion requirements stay blocked.
 

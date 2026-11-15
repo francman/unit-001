@@ -1,6 +1,6 @@
 # unit-001
 
-unit-001 is a named, always-on AI agent with its own identity, memory, tools and operator interfaces. It retains conversations and unfinished work across restarts. Its goal is to pursue an agreed mission without needing a new prompt for every step.
+unit-001 is a named, always-on AI agent with its own identity, memory, tools and operator interfaces. Its mission is its enduring purpose, agreed with its creator. It pursues that purpose through tasks and retains conversations and unfinished work across restarts.
 
 **Available now:** persistent conversations and memory, a rich terminal interface, named Ubuntu services, provider setup and signed automatic updates. Maintainer feed renewal still needs an installed schedule. Source also includes mission agreements, remote SSH sessions and creator-authorized channel setup. The autonomous mission execution loop and browser workspace are in development; they are not shipped in the current download.
 
@@ -22,7 +22,9 @@ Read the [deployment guide](apps/unit-001/docs/deployment.md), [commands and acc
 
 ## Principles and development
 
-The agent should pursue an agreed mission without repeated prompts, preserve work across failures and ask when it lacks authority. Keep slow work off the response path. Build on upstream public APIs; keep Pi implementation files unchanged.
+The agent should choose work toward its agreed purpose without repeated prompts, preserve work across failures and ask when it lacks authority. Tasks can finish and execution can be suspended; the mission remains until its creator changes it. The current bounded-work engine is an implementation step; continuous purpose-driven planning remains unfinished. See the [purpose and work contract](apps/unit-001/docs/missions/purpose.md).
+
+Keep slow work off the response path. Build on upstream public APIs; keep Pi implementation files unchanged.
 
 Unit code lives in `apps/unit-001` and `packages/unit-*`. See the [developer README](apps/unit-001/README.md) for checks, source setup, upstream syncing and attribution. GitHub Actions is disabled; validation and publication run independently.
 
