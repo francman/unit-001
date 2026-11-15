@@ -26,7 +26,8 @@ export function mountWorkspace(
 	let mobileMenu = false;
 	let destroyed = false;
 	let signedOut = false;
-	let pendingForget: string | null = null;
+	let pendingForget: { id: string; requestId: string } | null = null;
+	let forgetNotice = "";
 	let query = "";
 
 	const run = async (operation: () => Promise<void>) => {
@@ -39,12 +40,13 @@ export function mountWorkspace(
 	};
 	const refresh = async () => {
 		const next = await port.details();
-		if (!signedOut) details = next;
+		if (!signedOut) details = { ...next, memory: { ...next.memory, records: details?.memory.records ?? [] } };
 	};
 	const render = () => {
 		const focused = document.activeElement;
-		const wasComposer = focused instanceof HTMLTextAreaElement && focused.id === "composer";
-		const selection = wasComposer ? focused.selectionStart : null;
+		const focusedInput = focused instanceof HTMLTextAreaElement || focused instanceof HTMLInputElement ? focused : null;
+		const focusId = focusedInput?.id;
+		const selection = focusedInput?.selectionStart ?? null;
 		root.replaceChildren();
 		const shell = element("div", `shell${mobileMenu ? " menu-open" : ""}`);
 		const aside = element("aside", "sidebar");
@@ -65,6 +67,7 @@ export function mountWorkspace(
 				section = key;
 				mobileMenu = false;
 				render();
+				void run(refresh);
 			});
 			item.setAttribute("aria-current", section === key ? "page" : "false");
 			item.prepend(element("span", `nav-icon icon-${key}`));
@@ -142,7 +145,9 @@ export function mountWorkspace(
 					"connection-banner",
 					connection === "connecting"
 						? "Reconnecting. Your draft is saved here; requests will not be replayed."
-						: "Connection lost. Your draft is preserved. Reconnect before sending.",
+						: connection === "expired"
+							? "Session expired. Restart the operator web command, reload, and pair with its new code."
+							: "Connection lost or stream limit reached. Your draft is preserved. Close extra tabs and reload if needed.",
 				),
 			);
 		if (notice) {
@@ -258,6 +263,7 @@ export function mountWorkspace(
 						const result = await port.send(text, requestId);
 						if (signedOut) return;
 						if (result.state === "unknown") unknown = { requestId, prompt: text };
+						else if (result.state === "failed") notice = result.message;
 						else if (draft.trim() === text) draft = "";
 					} catch {
 						unknown = { requestId, prompt: text };
@@ -295,6 +301,7 @@ export function mountWorkspace(
 			const search = element("form", "memory-search");
 			const input = element("input", "search-input");
 			input.type = "search";
+			input.id = "memory-query";
 			input.placeholder = "Search memories…";
 			input.value = query;
 			input.setAttribute("aria-label", "Search memories");
@@ -307,17 +314,22 @@ export function mountWorkspace(
 			search.addEventListener("submit", (event) => {
 				event.preventDefault();
 				void run(async () => {
-					if (details) details.memory = await port.recall(query);
+					const memory = await port.recall(query);
+					if (details && !signedOut) details.memory = memory;
 				});
 			});
 			page.append(search);
+			page.append(
+				element("p", "history-note", "Recall shows up to five ranked matches. Refine the query for other memories."),
+			);
 			for (const record of details?.memory.records ?? []) {
 				const card = element("article", "memory-card");
 				card.append(
 					element("p", "", record.content),
 					element("span", "small-meta", record.source),
 					button("Forget", "text-button danger", () => {
-						pendingForget = record.id;
+						pendingForget = { id: record.id, requestId: crypto.randomUUID() };
+						forgetNotice = "";
 						render();
 					}),
 				);
@@ -357,13 +369,12 @@ export function mountWorkspace(
 		root.append(shell);
 		if (pendingForget) {
 			const dialog = element("dialog", "confirm-dialog");
-			const id = pendingForget;
+			const pending = pendingForget;
 			dialog.setAttribute("aria-labelledby", "forget-title");
 			dialog.append(element("h2", "", "Forget this memory?"));
 			dialog.querySelector("h2")?.setAttribute("id", "forget-title");
-			dialog.append(
-				element("p", "muted", "It will no longer be recalled. Original conversation history is retained."),
-			);
+			dialog.append(element("p", "muted", "It will no longer be recalled. Original conversation history is retained."));
+			if (forgetNotice) dialog.append(element("p", "notice", forgetNotice));
 			const actions = element("div", "dialog-actions");
 			actions.append(
 				button("Keep memory", "secondary-button", () => {
@@ -375,10 +386,22 @@ export function mountWorkspace(
 					"primary-button danger-fill",
 					() =>
 						void run(async () => {
-							await port.forget(id, crypto.randomUUID());
-							pendingForget = null;
-							await refresh();
-							notice = "Memory forgotten. Conversation history was retained.";
+							try {
+								const result = await port.forget(pending.id, pending.requestId);
+								if (result.state !== "completed") {
+									forgetNotice =
+										result.state === "unknown"
+											? `${result.message} Request ID: ${pending.requestId}. Close this dialog and inspect memory. A repeated request retains this ID and may remain unknown.`
+											: result.message;
+									return;
+								}
+								pendingForget = null;
+								if (details)
+									details.memory.records = details.memory.records.filter((record) => record.id !== pending.id);
+								notice = "Memory forgotten. Conversation history was retained.";
+							} catch {
+								forgetNotice = `Forget outcome not confirmed. Close this dialog and inspect memory. Request ID: ${pending.requestId}. Repeated requests retain this ID and may remain unknown.`;
+							}
 						}),
 				),
 			);
@@ -390,8 +413,8 @@ export function mountWorkspace(
 			dialog.showModal();
 			dialog.querySelector<HTMLButtonElement>("button")?.focus();
 		}
-		if (wasComposer && selection !== null) {
-			const input = root.querySelector<HTMLTextAreaElement>("#composer");
+		if (focusId && selection !== null) {
+			const input = root.querySelector<HTMLInputElement | HTMLTextAreaElement>(`#${focusId}`);
 			input?.focus();
 			input?.setSelectionRange(selection, selection);
 		}
@@ -421,7 +444,17 @@ function missionCard(details: WorkspaceDetails | null): HTMLElement {
 		element("p", "muted", details?.mission.scope ?? "An agreed mission gives the agent direction and limits."),
 	);
 	card.append(element("span", "subtle-pill", details?.mission.stage.replaceAll("_", " ") ?? "Loading agreement"));
-	card.append(element("p", "execution-note", "Autonomous execution is not implemented in this release."));
+	card.append(
+		element(
+			"p",
+			"execution-note",
+			details?.mission.execution === "not-implemented"
+				? "Autonomous execution is not implemented in this release."
+				: details
+					? `Execution: ${details.mission.execution}`
+					: "Waiting for observed mission state.",
+		),
+	);
 	return card;
 }
 

@@ -93,6 +93,7 @@ const port: WorkspacePort = {
 			count: (details.memory.count ?? 0) - 1,
 			records: details.memory.records.filter((record) => record.id !== id),
 		};
+		return { state: "completed" };
 	},
 	async logout() {
 		listener?.({ type: "connection", state: "offline" });

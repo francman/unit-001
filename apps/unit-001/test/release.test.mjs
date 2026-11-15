@@ -17,12 +17,25 @@ import {
 	writeReleaseDocumentation,
 	writeReleaseLauncher,
 	writeUpdateBootstrap,
+	writeWebAssets,
 } from "../scripts/build-release.mjs";
 import { generateRepositoryKeys } from "../scripts/update-repository.mjs";
 
 const temporary = [];
 afterEach(() => {
 	for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+test("#65 packages exactly the live browser entry and assets in the signed inventory", () => {
+	const directory = mkdtempSync(join(tmpdir(), "unit-release-web-"));
+	temporary.push(directory);
+	writeWebAssets(directory);
+	assert.deepEqual(releaseFiles(directory), ["web-dist/bootstrap.js", "web-dist/index.html", "web-dist/style.css"]);
+	const bundle = readFileSync(join(directory, "web-dist/bootstrap.js"), "utf8");
+	assert.match(bundle, /\/api\/v1\/events/);
+	assert.doesNotMatch(bundle, /unitPreview|Violet browser acceptance memory/);
+	writeReleaseChecksums(directory);
+	assert.match(readFileSync(join(directory, "SHA256SUMS"), "utf8"), /\.\/web-dist\/bootstrap\.js/);
 });
 
 test("#6–#9 local memory package includes its compiled runtime in the release artifact", () => {

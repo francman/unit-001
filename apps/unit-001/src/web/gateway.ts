@@ -36,15 +36,12 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 	let pairingFailures = 0;
 	let pairingWindow = Date.now();
 	let paired = false;
-	const server = createServer(
-		{ headersTimeout: 5000, requestTimeout: 10_000, maxHeaderSize: 8192 },
-		(req, res) => {
-			void handle(req, res).catch(() => {
-				if (!res.headersSent) json(res, 400, { error: "Invalid request." });
-				else res.destroy();
-			});
-		},
-	);
+	const server = createServer({ headersTimeout: 5000, requestTimeout: 10_000, maxHeaderSize: 8192 }, (req, res) => {
+		void handle(req, res).catch(() => {
+			if (!res.headersSent) json(res, 400, { error: "Invalid request." });
+			else res.destroy();
+		});
+	});
 	server.maxConnections = 32;
 	server.maxHeadersCount = 32;
 	const cleanup = setInterval(() => {
@@ -111,17 +108,15 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 					pairingFailures = 0;
 					pairingWindow = Date.now();
 				}
-				if (paired || pairingFailures >= 5)
-					return json(res, 429, { error: "Pairing is temporarily unavailable." });
+				if (paired) return json(res, 429, { error: "Pairing is temporarily unavailable." });
 				const body = await readJson(req);
 				if (paired) return json(res, 429, { error: "Pairing is temporarily unavailable." });
-				const secret =
-					typeof body === "object" && body !== null && "secret" in body ? body.secret : undefined;
+				const secret = typeof body === "object" && body !== null && "secret" in body ? body.secret : undefined;
 				const supplied = Buffer.from(typeof secret === "string" ? secret : "");
 				const expected = Buffer.from(options.secret);
 				if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
 					pairingFailures++;
-					return json(res, 401, { error: "Pairing failed." });
+					return json(res, pairingFailures >= 5 ? 429 : 401, { error: "Pairing failed." });
 				}
 				const token = randomBytes(32).toString("hex");
 				paired = true;
@@ -151,13 +146,14 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 				signal.addEventListener("abort", abort, { once: true });
 				res.once("close", () => disconnected.abort());
 				const heartbeat = setInterval(() => {
-					if (!res.write(": heartbeat\n\n")) disconnected.abort();
+					if (res.writableLength > 1_048_576) disconnected.abort();
+					else res.write(": heartbeat\n\n");
 				}, 15_000);
 				try {
 					await options.client.watch((event) => {
 						const frame = `event: ${event.type}\ndata: ${JSON.stringify(event.type === "view" ? event.view : { message: "Owner reconnecting." })}\n\n`;
-						if (Buffer.byteLength(frame) > 1_048_576 || res.writableLength > 1_048_576 || !res.write(frame))
-							disconnected.abort();
+						if (Buffer.byteLength(frame) + res.writableLength > 1_048_576) disconnected.abort();
+						else res.write(frame);
 					}, signal);
 				} finally {
 					clearInterval(heartbeat);
@@ -180,18 +176,26 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 				if (session.expiresAt <= Date.now() || session.abort.signal.aborted)
 					return json(res, 401, { error: "Session expired." });
 				const fingerprint = JSON.stringify(parsed.operation);
-				let record = session.requests.get(parsed.requestId);
+				const mutation =
+					parsed.operation.type === "send" ||
+					parsed.operation.type === "cancel" ||
+					(parsed.operation.type === "memory" && parsed.operation.request.operation === "forget");
+				let record = mutation ? session.requests.get(parsed.requestId) : undefined;
 				if (record !== undefined && record.fingerprint !== fingerprint)
 					return json(res, 409, { error: "Request ID already belongs to another operation." });
 				if (record === undefined) {
-					if (session.requests.size >= 32 || session.inFlight >= 4)
+					if ((mutation && session.requests.size >= 32) || session.inFlight >= 4)
 						return json(res, 429, { error: "Session request limit reached." });
 					session.inFlight++;
 					const result = options.client
 						.request(parsed.operation, AbortSignal.any([session.abort.signal, AbortSignal.timeout(120_000)]))
 						.then<WebResult>((response) => {
 							if (Buffer.byteLength(JSON.stringify(response)) > 131_072)
-								throw new Error("Response is too large.");
+								return {
+									requestId: parsed.requestId,
+									state: "unknown",
+									message: "Owner response exceeded the browser limit. Inspect current work before acting again.",
+								};
 							const safeResponse =
 								response.type === "error"
 									? { type: "error" as const, message: "Owner rejected the operation." }
@@ -211,11 +215,15 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 							session.inFlight--;
 						});
 					record = { fingerprint, result };
-					session.requests.set(parsed.requestId, record);
+					if (mutation) session.requests.set(parsed.requestId, record);
 				}
 				const result = await record.result;
 				if (session.expiresAt <= Date.now() || session.abort.signal.aborted)
-					return json(res, 401, { error: "Session expired." });
+					return json(res, 200, {
+						requestId: parsed.requestId,
+						state: "unknown",
+						message: "Session ended after dispatch. Inspect the owner before acting again.",
+					});
 				return json(res, 200, result);
 			}
 			return json(res, 404, { error: "Unknown endpoint." });

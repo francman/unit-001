@@ -262,10 +262,18 @@ export function writeReleaseDocumentation(stage) {
 		"setup-experience.md",
 		"updates.md",
 		"distribution.md",
+		"web-ui.md",
 	]) {
 		mkdirSync(dirname(join(stage, "docs", name)), { recursive: true });
 		cpSync(join(repository, "apps/unit-001/docs", name), join(stage, "docs", name));
 	}
+}
+
+/** Packages only the reviewed browser entry, stylesheet and document, excluding synthetic fixtures. */
+export function writeWebAssets(app) {
+	mkdirSync(join(app, "web-dist"));
+	for (const asset of ["index.html", "bootstrap.js", "style.css"])
+		cpSync(join(repository, "apps/unit-001/web-dist", asset), join(app, "web-dist", asset));
 }
 
 /** Builds the archive without publishing, installing a service, or changing upstream sources. */
@@ -290,6 +298,7 @@ export function buildRelease(out, options = {}) {
 		const app = join(stage, "app");
 		mkdirSync(app, { recursive: true });
 		cpSync(join(repository, "apps/unit-001/dist"), join(app, "dist"), { recursive: true });
+		writeWebAssets(app);
 		cpSync(join(repository, "LICENSE"), join(stage, "LICENSE"));
 		const dependencies = installDependencies(app, sourceManifest);
 		copyNodeRuntime(stage, scratch);

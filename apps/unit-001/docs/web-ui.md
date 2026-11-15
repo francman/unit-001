@@ -1,39 +1,60 @@
-# Browser workspace and operator gateway
+# Browser workspace
 
-The browser workspace attaches to the existing agent owner. It does not create another agent, open SQLite, read provider credentials, or grant creator authority. A small separate Node HTTP process uses the existing operator socket and serves bundled static assets. This isolates browser parsing and connection failures from the owner; embedding HTTP in the owner would save one process but expose its private account to browser-facing code.
+Run `agent web` as an authorized operator, without sudo. Open `http://127.0.0.1:4317` and enter the one-time code printed in that terminal. The browser shows conversation, mission, memory and channel state; it can send direction, cancel the current run and explicitly forget selected memories. The existing owner keeps all storage and execution authority.
 
-This slice is a prototype library and browser fixture, not an installed service. There is no launch command, public listener, deployment, or production authentication bootstrap yet. Private access is the default design pending the operator's access choice.
+For a remote installation, keep the same loopback port on both ends:
 
-The reviewed browser source is preserved in `web/`. Its `bootstrap.ts` displays an honest connection-pending screen; `preview.ts` supplies developer-only synthetic data for browser acceptance. No web assets are packaged by the current release builder. Future production packaging must use an explicit asset allowlist that excludes `preview.ts`, its bundle, and all fixture controls.
+```sh
+ssh -L 4317:127.0.0.1:4317 unit-01
+# In that remote terminal, use the installation's actual command:
+bob web
+```
 
-## Access boundary
+Then open the address locally. `bob` is this installation's chosen name, not the product name. Use `--port 4318` and matching forwarding if the default port is occupied. No public listener, reverse proxy, TLS termination or extra firewall opening is required or supported.
 
-The gateway must run as an authorized operator, ideally a dedicated account with only the installation's operator group. Its configuration selects exactly one installation/session/socket; HTTP requests cannot select another agent. A protected administrator provisioning step must supply that socket and a freshly generated random pairing secret. The eventual launcher must resolve the managed operator endpoint rather than accept a private administrator socket from browser input. Root setup and Linux account proof remain release gates.
+Pairing grants the operator's existing conversation and coding authority. Keep the code private. It is generated in memory, accepted once, never put into a URL, file, environment variable or browser storage. The command requires a terminal so it cannot silently write a code into service logs. A session lasts thirty minutes. After sign-out or expiry, stop the web command and run it again for a fresh code. Ctrl+C detaches the browser gateway; owner work continues. Closing a tab never cancels work. This first version intentionally requires an operator terminal for provisioning; it is not a public, unattended web login service.
 
-The current library accepts only an exact `http://127.0.0.1:PORT` or `http://[::1]:PORT` origin. It checks loopback TCP peers, exact Host, and any supplied Origin on every request. Writes additionally require the exact Origin, JSON content type, and a session CSRF token. Forwarded headers are rejected. Remote access, TLS termination, trusted proxies, cookie Secure policy, and nonloopback binding require a separately reviewed explicit configuration; this library does not support them.
+## Authority and access
 
-Pairing sends the secret once in a JSON POST, never a URL. The gateway consumes it for the process lifetime, allowing one thirty-minute session. The session cookie is host-only, HttpOnly, SameSite=Strict; browser code holds its CSRF token only in memory. Logout or expiry requires an administrator to restart with a new secret. This deliberately limited prototype is not the final recovery workflow: production provisioning must rotate consumed credentials durably and define simple re-pairing without exposing secrets in logs, model context, browser storage, or command arguments.
+The gateway runs in a separate process as the operator. Managed installations reject owner/root web launches; the launcher resolves only the installation's existing operator socket. It never opens SQLite or private credentials. Creator approval, channel grants, security changes, updates and lifecycle administration have no browser endpoints. Source-checkout launches use the developer's existing owner socket and authority.
 
-An authenticated web user has the existing operator's coding authority: sending text can cause the agent to execute allowed coding tools. Pairing is therefore an authority grant, not anonymous chat access. Creator approval, security administration, installation updates, and channel grants have no browser endpoints. Pending approvals are shown as pending, with no invented approval action. Mission execution remains explicitly `not-implemented` where reported by the owner.
+Only exact `http://127.0.0.1:PORT` origins and loopback peers are accepted. Every request checks Host and Origin; forwarded headers are rejected. Writes additionally require same-origin JSON and an in-memory CSRF token. The host-only session cookie is HttpOnly and SameSite=Strict. The computer and browser must be trusted: loopback HTTP is not an isolation boundary against a compromised browser, OS administrator, or malicious local program able to acquire the pairing/session credentials. The Linux operator account cannot read private owner state; trusted coding tools still run with the owner's existing authority.
 
-## Version-one HTTP contract
+Static assets use an exact path map, never a filesystem traversal. The production builder bundles `bootstrap.ts` and copies only `index.html`, `bootstrap.js` and `style.css`. `preview.ts` and its fixture controls are excluded from production assets and releases. Text renders through DOM text nodes, including model output; no executable model-generated markup is accepted.
 
-All API paths start with `/api/v1`. Response bodies and assets use `Cache-Control: no-store`. Static assets are an exact path map, never a filesystem traversal. Browser text must render through text nodes; no raw HTML or executable model-generated markup.
+## Requests and recovery
 
-| Method/path | Body or result |
+All API paths start with `/api/v1`. Responses and assets have `Cache-Control: no-store`.
+
+| Method/path | Purpose |
 | --- | --- |
-| GET `/session` | `{authenticated:false}` or `{authenticated:true,csrfToken,expiresAt}` |
-| POST `/session` | `{secret}`; creates the protected cookie and returns session metadata |
-| POST `/logout` | CSRF header required; expires cookie and detaches streams |
-| GET `/events` | SSE `view` containing the existing bounded `ServiceView`; optional `connecting` message |
-| POST `/requests` | `{requestId,operation}` with `X-Unit-CSRF`; returns completed owner response or unknown outcome |
+| GET `/session` | Inspect the current session and obtain its CSRF token. |
+| POST `/session` | Exchange the one-time pairing code for a session cookie. |
+| POST `/logout` | Revoke that session, pending observations and streams. |
+| GET `/events` | Watch bounded owner snapshots over server-sent events. |
+| POST `/requests` | Submit one stable-ID operator operation. |
 
-`src/web/contract.ts` defines the closed operation set: status, send, cancel, mission status, channel status, memory stats, recall, and explicitly confirmed forget. Forget forwards the displayed record ID and stable request ID. Unknown fields, authority claims, agent selectors, and other operations are rejected before owner dispatch.
+The closed operation set is status, send, cancel, mission status, channel status, memory stats, recall and explicitly confirmed forget. Browser requests cannot select another installation, claim creator authority or change the configured endpoint.
 
-The browser generates one request ID per explicit action. A repeated ID with identical input receives the same in-memory outcome; different input conflicts. The gateway never automatically retries a mutation. A disconnect after admission may leave work running; `unknown` tells the user to inspect current state before deciding what to do. Owner send/forget IDs remain the durable deduplication boundary. Cancel is an explicit independent operation; closing a tab only detaches observation.
+Each explicit action gets one request ID. A repeated ID with the same input receives the same gateway result; different input conflicts. Mutations are never automatically retried. If the connection fails after admission, delivery remains unknown; inspect the conversation and keep the displayed ID before deciding to act again. Owner send/forget receipts remain the durable deduplication boundary. SSE reconnects replace the current snapshot without replaying commands. Drafts stay in page memory during reconnect and are cleared on sign-out; reloading the page discards them.
 
-SSE reconnects obtain a current full owner snapshot; they do not replay commands or pretend to deliver every intermediate event. Frontends replace their projection, using existing entry IDs to avoid duplicates. There are at most two streams, four active requests, thirty-two recorded outcomes, and one session; frames cap at 1 MiB, stored responses at 128 KiB, input at 64 KiB, request observation at two minutes. Slow streams disconnect instead of accumulating backlog. Expiry/logout/shutdown detach watches and request observation while owner-admitted work survives.
+Limits are one session, two streams, four active requests, thirty-two mutation outcomes, 1 MiB frames, 128 KiB stored responses, 64 KiB HTTP input and two-minute request observation. A consumed mutation outcome budget requires restarting and pairing again. Slow streams disconnect rather than accumulate backlog. Authentication expiry, sign-out and shutdown detach observation; admitted owner work survives.
 
-## Required before installation or release
+## Local verification and release gate
 
-Implement protected one-time provisioning and recovery, a launcher that enforces the operator endpoint and loopback bind, and packaged static asset verification. Prove the gateway's Linux UID cannot read private state or use the administrator socket. Complete browser acceptance with synthetic streamed content, reconnect, cancel, unknown outcomes, memory confirmation, and malicious text. Exercise actual owner UDS integration and bounded resource behavior on the small VPS profile. Run the full local check and focused tests; GitHub Actions remain disabled. No production deployment is implied by this prototype.
+`test/web-gateway.test.ts` and `test/web-review.test.ts` exercise actual HTTP authentication, CSRF, bounds, deduplication, session expiry and pending cleanup. `test/web-owner.test.ts` uses real SQLite and an operator Unix socket to verify packaged assets, observation, replies and explicit forget without a second writer. `test/fixtures/web-workspace.ts` supports actual Chromium interaction with synthetic provider data. Browser acceptance covers pairing rejection/success, streaming, malicious text, memory confirmation, cancellation, desktop/mobile layout and sign-out. Release tests verify the exact asset inventory and checksums.
+
+Native Linux account isolation and complete packaged/systemd acceptance must pass before production release. GitHub Actions remain disabled. No production installation or public exposure is implied by source merge.
+
+Run the transport and real browser checks after building the app:
+
+```sh
+npm run build --workspace apps/unit-001
+# From apps/unit-001:
+node ../../node_modules/vitest/dist/cli.js --run --config web/vitest.config.ts
+UNIT_001_BROWSER_EXECUTABLE=/path/to/chromium node --test test/web-browser.test.mjs
+```
+
+The Chromium executable is explicitly supplied; tests do not download a browser. `UNIT_001_KEEP_BROWSER_EVIDENCE=1` preserves screenshots while deleting synthetic SQLite state and the browser profile. The actual browser test verifies known versus unknown outcomes, retained forget IDs and search focus during a real owner update. An oversized or lost post-admission response remains unknown. A gateway-cached unknown result may stay unknown on an explicit repeat; close the dialog and inspect memory rather than assuming that a retry proves completion. A new send always creates a new request ID; inspect an earlier unknown send before submitting its text again.
+
+Disposable Linux x64 Docker acceptance also exercised a gateway under operator UID 2001 and an owner under UID 2000, using the published Node 24 runtime and release dependencies with the candidate application. Operator access to private credentials, SQLite and the administrator socket was denied; outsider UID 2002 could not connect to the operator socket or make unauthenticated HTTP requests. Pairing reached real owner status with zero provider calls. This is x64 emulation on a macOS host, not native systemd or complete release acceptance.

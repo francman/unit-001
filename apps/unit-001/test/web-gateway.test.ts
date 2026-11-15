@@ -3,8 +3,8 @@ import { once } from "node:events";
 import { request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ServiceClient } from "../src/service-client.ts";
 import type { ServiceRequest } from "../src/service.ts";
+import type { ServiceClient } from "../src/service-client.ts";
 import { parseWebRequest } from "../src/web/contract.ts";
 import { createWebGateway } from "../src/web/gateway.ts";
 
@@ -16,7 +16,7 @@ afterEach(async () => {
 	servers.length = 0;
 });
 
-async function fixture() {
+async function fixture(wrongGuesses = 0) {
 	const requests: ServiceRequest[] = [];
 	const client: ServiceClient = {
 		session: "default",
@@ -45,6 +45,18 @@ async function fixture() {
 	servers.push(server);
 	server.server.listen(port, "127.0.0.1");
 	await once(server.server, "listening");
+	const failedStatuses: number[] = [];
+	for (let index = 0; index < wrongGuesses; index++) {
+		failedStatuses.push(
+			(
+				await fetch(`${origin}/api/v1/session`, {
+					method: "POST",
+					headers: { Origin: origin, "Content-Type": "application/json" },
+					body: JSON.stringify({ secret: "wrong" }),
+				})
+			).status,
+		);
+	}
 	const pair = await fetch(`${origin}/api/v1/session`, {
 		method: "POST",
 		headers: { Origin: origin, "Content-Type": "application/json" },
@@ -57,10 +69,72 @@ async function fixture() {
 		Cookie: pair.headers.get("set-cookie")?.split(";")[0] ?? "",
 		"X-Unit-CSRF": body.csrfToken,
 	};
-	return { origin, headers, requests, client, pair };
+	return { origin, headers, requests, client, pair, failedStatuses };
 }
 
 describe("web gateway", () => {
+	it("#65 retains an oversized post-admission reply as unknown without redispatching", async () => {
+		const f = await fixture();
+		f.client.request = async (request) => {
+			f.requests.push(request);
+			return { type: "reply", reply: { status: "answered", text: "x".repeat(140000) } };
+		};
+		const body = JSON.stringify({ requestId: "oversized-reply", operation: { type: "send", prompt: "work" } });
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const response = await fetch(`${f.origin}/api/v1/requests`, { method: "POST", headers: f.headers, body });
+			expect(await response.json()).toMatchObject({ state: "unknown", requestId: "oversized-reply" });
+		}
+		expect(f.requests).toHaveLength(1);
+	});
+	it("#65 a valid pairing code remains usable after invalid local guesses", async () => {
+		const f = await fixture(6);
+		expect(f.failedStatuses).toEqual([401, 401, 401, 401, 429, 429]);
+		expect(f.pair.status).toBe(200);
+	});
+	it("#65 read-only refreshes do not exhaust mutation receipts and rejected UTF-8 prompts never dispatch", async () => {
+		const { origin, headers, requests } = await fixture();
+		for (let index = 0; index < 40; index++) {
+			const response = await fetch(`${origin}/api/v1/requests`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify({ requestId: `status-${index}`, operation: { type: "status" } }),
+			});
+			expect(response.status).toBe(200);
+		}
+		const oversized = await fetch(`${origin}/api/v1/requests`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ requestId: "oversized", operation: { type: "send", prompt: "語".repeat(12000) } }),
+		});
+		expect(oversized.status).toBe(400);
+		expect(requests).toHaveLength(40);
+		for (let index = 0; index < 32; index++) {
+			const response = await fetch(`${origin}/api/v1/requests`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify({ requestId: `cancel-${index}`, operation: { type: "cancel" } }),
+			});
+			expect(response.status).toBe(200);
+		}
+		expect(
+			(
+				await fetch(`${origin}/api/v1/requests`, {
+					method: "POST",
+					headers,
+					body: JSON.stringify({ requestId: "exhausted", operation: { type: "cancel" } }),
+				})
+			).status,
+		).toBe(429);
+		expect(
+			(
+				await fetch(`${origin}/api/v1/requests`, {
+					method: "POST",
+					headers,
+					body: JSON.stringify({ requestId: "still-inspect", operation: { type: "status" } }),
+				})
+			).status,
+		).toBe(200);
+	});
 	it("requires authenticated exact-origin JSON and a per-session CSRF token", async () => {
 		const { origin, headers, requests, pair } = await fixture();
 		expect(pair.headers.get("set-cookie")).toContain("HttpOnly; SameSite=Strict");
@@ -102,8 +176,7 @@ describe("web gateway", () => {
 			}),
 		).toBe(403);
 		expect(
-			(await fetch(`${origin}/api/v1/session`, { headers: { "X-Forwarded-Host": "trusted.example" } }))
-				.status,
+			(await fetch(`${origin}/api/v1/session`, { headers: { "X-Forwarded-Host": "trusted.example" } })).status,
 		).toBe(403);
 		expect(requests).toEqual([]);
 	});

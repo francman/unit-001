@@ -1,5 +1,5 @@
 // Defines the browser workspace projection independently of private owner storage.
-export type Connection = "connected" | "connecting" | "offline";
+export type Connection = "connected" | "connecting" | "offline" | "expired";
 
 export interface WorkspaceView {
 	name: string;
@@ -31,9 +31,15 @@ export interface WorkspacePort {
 		listener: (event: { type: "view"; view: WorkspaceView } | { type: "connection"; state: Connection }) => void,
 	): () => void;
 	details(): Promise<WorkspaceDetails>;
-	send(prompt: string, requestId: string): Promise<{ state: "completed" } | { state: "unknown"; message: string }>;
+	send(
+		prompt: string,
+		requestId: string,
+	): Promise<{ state: "completed" } | { state: "unknown" | "failed"; message: string }>;
 	cancel(requestId: string): Promise<void>;
 	recall(query: string): Promise<WorkspaceDetails["memory"]>;
-	forget(id: string, requestId: string): Promise<void>;
+	forget(
+		id: string,
+		requestId: string,
+	): Promise<{ state: "completed" } | { state: "unknown" | "failed"; message: string }>;
 	logout(): Promise<void>;
 }
