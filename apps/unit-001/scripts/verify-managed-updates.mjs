@@ -82,6 +82,8 @@ try {
 	// This fixture signs copied payload bytes; it is never published as a production release.
 	release.source.dirty = false;
 	writeFileSync(join(candidate, "release.json"), JSON.stringify(release));
+	// Replace trust only inside this disposable copied payload; production bootstrap creation remains exclusive.
+	for (const file of ["update-root.json", "update-feed.json"]) rmSync(join(candidate, "deploy", file), { force: true });
 	writeUpdateBootstrap(candidate, join(keys, "root.json"));
 	writeReleaseChecksums(candidate);
 	const archive = join(work, `${name}.tar.gz`);
