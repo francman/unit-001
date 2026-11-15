@@ -141,7 +141,8 @@ assert.deepEqual(await activateUpdate(readInstallation(${JSON.stringify(owned.id
 	execFileSync(node, [reactivateEntry], { stdio: "inherit", timeout: 180000 });
 	assert.equal(readInstallation(owned.id).releaseVersion, "0.0.8");
 	// The candidate now owns the actual service: exercise its update, rollback and crash recovery too.
-	execFileSync(node, [verify, source, owned.id], { stdio: "inherit", timeout: 360000 });
+	// Full-system CPU emulation includes archive copies and four activations; production readiness deadlines stay fixed.
+	execFileSync(node, [verify, source, owned.id], { stdio: "inherit", timeout: 900000 });
 	assert.equal(readInstallation(owned.id).releaseVersion, "0.0.8");
 	for (const [file, bytes] of retained) assert.deepEqual(readFileSync(join(paths.state, file)), bytes);
 	execFileSync(`/usr/local/bin/${name}`, ["stop", "--yes"], { stdio: "inherit", timeout: 60000 });
@@ -157,6 +158,9 @@ assert.deepEqual(await activateUpdate(readInstallation(${JSON.stringify(owned.id
 	console.log(
 		"Published 0.0.7 updater → candidate 0.0.8, retained identity/auth/settings, and candidate rollback/crash recovery passed; no model requests.",
 	);
+} catch (error) {
+	console.error(`Published migration acceptance failed: ${error.stack ?? error}`);
+	throw error;
 } finally {
 	if (owned !== undefined) {
 		const record = readInstallation(owned.id);
