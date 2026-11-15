@@ -1,6 +1,6 @@
 // Reads the existing private owner protocol without loading providers, tools or application storage.
+import { realpathSync } from "node:fs";
 import { createConnection } from "node:net";
-import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 /** Converts only the updater's three admitted operations into private owner requests. */
@@ -59,7 +59,7 @@ export function readOwnerControl(endpoint, args, timeoutMs) {
 	});
 }
 
-if (process.argv[1] !== undefined && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url) {
 	if (process.getuid?.() === 0) throw new Error("Run private owner controls as the installation account.");
 	const [id, timeout, ...args] = process.argv.slice(2);
 	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id ?? ""))
