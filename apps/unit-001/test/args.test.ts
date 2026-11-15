@@ -9,15 +9,7 @@ describe("parseArguments", () => {
 
 	it("reads every option, in both the spaced and the = form", () => {
 		expect(
-			parseArguments([
-				"-p",
-				"hello",
-				"--session",
-				"work",
-				"--model=anthropic/claude-sonnet-5-5",
-				"--data-dir",
-				"/d",
-			]),
+			parseArguments(["-p", "hello", "--session", "work", "--model=anthropic/claude-sonnet-5-5", "--data-dir", "/d"]),
 		).toEqual({
 			kind: "run",
 			options: { print: "hello", session: "work", model: "anthropic/claude-sonnet-5-5", dataDir: "/d" },
@@ -92,6 +84,23 @@ describe("parseArguments account commands", () => {
 });
 
 describe("parseArguments service commands", () => {
+	it("#65 limits browser access to a local port without caller-selected hosts or secrets", () => {
+		expect(parseArguments(["web"])).toEqual({ kind: "web", port: 4317, options: { session: "default" } });
+		expect(parseArguments(["web", "--port=5432", "--session", "work"])).toEqual({
+			kind: "web",
+			port: 5432,
+			options: { session: "work" },
+		});
+		for (const argv of [
+			["web", "--host", "0.0.0.0"],
+			["web", "--secret", "key"],
+			["web", "--port", "0"],
+			["web", "--port=1e4"],
+			["web", "--port=65536"],
+			["web", "--port", "4317", "--port=4318"],
+		])
+			expect(() => parseArguments(argv)).toThrow(UsageError);
+	});
 	it("#8 parses owner-only memory commands with explicit automation confirmation", () => {
 		expect(parseArguments(["memory"])).toEqual({
 			kind: "memory",
