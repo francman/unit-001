@@ -1,5 +1,7 @@
 import { commandCatalog } from "./commands/catalog.ts";
 import { UsageError } from "./errors.ts";
+import { inspectionCommand } from "./introspection/command.ts";
+import type { InspectionQuery } from "./introspection/contract.ts";
 import { memoryCommand } from "./memory-control.ts";
 import { type MissionCommand, parseMissionCommand } from "./missions/command.ts";
 import { parseRemoteArguments, type RemoteCommand } from "./remote/args.ts";
@@ -26,6 +28,12 @@ export interface AttachOptions extends ServiceOptions {
 }
 
 export type Command =
+	| {
+			readonly kind: "inspection";
+			readonly query: InspectionQuery;
+			readonly json: boolean;
+			readonly options: ServiceOptions;
+	  }
 	| { readonly kind: "web"; readonly options: ServiceOptions; readonly port: number }
 	| { readonly kind: "channels"; readonly options: ServiceOptions }
 	| { readonly kind: "remote"; readonly command: RemoteCommand }
@@ -79,6 +87,9 @@ export const USAGE = `Usage: agent [options]
        agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]
        agent mission [status|setup|draft|propose|creator|approve|start|pause|resume|stop] [options]
        agent channels [status] [options] show available adapters and observed channel state
+       agent inspect [runtime|configuration|tools|channels|mission|tasks|host] [--json]
+       agent inspect os [options]        read observed operating-system facts
+       agent inspect file <path> [--offset N] [--json] [options]
 
 Starts the agent. Its conversations persist, so a restarted process resumes unfinished work.
 
@@ -224,8 +235,39 @@ export function parseArguments(argv: readonly string[]): Command {
 		return parsed.kind === "service-status" ? { kind: "channels", options: parsed.options } : parsed;
 	}
 	if (first === "inspect") {
-		if (argv[1] !== "os") throw new UsageError("Usage: agent inspect os [options]");
-		return parseServiceCommand("send", ["inspect os", ...argv.slice(2)]);
+		if (argv[1] === "os") return parseServiceCommand("send", ["inspect os", ...argv.slice(2)]);
+		const remaining: string[] = [];
+		const operands: string[] = [];
+		let json = false;
+		let offset = 0;
+		for (let index = 1; index < argv.length; index++) {
+			const argument = argv[index];
+			if (argument === "--json") {
+				if (json) throw new UsageError("Duplicate --json.");
+				json = true;
+			} else if (argument === "--offset") {
+				const value = argv[++index];
+				if (!value || !/^[0-9]+$/.test(value) || !Number.isSafeInteger(Number(value)))
+					throw new UsageError("Offset must be a nonnegative integer.");
+				offset = Number(value);
+			} else if (argument === "--session" || argument === "--data-dir") {
+				remaining.push(argument, argv[++index]);
+			} else if (argument.startsWith("-")) remaining.push(argument);
+			else operands.push(argument);
+		}
+		if (operands.length > 2) throw new UsageError("Unexpected inspection operand.");
+		const parsed = parseServiceCommand("service-status", remaining);
+		if (parsed.kind !== "service-status") return parsed;
+		try {
+			return {
+				kind: "inspection",
+				query: inspectionCommand(operands[0], operands[1], offset),
+				json,
+				options: parsed.options,
+			};
+		} catch (error) {
+			throw new UsageError(error instanceof Error ? error.message : String(error));
+		}
 	}
 	if (first === "remote") return { kind: "remote", command: parseRemoteArguments(argv.slice(1)) };
 	if (first === "mission") {

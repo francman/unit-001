@@ -18,6 +18,15 @@ export const COMMAND_CATALOG_VERSION = 2;
 /** Commands available in the shipped application; definitions never confer execution authority. */
 export const COMMANDS: readonly CommandDefinition[] = [
 	{
+		id: "inspect",
+		surfaces: ["cli", "slash"],
+		invocation: "inspect",
+		summary: "Read owner runtime, configuration, tools, channels, mission, tasks, host or public files",
+		aliases: [],
+		keywords: ["runtime", "configuration", "tools", "channels", "mission", "tasks", "host", "file", "introspect"],
+		effect: "read",
+	},
+	{
 		id: "inspect.os",
 		surfaces: ["cli", "slash"],
 		invocation: "inspect os",

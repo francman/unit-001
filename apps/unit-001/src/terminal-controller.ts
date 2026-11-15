@@ -7,6 +7,8 @@ import { type CommandDefinition, commandCatalog } from "./commands/catalog.ts";
 import { isOperatingSystemQuestion } from "./commands/facts.ts";
 import type { CommandInterpretation } from "./commands/interpretation.ts";
 import { resolveLocalCommand } from "./commands/resolution.ts";
+import { describeInspection, inspectionText } from "./introspection/command.ts";
+import type { InspectionQuery, InspectionWireReport } from "./introspection/contract.ts";
 import { describeMemory, type MemoryRequest, type MemoryResult, memoryCommand } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
@@ -96,6 +98,12 @@ export function createServiceTerminalController(
 				if (response.type !== "status") throw new Error("Unexpected status response.");
 				return response.runtime;
 			},
+			async inspect(query, signal) {
+				const response = await client.request({ type: "inspection", query }, signal);
+				if (response.type === "error") throw new Error(response.message);
+				if (response.type !== "inspection") throw new Error("Unexpected inspection response.");
+				return response.report;
+			},
 			async mission(request, signal) {
 				const response = await client.request({ type: "mission", request }, signal);
 				if (response.type === "error") throw new Error(response.message);
@@ -169,6 +177,10 @@ export function createForegroundTerminalController(
 				return agent.mission(request, BACKGROUND_CONTEXT);
 			},
 			resolveCommand: (input, signal) => agent.resolveCommand(input, "slash", BACKGROUND_CONTEXT, signal),
+			async inspect(query, signal) {
+				signal.throwIfAborted();
+				return agent.inspect(query, BACKGROUND_CONTEXT);
+			},
 		},
 		onChange,
 		signal,
@@ -189,6 +201,7 @@ interface ConversationTransport {
 	memory(request: MemoryRequest, signal: AbortSignal): Promise<MemoryResult>;
 	runtime(signal: AbortSignal): Promise<RuntimeFacts>;
 	mission(request: MissionRequest, signal: AbortSignal): Promise<MissionView>;
+	inspect(query: InspectionQuery, signal: AbortSignal): Promise<InspectionWireReport>;
 	resolveCommand(input: string, signal: AbortSignal): Promise<CommandInterpretation>;
 }
 
@@ -283,6 +296,15 @@ class OwnerTerminalController implements TerminalController {
 			return { status: "command" };
 		}
 		if (text === "/mission setup") return { status: "mission-setup" };
+		if ((text === "/inspect" || text.startsWith("/inspect ")) && !isOperatingSystemQuestion(text)) {
+			try {
+				void this.#inspect(inspectionText(text));
+				return { status: "command" };
+			} catch (error) {
+				this.#notice(describeError(error), "error");
+				return { status: "rejected" };
+			}
+		}
 		if (text === "/mission" || text === "/mission status") {
 			void this.#mission();
 			return { status: "command" };
@@ -372,10 +394,7 @@ class OwnerTerminalController implements TerminalController {
 		this.#state = { ...this.#state, suggesting: true };
 		this.#publish();
 		try {
-			const result = await this.#transport.resolveCommand(
-				input,
-				AbortSignal.any([pending.signal, this.#local.signal]),
-			);
+			const result = await this.#transport.resolveCommand(input, AbortSignal.any([pending.signal, this.#local.signal]));
 			if (pending.signal.aborted || this.#finished) return;
 			const commands = commandCatalog("slash").filter((command) => result.commandIds.includes(command.id));
 			if (commands.length > 0) this.#showSuggestions(commands);
@@ -454,10 +473,7 @@ class OwnerTerminalController implements TerminalController {
 			if (this.#finished) return;
 			// The watch is authoritative for transcript output; never duplicate an answer from the send reply.
 			if (reply.status === "failed")
-				this.#notice(
-					`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`,
-					"error",
-				);
+				this.#notice(`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`, "error");
 		} catch (error) {
 			if (error instanceof OwnerRequestError) this.#acknowledge(requestId);
 			if (!this.#finished) this.#notice(`Send failed; retry request ${requestId}: ${describeError(error)}`, "error");
@@ -492,10 +508,7 @@ class OwnerTerminalController implements TerminalController {
 				return;
 			}
 			if ((this.#state.unresolvedRequestIds?.length ?? 0) >= 8) {
-				this.#notice(
-					"Eight requests have unconfirmed outcomes. Inspect persisted work before sending more.",
-					"error",
-				);
+				this.#notice("Eight requests have unconfirmed outcomes. Inspect persisted work before sending more.", "error");
 				return;
 			}
 			this.#state = {
@@ -543,6 +556,15 @@ class OwnerTerminalController implements TerminalController {
 				);
 		} catch (error) {
 			if (!this.#finished) this.#notice(`Status: ${describeError(error)}`, "error");
+		}
+	}
+
+	async #inspect(query: InspectionQuery): Promise<void> {
+		try {
+			const report = await this.#transport.inspect(query, this.#local.signal);
+			if (!this.#finished) this.#notice(describeInspection(report));
+		} catch (error) {
+			if (!this.#finished) this.#notice(`Inspection: ${describeError(error)}`, "error");
 		}
 	}
 

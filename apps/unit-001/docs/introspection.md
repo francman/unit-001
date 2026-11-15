@@ -1,3 +1,40 @@
+# Inspect the agent and its host
+
+Use `agent inspect host` to read the owner's actual process memory, identity, CPU and accessible disk facts. Use `agent inspect runtime`, `configuration`, `tools`, `channels`, `mission` or `tasks` for other selected reports. Add `--json` for the complete bounded response. These commands use the running owner, need no sudo and work without a configured LLM.
+
+The terminal equivalents are `/inspect host` and `/inspect runtime`. `/inspect os` keeps the existing deterministic OS report. The model can call the safe-replay `unit_inspect` tool with the same query; facts come from code rather than guessed shell output or model identity.
+
+For public implementation files:
+
+```sh
+agent inspect file src/agent.ts --json
+agent inspect file src/agent.ts --offset 8192 --json
+# Installed releases contain compiled implementation:
+agent inspect file dist/agent.js --json
+```
+
+Use the returned `nextOffset`; it follows complete UTF-8 boundaries in the sanitized view. A file can be read in full through successive explicit queries. Individual excerpts are at most 8 KiB, source files at most 128 KiB and complete reports at most 32 KiB. The terminal shows a short preview; JSON includes the complete excerpt. Over-limit or inaccessible evidence is reported as unavailable.
+
+## What a report means
+
+Each response includes its schema version, observation time, service-account access and selected-query coverage. A tool being registered does not prove it works. Channel setup identity is separate from message-delivery health. A saved mission agreement is separate from execution evidence. System memory describes the current process namespace; it is not an observed container or systemd memory limit. Resource reports do not claim a physical-host identity or complete security attestation.
+
+Task reports include bounded live IDs, types, scheduler states and sleep deadlines. They exclude task input, checkpoints, raw errors and queued message text. Runtime/configuration reports expose effective provider/model identity, never authentication values. Reads neither resume the scheduler nor change durable documents. No new daemon, provider request, network scan or privilege escalation is involved.
+
+## File boundary
+
+The host fixes the application root. Only `package.json`, `README.md`, Markdown under `docs/`, TypeScript under `src/` and JavaScript under `dist/` are eligible. Absolute paths, traversal, hidden segments, symlinks, group/world-writable entries, special files, credential stores and state/configuration directories are excluded. The selected release symlink is resolved by the host before checking relative paths.
+
+Recognizable literal API tokens, credential assignments and private-key blocks are redacted across the entire bounded public source file before paging, so a page boundary cannot expose fragments. This is additional protection for public code, not a claim to identify every arbitrary secret encoding. Private files never become eligible because a caller knows their name. Trusted owner coding tools retain their existing filesystem authority; this report does not turn that execution profile into an OS sandbox.
+
+## Verification
+
+Focused tests cover real SQLite/owner IPC, all selectors without model calls, explicit model-tool access through a faux provider, maintenance reads, excluded task input, traversal, symlinks, FIFOs, writable paths, UTF-8 paging, cross-page credential redaction and file/report bounds. The actual terminal is checked at 80×24 and 40×12, with no provider network and no sudo prompt. Full local checks and independent code review remain required before merging. Production release qualification is separate.
+
+## Earlier implementation definition and remaining collectors
+
+The definition below is retained as design history and follow-up scope. Its proposed `topic` API and file bounds are superseded by the implemented `scope` selectors and limits above. General process/service inventory, cancellation of pending host reads, two-call admission limits and deeper configuration provenance remain planned. The present report is explicitly limited to each implemented query; it does not claim those remaining collectors exist.
+
 # Agent and host introspection
 
 The agent should answer “what are you running, what can you access, and what is happening?” from current host records. Today its coding tools can inspect files and run commands as the service account, but those results are not a consistent self-report. Add one typed, read-only inspection dispatch; keep authority and secret handling outside model interpretation. This is the implementation definition for [#57](https://github.com/francman/unit-001/issues/57), building on metrics [#42](https://github.com/francman/unit-001/issues/42) and posture [#44](https://github.com/francman/unit-001/issues/44).
