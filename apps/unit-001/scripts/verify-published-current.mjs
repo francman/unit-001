@@ -130,6 +130,16 @@ assert.deepEqual(await rollbackUpdate(readInstallation(${JSON.stringify(owned.id
 	execFileSync(node, [verify, source, owned.id], { stdio: "inherit", timeout: 360000 });
 	assert.equal(readInstallation(owned.id).releaseVersion, "0.0.8");
 	for (const [file, bytes] of retained) assert.deepEqual(readFileSync(join(paths.state, file)), bytes);
+	execFileSync(`/usr/local/bin/${name}`, ["stop", "--yes"], { stdio: "inherit", timeout: 60000 });
+	execFileSync("cp", [
+		"--preserve=mode,ownership",
+		join(paths.state, "sessions/default.sqlite"),
+		join(ledger, "session.sqlite"),
+	]);
+	execFileSync("runuser", ["-u", owned.account, "--", node, ledgerFixture, "verify", ledger, "paused"], {
+		stdio: "inherit",
+		timeout: 120000,
+	});
 	console.log(
 		"Published 0.0.7 updater → candidate 0.0.8, retained identity/auth/settings, and candidate rollback/crash recovery passed; no model requests.",
 	);
