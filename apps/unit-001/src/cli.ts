@@ -43,6 +43,7 @@ import {
 import { readDefaultModel, saveDefaultModel } from "./settings.ts";
 import { runSetup } from "./setup.ts";
 import { runRichAttach, runRichForeground } from "./terminal-ui.ts";
+import { runWebWorkspace } from "./web/launcher.ts";
 
 /** What the CLI reads from its process, so tests can run it against fakes. */
 export interface ManagedIdentity {
@@ -197,8 +198,7 @@ async function run(
 	const options = command.options;
 	const directory = resolveDirectory(options.dataDir, runtime);
 	const file = sessionFile(directory, options.session, runtime.platform);
-	const endpoint =
-		command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
+	const endpoint = command.kind === "serve" ? serviceEndpoint(directory, options.session, runtime.platform) : undefined;
 	let prompt = command.kind === "run" ? command.options.print : undefined;
 	if (prompt === "-") prompt = (await readAll(runtime.stdin)).trim();
 	if (prompt === "") throw new UsageError("The prompt is empty.");
@@ -304,11 +304,7 @@ async function control(
 	const endpoint =
 		runtime.managed?.access === "operator"
 			? operatorEndpoint(runtime.managed.id, command.options.session)
-			: serviceEndpoint(
-					resolveDirectory(command.options.dataDir, runtime),
-					command.options.session,
-					runtime.platform,
-				);
+			: serviceEndpoint(resolveDirectory(command.options.dataDir, runtime), command.options.session, runtime.platform);
 	if (command.kind === "channels") {
 		const response = await requestService(endpoint, { type: "channels", request: { operation: "status" } }, signal);
 		if (response.type === "error") throw new ConfigurationError(response.message);
@@ -422,8 +418,7 @@ async function control(
 		let request: MemoryRequest;
 		if (command.request.operation === "confirm-forget") {
 			if (!command.yes) {
-				if (!runtime.interactive)
-					throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
+				if (!runtime.interactive) throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
 				const readline = createInterface({ input: runtime.stdin, output: runtime.stdout });
 				try {
 					const answer = await readline.question(
@@ -535,8 +530,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		}
 		if (runtime.managed?.access === "operator") {
 			if (command.kind === "status") {
-				if (command.dataDir !== undefined)
-					throw new UsageError("Operator clients cannot change their data directory.");
+				if (command.dataDir !== undefined) throw new UsageError("Operator clients cannot change their data directory.");
 				return control({ kind: "service-status", options: { session: "default" } }, runtime, signal);
 			}
 			if (
@@ -547,6 +541,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				command.kind !== "memory" &&
 				command.kind !== "channels" &&
 				command.kind !== "mission" &&
+				command.kind !== "web" &&
 				!(command.kind === "run" && argv.length === 0 && runtime.interactive)
 			)
 				throw new ConfigurationError("This operation requires the administrator command.");
@@ -559,7 +554,21 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				throw new UsageError("Operator clients cannot change their data directory.");
 		}
 		let code: number;
-		if (command.kind === "setup") code = await setup(command, runtime, signal);
+		if (command.kind === "web") {
+			if (!runtime.interactive)
+				throw new UsageError("Web pairing requires an operator terminal; pairing codes must not enter logs.");
+			if (runtime.managed !== undefined && runtime.managed.access !== "operator")
+				throw new ConfigurationError("Run the web command as an authorized operator without sudo.");
+			const endpoint =
+				runtime.managed === undefined
+					? serviceEndpoint(
+							resolveDirectory(command.options.dataDir, runtime),
+							command.options.session,
+							runtime.platform,
+						)
+					: operatorEndpoint(runtime.managed.id, command.options.session);
+			code = await runWebWorkspace(endpoint, command.port, (text) => void runtime.stdout.write(text), signal);
+		} else if (command.kind === "setup") code = await setup(command, runtime, signal);
 		else if (command.kind === "run" && argv.length === 0 && runtime.managed !== undefined && runtime.interactive) {
 			// The normal installed entry is a client; explicit foreground flags retain their existing owner semantics.
 			try {
@@ -608,9 +617,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 						signal,
 					);
 					if (response.type === "command-suggestions")
-						suggestions = commandCatalog("cli").filter((command) =>
-							response.result.commandIds.includes(command.id),
-						);
+						suggestions = commandCatalog("cli").filter((command) => response.result.commandIds.includes(command.id));
 				} catch {
 					/* Ordinary usage remains available when no owner can interpret the command. */
 				}

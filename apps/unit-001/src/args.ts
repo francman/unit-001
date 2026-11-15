@@ -26,6 +26,7 @@ export interface AttachOptions extends ServiceOptions {
 }
 
 export type Command =
+	| { readonly kind: "web"; readonly options: ServiceOptions; readonly port: number }
 	| { readonly kind: "channels"; readonly options: ServiceOptions }
 	| { readonly kind: "remote"; readonly command: RemoteCommand }
 	| { readonly kind: "mission"; readonly command: MissionCommand; readonly options: ServiceOptions }
@@ -74,6 +75,7 @@ export const USAGE = `Usage: agent [options]
        agent service-status [options]    inspect the running service
        agent cancel [options]            abort its current run
        agent remote --help               connect this terminal to a named remote installation
+       agent web [--port 4317] [options]  open a paired browser workspace on private loopback
        agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]
        agent mission [status|setup|draft|propose|creator|approve|start|pause|resume|stop] [options]
        agent channels [status] [options] show available adapters and observed channel state
@@ -199,6 +201,24 @@ export function parseArguments(argv: readonly string[]): Command {
 	);
 	if (alias !== undefined) return parseArguments([alias.invocation, ...argv.slice(1)]);
 	if (first === "help") return { kind: "help" };
+	if (first === "web") {
+		let port = 4317;
+		const remaining: string[] = [];
+		let seen = false;
+		for (let index = 1; index < argv.length; index++) {
+			const argument = argv[index];
+			if (argument === "--port" || argument.startsWith("--port=")) {
+				if (seen) throw new UsageError("Option --port was given more than once.");
+				seen = true;
+				const value = argument === "--port" ? argv[++index] : argument.slice(7);
+				if (!value || !/^[0-9]+$/.test(value)) throw new UsageError("Web port must be 1024 to 65535.");
+				port = Number(value);
+				if (port < 1024 || port > 65535) throw new UsageError("Web port must be 1024 to 65535.");
+			} else remaining.push(argument);
+		}
+		const parsed = parseServiceCommand("service-status", remaining);
+		return parsed.kind === "service-status" ? { kind: "web", options: parsed.options, port } : parsed;
+	}
 	if (first === "channels") {
 		const parsed = parseServiceCommand("service-status", argv.slice(argv[1] === "status" ? 2 : 1));
 		return parsed.kind === "service-status" ? { kind: "channels", options: parsed.options } : parsed;
