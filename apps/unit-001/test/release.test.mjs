@@ -12,6 +12,7 @@ import {
 	releaseFiles,
 	verifyExternalResolutions,
 	verifyNodeDownload,
+	verifyRuntimePins,
 	writeReleaseArchive,
 	writeReleaseChecksums,
 	writeReleaseDocumentation,
@@ -200,6 +201,21 @@ test("rejects external dependency drift while allowing packed local checkout pac
 			),
 		/Unreviewed release dependency/,
 	);
+});
+
+test("#18 patched runtime pins reject a vulnerable nested SDK or TUF dependency", () => {
+	const pins = { minimatch: "11.0.1", zod: "4.6.6" };
+	const packages = { "node_modules/minimatch": { version: "11.0.1" }, "node_modules/zod": { version: "4.6.6" } };
+	assert.doesNotThrow(() => verifyRuntimePins({ packages }, pins));
+	for (const [path, version] of [
+		["node_modules/@tufjs/models/node_modules/minimatch", "10.2.6"],
+		["node_modules/openai/node_modules/zod", "3.25.76"],
+	])
+		assert.throws(
+			() => verifyRuntimePins({ packages: { ...packages, [path]: { version } } }, pins),
+			/differs from Unit pin/,
+		);
+	assert.throws(() => verifyRuntimePins({ packages: {} }, pins), /Missing reviewed release dependency/);
 });
 
 test("#18 production bootstrap bundles public trust and a credential-free feed inside the release inventory", () => {

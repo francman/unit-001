@@ -43,8 +43,10 @@
 		"@earendil-works/pi-durable": "1.4.0",
 		"@earendil-works/pi-tui": "1.4.0",
 		"@tufjs/models": "4.1.1",
+		"minimatch": "11.0.1",
 		"tuf-js": "5.0.1",
-		"unit-memory": "0.0.1"
+		"unit-memory": "0.0.1",
+		"zod": "4.6.6"
 	},
 	"devDependencies": {
 		"shx": "0.3.4",

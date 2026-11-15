@@ -93,6 +93,19 @@ export function verifyExternalResolutions(sourceLock, releaseLock, localNames) {
 	}
 }
 
+/** Rejects older nested copies even when a reviewed patched direct dependency is present. */
+export function verifyRuntimePins(releaseLock, pins) {
+	for (const [name, version] of Object.entries(pins)) {
+		const copies = Object.entries(releaseLock.packages).filter(
+			([path]) => path === `node_modules/${name}` || path.endsWith(`/node_modules/${name}`),
+		);
+		if (copies.length === 0) throw new Error(`Missing reviewed release dependency: ${name}`);
+		for (const [, dependency] of copies)
+			if (dependency.version !== version)
+				throw new Error(`Release dependency ${name}@${dependency.version} differs from Unit pin ${version}`);
+	}
+}
+
 function npm(args, cwd = repository) {
 	execFileSync("npm", args, { cwd, stdio: "inherit" });
 }
@@ -153,7 +166,8 @@ function installDependencies(app, sourceManifest) {
 		dependencies: Object.fromEntries(
 			Object.entries(sourceManifest.dependencies).map(([name, version]) => [name, specifiers[name] ?? version]),
 		),
-		overrides: specifiers,
+		// TUF still requests matcher v10; Unit's reviewed pin removes its resource-amplification advisory.
+		overrides: { ...specifiers, minimatch: sourceManifest.dependencies.minimatch },
 	};
 	// Keep reviewed external resolutions from the repository lock; replace workspace links with the packed checkout.
 	const sourceLock = JSON.parse(readFileSync(join(repository, "package-lock.json"), "utf8"));
@@ -183,6 +197,7 @@ function installDependencies(app, sourceManifest) {
 	removeCommandLinks(join(app, "node_modules"));
 	const lock = JSON.parse(readFileSync(join(app, "package-lock.json"), "utf8"));
 	verifyExternalResolutions(sourceLock, lock, new Set(packages.map(({ manifest: pkg }) => pkg.name)));
+	verifyRuntimePins(lock, { minimatch: sourceManifest.dependencies.minimatch, zod: sourceManifest.dependencies.zod });
 	for (const { manifest: pkg, file, integrity } of packages) {
 		const resolved = lock.packages[`node_modules/${pkg.name}`];
 		if (resolved?.resolved !== `file:${file}` || resolved.integrity !== integrity) {
