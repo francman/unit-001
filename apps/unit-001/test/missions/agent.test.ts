@@ -48,7 +48,10 @@ it("keeps mission drafting, status and memory available without registering a fa
 		{ operation: "draft", expectedRevision: 0, requestId: "first-goal", terms: { objective: "Monitor a fixture" } },
 		context,
 	);
-	if (process.platform !== "win32") expect([...saved.tools].sort()).toEqual([...MANAGED_MISSION_ACTIONS].sort());
+	if (process.platform !== "win32")
+		expect([...saved.tools].sort()).toEqual(
+			[...MANAGED_MISSION_ACTIONS, "unit_channels", "unit_channel_request_setup", "unit_channel_setup"].sort(),
+		);
 	expect(saved.stage).toBe("awaiting_creator");
 	expect(saved.execution).toBe("not-implemented");
 	await expect(agent.ask("Do not admit a request", context)).rejects.toThrow("No provider is configured");
