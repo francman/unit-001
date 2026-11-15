@@ -124,7 +124,21 @@ assert.deepEqual(await rollbackUpdate(readInstallation(${JSON.stringify(owned.id
 		timeout: 120000,
 	});
 	await startPublishedOwner(readInstallation(owned.id));
-	execFileSync(node, [verify, source, owned.id, "--published-entry-only"], { stdio: "inherit", timeout: 360000 });
+	// Reuse the already authenticated payload: regenerating fixture keys would change immutable version 0.0.8.
+	const reactivateEntry = join(work, "reactivate-verified.mjs");
+	writeFileSync(
+		reactivateEntry,
+		`import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { activateUpdate, createUpdateContext } from ${JSON.stringify(pathToFileURL(join(installedCore, "update-activation.mjs")).href)};
+import { readInstallation } from ${JSON.stringify(pathToFileURL(join(installedCore, "installation.mjs")).href)};
+const releasePath = "/opt/unit-001/releases/0.0.8";
+const release = JSON.parse(readFileSync(releasePath + "/release.json", "utf8"));
+assert.deepEqual(await activateUpdate(readInstallation(${JSON.stringify(owned.id)}), { releasePath, version: release.version, compatibility: release.compatibility }, createUpdateContext()), { status: "updated", version: "0.0.8" });
+`,
+		{ mode: 0o600 },
+	);
+	execFileSync(node, [reactivateEntry], { stdio: "inherit", timeout: 180000 });
 	assert.equal(readInstallation(owned.id).releaseVersion, "0.0.8");
 	// The candidate now owns the actual service: exercise its update, rollback and crash recovery too.
 	execFileSync(node, [verify, source, owned.id], { stdio: "inherit", timeout: 360000 });
