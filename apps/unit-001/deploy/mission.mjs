@@ -72,7 +72,7 @@ await withManagementLock(async () => {
 		const retry = previous.executionIntent?.requestId === requestId ? previous.executionIntent : undefined;
 		const expectedPolicyRevision =
 			values["policy-revision"] === undefined
-				? (retry?.expectedPolicyRevision ?? view.runtime?.policyRevision ?? 0)
+				? (retry?.expectedPolicyRevision ?? view.policyRevision ?? view.runtime?.policyRevision ?? 0)
 				: Number(values["policy-revision"]);
 		if (!Number.isSafeInteger(expectedPolicyRevision) || expectedPolicyRevision < 0)
 			throw new Error("Mission policy revision must be a nonnegative integer.");
@@ -80,7 +80,7 @@ await withManagementLock(async () => {
 			if (retry.action !== positionals[0] || retry.expectedPolicyRevision !== expectedPolicyRevision)
 				throw new Error("Conflicting mission lifecycle request ID.");
 		} else {
-			if ((view.runtime?.policyRevision ?? 0) !== expectedPolicyRevision)
+			if ((view.policyRevision ?? view.runtime?.policyRevision ?? 0) !== expectedPolicyRevision)
 				throw new Error("Stale mission policy revision.");
 			if (positionals[0] === "start" ? view.runtime != null : view.runtime == null && positionals[0] !== "stop")
 				throw new Error(

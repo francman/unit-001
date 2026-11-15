@@ -64,10 +64,13 @@ export class MissionOwner {
 	async inspect(context: Context): Promise<MissionView> {
 		const view = await this.#formation.inspect(context);
 		const current = (await this.#harness.snapshot(MissionExecutionDoc, context))?.current;
+		const intent = (await readMissionAuthority(this.#location).catch(() => null))?.executionIntent;
 		return {
 			...view,
 			execution: current?.state.status ?? "not-started",
 			runtime: current ? missionExecutionView(current, Date.now()) : null,
+			policyRevision:
+				current?.policyRevision ?? (intent?.expectedPolicyRevision ?? 0) + (intent?.action === "stop" ? 1 : 0),
 		};
 	}
 
@@ -104,7 +107,11 @@ export class MissionOwner {
 				throw new Error("Conflicting mission lifecycle request ID.");
 			return;
 		}
-		if ((current?.policyRevision ?? 0) !== request.expectedPolicyRevision)
+		if (
+			(current?.policyRevision ??
+				(previous?.expectedPolicyRevision ?? 0) + (previous?.action === "stop" ? 1 : 0)) !==
+			request.expectedPolicyRevision
+		)
 			throw new Error("Stale mission policy revision.");
 		if (request.action === "start" ? current != null : current == null && request.action !== "stop")
 			throw new Error(
@@ -167,7 +174,9 @@ export class MissionOwner {
 		}
 		if (current?.intent && current.intent.sequence >= intent.sequence)
 			throw new Error("Stale mission lifecycle intent.");
-		if ((current?.policyRevision ?? 0) !== intent.expectedPolicyRevision)
+		// With no execution, protected intent is the durable compare-and-set receipt; stop consumes its revision.
+		if (intent.action === "stop" && !current) return;
+		if (current && current.policyRevision !== intent.expectedPolicyRevision)
 			throw new Error("Stale mission policy revision.");
 		if (intent.action === "start") {
 			if (this.#model === null) throw new Error("Configure a provider before starting mission execution.");
@@ -183,7 +192,6 @@ export class MissionOwner {
 			this.#harness.resume();
 			return;
 		}
-		if (intent.action === "stop" && !current) return;
 		if (!current || current.agreement.digest !== agreement.digest)
 			throw new Error("No matching mission execution exists.");
 		if (intent.action === "pause" && (current.state.status === "stopped" || current.state.status === "completed"))

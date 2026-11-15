@@ -132,6 +132,7 @@ export type MissionView = {
 	missing: string[];
 	execution: "not-implemented" | "not-started" | MissionExecutionView["status"];
 	runtime?: MissionExecutionView | null;
+	policyRevision?: number;
 	tools: string[];
 };
 

@@ -228,20 +228,21 @@ export async function startMissionExecution(
 			throw new Error("Mission agreement changed.");
 		const document = await tx.doc(MissionExecutionDoc);
 		if (document.current !== null) throw new Error("A mission execution already exists.");
+		const policyRevision = (intent?.expectedPolicyRevision ?? 0) + 1;
 		const scope = await createExecutionScope(
 			tx,
 			engine,
 			admission,
 			model,
 			agreement.missionId,
-			1,
+			policyRevision,
 			tools.map((item) => item.tool.name),
 		);
 		document.current = {
 			agreement,
 			...scope,
 			revision: 1,
-			policyRevision: 1,
+			policyRevision,
 			intent: intent ? { requestId: intent.requestId, sequence: intent.sequence } : null,
 			cycles: 0,
 			requests: 0,

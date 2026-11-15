@@ -91,8 +91,10 @@ def admin(*arguments, actor="um-human", success=True):
                   env={"SUDO_UID": str(uid), "SUDO_USER": actor})
 
 
-def start_owner():
-    process = subprocess.Popen([node, str(release / ("app/test/fixtures/mission-execution-owner.mjs" if execution else "app/test/fixtures/mission-managed-owner.mjs"))],
+def start_owner(configured=None):
+    if configured is None:
+        configured = execution
+    process = subprocess.Popen([node, str(release / ("app/test/fixtures/mission-execution-owner.mjs" if configured else "app/test/fixtures/mission-managed-owner.mjs"))],
                                cwd="/", env={"PATH": "/usr/bin:/bin"}, preexec_fn=identity(account),
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     for _ in range(150):
@@ -105,7 +107,7 @@ def start_owner():
     raise AssertionError("Managed owner did not become ready")
 
 
-process = start_owner()
+process = start_owner(False)
 try:
     assert client("status", "--json")["authority"] == "unconfigured"
     creator_file = Path("/tmp/unit-mission-creator.json")
@@ -182,8 +184,20 @@ try:
         admin("approve", "--revision", str(revision), "--digest", digest)
         for action in ["start", "pause", "resume", "stop"]:
             client(action, user="um-human", success=False)
+        admin("start", "--request-id", "pending-start", "--policy-revision", "0", success=False)
+        cancelled = json.loads(admin("stop", "--request-id", "cancel", "--policy-revision", "0"))
+        assert cancelled["status"] == "not-started"
+        admin("stop", "--request-id", "cancel", "--policy-revision", "0")
+        assert client("status", "--json")["policyRevision"] == 1
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=20) == 0
+        process = start_owner()
+        protected = authority.read_bytes()
+        admin("start", "--request-id", "pending-start", "--policy-revision", "0", success=False)
+        assert authority.read_bytes() == protected
+        assert not (state / "workspace/request-count").exists()
         (state / "workspace/retry-once").write_text("retry")
-        admin("start", "--request-id", "S1", "--policy-revision", "0")
+        admin("start", "--request-id", "S1", "--policy-revision", "1")
 
         def requested(count):
             for _ in range(2000):
@@ -209,16 +223,16 @@ try:
         time.sleep(0.2)
         assert int((state / "workspace/request-count").read_text()) == 1
         requested(2)
-        paused = json.loads(admin("pause", "--request-id", "P1", "--policy-revision", "1"))
+        paused = json.loads(admin("pause", "--request-id", "P1", "--policy-revision", "2"))
         assert paused["status"] == "paused" and paused["runtime"]["unknownRequests"] == 0
-        admin("pause", "--request-id", "P1", "--policy-revision", "1")
-        admin("resume", "--request-id", "R1", "--policy-revision", "2")
+        admin("pause", "--request-id", "P1", "--policy-revision", "2")
+        admin("resume", "--request-id", "R1", "--policy-revision", "3")
         requested(3)
-        paused = json.loads(admin("pause", "--request-id", "P2", "--policy-revision", "3"))
+        paused = json.loads(admin("pause", "--request-id", "P2", "--policy-revision", "4"))
         assert paused["runtime"]["requests"] == 3
         protected = authority.read_bytes()
         admin("resume", "--request-id", "R1", success=False)
-        admin("resume", "--request-id", "R1", "--policy-revision", "2", success=False)
+        admin("resume", "--request-id", "R1", "--policy-revision", "3", success=False)
         assert authority.read_bytes() == protected
         for request in [{"operation": "control-local", "action": "resume", "expectedPolicyRevision": 4, "requestId": "forged"},
                         {"operation": "reconcile-execution", "requestId": "forged"}]:
@@ -234,10 +248,10 @@ try:
         creator["creator"]["id"] = "replacement-creator"
         save(creator_file, creator)
         admin("creator", "--file", str(creator_file))
-        stopped = json.loads(admin("stop", "--request-id", "revoked-stop", "--policy-revision", "4"))
-        assert stopped["status"] == "stopped" and stopped["runtime"]["intentSequence"] == 5
+        stopped = json.loads(admin("stop", "--request-id", "revoked-stop", "--policy-revision", "5"))
+        assert stopped["status"] == "stopped" and stopped["runtime"]["intentSequence"] == 7
         assert client("status", "--json")["agreementValid"] is False
-        admin("resume", "--request-id", "revive", "--policy-revision", "5", success=False)
+        admin("resume", "--request-id", "revive", "--policy-revision", "6", success=False)
         assert not (state / "workspace/proof.txt").exists()
     before = client("status", "--json")
     process.send_signal(signal.SIGTERM)

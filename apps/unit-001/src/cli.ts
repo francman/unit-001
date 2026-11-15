@@ -354,7 +354,7 @@ async function control(
 			operation = {
 				operation: "control-local",
 				action: input.action,
-				expectedPolicyRevision: input.policyRevision ?? view.runtime?.policyRevision ?? 0,
+				expectedPolicyRevision: input.policyRevision ?? view.policyRevision ?? view.runtime?.policyRevision ?? 0,
 				requestId: input.requestId,
 			};
 		} else if (input.action === "draft" || input.action === "creator") {

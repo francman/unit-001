@@ -122,6 +122,7 @@ export function describeMission(view: MissionView): string {
 			`Agreement revision ${agreement.revision}: ${view.agreementValid ? "verified receipt" : "authority expired, changed or awaiting reconciliation"}.`,
 		);
 	if (view.authorityError) lines.push(`Authority error: ${field(view.authorityError)}`);
+	if (view.policyRevision !== undefined && !view.runtime) lines.push(`Policy revision ${view.policyRevision}.`);
 	if (view.runtime) {
 		const runtime = view.runtime;
 		lines.push(

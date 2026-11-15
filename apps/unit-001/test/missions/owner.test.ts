@@ -483,4 +483,39 @@ describe("mission owner lifecycle", () => {
 		expect(stopped.execution).toBe("completed");
 		expect(stopped.runtime!.evidence).toEqual(completed.runtime!.evidence);
 	});
+	it("consumes a cancelled activation revision before any execution exists, across owner restart", async () => {
+		const first = await launch([], "unconfigured");
+		await agree(first.agent);
+		await expect(
+			first.agent.mission(
+				{ operation: "control-local", action: "start", expectedPolicyRevision: 0, requestId: "pending-start" },
+				context,
+			),
+		).rejects.toThrow("Configure a provider");
+		const cancel = {
+			operation: "control-local" as const,
+			action: "stop" as const,
+			expectedPolicyRevision: 0,
+			requestId: "cancel",
+		};
+		expect((await first.agent.mission(cancel, context)).policyRevision).toBe(1);
+		expect((await first.agent.mission(cancel, context)).policyRevision).toBe(1);
+		await close(first.agent);
+		const next = await launch([write]);
+		const view = await next.agent.mission({ operation: "status" }, context);
+		expect(parseMissionView(view)).toEqual(view);
+		expect(view.policyRevision).toBe(1);
+		await expect(
+			next.agent.mission(
+				{ operation: "control-local", action: "start", expectedPolicyRevision: 0, requestId: "pending-start" },
+				context,
+			),
+		).rejects.toThrow("Stale mission policy");
+		expect(next.faux.state.callCount).toBe(0);
+		await next.agent.mission(
+			{ operation: "control-local", action: "start", expectedPolicyRevision: 1, requestId: "new-start" },
+			context,
+		);
+		expect((await waitFor(next.agent, "completed")).runtime!.policyRevision).toBe(2);
+	});
 });

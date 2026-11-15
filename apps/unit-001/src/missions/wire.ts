@@ -136,6 +136,7 @@ export function parseMissionView(value: unknown): MissionView {
 		missing: missionTextList(input.missing, 32, 200),
 		execution: input.execution,
 		...(input.runtime === undefined ? {} : { runtime }),
+		...(input.policyRevision === undefined ? {} : { policyRevision: revision(input.policyRevision, 0) }),
 		tools: missionTextList(input.tools, 128, 100),
 	};
 }
