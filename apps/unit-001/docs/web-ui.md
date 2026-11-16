@@ -12,6 +12,8 @@ bob web
 
 Then open the address locally. `bob` is this installation's chosen name, not the product name. Use `--port 4318` and matching forwarding if the default port is occupied. No public listener, reverse proxy, TLS termination or extra firewall opening is required or supported.
 
+Use the exact `Browser workspace` URL printed by the command: `http://127.0.0.1:4317`, not `localhost`, the server hostname, or a different local port. If the browser reports `Origin is not permitted`, check that URL and use the same port on both sides of the SSH tunnel. Direct browser navigation does not require an `Origin` header; writes still require the exact origin.
+
 Pairing grants the operator's existing conversation and coding authority. Keep the code private. It is generated in memory, accepted once, never put into a URL, file, environment variable or browser storage. The command requires a terminal so it cannot silently write a code into service logs. A session lasts thirty minutes. After sign-out or expiry, stop the web command and run it again for a fresh code. Ctrl+C detaches the browser gateway; owner work continues. Closing a tab never cancels work. This first version intentionally requires an operator terminal for provisioning; it is not a public, unattended web login service.
 
 ## Authority and access

@@ -86,7 +86,9 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 			Object.keys(req.headers).some((name) => name === "forwarded" || name.startsWith("x-forwarded-")) ||
 			!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "")
 		)
-			return json(res, 403, { error: "Origin is not permitted." });
+			return json(res, 403, {
+				error: `Origin is not permitted. Open ${options.origin} exactly. SSH forwarding must use the same local and remote port.`,
+			});
 		const path = req.url;
 		const id = /(?:^|;\s*)unit_session=([a-f0-9]{64})(?:;|$)/.exec(req.headers.cookie ?? "")?.[1];
 		const session = id === undefined ? undefined : sessions.get(id);
@@ -194,7 +196,8 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 								return {
 									requestId: parsed.requestId,
 									state: "unknown",
-									message: "Owner response exceeded the browser limit. Inspect current work before acting again.",
+									message:
+										"Owner response exceeded the browser limit. Inspect current work before acting again.",
 								};
 							const safeResponse =
 								response.type === "error"
