@@ -117,6 +117,9 @@ test(
 				deviceScaleFactor: 1,
 				mobile: false,
 			});
+			await call("Page.navigate", { url: origin.replace("127.0.0.1", "localhost") });
+			await until(() => has("Origin is not permitted."));
+			assert.equal(await has(origin), true);
 			await call("Page.navigate", { url: origin });
 			await until(() => has("Connect to your agent."));
 			await fill('input[aria-label="Pairing code"]', "wrong");
@@ -176,7 +179,12 @@ test(
 			await evaluate(`window.fetch=window.originalFetch`);
 			const desktop = await call("Page.captureScreenshot", { format: "png" });
 			await writeFile(join(directory, "desktop.png"), Buffer.from(desktop.data, "base64"));
-			await call("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+			await call("Emulation.setDeviceMetricsOverride", {
+				width: 390,
+				height: 844,
+				deviceScaleFactor: 1,
+				mobile: true,
+			});
 			assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`), true);
 			const mobile = await call("Page.captureScreenshot", { format: "png" });
 			await writeFile(join(directory, "mobile.png"), Buffer.from(mobile.data, "base64"));

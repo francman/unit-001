@@ -41,7 +41,14 @@ async function fixture(wrongGuesses = 0) {
 	const port = (reservation.server.address() as AddressInfo).port;
 	await reservation.close();
 	const origin = `http://127.0.0.1:${port}`;
-	const server = createWebGateway({ client, origin, secret: "a".repeat(32), assets: new Map() });
+	const server = createWebGateway({
+		client,
+		origin,
+		secret: "a".repeat(32),
+		assets: new Map([
+			["/", { contentType: "text/html; charset=utf-8", body: Buffer.from("<title>Workspace</title>") }],
+		]),
+	});
 	servers.push(server);
 	server.server.listen(port, "127.0.0.1");
 	await once(server.server, "listening");
@@ -73,6 +80,31 @@ async function fixture(wrongGuesses = 0) {
 }
 
 describe("web gateway", () => {
+	it("#65 permits direct navigation without Origin and explains rejected hostnames without reflecting them", async () => {
+		const { origin, requests } = await fixture();
+		const direct = await fetch(origin);
+		expect(direct.status).toBe(200);
+		expect(await direct.text()).toBe("<title>Workspace</title>");
+		for (const host of [new URL(origin).host.replace("127.0.0.1", "localhost"), "127.0.0.1:1", "evil.example"]) {
+			const rejected = await new Promise<{ status: number | undefined; body: string }>((resolve) => {
+				const req = request(origin, { headers: { Host: host } }, (response) => {
+					let body = "";
+					response.setEncoding("utf8");
+					response.on("data", (chunk: string) => {
+						body += chunk;
+					});
+					response.on("end", () => resolve({ status: response.statusCode, body }));
+				});
+				req.end();
+			});
+			expect(rejected.status).toBe(403);
+			expect(JSON.parse(rejected.body)).toEqual({
+				error: `Origin is not permitted. Open ${origin} exactly. SSH forwarding must use the same local and remote port.`,
+			});
+			expect(rejected.body).not.toContain(host);
+		}
+		expect(requests).toEqual([]);
+	});
 	it("#65 retains an oversized post-admission reply as unknown without redispatching", async () => {
 		const f = await fixture();
 		f.client.request = async (request) => {
