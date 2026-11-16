@@ -285,6 +285,7 @@ export function writeReleaseDocumentation(stage) {
 		"distribution.md",
 		"web-ui.md",
 		"releases/0.0.8.md",
+		"releases/0.0.9.md",
 	]) {
 		mkdirSync(dirname(join(stage, "docs", name)), { recursive: true });
 		cpSync(join(repository, "apps/unit-001/docs", name), join(stage, "docs", name));
