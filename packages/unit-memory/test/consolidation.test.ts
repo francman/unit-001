@@ -8,8 +8,10 @@ import { createRegistry, defineExtension, defineTask, Harness } from "@earendil-
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { describe, expect, it } from "vitest";
 import {
+	MEMORY_RELATIONS_PER_CONSOLIDATED,
 	MemoryConsolidation,
 	pendingMemories,
+	relatedMemories,
 	scheduleMemoryConsolidation,
 	summarizeMemories,
 } from "../src/consolidation.ts";
@@ -47,6 +49,52 @@ describe("extractive consolidation", () => {
 		expect(summaries[0]!.content.match(/same/gu)).toHaveLength(1);
 		for (const summary of summaries) expect(Array.from(summary.content).length).toBeLessThanOrEqual(3000);
 		expect(summarizeMemories(records)).toEqual(summaries);
+	});
+});
+
+describe("cross-conversation relation candidates", () => {
+	function note(
+		state: ReturnType<typeof MemoryDoc.definition.initial>,
+		key: string,
+		conversation: number,
+		content: string,
+	) {
+		return rememberMemory(state, {
+			writeKey: key,
+			content,
+			now: 0,
+			provenance: {
+				origin: "user",
+				conversationId: conversation as LiveMemory["provenance"]["conversationId"],
+				entryIds: [],
+				derivation: "explicit",
+			},
+		});
+	}
+
+	it("pairs lexically related memories of other conversations only, best first and bounded", () => {
+		const state = MemoryDoc.definition.initial();
+		const deploy = note(state, "deploy", 1, "Deploy the web app to fly.io from main");
+		const sameConversation = note(state, "same", 1, "deploy web app fly.io nightly");
+		// Related but displaced by the closer copies below.
+		note(state, "other", 2, "The web app deploys to fly.io");
+		const weak = note(state, "weak", 3, "The web looks nice");
+		const unrelated = note(state, "unrelated", 4, "I prefer tabs over spaces");
+		for (let index = 0; index < MEMORY_RELATIONS_PER_CONSOLIDATED + 1; index++)
+			note(state, `copy-${index}`, 10 + index, `Deploy the web app to fly.io from main ${index}`);
+		const pairs = relatedMemories(state, [state.records[deploy] as LiveMemory]);
+		expect(pairs).toHaveLength(MEMORY_RELATIONS_PER_CONSOLIDATED);
+		for (const pair of pairs) {
+			expect(pair.from).toEqual({ id: deploy, revision: 1 });
+			expect([sameConversation, weak, unrelated]).not.toContain(pair.to.id);
+		}
+		expect(pairs.map((pair) => pair.to.id)).toEqual(["memory:copy-0", "memory:copy-1", "memory:copy-2"]);
+		const only = MemoryDoc.definition.initial();
+		const a = note(only, "a", 1, "Deploy the web app to fly.io from main");
+		const b = note(only, "b", 2, "The web app deploys to fly.io");
+		const both = relatedMemories(only, pendingMemories(only));
+		expect(both).toEqual([{ from: { id: a, revision: 1 }, to: { id: b, revision: 1 } }]);
+		expect(relatedMemories(only, pendingMemories(only))).toEqual(both);
 	});
 });
 
@@ -286,4 +334,47 @@ describe("durable consolidation checkpoints", () => {
 			}
 		},
 	);
+
+	it("relates memories across conversations while each summary keeps one conversation", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "unit-consolidation-relations-"));
+		const harness = await openMemory(join(directory, "memory.sqlite"));
+		try {
+			const root = await harness.root(context);
+			const now = Date.now() - 13 * 60 * 60 * 1000;
+			const taskId = await root.commit(async (tx) => {
+				const second = await tx.createConversation({ ownership: { kind: "ownerless" } });
+				const memory = await tx.doc(MemoryDoc);
+				for (const [key, conversationId, content] of [
+					["first", root.id, "The staging database runs Postgres 17"],
+					["second", second.id, "Postgres 17 staging database needs a vacuum"],
+				] as const)
+					rememberMemory(memory, {
+						writeKey: key,
+						content,
+						now,
+						provenance: { origin: "user", conversationId, entryIds: [], derivation: "explicit" },
+					});
+				return (await scheduleMemoryConsolidation(tx, root.id, Date.now()))!;
+			}, context);
+			harness.resume();
+			expect((await harness.waitForTask(taskId, context)).state.outcome.status).toBe("completed");
+			const memory = (await harness.snapshot(MemoryDoc, context))!;
+			const summaries = Object.values(memory.records).filter(
+				(record): record is LiveMemory => record.state === "live" && record.tier.kind === "episodic",
+			);
+			expect(summaries).toHaveLength(2);
+			for (const summary of summaries) expect(summary.tier).toMatchObject({ summaryOf: [expect.anything()] });
+			expect(Object.values(memory.relations)).toEqual([
+				expect.objectContaining({
+					kind: "relates",
+					from: { id: "memory:first", revision: 1 },
+					to: { id: "memory:second", revision: 1 },
+					provenance: { derivation: "consolidation", taskId },
+				}),
+			]);
+		} finally {
+			await harness.close(context);
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
 });

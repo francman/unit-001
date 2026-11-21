@@ -1,5 +1,15 @@
 // Connects the workspace to the paired loopback gateway without replaying mutations.
-import type { WorkspacePort, WorkspaceView } from "./contract.ts";
+import type {
+	MemoryGraphEdgeView,
+	MemoryGraphView,
+	MemoryStatsView,
+	MissionAgreementView,
+	MissionRunView,
+	WorkspaceDetails,
+	WorkspacePort,
+	WorkspaceUsage,
+	WorkspaceView,
+} from "./contract.ts";
 
 type JsonObject = Record<string, unknown>;
 
@@ -63,10 +73,12 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 			return () => stream.close();
 		},
 		async details() {
-			const [missionReply, memoryReply, channelsReply] = await Promise.all([
+			const [missionReply, memoryReply, channelsReply, owner] = await Promise.all([
 				request({ type: "mission", request: { operation: "status" } }),
 				request({ type: "memory", request: { operation: "stats" } }),
 				request({ type: "channels", request: { operation: "status" } }),
+				// A failed status read must not hide mission, memory or channel details.
+				request({ type: "status" }).then(parseOwner, () => null),
 			]);
 			const mission = object(missionReply.result);
 			const formation = object(mission.formation);
@@ -76,24 +88,35 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 			const channels = object(object(channelsReply.result).view).channels;
 			if (!Array.isArray(channels)) throw new Error("Invalid channel response.");
 			return {
+				owner,
 				mission: {
 					stage: text(mission.stage),
 					objective: typeof terms.objective === "string" ? terms.objective : null,
 					scope: typeof terms.scope === "string" ? terms.scope : null,
 					missing: Array.isArray(mission.missing) ? mission.missing.map(text) : [],
 					execution: text(mission.execution),
+					tools: list(mission.tools, 64, text),
+					agreement: formation.agreement === null ? null : parseAgreement(formation.agreement),
+					run: mission.runtime === undefined || mission.runtime === null ? null : parseRun(mission.runtime),
+					creator: mission.creator === null ? null : parseCreator(mission.creator),
+					authority: oneOf(mission.authority, AUTHORITIES),
+					agreementValid: boolean(mission.agreementValid),
+					authorityError: mission.authorityError === null ? null : text(mission.authorityError),
+					draft: formation.draft === null ? null : parseDraft(formation.draft),
 				},
 				memory: {
 					count:
 						typeof stats.working === "number" && typeof stats.episodic === "number"
 							? stats.working + stats.episodic
 							: null,
+					stats: parseMemoryStats(stats),
 					records: [],
 				},
 				channels: channels.slice(0, 64).map((value: unknown) => {
 					const channel = object(value);
 					const input = object(channel.request);
 					const outcome = object(channel.outcome);
+					// The confirmation url on awaiting_creator outcomes is a credential-bearing link; it is never read.
 					return {
 						id: text(input.channelId),
 						adapter: text(input.adapter),
@@ -102,9 +125,12 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 							outcome.kind === "ready"
 								? "Setup identity verified. Message delivery has not been verified."
 								: "Setup is pending or unavailable. Creator authority is required.",
+						lastHealth: channel.lastHealth === null || channel.lastHealth === undefined ? null : parseHealth(channel.lastHealth),
+						failure: outcome.kind === "failed" ? oneOf(outcome.reason, FAILURES) : null,
+						awaiting: outcome.kind === "awaiting_creator" ? oneOf(outcome.step, AWAITING) : null,
 					};
 				}),
-			};
+			} satisfies WorkspaceDetails;
 		},
 		async send(prompt, requestId) {
 			try {
@@ -125,6 +151,7 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 				throw new Error("Invalid memory response.");
 			return {
 				count: null,
+				stats: null,
 				records: result.records.slice(0, 5).map((value: unknown) => {
 					const record = object(value);
 					return {
@@ -134,6 +161,11 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 					};
 				}),
 			};
+		},
+		async memoryGraph() {
+			const reply = await request({ type: "memory", request: { operation: "graph" } });
+			if (reply.type !== "memory") throw new Error("Invalid memory response.");
+			return parseMemoryGraph(reply.result);
 		},
 		async forget(id, requestId) {
 			try {
@@ -170,6 +202,7 @@ export function parseWorkspaceView(value: unknown): WorkspaceView {
 		installationId: view.installationId === null ? null : text(view.installationId),
 		busy: boolean(view.busy),
 		model: model === null ? null : { provider: text(model.provider), modelId: text(model.modelId) },
+		usage: view.usage === null ? null : parseUsage(view.usage),
 		text: text(view.text),
 		textTruncated: boolean(view.textTruncated),
 		historyTruncated: boolean(view.historyTruncated),
@@ -209,4 +242,202 @@ function text(value: unknown): string {
 function boolean(value: unknown): boolean {
 	if (typeof value !== "boolean") throw new Error("Invalid owner flag.");
 	return value;
+}
+
+const FAILURES = ["authorization", "credentials", "transport", "provider", "identity"] as const;
+const AWAITING = ["grant", "manager-bootstrap", "telegram-confirmation"] as const;
+const APPROVERS = ["local-creator", "host-administrator", "developer-local"] as const;
+const RUN_STATUSES = ["ready", "running", "waiting", "paused", "blocked", "completed", "stopped"] as const;
+
+function parseUsage(value: unknown): WorkspaceUsage {
+	const usage = object(value);
+	const cost = object(usage.cost);
+	return {
+		input: number(usage.input),
+		output: number(usage.output),
+		cacheRead: number(usage.cacheRead),
+		cacheWrite: number(usage.cacheWrite),
+		totalTokens: number(usage.totalTokens),
+		cost:
+			cost.kind === "estimate"
+				? { kind: "estimate", usd: number(cost.usd) }
+				: cost.kind === "unknown"
+					? { kind: "unknown" }
+					: fail("Invalid owner cost."),
+	};
+}
+
+function parseOwner(reply: JsonObject): NonNullable<WorkspaceDetails["owner"]> {
+	if (reply.type !== "status") throw new Error("Invalid status response.");
+	const runtime = object(reply.runtime);
+	const maintenance = object(reply.maintenance);
+	return {
+		uptimeMs: number(runtime.uptimeMs),
+		held: maintenance.state === "held",
+		inhibited: boolean(reply.inhibited),
+		configured: runtime.configuration === "configured",
+	};
+}
+
+function parseAgreement(value: unknown): MissionAgreementView {
+	const agreement = object(value);
+	const terms = object(agreement.terms);
+	const policy = object(terms.policy);
+	const approval = object(agreement.approval);
+	return {
+		revision: number(agreement.revision),
+		successCriteria: list(terms.successCriteria, 32, text),
+		approvalBoundary: list(terms.approvalBoundary, 32, text),
+		reviewEveryMs: number(terms.reviewEveryMs),
+		approvedAt: number(approval.approvedAt),
+		approvedBy: oneOf(object(approval.approvedBy).kind, APPROVERS),
+		limits: {
+			maxCycles: number(policy.maxCycles),
+			maxRequests: number(policy.maxRequests),
+			maxRetries: number(policy.maxRetries),
+			maxNoProgress: number(policy.maxConsecutiveNoProgress),
+			deadlineAt: number(policy.deadlineAt),
+			maxEstimatedCost: policy.maxEstimatedCost === undefined ? null : number(policy.maxEstimatedCost),
+		},
+	};
+}
+
+function parseRun(value: unknown): MissionRunView {
+	const run = object(value);
+	return {
+		status: oneOf(run.status, RUN_STATUSES),
+		blocker: run.blocker === null ? null : text(run.blocker),
+		nextWakeAt: run.nextWakeAt === null ? null : number(run.nextWakeAt),
+		cycles: number(run.cycles),
+		requests: number(run.requests),
+		retries: number(run.retries),
+		noProgress: number(run.noProgress),
+		estimatedCost: number(run.estimatedCost),
+		reservedCost: number(run.reservedCost),
+		unknownRequests: number(run.unknownRequests),
+		unpricedResponses: number(run.unpricedResponses),
+		uncertainTools: number(run.uncertainTools),
+		evidence: list(run.evidence, 32, (item) => {
+			const evidence = object(item);
+			return {
+				criterion: text(evidence.criterion),
+				accepted: boolean(evidence.accepted),
+				detail: text(evidence.detail),
+				observedAt: number(evidence.observedAt),
+			};
+		}),
+		observedAt: number(run.observedAt),
+	};
+}
+
+function parseMemoryStats(stats: JsonObject): MemoryStatsView {
+	return {
+		working: number(stats.working),
+		episodic: number(stats.episodic),
+		tombstones: number(stats.tombstones),
+		pendingCaptures: number(stats.pendingCaptures),
+		failedCaptures: number(stats.failedCaptures),
+		consolidation: oneOf(stats.consolidation, ["idle", "scheduled"] as const),
+	};
+}
+
+const GRAPH_NODES = 300;
+const GRAPH_EDGES = 1000;
+const GRAPH_CONTENT = 280;
+const MEMORY_KINDS = ["fact", "preference", "decision", "observation"] as const;
+const MEMORY_TIERS = ["working", "episodic"] as const;
+const MEMORY_ORIGINS = ["user", "agent", "tool"] as const;
+const MEMORY_RELATIONS = ["relates", "supports", "contradicts", "updates"] as const;
+const MEMORY_DERIVATIONS = ["explicit", "consolidation"] as const;
+
+/** Validates a memory graph reply; rejects oversize lists, unknown values, self relations and edges to absent nodes. */
+export function parseMemoryGraph(value: unknown): MemoryGraphView {
+	const graph = object(value);
+	if (graph.operation !== "graph") throw new Error("Invalid memory response.");
+	const ids = new Set<string>();
+	const nodes = list(graph.nodes, GRAPH_NODES, (item) => {
+		const node = object(item);
+		const id = text(node.id);
+		const content = text(node.content);
+		if (id.length === 0 || id.length > 1000 || ids.has(id)) throw new Error("Invalid memory id.");
+		if (content.length === 0 || Array.from(content).length > GRAPH_CONTENT) throw new Error("Invalid memory content.");
+		const importance = number(node.importance);
+		if (importance > 1) throw new Error("Invalid memory importance.");
+		const conversation = text(node.conversation);
+		if (!/^[a-f0-9]{12}$/.test(conversation)) throw new Error("Invalid memory conversation.");
+		ids.add(id);
+		return {
+			id,
+			content,
+			truncated: boolean(node.truncated),
+			kind: oneOf(node.kind, MEMORY_KINDS),
+			tier: oneOf(node.tier, MEMORY_TIERS),
+			origin: oneOf(node.origin, MEMORY_ORIGINS),
+			importance,
+			createdAt: number(node.createdAt),
+			conversation,
+		};
+	});
+	const edges = list(graph.edges, GRAPH_EDGES, (item): MemoryGraphEdgeView => {
+		const edge = object(item);
+		const from = text(edge.from);
+		const to = text(edge.to);
+		if (!ids.has(from) || !ids.has(to)) throw new Error("Invalid memory edge.");
+		if (edge.kind === "summary") return { from, to, kind: "summary" };
+		if (from === to) throw new Error("Invalid memory edge.");
+		return {
+			from,
+			to,
+			kind: oneOf(edge.kind, MEMORY_RELATIONS),
+			derivation: oneOf(edge.derivation, MEMORY_DERIVATIONS),
+		};
+	});
+	const total = number(graph.total);
+	if (!Number.isSafeInteger(total) || total < nodes.length || boolean(graph.limited) !== nodes.length < total)
+		throw new Error("Invalid memory total.");
+	return { nodes, edges, total, limited: nodes.length < total };
+}
+
+function parseHealth(value: unknown): { observedAt: number; healthy: boolean } {
+	const health = object(value);
+	return { observedAt: number(health.observedAt), healthy: boolean(health.healthy) };
+}
+
+const AUTHORITIES = ["managed-administrator", "developer-local", "unconfigured", "invalid"] as const;
+const CREATOR_KINDS = ["human", "elder", "organization"] as const;
+const DRAFT_STATUSES = ["editing", "proposed"] as const;
+
+function parseCreator(value: unknown): NonNullable<WorkspaceDetails["mission"]["creator"]> {
+	const creator = object(value);
+	// The creator's local uid stays in the owner; the page shows who, not which account.
+	return { kind: oneOf(creator.kind, CREATOR_KINDS), id: text(creator.id) };
+}
+
+function parseDraft(value: unknown): NonNullable<WorkspaceDetails["mission"]["draft"]> {
+	const draft = object(value);
+	return {
+		revision: number(draft.revision),
+		status: oneOf(draft.status, DRAFT_STATUSES),
+		digest: draft.digest === null ? null : text(draft.digest),
+	};
+}
+
+function list<T>(value: unknown, max: number, item: (value: unknown) => T): T[] {
+	if (!Array.isArray(value) || value.length > max) throw new Error("Invalid owner list.");
+	return value.map(item);
+}
+
+function oneOf<const T extends string>(value: unknown, allowed: readonly T[]): T {
+	if (typeof value !== "string" || !allowed.includes(value as T)) throw new Error("Invalid owner value.");
+	return value as T;
+}
+
+function number(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER)
+		throw new Error("Invalid owner number.");
+	return value;
+}
+
+function fail(message: string): never {
+	throw new Error(message);
 }

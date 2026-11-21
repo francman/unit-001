@@ -9,7 +9,7 @@ export type WebOperation =
 	| {
 			type: "memory";
 			request:
-				| { operation: "stats" }
+				| { operation: "stats" | "graph" }
 				| { operation: "recall"; query: string }
 				| { operation: "forget"; id: string; confirmed: true };
 	  };
@@ -45,9 +45,9 @@ export function parseWebRequest(value: unknown): { requestId: string; operation:
 	}
 	if (input.type === "memory") {
 		const request = object(input.request, ["operation", "query", "id", "confirmed"]);
-		if (request.operation === "stats") {
+		if (request.operation === "stats" || request.operation === "graph") {
 			object(request, ["operation"]);
-			return { requestId, operation: { type: "memory", request: { operation: "stats" } } };
+			return { requestId, operation: { type: "memory", request: { operation: request.operation } } };
 		}
 		if (request.operation === "recall") {
 			object(request, ["operation", "query"]);

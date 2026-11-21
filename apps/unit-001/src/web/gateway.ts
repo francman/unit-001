@@ -182,6 +182,9 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 					parsed.operation.type === "send" ||
 					parsed.operation.type === "cancel" ||
 					(parsed.operation.type === "memory" && parsed.operation.request.operation === "forget");
+				// A full memory graph (300 nodes of 280 code points) exceeds the general browser limit; it stays within the owner's 1 MiB frame.
+				const limit =
+					parsed.operation.type === "memory" && parsed.operation.request.operation === "graph" ? 1_048_576 : 131_072;
 				let record = mutation ? session.requests.get(parsed.requestId) : undefined;
 				if (record !== undefined && record.fingerprint !== fingerprint)
 					return json(res, 409, { error: "Request ID already belongs to another operation." });
@@ -192,7 +195,7 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 					const result = options.client
 						.request(parsed.operation, AbortSignal.any([session.abort.signal, AbortSignal.timeout(120_000)]))
 						.then<WebResult>((response) => {
-							if (Buffer.byteLength(JSON.stringify(response)) > 131_072)
+							if (Buffer.byteLength(JSON.stringify(response)) > limit)
 								return {
 									requestId: parsed.requestId,
 									state: "unknown",

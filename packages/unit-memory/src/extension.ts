@@ -13,6 +13,7 @@ import { memoryBeforeRequest } from "./injection.ts";
 import { MemoryDoc } from "./memory.ts";
 import { forgetMemory, memoryStats, rememberMemory } from "./operations.ts";
 import { MemoryRecall } from "./recall.ts";
+import { MEMORY_RELATIONS_PER_REMEMBER } from "./relations.ts";
 
 /** One host's extension and disposable recall cache. */
 export type MemoryService = { extension: Extension; recall: MemoryRecall; close(): void };
@@ -34,12 +35,27 @@ export function createMemoryExtension(options: { now?: () => number } = {}): Mem
 			defineTool({
 				name: "remember",
 				description:
-					"Store a statement as agent-authored memory evidence. Stored statements are not authoritative host facts.",
+					"Store a statement as agent-authored memory evidence. Stored statements are not authoritative host facts. " +
+					"Name existing live memory ids in `relations` when the statement relates to, supports, contradicts or updates them, including memories from other conversations.",
 				replay: "safe",
 				parameters: Type.Object({
 					content: Type.String(),
 					source: Type.Optional(Type.String()),
 					importance: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+					relations: Type.Optional(
+						Type.Array(
+							Type.Object({
+								id: Type.String(),
+								kind: Type.Union([
+									Type.Literal("relates"),
+									Type.Literal("supports"),
+									Type.Literal("contradicts"),
+									Type.Literal("updates"),
+								]),
+							}),
+							{ maxItems: MEMORY_RELATIONS_PER_REMEMBER },
+						),
+					),
 				}),
 				execute: async (args, api, context) => {
 					const now = api.now();
@@ -61,6 +77,7 @@ export function createMemoryExtension(options: { now?: () => number } = {}): Mem
 							content: args.content,
 							source: args.source,
 							importance: args.importance,
+							relations: args.relations,
 							now,
 							provenance: {
 								origin: "agent",

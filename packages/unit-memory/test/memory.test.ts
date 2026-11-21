@@ -29,6 +29,7 @@ describe("session memory document", () => {
 			expect(await other.session.snapshot(MemoryDoc, context)).toEqual({
 				revision: 0,
 				records: {},
+				relations: {},
 				receipts: {},
 				captures: {},
 				consolidation: { state: "idle" },
@@ -232,16 +233,16 @@ describe("session memory document", () => {
 			memory.records.old = { state: "forgotten", id: "old", revision: 2 };
 		}, context);
 		await fixture.reopen();
-		const incompatible = defineDoc<MemoryState>({ ...MemoryDoc.definition, version: 2 });
+		const incompatible = defineDoc<MemoryState>({ ...MemoryDoc.definition, version: 3, migrate: undefined });
 		await expect(fixture.session.snapshot(incompatible, context)).rejects.toThrow(
-			"requires migration from version 1",
+			"requires migration from version 2",
 		);
 		const nextVersion = defineDoc<MemoryState>({
 			...MemoryDoc.definition,
-			version: 2,
+			version: 3,
 			migrate: (value, fromVersion) => {
-				expect(fromVersion).toBe(1);
-				// The persisted fixture was written with the complete version-1 MemoryDoc above.
+				expect(fromVersion).toBe(2);
+				// The persisted fixture was written with the complete version-2 MemoryDoc above.
 				return value as MemoryState;
 			},
 		});
@@ -256,6 +257,25 @@ describe("session memory document", () => {
 			id: "old",
 			revision: 2,
 		});
-		await expect(fixture.session.snapshot(MemoryDoc, context)).rejects.toThrow("newer version 2 than 1");
+		await expect(fixture.session.snapshot(MemoryDoc, context)).rejects.toThrow("newer version 3 than 2");
+	});
+
+	it("migrates a version-1 document by adding empty relations and keeping every record", async () => {
+		const versionOne = defineDoc<Omit<MemoryState, "relations">>({
+			kind: MemoryDoc.definition.kind,
+			version: 1,
+			scope: "session",
+			initial: () => ({ revision: 0, records: {}, receipts: {}, captures: {}, consolidation: { state: "idle" } }),
+			checkpointWhen: () => false,
+		});
+		await fixture.session.commit(async (tx) => {
+			const memory = await tx.doc(versionOne);
+			memory.revision = 3;
+			memory.records.old = { state: "forgotten", id: "old", revision: 2 };
+		}, context);
+		await fixture.reopen();
+		const migrated = await fixture.session.snapshot(MemoryDoc, context);
+		expect(migrated).toMatchObject({ revision: 3, relations: {} });
+		expect(migrated?.records.old).toEqual({ state: "forgotten", id: "old", revision: 2 });
 	});
 });

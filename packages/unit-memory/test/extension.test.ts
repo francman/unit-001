@@ -57,4 +57,61 @@ describe("in-process memory tools", () => {
 			service.close();
 		}
 	});
+
+	it("stores relations the agent names to existing memories and rejects a dead target", async () => {
+		const faux = fauxProvider();
+		const models = createModels();
+		models.setProvider(faux.provider);
+		const service = createMemoryExtension({ now: () => 0 });
+		const registry = createRegistry();
+		registry.install(service.extension);
+		const harness = await Harness.open(new MemoryStorage(), { models, registry, now: () => 0 }, context);
+		try {
+			const root = await harness.root(context, {
+				agent: { model: { provider: "faux", modelId: "faux-1" }, extensions: [service.extension] },
+			});
+			faux.setResponses([
+				fauxAssistantMessage(fauxToolCall("remember", { content: "Budget is ten thousand" }), {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage("saved"),
+			]);
+			await (await root.submit({ type: "input", content: "note the budget" }, context)).wait(context);
+			const target = Object.keys((await harness.snapshot(MemoryDoc, context))?.records ?? {})[0]!;
+			faux.setResponses([
+				fauxAssistantMessage(
+					fauxToolCall("remember", {
+						content: "Finance cut the budget",
+						relations: [{ id: target, kind: "updates" }],
+					}),
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage(
+					fauxToolCall("remember", {
+						content: "Points nowhere",
+						relations: [{ id: "memory:missing", kind: "relates" }],
+					}),
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("done"),
+			]);
+			await (await root.submit({ type: "input", content: "update it" }, context)).wait(context);
+			const memory = (await harness.snapshot(MemoryDoc, context))!;
+			const contents = Object.values(memory.records).map((record) =>
+				record.state === "live" ? record.content : "",
+			);
+			expect(contents).toEqual(["Budget is ten thousand", "Finance cut the budget"]);
+			expect(Object.values(memory.relations)).toEqual([
+				expect.objectContaining({
+					kind: "updates",
+					to: { id: target, revision: 1 },
+					provenance: expect.objectContaining({ derivation: "explicit", origin: "agent" }),
+				}),
+			]);
+			expect(JSON.stringify((await root.context(context)).messages)).toContain("is not live");
+		} finally {
+			await harness.close(context);
+			service.close();
+		}
+	});
 });

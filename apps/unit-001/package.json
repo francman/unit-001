@@ -43,13 +43,17 @@
 		"@earendil-works/pi-durable": "1.4.0",
 		"@earendil-works/pi-tui": "1.4.0",
 		"@tufjs/models": "4.1.1",
+		"d3-force": "3.0.0",
 		"minimatch": "11.0.1",
 		"tuf-js": "5.0.1",
 		"unit-memory": "0.0.1",
 		"zod": "4.6.6"
 	},
 	"devDependencies": {
+		"@tailwindcss/cli": "4.3.5",
+		"@types/d3-force": "3.0.10",
 		"shx": "0.3.4",
+		"tailwindcss": "4.3.5",
 		"vitest": "4.1.12"
 	}
 }

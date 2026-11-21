@@ -1,9 +1,11 @@
-// Durable, extractive consolidation of compatible working memories.
+// Durable, extractive consolidation of compatible working memories and their cross-conversation relations.
 import { createHash } from "node:crypto";
 import { type ConversationId, defineTask, type TaskId, type Tx } from "@earendil-works/pi-durable";
-import { type LiveMemory, MemoryDoc, type MemoryState } from "./memory.ts";
+import { type LiveMemory, MemoryDoc, type MemoryRef, type MemoryState } from "./memory.ts";
+import { memoryTokens } from "./recall.ts";
+import { addConsolidationRelations } from "./relations.ts";
 
-type Source = { id: string; revision: number };
+type Source = MemoryRef;
 type Summary = { id: string; content: string; sources: Source[] };
 type ConsolidationCheckpoint =
 	| { phase: "select" }
@@ -54,6 +56,64 @@ export function summarizeMemories(records: LiveMemory[]): Summary[] {
 		flush();
 	}
 	return summaries;
+}
+
+/** Maximum `relates` pairs consolidation proposes per batch memory. */
+export const MEMORY_RELATIONS_PER_CONSOLIDATED = 3;
+// Lexical overlap that counts as related: at least two shared tokens and a Jaccard index of 0.3.
+const relatedShared = 2;
+const relatedJaccard = 0.3;
+
+/**
+ * Pair each batch memory with the most lexically related live working memories of other conversations.
+ * Summaries stay per conversation so their provenance is exact; these pairs are the cross-conversation grouping.
+ */
+export function relatedMemories(
+	state: MemoryState,
+	batch: readonly LiveMemory[],
+): { from: MemoryRef; to: MemoryRef }[] {
+	// Background cost: one tokenization of every live working memory per published batch, never on a request path.
+	const tokens = new Map<string, Set<string>>();
+	const postings = new Map<string, string[]>();
+	const working: LiveMemory[] = [];
+	for (const record of Object.values(state.records)) {
+		if (record.state !== "live" || record.tier.kind !== "working") continue;
+		const words = memoryTokens(record.content);
+		tokens.set(record.id, words);
+		working.push(record);
+		for (const word of words) {
+			const posting = postings.get(word);
+			if (posting === undefined) postings.set(word, [record.id]);
+			else posting.push(record.id);
+		}
+	}
+	const byId = new Map(working.map((record) => [record.id, record]));
+	const pairs: { from: MemoryRef; to: MemoryRef }[] = [];
+	const seen = new Set<string>();
+	for (const record of batch) {
+		const words = tokens.get(record.id) ?? memoryTokens(record.content);
+		const shared = new Map<string, number>();
+		for (const word of words)
+			for (const id of postings.get(word) ?? []) if (id !== record.id) shared.set(id, (shared.get(id) ?? 0) + 1);
+		const ranked: { other: LiveMemory; jaccard: number }[] = [];
+		for (const [id, count] of shared) {
+			const other = byId.get(id)!;
+			if (count < relatedShared || other.provenance.conversationId === record.provenance.conversationId) continue;
+			const jaccard = count / (words.size + tokens.get(id)!.size - count);
+			if (jaccard >= relatedJaccard) ranked.push({ other, jaccard });
+		}
+		ranked.sort((a, b) => b.jaccard - a.jaccard || (a.other.id < b.other.id ? -1 : a.other.id > b.other.id ? 1 : 0));
+		for (const { other } of ranked.slice(0, MEMORY_RELATIONS_PER_CONSOLIDATED)) {
+			const key = JSON.stringify(record.id < other.id ? [record.id, other.id] : [other.id, record.id]);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			pairs.push({
+				from: { id: record.id, revision: record.revision },
+				to: { id: other.id, revision: other.revision },
+			});
+		}
+	}
+	return pairs;
 }
 
 /** Consolidate checkpoints survive close/reopen; publication rejects changed or forgotten sources. */
@@ -114,6 +174,7 @@ export const MemoryConsolidation = defineTask<null, ConsolidationCheckpoint, nul
 			);
 			// Deterministic text is rebuilt outside the transaction, never retained in task checkpoints.
 			const summaries = valid ? summarizeMemories(records as LiveMemory[]) : [];
+			const related = valid && snapshot !== undefined ? relatedMemories(snapshot, records as LiveMemory[]) : [];
 			await runtime.commit(async (tx) => {
 				const state = await tx.doc(MemoryDoc);
 				if (
@@ -150,10 +211,12 @@ export const MemoryConsolidation = defineTask<null, ConsolidationCheckpoint, nul
 					for (const record of records)
 						record.tier = { kind: "working", consolidation: { state: "done", summaryIds: [summary.id] } };
 				}
+				// Pairs were found on the snapshot; each endpoint is checked again at its pinned revision here.
+				const relations = addConsolidationRelations(state, related, runtime.taskId, runtime.now());
 				state.revision++;
 				await tx.appendEntry(runtime.conversationId, {
 					kind: "unit.memory.consolidated",
-					data: { ids: summaries.map((summary) => summary.id) },
+					data: { ids: summaries.map((summary) => summary.id), relations },
 				});
 				return { status: "running", checkpoint: { phase: "select" } };
 			}, context);

@@ -18,6 +18,9 @@ export function memoryEvidence(results: readonly MemoryRecallResult[]): string {
 			derivation: record.provenance.derivation,
 			tier: record.tier.kind,
 			entryIds: record.provenance.entryIds,
+			...(record.via.kind === "relation"
+				? { relatedTo: { id: record.via.memoryId, relation: record.via.relation } }
+				: {}),
 			content,
 		});
 		if (Array.from(block).length + Array.from(item).length + 1 > 3000) continue;

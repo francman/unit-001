@@ -126,12 +126,48 @@ it("#65 pairs packaged assets with the sole owner, streams, deduplicates and for
 		expect(await call("recall", { type: "memory", request: { operation: "recall", query: "violet" } })).toMatchObject({
 			response: { result: { records: [{ id: remembered.result.id }] } },
 		});
+		const graph = { type: "memory", request: { operation: "graph" } };
+		expect(await call("graph", graph)).toMatchObject({
+			state: "completed",
+			response: {
+				type: "memory",
+				result: {
+					operation: "graph",
+					nodes: [
+						{
+							id: remembered.result.id,
+							content: "violet browser memory",
+							truncated: false,
+							kind: "fact",
+							tier: "working",
+							origin: "user",
+							conversation: expect.stringMatching(/^[a-f0-9]{12}$/),
+						},
+					],
+					edges: [],
+					total: 1,
+					limited: false,
+				},
+			},
+		});
+		expect(
+			(
+				await fetch(`${origin}/api/v1/requests`, {
+					method: "POST",
+					headers: { ...headers, Cookie: "" },
+					body: JSON.stringify({ requestId: "anonymous-graph", operation: graph }),
+				})
+			).status,
+		).toBe(401);
 		expect(
 			await call("forget", {
 				type: "memory",
 				request: { operation: "forget", id: remembered.result.id, confirmed: true },
 			}),
 		).toMatchObject({ response: { result: { removed: true } } });
+		expect(await call("graph-after-forget", graph)).toMatchObject({
+			response: { result: { operation: "graph", nodes: [], edges: [], total: 0, limited: false } },
+		});
 		await expect(acquireSessionLock(`${file}.lock`)).rejects.toThrow("already running");
 		await fetch(`${origin}/api/v1/logout`, { method: "POST", headers, body: "{}" });
 		expect((await fetch(`${origin}/api/v1/events`, { headers })).status).toBe(401);

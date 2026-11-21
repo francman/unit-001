@@ -2,6 +2,7 @@
 import { copyFile, mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { buildTailwind } from "./build-tailwind.mjs";
 
 const source = new URL("../web/", import.meta.url);
 const destination = new URL("../web-dist/", import.meta.url);
@@ -16,4 +17,5 @@ await build({
 	minify: true,
 	metafile: false,
 });
-for (const file of ["index.html", "style.css"]) await copyFile(new URL(file, source), new URL(file, destination));
+await copyFile(new URL("index.html", source), new URL("index.html", destination));
+buildTailwind(fileURLToPath(new URL("style.css", destination)), true);

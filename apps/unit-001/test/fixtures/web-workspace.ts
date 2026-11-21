@@ -18,7 +18,15 @@ const file = join(directory, "session.sqlite");
 const release = await acquireSessionLock(`${file}.lock`);
 const faux = fauxProvider();
 faux.setResponses([
-	fauxAssistantMessage([fauxText('Verified browser answer. <img src=x onerror="window.injected=true">')]),
+	// The long tail makes the conversation overflow its pane, so layout checks run with a real thread scrollbar.
+	fauxAssistantMessage([
+		fauxText(
+			[
+				'Verified browser answer. <img src=x onerror="window.injected=true">',
+				...Array.from({ length: 40 }, (_, line) => `Acceptance paragraph ${line + 1}: text that fills the conversation pane.`),
+			].join("\n\n"),
+		),
+	]),
 	(_request, options) =>
 		new Promise((_resolve, reject) =>
 			options?.signal?.addEventListener("abort", () => reject(new Error("fixture cancellation")), { once: true }),
@@ -37,6 +45,10 @@ const agent = await Agent.open(
 );
 await agent.memory(
 	{ operation: "remember", content: "Violet browser acceptance memory", requestId: "browser-seed" },
+	BACKGROUND_CONTEXT,
+);
+await agent.memory(
+	{ operation: "remember", content: "Amber graph acceptance memory", requestId: "browser-graph-seed" },
 	BACKGROUND_CONTEXT,
 );
 const controller = new AbortController();

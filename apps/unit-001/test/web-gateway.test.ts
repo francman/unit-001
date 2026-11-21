@@ -261,6 +261,78 @@ describe("web gateway", () => {
 		expect(requests).toHaveLength(1);
 	});
 
+	it("dispatches the read-only memory graph only through an authenticated CSRF-checked session", async () => {
+		const { origin, headers, requests } = await fixture();
+		const body = (request: unknown) => JSON.stringify({ requestId: "graph", operation: { type: "memory", request } });
+		const post = (init: { headers: Record<string, string>; body: string }) =>
+			fetch(`${origin}/api/v1/requests`, { method: "POST", ...init });
+		const { Cookie: _cookie, ...anonymous } = headers;
+		expect((await post({ headers: anonymous, body: body({ operation: "graph" }) })).status).toBe(401);
+		expect((await post({ headers: { ...headers, "X-Unit-CSRF": "wrong" }, body: body({ operation: "graph" }) })).status).toBe(
+			403,
+		);
+		expect(
+			(await post({ headers: { ...headers, Origin: "https://evil.example" }, body: body({ operation: "graph" }) })).status,
+		).toBe(403);
+		expect((await post({ headers, body: body({ operation: "graph", limit: 10_000 }) })).status).toBe(400);
+		expect((await post({ headers, body: body({ operation: "graph", id: "memory:a" }) })).status).toBe(400);
+		expect(requests).toEqual([]);
+		for (let attempt = 0; attempt < 2; attempt++)
+			expect((await post({ headers, body: body({ operation: "graph" }) })).status).toBe(200);
+		// A read is never retained as a mutation receipt, so each refresh reaches the owner.
+		expect(requests).toEqual([
+			{ type: "memory", request: { operation: "graph" } },
+			{ type: "memory", request: { operation: "graph" } },
+		]);
+	});
+
+	it("allows a full memory graph past the general browser limit but not past the owner frame", async () => {
+		const f = await fixture();
+		let size = 400_000;
+		f.client.request = async (request) => {
+			f.requests.push(request);
+			const content = "x".repeat(size);
+			return request.type === "memory"
+				? {
+						type: "memory",
+						result: {
+							operation: "graph",
+							nodes: [
+								{
+									id: "memory:a",
+									content,
+									truncated: false,
+									kind: "fact",
+									tier: "working",
+									origin: "user",
+									importance: 0,
+									createdAt: 0,
+									conversation: "0123456789ab",
+								},
+							],
+							edges: [],
+							total: 1,
+							limited: false,
+						},
+					}
+				: { type: "reply", reply: { status: "answered", text: content } };
+		};
+		const post = (requestId: string, operation: unknown) =>
+			fetch(`${f.origin}/api/v1/requests`, {
+				method: "POST",
+				headers: f.headers,
+				body: JSON.stringify({ requestId, operation }),
+			}).then((response) => response.json());
+		expect(await post("graph", { type: "memory", request: { operation: "graph" } })).toMatchObject({
+			state: "completed",
+		});
+		expect(await post("status", { type: "status" })).toMatchObject({ state: "unknown" });
+		size = 1_100_000;
+		expect(await post("graph-2", { type: "memory", request: { operation: "graph" } })).toMatchObject({
+			state: "unknown",
+		});
+	});
+
 	it("rejects unconfirmed forget and caller-supplied authority", () => {
 		expect(() =>
 			parseWebRequest({

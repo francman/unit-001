@@ -10,7 +10,7 @@ import { MemoryRecall, memoryTokens } from "../src/recall.ts";
 import { sqliteFixture } from "./sqlite-fixture.ts";
 
 function state(): MemoryState {
-	return { revision: 0, records: {}, receipts: {}, captures: {}, consolidation: { state: "idle" } };
+	return { revision: 0, records: {}, relations: {}, receipts: {}, captures: {}, consolidation: { state: "idle" } };
 }
 function add(memory: MemoryState, key: string, content: string) {
 	return rememberMemory(memory, {
@@ -171,5 +171,60 @@ describe("bounded lexical recall", () => {
 			kind: "working",
 			consolidation: { state: "done", summaryIds: [] },
 		});
+	});
+});
+
+describe("one-hop relation recall", () => {
+	function note(memory: MemoryState, key: string, conversation: number, content: string, relates?: string) {
+		return rememberMemory(memory, {
+			writeKey: key,
+			content,
+			now: 0,
+			provenance: {
+				origin: "agent",
+				conversationId: conversation as ConversationId,
+				entryIds: [],
+				derivation: "explicit",
+			},
+			...(relates === undefined ? {} : { relations: [{ id: relates, kind: "contradicts" as const }] }),
+		});
+	}
+
+	it("brings a related memory from another conversation at half the matching score", () => {
+		const memory = state();
+		const recall = new MemoryRecall();
+		const budget = note(memory, "budget", 1, "The launch budget is ten thousand");
+		const cut = note(memory, "cut", 2, "Finance cut spending for next quarter", budget);
+		note(memory, "noise", 3, "Unrelated gardening note");
+		const results = recall.recall(memory, "launch budget", { now: 0 });
+		expect(results.map((result) => [result.id, result.via])).toEqual([
+			[budget, { kind: "match" }],
+			[cut, { kind: "relation", relation: "contradicts", memoryId: budget }],
+		]);
+		expect(results[1]!.score).toBeCloseTo(results[0]!.score / 2);
+		expect(memoryEvidence(results)).toContain(`"relatedTo":{"id":"${budget}","relation":"contradicts"}`);
+	});
+
+	it("follows only one hop, respects topK and drops relations of forgotten memories", () => {
+		const memory = state();
+		const recall = new MemoryRecall();
+		const a = note(memory, "a", 1, "violet approval");
+		const b = note(memory, "b", 2, "second statement", a);
+		note(memory, "c", 3, "third statement", b);
+		expect(recall.recall(memory, "violet", { now: 0 }).map((result) => result.id)).toEqual([a, b]);
+		expect(recall.recall(memory, "violet", { now: 0, topK: 1 }).map((result) => result.id)).toEqual([a]);
+		forgetMemory(memory, { writeKey: "forget-b", id: b });
+		expect(recall.recall(memory, "violet", { now: 0 }).map((result) => result.id)).toEqual([a]);
+	});
+
+	it("ignores a relation pinned to a stale revision", () => {
+		const memory = state();
+		const recall = new MemoryRecall();
+		const a = note(memory, "a", 1, "violet approval");
+		note(memory, "b", 2, "second statement", a);
+		const relation = Object.values(memory.relations)[0]!;
+		memory.relations = { [relation.id]: { ...relation, to: { id: a, revision: 2 } } };
+		memory.revision++;
+		expect(recall.recall(memory, "violet", { now: 0 }).map((result) => result.id)).toEqual([a]);
 	});
 });

@@ -1,5 +1,11 @@
 // Transaction-local memory mutations and content-free operational counts.
 import type { LiveMemory, MemoryProvenance, MemoryState } from "./memory.ts";
+import {
+	addExplicitRelations,
+	checkRelationRequests,
+	type MemoryRelationRequest,
+	removeRelations,
+} from "./relations.ts";
 
 /** Validated statement and host-established provenance admitted under a stable replay key. */
 export type RememberMemory = {
@@ -9,6 +15,8 @@ export type RememberMemory = {
 	importance?: number;
 	kind?: LiveMemory["kind"];
 	provenance: MemoryProvenance;
+	/** Existing live memories this statement relates to; stored only on the first execution. */
+	relations?: readonly MemoryRelationRequest[];
 	now: number;
 };
 
@@ -26,8 +34,10 @@ export function rememberMemory(state: MemoryState, input: RememberMemory): strin
 	if (!Number.isFinite(importance) || importance < 0 || importance > 1)
 		throw new Error("Memory importance must be between 0 and 1");
 	if (!Number.isFinite(input.now)) throw new Error("Memory timestamp must be finite");
+	const relations = input.relations ?? [];
+	checkRelationRequests(state, relations);
 	const id = `memory:${input.writeKey}`;
-	state.records[id] = {
+	const record: LiveMemory = {
 		state: "live",
 		id,
 		revision: 1,
@@ -40,12 +50,25 @@ export function rememberMemory(state: MemoryState, input: RememberMemory): strin
 		provenance: input.provenance,
 		tier: { kind: "working", consolidation: { state: "pending" } },
 	};
+	state.records[id] = record;
+	addExplicitRelations(
+		state,
+		record,
+		relations,
+		{
+			derivation: "explicit",
+			origin: input.provenance.origin,
+			conversationId: input.provenance.conversationId,
+			entryIds: input.provenance.entryIds,
+		},
+		input.now,
+	);
 	state.receipts[input.writeKey] = { kind: "remember", memoryId: id };
 	state.revision++;
 	return id;
 }
 
-/** Forget a statement and dependent summaries atomically, preserving the first replay result. */
+/** Forget a statement, dependent summaries and their relations atomically, preserving the first replay result. */
 export function forgetMemory(state: MemoryState, input: { writeKey: string; id: string }): boolean {
 	const receipt = Object.hasOwn(state.receipts, input.writeKey) ? state.receipts[input.writeKey] : undefined;
 	if (receipt !== undefined) {
@@ -72,6 +95,7 @@ export function forgetMemory(state: MemoryState, input: { writeKey: string; id: 
 				changed = true;
 			}
 		}
+		removeRelations(state, forgotten);
 	}
 	state.receipts[input.writeKey] = { kind: "forget", removed };
 	state.revision++;

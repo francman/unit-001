@@ -10,5 +10,5 @@
 		"allowImportingTsExtensions": true,
 		"skipLibCheck": true
 	},
-	"include": ["*.ts"]
+	"include": ["*.ts", "ui/*.ts", "views/*.ts"]
 }

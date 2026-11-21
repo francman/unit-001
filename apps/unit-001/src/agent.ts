@@ -29,6 +29,7 @@ import {
 	MemoryDoc,
 	MemoryInputEntry,
 	type MemoryService,
+	memoryGraph,
 	memoryStats,
 	reconcileMemoryTasks,
 	recordMemoryInput,
@@ -460,6 +461,8 @@ export class Agent {
 			const stats = memoryStats(await this.#harness.snapshot(MemoryDoc, context));
 			return { operation: "stats", ...stats, consolidation: stats.consolidation.state };
 		}
+		if (input.operation === "graph")
+			return { operation: "graph", ...memoryGraph(await this.#harness.snapshot(MemoryDoc, context)) };
 		if (input.operation === "recall") {
 			const state = await this.#harness.snapshot(MemoryDoc, context);
 			return {

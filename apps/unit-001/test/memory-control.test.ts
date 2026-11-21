@@ -56,4 +56,54 @@ describe("memory control", () => {
 			"Immutable conversation history remains",
 		);
 	});
+
+	it("accepts the read-only graph request without arguments and validates graph result frames", () => {
+		expect(parseMemoryRequest({ operation: "graph" })).toEqual({ operation: "graph" });
+		expect(parseMemoryRequest({ operation: "graph", requestId: "ignored" })).toEqual({ operation: "graph" });
+		expect(() => memoryCommand("graph", "extra")).toThrow();
+		const node = {
+			id: "memory:a",
+			content: "a",
+			truncated: false,
+			kind: "fact",
+			tier: "working",
+			origin: "user",
+			importance: 0.5,
+			createdAt: 1,
+			conversation: "0123456789ab",
+		};
+		const valid = {
+			operation: "graph",
+			nodes: [node, { ...node, id: "memory:s", tier: "episodic" }],
+			edges: [
+				{ from: "memory:s", to: "memory:a", kind: "summary" },
+				{ from: "memory:a", to: "memory:s", kind: "contradicts", derivation: "explicit" },
+				{ from: "memory:s", to: "memory:a", kind: "relates", derivation: "consolidation" },
+			],
+			total: 3,
+			limited: true,
+		};
+		expect(parseMemoryResult({ ...valid, extra: "dropped" })).toEqual(valid);
+		expect(describeMemory(parseMemoryResult(valid))).toBe(
+			"Memory graph: 2 of 3 live memories, 1 summary links, 2 relations (newest only).",
+		);
+		for (const patch of [
+			{ nodes: Array(301).fill(node), total: 301, limited: false },
+			{ edges: Array(1001).fill(valid.edges[0]) },
+			{ nodes: [{ ...node, content: "x".repeat(281) }], edges: [] },
+			{ nodes: [{ ...node, conversation: "1" }], edges: [] },
+			{ nodes: [{ ...node, kind: "secret" }], edges: [] },
+			{ nodes: [{ ...node, importance: 2 }], edges: [] },
+			{ nodes: [node, node], edges: [] },
+			{ edges: [{ from: "memory:s", to: "memory:gone", kind: "summary" }] },
+			{ edges: [{ from: "memory:s", to: "memory:a", kind: "causes", derivation: "explicit" }] },
+			{ edges: [{ from: "memory:s", to: "memory:a", kind: "supports" }] },
+			{ edges: [{ from: "memory:s", to: "memory:a", kind: "supports", derivation: "guessed" }] },
+			{ edges: [{ from: "memory:a", to: "memory:a", kind: "relates", derivation: "explicit" }] },
+			{ edges: [{ from: "memory:a", to: "memory:gone", kind: "updates", derivation: "explicit" }] },
+			{ total: 1 },
+			{ limited: false },
+		])
+			expect(() => parseMemoryResult({ ...valid, ...patch })).toThrow();
+	});
 });

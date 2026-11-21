@@ -58,7 +58,7 @@ For interactive use, run `agent` or `agent attach` in an SSH terminal. It shows 
 
 | Normal authorized operator | Administrator with sudo |
 |---|---|
-| Chat, attach, send, cancel, runtime status, memory stats/recall/remember/forget/sleep | Install, setup, login/logout, model configuration, identity/access changes, start/stop/kill/uninstall, updates and maintenance |
+| Chat, attach, send, cancel, runtime status, memory stats/graph/recall/remember/forget/sleep | Install, setup, login/logout, model configuration, identity/access changes, start/stop/kill/uninstall, updates and maintenance |
 
 Help and version are public. Normal `agent status` reports the running owner; `sudo agent status` retains the provider-configuration summary. Source `agent status` also retains that summary. Explicit foreground-owner options require administrator access on installed commands.
 
