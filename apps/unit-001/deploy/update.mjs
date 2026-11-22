@@ -32,6 +32,7 @@ import {
 	validateRelease,
 	withManagementLock,
 } from "./installation.mjs";
+import { compareReleaseVersions, RELEASE_VERSION as VERSION } from "./release-version.mjs";
 import {
 	activateUpdate,
 	assertUpdateSchedulingOwned,
@@ -44,7 +45,6 @@ import {
 } from "./update-activation.mjs";
 import { fetchUpdate } from "./update-trust.mjs";
 
-const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const PUBLIC_REPOSITORY = "francman/unit-001-releases";
 const PRIVATE_REPOSITORY = "francman/unit-001";
 const HELP =
@@ -405,14 +405,7 @@ function candidatePolicy(candidate, policy, current) {
 	if (candidate.version === current) return { status: "current", version: current };
 	if (policy.pin !== null && candidate.version !== policy.pin)
 		return { status: "pinned", version: candidate.version, pin: policy.pin };
-	const parts = candidate.version.split(".").map(Number);
-	const installed = current.split(".").map(Number);
-	if (
-		!VERSION.test(current) ||
-		!parts.some(
-			(value, i) => value > installed[i] && parts.slice(0, i).every((part, index) => part === installed[index]),
-		)
-	)
+	if (!VERSION.test(current) || compareReleaseVersions(candidate.version, current) <= 0)
 		return { status: "held", reason: "Automatic downgrade is not allowed.", version: candidate.version };
 	if (
 		candidate.compatibility?.stateVersion !== 1 ||

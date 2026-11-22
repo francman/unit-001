@@ -362,6 +362,8 @@ for (const changes of [
 	{ platform: "darwin-arm64" },
 	{ archiveTarget: "../../evil" },
 	{ compatibility: { stateVersion: 1, minReaderVersion: 1, maintenanceProtocol: 0 } },
+	{ compatibility: { stateVersion: 1, minReaderVersion: 1, maintenanceProtocol: 1, features: "mission-loop" } },
+	{ compatibility: { stateVersion: 1, minReaderVersion: 1, maintenanceProtocol: 1, features: [1] } },
 ]) {
 	test(`rejects signed unsupported descriptor ${JSON.stringify(changes)}`, async () => {
 		const f = await fixture();

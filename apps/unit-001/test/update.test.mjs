@@ -203,6 +203,20 @@ test("check, current, pin, incompatible, and downgrade policies avoid archive ad
 	assert(!admitted);
 });
 
+// The updater orders versions with the publisher's rule (deploy/release-version.mjs): 2^53 + 1 is not 2^53.
+test("downgrade policy compares version components at full precision", async (t) => {
+	const f = fixture(t);
+	await f.configure();
+	const installed = "9007199254740992.0.0";
+	writeInstallation({ ...f.record, releaseVersion: installed }, f.root);
+	const release = join(f.root, "opt/unit-001/releases", installed);
+	mkdirSync(release, { recursive: true });
+	writeFileSync(join(release, "release.json"), JSON.stringify({ compatibility }));
+	const check = (version) => f.run(["check"], { fetchCandidate: supplied({ version, compatibility }) });
+	assert.equal((await check("9007199254740993.0.0")).status, "available");
+	assert.equal((await check("9007199254740991.0.0")).status, "held");
+});
+
 test("fetch leaves management lock free while independent lock serializes cache users", async (t) => {
 	const f = fixture(t);
 	await f.configure();

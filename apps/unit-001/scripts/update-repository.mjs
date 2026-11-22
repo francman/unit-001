@@ -2,11 +2,24 @@
 // Signs and publishes the unit-owned TUF repository; never updates a running installation.
 import { execFileSync } from "node:child_process";
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign } from "node:crypto";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { Key, Metadata, MetaFile, Root, Signature, Snapshot, TargetFile, Targets, Timestamp } from "@tufjs/models";
+// The installed updater's own grammar and order: a version the publisher accepts is one every client accepts.
+import { compareReleaseVersions, isReleaseVersion } from "../deploy/release-version.mjs";
 
 export const UPDATE_REPOSITORY = "francman/unit-001-releases";
 export const METADATA_RELEASE = "unit-updates-stable";
@@ -117,20 +130,27 @@ function priorForRoot(directory, root, previousRootBytes) {
 	}
 }
 
-/** Builds fresh signed metadata from reviewed release metadata and immutable archive bytes. */
+/**
+ * Builds fresh signed metadata from reviewed release metadata and immutable archive bytes. A version new to the feed
+ * also needs `rollbackQualification`, the records `test/rollback/qualify.mjs` writes for this exact archive, one per earlier release.
+ * `archiveBytes` are the archive's contents read once by the caller; the signed digest and the download alias both come
+ * from them, never from a second read of `archive`.
+ */
 export function prepareRepository({
 	archive,
+	archiveBytes = readFileSync(archive),
 	release,
 	rootBytes,
 	keys,
 	previous,
 	previousRootBytes,
+	rollbackQualification,
 	expectedSourceCommit = release.source?.commit,
 	out,
 	now = new Date(),
 }) {
 	if (
-		!/^\d+\.\d+\.\d+$/.test(release.version) ||
+		!isReleaseVersion(release.version) ||
 		release.platform !== "linux-x64" ||
 		!/^[a-f0-9]{40}$/.test(release.source?.commit ?? "") ||
 		release.source.dirty !== false
@@ -156,7 +176,6 @@ export function prepareRepository({
 	const version = release.version;
 	const assetName = `unit-001-${version}-linux-x64.tar.gz`;
 	if (basename(archive) !== assetName) throw new Error("Archive filename does not match release version");
-	const archiveBytes = readFileSync(archive);
 	const archiveTarget = `linux-x64/releases/${version}.tar.gz`;
 	const releaseTag = `unit-v${version}`;
 	const descriptor = {
@@ -185,23 +204,19 @@ export function prepareRepository({
 	const oldArchive = targets.targets[archiveTarget];
 	if (oldArchive !== undefined && !oldArchive.equals(archiveFile))
 		throw new Error("Refusing to reuse a release version with different archive bytes");
-	const versions = Object.keys(targets.targets)
-		.map((path) =>
-			path
-				.match(/^linux-x64\/releases\/(\d+)\.(\d+)\.(\d+)\.tar\.gz$/)
-				?.slice(1)
-				.map(Number),
-		)
-		.filter(Boolean);
-	const selected = version.split(".").map(Number);
 	if (
-		versions.some((parts) =>
-			parts.some(
-				(part, index) => part > selected[index] && parts.slice(0, index).every((value, i) => value === selected[i]),
-			),
-		)
+		Object.keys(targets.targets).some((path) => {
+			const published = releaseVersion(path);
+			return published !== undefined && compareReleaseVersions(published, version) > 0;
+		})
 	)
 		throw new Error("Stable publication cannot downgrade the release version");
+	// A renewal re-signs a release already in the targets and needs no record. Records given anyway are checked and
+	// kept: publish falls back on them when no live timestamp proves the release was promoted.
+	const qualified =
+		oldArchive === undefined || rollbackQualification !== undefined
+			? checkRollbackQualification(rollbackQualification, version, archiveBytes, targets.targets)
+			: [];
 	targets.addTarget(archiveFile);
 	targets.addTarget(
 		new TargetFile({
@@ -244,7 +259,7 @@ export function prepareRepository({
 		"timestamp.json": encode(timestamp.toJSON()),
 	};
 	for (const [name, bytes] of Object.entries(files)) writeFileSync(join(out, name), bytes, { flag: "wx" });
-	copyFileSync(archive, join(out, DOWNLOAD_ASSET));
+	writeFileSync(join(out, DOWNLOAD_ASSET), archiveBytes, { flag: "wx" });
 	writeFileSync(
 		join(out, "publication.json"),
 		encode({
@@ -259,7 +274,209 @@ export function prepareRepository({
 		}),
 		{ flag: "wx" },
 	);
+	writeFileSync(
+		join(out, QUALIFICATION_RECEIPT),
+		encode({
+			schemaVersion: 1,
+			version,
+			archiveSha256: digest(archiveBytes),
+			renewal: oldArchive !== undefined,
+			records: qualified,
+		}),
+		{ flag: "wx" },
+	);
 	return { descriptor, files };
+}
+
+const RELEASE_TARGET = /^linux-x64\/releases\/(.*)\.tar\.gz$/;
+const QUALIFICATION_RECEIPT = "rollback-qualification.json";
+const REQUIRED_SCENARIOS = ["fresh", "version-2"];
+const SHA256 = /^[a-f0-9]{64}$/;
+
+/**
+ * Returns the release version a target path names, or undefined for a target that is not a release archive. A
+ * non-canonical name is refused: `0.0.01` would otherwise stand in for `0.0.1` and hide a reader from the gate.
+ */
+function releaseVersion(path) {
+	const version = path.match(RELEASE_TARGET)?.[1];
+	if (version !== undefined && !isReleaseVersion(version))
+		throw new Error(`Signed target ${path} does not name a canonical stable release version`);
+	return version;
+}
+
+/** Lists every release in `published` older than `version`, with the archive digest the signed targets pin. */
+function earlierReleases(version, published) {
+	const earlier = [];
+	for (const file of Object.values(published)) {
+		const reader = releaseVersion(file.path);
+		if (reader === undefined || compareReleaseVersions(reader, version) >= 0) continue;
+		// TUF accepts a hash map without SHA-256; two missing digests must never compare as a match.
+		if (!SHA256.test(file.hashes.sha256 ?? ""))
+			throw new Error(`Signed target ${file.path} has no SHA-256 digest to qualify against`);
+		earlier.push({ version: reader, archiveSha256: file.hashes.sha256 });
+	}
+	return earlier.sort((a, b) => compareReleaseVersions(a.version, b.version));
+}
+
+/**
+ * Refuses a new stable version unless the whole owner was qualified with these archive bytes against every earlier
+ * published release: the updater accepts any installed release that declares the supported compatibility numbers as
+ * a source, so an installation may skip versions and roll back to any of them. The qualification is a list of
+ * `qualify.mjs` records, one per earlier release, each naming that reader's exact archive and the candidate's.
+ */
+function checkRollbackQualification(records, version, archiveBytes, published) {
+	const earlier = earlierReleases(version, published);
+	// The first publication has no earlier release to roll back to.
+	if (earlier.length === 0) return [];
+	if (!Array.isArray(records) || records.length === 0)
+		throw new Error(
+			"A new stable release requires a passed full-owner rollback qualification for every earlier release (test/rollback/qualify.mjs)",
+		);
+	for (const record of records) {
+		if (
+			record?.schemaVersion !== 1 ||
+			record.kind !== "unit.full-owner-rollback" ||
+			record.result !== "passed" ||
+			// An array, not a string: `"fresh version-2".includes("fresh")` would also pass.
+			!Array.isArray(record.scenarios) ||
+			record.scenarios.length !== REQUIRED_SCENARIOS.length ||
+			!REQUIRED_SCENARIOS.every((scenario) => record.scenarios.includes(scenario)) ||
+			!SHA256.test(record.reader?.archiveSha256 ?? "")
+		)
+			throw new Error("A new stable release requires a passed full-owner rollback qualification (test/rollback/qualify.mjs)");
+		if (record.candidate?.version !== version || record.candidate.archiveSha256 !== digest(archiveBytes))
+			throw new Error("Rollback qualification does not cover this exact release archive");
+	}
+	for (const reader of earlier) {
+		const matching = records.filter((record) => record.reader?.version === reader.version);
+		if (matching.length === 0) throw new Error(`Rollback qualification is missing for earlier release ${reader.version}`);
+		if (matching.length > 1 || matching[0].reader.archiveSha256 !== reader.archiveSha256)
+			throw new Error(`Rollback qualification must use the published ${reader.version} archive`);
+	}
+	if (records.length !== earlier.length)
+		throw new Error("Rollback qualification names a reader that is not an earlier published release");
+	return records;
+}
+
+/**
+ * Checks the approved root against the published root chain and returns the published root one version below it, or
+ * undefined for version one. The predecessor is chosen by version, never as the newest upload: after a rotation was
+ * interrupted between the root and the freshness upload, the newest published root is the approved one while the live
+ * timestamp is still signed under its predecessor.
+ */
+function predecessorRoot(assets, root, rootBytes, remote) {
+	const published = new Map();
+	for (const asset of assets) {
+		const match = asset.name.match(/^([1-9]\d*)\.root\.json$/);
+		if (match !== null) published.set(Number(match[1]), asset);
+	}
+	const version = root.signed.version;
+	const newest = Math.max(0, ...published.keys());
+	if (newest > version) throw new Error("A newer root is already published; fetch and prepare again with it");
+	if (newest === version && !remote.read(published.get(version)).equals(rootBytes))
+		throw new Error("Published root version cannot change bytes");
+	if (version === 1) return undefined;
+	if (newest === 0) throw new Error("Missing bootstrap root chain");
+	if (newest < version - 1) throw new Error("Published root rotation must advance by one version");
+	const asset = published.get(version - 1);
+	if (asset === undefined) throw new Error("Published root chain has a gap");
+	const bytes = remote.read(asset);
+	const previous = Metadata.fromJSON("root", JSON.parse(bytes));
+	previous.verifyDelegate("root", previous);
+	if (previous.signed.version !== version - 1) throw new Error("Published root filename does not match its version");
+	previous.verifyDelegate("root", root);
+	return bytes;
+}
+
+/**
+ * Fetches the metadata the feed serves now, authenticated against `root` or its predecessor, and says which timestamp
+ * it came from. After an interrupted freshness replacement this is the newest signed receipt, so a missing
+ * `timestamp.json` is not mistaken for an empty feed.
+ */
+function servedMetadata(remote, root, previousRootBytes) {
+	const scratch = mkdtempSync(join(tmpdir(), "unit-served-"));
+	try {
+		const directory = join(scratch, "served");
+		const { freshness } = fetchRepository(directory, remote);
+		return { freshness, metadata: priorForRoot(directory, root, previousRootBytes) };
+	} finally {
+		rmSync(scratch, { recursive: true, force: true });
+	}
+}
+
+/**
+ * A stage's releases must be exactly the feed's plus the candidate. It must carry forward every served release byte for
+ * byte, or a stage prepared without the served predecessor could drop the earlier releases from the gate (a "first
+ * publication") on a live feed. It must add nothing else, or a release the feed never authenticated would enter history.
+ */
+function checkFeedContinuity(served, signedTargets, candidate) {
+	const servedTargets = served?.targets.signed.targets ?? {};
+	for (const [path, file] of Object.entries(servedTargets)) {
+		if (releaseVersion(path) === undefined) continue;
+		if (signedTargets[path]?.equals(file) !== true)
+			throw new Error(`Staged publication drops or changes ${path}, which the feed serves; fetch and prepare again`);
+	}
+	for (const path of Object.keys(signedTargets))
+		if (releaseVersion(path) !== undefined && path !== candidate && servedTargets[path] === undefined)
+			throw new Error(`Staged publication adds ${path}, which the feed does not serve; only the candidate may be new`);
+}
+
+/**
+ * Without a live `timestamp.json`, the served receipt's own candidate (the release its stable descriptor names) was
+ * never proven promoted or qualified: its publication may have stopped before the live pointer, or come from a
+ * publisher that predates the gate. A later version would carry it into served history without its own qualification,
+ * since the gate checks only the stage's candidate. So only a stage of that same candidate may go out, and
+ * `checkStagedQualification` then requires the records for it. Every other served release passed through a live
+ * timestamp or through this rule.
+ */
+function checkInterruptedCandidate(served, signedTargets) {
+	if (served.freshness !== "receipt") return;
+	const interrupted = served.metadata.targets.signed.targets["linux-x64/stable.json"];
+	if (signedTargets["linux-x64/stable.json"]?.equals(interrupted) !== true)
+		throw new Error(
+			"The feed has no live timestamp.json, so the release its newest receipt names was never proven promoted; publish that release again (renew with --rollback-qualification) before any other",
+		);
+}
+
+/** Reads the staged receipt `prepare` wrote and repeats the gate against the signed targets and archive bytes. */
+function checkStagedQualification(directory, descriptor, archiveBytes, signedTargets, served, remote, plan) {
+	const path = join(directory, QUALIFICATION_RECEIPT);
+	if (!existsSync(path))
+		throw new Error("Staged publication has no rollback qualification receipt; prepare it again with this publisher");
+	const receipt = JSON.parse(readFileSync(path));
+	if (
+		receipt.schemaVersion !== 1 ||
+		receipt.version !== descriptor.version ||
+		receipt.archiveSha256 !== digest(archiveBytes) ||
+		typeof receipt.renewal !== "boolean"
+	)
+		throw new Error("Rollback qualification receipt does not match the signed archive");
+	if (receipt.renewal && served.freshness === "live") {
+		// A renewal re-signs a release the feed already serves. The live timestamp must pin this archive: an uploaded
+		// asset alone proves nothing, since an orphaned upload never passed the gate.
+		const pinned = served.metadata?.targets.signed.targets[descriptor.archiveTarget];
+		const published = remote.assets(plan.releaseTag)?.find((asset) => asset.name === plan.assetName);
+		if (
+			pinned === undefined ||
+			pinned.hashes.sha256 !== digest(archiveBytes) ||
+			published === undefined ||
+			!remote.read(published).equals(archiveBytes)
+		)
+			throw new Error("Staged publication claims a renewal but the feed does not serve this archive");
+		return;
+	}
+	// Only the live `timestamp.json` proves promotion. Every publication uploads its numbered receipt before the live
+	// pointer, so without one the newest receipt may belong to a publication that never went live, possibly from a
+	// publisher that predates the gate. A renewal then passes the gate like a new version.
+	try {
+		checkRollbackQualification(receipt.records, descriptor.version, archiveBytes, signedTargets);
+	} catch (error) {
+		if (!receipt.renewal) throw error;
+		throw new Error(
+			`The feed has no live timestamp.json to prove ${descriptor.version} was promoted, so its renewal needs the rollback qualification (prepare or renew with --rollback-qualification): ${error.message}`,
+			{ cause: error },
+		);
+	}
 }
 
 /** Publishes only to the public release repository; its credential never reaches downloaded bundles. */
@@ -323,7 +540,12 @@ export function githubPublisher() {
 	};
 }
 
-/** Fetches publisher state; only a confirmed missing release represents an empty repository. */
+/**
+ * Fetches publisher state; only a confirmed missing release represents an empty repository. Returns which timestamp it
+ * used: `live` (`timestamp.json`), `receipt` (the newest numbered one, after an interrupted replacement deleted the live
+ * pointer) or `none`. No timestamp at all means no publication ever reached its freshness step: each uploads its
+ * numbered receipt before the live pointer, and retention keeps the newest receipt.
+ */
 export function fetchRepository(out, remote = githubPublisher()) {
 	mkdirSync(out, { mode: 0o700 });
 	const assets = remote.assets(METADATA_RELEASE) ?? [];
@@ -338,7 +560,7 @@ export function fetchRepository(out, remote = githubPublisher()) {
 		assets
 			.filter((asset) => /^[1-9]\d*\.timestamp\.json$/.test(asset.name))
 			.sort((a, b) => Number.parseInt(b.name, 10) - Number.parseInt(a.name, 10))[0];
-	if (timestampAsset === undefined) return;
+	if (timestampAsset === undefined) return { freshness: "none" };
 	const timestampBytes = remote.read(timestampAsset);
 	writeFileSync(join(out, "timestamp.json"), timestampBytes, { flag: "wx" });
 	const timestamp = Metadata.fromJSON("timestamp", JSON.parse(timestampBytes));
@@ -352,11 +574,15 @@ export function fetchRepository(out, remote = githubPublisher()) {
 	const targetsAsset = assets.find((asset) => asset.name === targetsName);
 	if (targetsAsset === undefined) throw new Error("Missing targets asset");
 	writeFileSync(join(out, targetsName), remote.read(targetsAsset), { flag: "wx" });
+	return { freshness: timestampAsset.name === "timestamp.json" ? "live" : "receipt" };
 }
 
-/** Renews metadata for the exact existing archive; never rebuilds an already published version. */
+/**
+ * Renews metadata for the exact existing archive; never rebuilds an already published version. `rollbackQualification`
+ * is needed only when the feed has lost its live `timestamp.json` (see `checkStagedQualification`).
+ */
 export function renewRepository(
-	{ out, rootBytes, keys, previousRootBytes, now = new Date() },
+	{ out, rootBytes, keys, previousRootBytes, rollbackQualification, now = new Date() },
 	remote = githubPublisher(),
 ) {
 	mkdirSync(out, { mode: 0o700 });
@@ -373,7 +599,7 @@ export function renewRepository(
 		throw new Error("Descriptor hash mismatch");
 	const descriptor = JSON.parse(bytes);
 	if (
-		!/^\d+\.\d+\.\d+$/.test(descriptor.version) ||
+		!isReleaseVersion(descriptor.version) ||
 		descriptor.archiveTarget !== `linux-x64/releases/${descriptor.version}.tar.gz`
 	)
 		throw new Error("Invalid descriptor target");
@@ -391,6 +617,7 @@ export function renewRepository(
 	writeFileSync(archive, archiveBytes, { flag: "wx" });
 	return prepareRepository({
 		archive,
+		archiveBytes,
 		release: {
 			version: descriptor.version,
 			platform: descriptor.platform,
@@ -401,13 +628,29 @@ export function renewRepository(
 		keys,
 		previous,
 		previousRootBytes,
+		rollbackQualification,
 		now,
 		out: join(out, "publication"),
 	});
 }
 
-/** Publishes immutable content first, with timestamp last and a stale-publisher check. */
+/**
+ * Publishes immutable content first, with timestamp last and a stale-publisher check. The stage is copied once into a
+ * private directory and everything is validated and uploaded from that copy, so a file swapped in the stage after
+ * validation cannot change what ships.
+ */
 export function publishRepository(directory, rootBytes, remote = githubPublisher(), now = new Date()) {
+	const snapshot = mkdtempSync(join(tmpdir(), "unit-publish-"));
+	try {
+		for (const entry of readdirSync(directory, { withFileTypes: true }))
+			if (entry.isFile()) writeFileSync(join(snapshot, entry.name), readFileSync(join(directory, entry.name)));
+		publishSnapshot(snapshot, rootBytes, remote, now);
+	} finally {
+		rmSync(snapshot, { recursive: true, force: true });
+	}
+}
+
+function publishSnapshot(directory, rootBytes, remote, now) {
 	const plan = JSON.parse(readFileSync(join(directory, "publication.json")));
 	if (plan.repository !== UPDATE_REPOSITORY || plan.schemaVersion !== 1) throw new Error("Invalid publication plan");
 	const root = rootMetadata(rootBytes, now);
@@ -439,6 +682,9 @@ export function publishRepository(directory, rootBytes, remote = githubPublisher
 		throw new Error("Archive publication plan mismatch");
 	if (!readFileSync(join(directory, DOWNLOAD_ASSET)).equals(archiveBytes))
 		throw new Error("Direct download alias differs from the signed archive");
+	// The archive is read from its path once; the validated bytes are what every upload below sends.
+	const archivePath = join(directory, plan.assetName);
+	writeFileSync(archivePath, archiveBytes, { flag: "wx" });
 	const rootName = `${root.signed.version}.root.json`;
 	if (!readFileSync(join(directory, rootName)).equals(rootBytes))
 		throw new Error("Staged root differs from approved root");
@@ -451,22 +697,12 @@ export function publishRepository(directory, rootBytes, remote = githubPublisher
 	const initial = remote.assets(METADATA_RELEASE);
 	if (initial === null && root.signed.version !== 1)
 		throw new Error("A fresh repository requires bootstrap root version one");
-	const publishedRoots = (initial ?? [])
-		.filter((asset) => /^[1-9]\d*\.root\.json$/.test(asset.name))
-		.sort((a, b) => Number.parseInt(a.name, 10) - Number.parseInt(b.name, 10));
-	const latestRootAsset = publishedRoots.at(-1);
-	if (latestRootAsset !== undefined) {
-		const previousRootBytes = remote.read(latestRootAsset);
-		const previousRoot = Metadata.fromJSON("root", JSON.parse(previousRootBytes));
-		previousRoot.verifyDelegate("root", previousRoot);
-		if (root.signed.version === previousRoot.signed.version) {
-			if (!rootBytes.equals(previousRootBytes)) throw new Error("Published root version cannot change bytes");
-		} else {
-			if (root.signed.version !== previousRoot.signed.version + 1)
-				throw new Error("Published root rotation must advance by one version");
-			previousRoot.verifyDelegate("root", root);
-		}
-	} else if (root.signed.version !== 1) throw new Error("Missing bootstrap root chain");
+	const previousRootBytes = predecessorRoot(initial ?? [], root, rootBytes, remote);
+	// Bootstrap and renewal come from what the feed authenticates now, not from the stage's own claims.
+	const served = servedMetadata(remote, root, previousRootBytes);
+	checkFeedContinuity(served.metadata, metadata.targets.signed.targets, descriptor.archiveTarget);
+	checkInterruptedCandidate(served, metadata.targets.signed.targets);
+	checkStagedQualification(directory, descriptor, archiveBytes, metadata.targets.signed.targets, served, remote, plan);
 	const checkTimestamp = () => {
 		const assets = remote.assets(METADATA_RELEASE) ?? [];
 		const asset = assets.find((entry) => entry.name === "timestamp.json");
@@ -512,11 +748,10 @@ export function publishRepository(directory, rootBytes, remote = githubPublisher
 		}
 		remote.upload(tag, path);
 	};
-	put(plan.releaseTag, plan.assetName, plan.archive);
+	put(plan.releaseTag, plan.assetName, archivePath);
 	put(plan.releaseTag, DOWNLOAD_ASSET, join(directory, DOWNLOAD_ASSET));
 	if (initial === null) remote.create(METADATA_RELEASE);
 	const names = [
-		rootName,
 		`${metadata.targets.signed.version}.targets.json`,
 		`${metadata.snapshot.signed.version}.snapshot.json`,
 		descriptorAsset,
@@ -524,6 +759,10 @@ export function publishRepository(directory, rootBytes, remote = githubPublisher
 	];
 	for (const name of names) put(METADATA_RELEASE, name, join(directory, name));
 	checkTimestamp();
+	// A rotated root goes out right before freshness: clients that see it reject the live timestamp its predecessor
+	// signed, so the feed fails closed for one upload only, and a stale publisher is refused before that window opens.
+	// A retry from here finds the root published and authenticates the old timestamp with `predecessorRoot`.
+	put(METADATA_RELEASE, rootName, join(directory, rootName));
 	remote.upload(METADATA_RELEASE, join(directory, "timestamp.json"), true);
 	const current = remote.assets(METADATA_RELEASE)?.find((asset) => asset.name === "timestamp.json");
 	if (current === undefined || !remote.read(current).equals(metadata.timestampBytes))
@@ -648,16 +887,25 @@ export function pruneRepository(rootBytes, remote = githubPublisher(), now = new
 	return { removed: removals.map((asset) => asset.name), retained: inventory.length - removals.length };
 }
 
+/** Reads the `--rollback-qualification` record files, one per earlier published release; undefined when none given. */
+function qualificationRecords(values) {
+	return values["rollback-qualification"]?.map((file) => JSON.parse(readFileSync(file, "utf8")));
+}
+
 if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url) {
 	const command = process.argv[2];
 	const { values } = parseArgs({
 		args: process.argv.slice(3),
-		options: Object.fromEntries(
-			["out", "root", "keys", "new-keys", "previous", "previous-root", "archive", "source-commit"].map((name) => [
-				name,
-				{ type: "string" },
-			]),
-		),
+		options: {
+			...Object.fromEntries(
+				["out", "root", "keys", "new-keys", "previous", "previous-root", "archive", "source-commit"].map((name) => [
+					name,
+					{ type: "string" },
+				]),
+			),
+			// One qualify.mjs record per earlier published release.
+			"rollback-qualification": { type: "string", multiple: true },
+		},
 	});
 	if (command === "keygen") generateRepositoryKeys(values.out);
 	else if (command === "rotate-root")
@@ -671,6 +919,7 @@ if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])
 			out: values.out,
 			rootBytes: readFileSync(values.root),
 			keys: values.keys,
+			rollbackQualification: qualificationRecords(values),
 			...(values["previous-root"] === undefined ? {} : { previousRootBytes: readFileSync(values["previous-root"]) }),
 		});
 	else if (command === "prepare") {
@@ -679,22 +928,15 @@ if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])
 		const version = basename(values.archive)
 			.replace(/^unit-001-/, "")
 			.replace(/-linux-x64\.tar\.gz$/, "");
-		const release = JSON.parse(
-			execFileSync("tar", ["-xOf", values.archive, `unit-001-${version}-linux-x64/release.json`], {
-				encoding: "utf8",
-			}),
-		);
+		// One read: the members checked here, the signed digest and the download alias all come from these bytes, so a
+		// file swapped at the path meanwhile cannot bind one build's archive to another build's descriptor.
+		const archiveBytes = readFileSync(values.archive);
+		const member = (path, maxBuffer) =>
+			execFileSync("tar", ["-xzOf", "-", `unit-001-${version}-linux-x64/${path}`], { input: archiveBytes, maxBuffer });
+		const release = JSON.parse(member("release.json", 1024 * 1024));
 		const rootBytes = readFileSync(values.root);
-		const bootstrap = execFileSync(
-			"tar",
-			["-xOf", values.archive, `unit-001-${version}-linux-x64/deploy/update-root.json`],
-			{ maxBuffer: 4 * 1024 * 1024 },
-		);
-		const feed = JSON.parse(
-			execFileSync("tar", ["-xOf", values.archive, `unit-001-${version}-linux-x64/deploy/update-feed.json`], {
-				maxBuffer: 8192,
-			}),
-		);
+		const bootstrap = member("deploy/update-root.json", 4 * 1024 * 1024);
+		const feed = JSON.parse(member("deploy/update-feed.json", 8192));
 		if (
 			!bootstrap.equals(rootBytes) ||
 			JSON.stringify(feed) !== JSON.stringify({ schemaVersion: 1, repository: UPDATE_REPOSITORY, channel: "stable" })
@@ -702,7 +944,9 @@ if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])
 			throw new Error("Public release must bundle the approved verification root and fixed public update feed");
 		prepareRepository({
 			...values,
+			archiveBytes,
 			release,
+			rollbackQualification: qualificationRecords(values),
 			expectedSourceCommit: values["source-commit"],
 			rootBytes,
 			...(values["previous-root"] === undefined ? {} : { previousRootBytes: readFileSync(values["previous-root"]) }),
@@ -710,6 +954,6 @@ if (process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])
 	} else if (command === "publish") publishRepository(values.out, readFileSync(values.root));
 	else
 		throw new Error(
-			"Usage: update-repository.mjs keygen|rotate-root|fetch|prepare|renew|publish --out PATH [--root FILE --keys DIR --new-keys DIR --previous DIR --previous-root FILE --archive FILE --source-commit SHA]",
+			"Usage: update-repository.mjs keygen|rotate-root|fetch|prepare|renew|publish --out PATH [--root FILE --keys DIR --new-keys DIR --previous DIR --previous-root FILE --archive FILE --source-commit SHA --rollback-qualification FILE]",
 		);
 }

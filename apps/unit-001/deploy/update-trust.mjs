@@ -7,11 +7,11 @@ import { pipeline } from "node:stream/promises";
 import { Updater } from "tuf-js";
 // tuf-js 5.0.1 does not export this class publicly; Updater requires its exact identity to end root rotation on 404.
 import { DownloadHTTPError } from "tuf-js/dist/error.js";
+import { isReleaseVersion } from "./release-version.mjs";
 
 const ORIGIN = "https://unit001.invalid/";
 const MAX_METADATA = 4 * 1024 * 1024;
 const MAX_ARCHIVE = 512 * 1024 * 1024;
-const VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
 const REDIRECT_HOSTS = new Set(["release-assets.githubusercontent.com", "objects.githubusercontent.com"]);
 
 /** Refreshes trusted metadata and returns a verified archive; policy/version ordering belongs to the caller. */
@@ -141,7 +141,7 @@ export function validateDescriptor(value) {
 		value === null ||
 		typeof value !== "object" ||
 		value.schemaVersion !== 1 ||
-		!VERSION.test(value.version) ||
+		!isReleaseVersion(value.version) ||
 		value.platform !== "linux-x64" ||
 		!/^[a-f0-9]{40}$/.test(value.sourceCommit) ||
 		value.archiveTarget !== `linux-x64/releases/${value.version}.tar.gz`
@@ -157,7 +157,11 @@ export function validateDescriptor(value) {
 		compatibility.minReaderVersion < 1 ||
 		compatibility.minReaderVersion > compatibility.stateVersion ||
 		!Number.isSafeInteger(compatibility.maintenanceProtocol) ||
-		compatibility.maintenanceProtocol < 1
+		compatibility.maintenanceProtocol < 1 ||
+		// Activation compares these names with the archive's own declaration; releases before features omit them.
+		(compatibility.features !== undefined &&
+			(!Array.isArray(compatibility.features) ||
+				!compatibility.features.every((feature) => typeof feature === "string")))
 	)
 		throw new Error("Invalid signed compatibility contract.");
 	return value;
