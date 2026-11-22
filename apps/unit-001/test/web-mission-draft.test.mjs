@@ -87,18 +87,19 @@ function exercise() {
 	check(!card.querySelector("img") && !window.executed && values.Objective.includes("\\u000D\\u000A\\u202E\\u0085\\\\u{202E}"), "model text is literal and controls are visible");
 	check(values.Objective.endsWith(`${escapedSpaces}"`), "exact review distinguishes Unicode spaces from ASCII space");
 	check(card.querySelector("details dd").textContent === '"old scope"', "amendment retains previous values of changed terms");
-	check(agreeButton().textContent === "Agree to revision 13", "approval names the proposed revision");
-	agreeButton().click();
-	check(JSON.stringify(calls.pop()) === JSON.stringify({ revision: 13, digest, confirmed: true }), "one click agrees to the exact visible revision and digest");
+	check(!agreeButton(), "managed review never offers browser Agree even when passed an approval callback");
 	const developerReview = insert(renderMissionDraftCard({ ...proposed, binding: { kind: "developer-local" } }));
 	check(agreeButton() && developerReview.textContent.includes("The digest binds the developer-local authority revision, which is not shown here.") &&
 		![...developerReview.querySelectorAll("dt")].some((term) => term.textContent === "Authority revision"), "developer-local review discloses the omitted binding without inventing a value");
-	insert(renderMissionDraftCard({ ...proposed, disabled: true }));
+	check(agreeButton().textContent === "Agree to revision 13", "approval names the proposed revision");
+	agreeButton().click();
+	check(JSON.stringify(calls.pop()) === JSON.stringify({ revision: 13, digest, confirmed: true }), "one click agrees to the exact visible revision and digest");
+	insert(renderMissionDraftCard({ ...proposed, binding: { kind: "developer-local" }, disabled: true }));
 	agreeButton().click();
 	check(calls.length === 0, "pending or blocked review cannot send agreement");
-	insert(renderMissionDraftCard({ ...proposed, terms: { objective: terms.objective, scope: terms.scope } }));
+	insert(renderMissionDraftCard({ ...proposed, binding: { kind: "developer-local" }, terms: { objective: terms.objective, scope: terms.scope } }));
 	check(!agreeButton() && document.body.textContent.includes("complete proposal is not available"), "partial status projection cannot enable approval");
-	insert(renderMissionDraftCard({ ...proposed, digest: "not-the-full-digest" }));
+	insert(renderMissionDraftCard({ ...proposed, binding: { kind: "developer-local" }, digest: "not-the-full-digest" }));
 	check(!agreeButton(), "a truncated digest cannot enable approval");
 	insert(renderMissionDraftCard({ ...proposed, digest: null, approval: { kind: "unavailable" } }));
 	check(!agreeButton() && !document.querySelector("code") && document.body.textContent.includes("workspace only"), "an unarmed proposal retains terms but offers no digest-bound action");
@@ -113,9 +114,13 @@ function exercise() {
 		previousReceipt: "receipt-10", review: { missionId: "mission-13", revision: 13, digest, ...proposed.binding.review },
 		draft: { missionId: "mission-13", status: "proposed", digest, revision: 13 },
 	};
-	const ctx = { name: "unit-001", ui: { details: { mission }, view: null }, act: { copy: async () => false } };
+	const ctx = { name: "unit-001", ui: { details: { mission }, view: null, connection: "connected" }, act: { copy: async () => false } };
 	insert(renderMission(ctx));
-	check(!byKey("open-mission-draft") && document.querySelector("code").textContent === line, "unarmed managed review offers the exact sudo fallback before a watch frame");
+	check(!byKey("open-mission-draft") && document.querySelector("code").textContent === line, "a verified managed review offers the exact sudo fallback");
+	ctx.ui.connection = "workspace-changed";
+	insert(renderMission(ctx));
+	check(!byKey("copy-mission-approve") && document.body.textContent.includes("last reported as proposed"), "old status is readable without offering a stale command");
+	ctx.ui.connection = "connected";
 	mission.review = null;
 	insert(renderMission(ctx));
 	check(!byKey("copy-mission-approve"), "a managed owner digest without a matching gateway review is not a terminal command");
@@ -152,6 +157,9 @@ async function exerciseShell() {
 		draft: { missionId: "m", revision, digest: digit.repeat(64), terms: { ...terms, scope }, status: "proposed" },
 		review: { missionId: "m", revision, digest: digit.repeat(64), authorityRevision: 9, previousReceipt: head },
 	});
+	const developer = (revision, digit, scope = terms.scope) => ({
+		...proposal(revision, digit, undefined, scope), authority: "developer-local", review: null,
+	});
 	const recorded = (current, revision, approvedBy) => ({
 		...current, draft: null, review: null, stage: "agreed", agreementValid: true,
 		agreement: {
@@ -166,31 +174,21 @@ async function exerciseShell() {
 		textTruncated: false, historyTruncated: false, entries: [], tools: [], model: { provider: "faux", modelId: "faux" } };
 	const writes = [];
 	let sends = 0;
-	let resolveLogout;
 	let receive;
-	let pendingStatusRead;
-	let heldStatusRead;
 	const port = {
 		watch(listener) { receive = listener; listener({ type: "view", view }); return () => {}; },
 		async details() { return { mission, owner: null, channels: [], memory: { count: null, stats: null, records: [] } }; },
-		async mission() {
-			if (pendingStatusRead) {
-				const capture = pendingStatusRead;
-				pendingStatusRead = null;
-				return new Promise(capture);
-			}
-			return mission;
-		},
+		async mission() { return mission; },
 		async mutateMission(request) {
 			writes.push(request);
 			if (writes.length === 1) {
-				mission = proposal(7, "b", "receipt-6", "fresh scope");
+				mission = developer(8, "b", "fresh scope");
 				return { state: "refused", code: "stale-digest" };
 			}
-			return { state: "issued", receiptId: `receipt-${request.revision}`, reconciled: request.revision === 8 };
+			mission = recorded(mission, request.revision, "developer-local");
+			return { state: "completed", mission };
 		},
 		async send() { sends++; return { state: "completed" }; },
-		logout() { return new Promise((resolve) => { resolveLogout = resolve; }); },
 	};
 	const root = document.createElement("div");
 	document.body.replaceChildren(root);
@@ -239,46 +237,22 @@ async function exerciseShell() {
 		byKey("mission-draft-save").click();
 		check(!agree() && writes.length === 0, "conflict cannot save or approve through the preserved editor");
 		byKey("mission-draft-discard").click();
-		await wait(() => agree()?.textContent === "Agree to revision 6", "explicit discard shows only the latest proposal");
-		check(!root.contains(objective) && !root.textContent.includes("edits based on revision 4") && !agree().disabled, "discard removes the local copy and allows a fresh review");
+		await wait(() => byKey("copy-mission-draft-approve"), "explicit discard shows the latest managed proposal");
+		check(!root.contains(objective) && !root.textContent.includes("edits based on revision 4") && !agree(), "managed review is readable but never offers Agree");
 		check(composer.value === "An unsent message" && writes.length === 0 && sends === 0, "entry, updates and discard do not send or write");
+		mission = developer(7, "a");
+		byKey("mission-draft-refresh").click();
+		await wait(() => agree()?.textContent === "Agree to revision 7", "affirmative developer-local capability offers Agree");
 		agree().click();
-		await wait(() => agree()?.textContent === "Agree to revision 7", "fresh review after refusing stale digest");
-		check(writes.length === 1 && writes[0].digest === "a".repeat(64) && writes[0].previousReceipt === "receipt-5", "first request uses only its visible review and is not replayed");
+		await wait(() => agree()?.textContent === "Agree to revision 8", "fresh review after refusing stale digest");
+		check(writes.length === 1 && JSON.stringify(writes[0]) === JSON.stringify({ operation: "agree", revision: 7, digest: "a".repeat(64), confirmed: true }),
+			"the first request uses only its visible legacy review and is not replayed");
 		check(root.textContent.includes("fresh scope") && root.querySelector('[role="alert"]').textContent.includes("proposal or its authority changed"), "fixed refusal and all updated terms shown");
 		agree().click();
-		await wait(() => root.textContent.includes("Reconciliation is pending"), "pending receipt");
-		check(writes.length === 2 && writes[1].revision === 7 && writes[1].digest === "b".repeat(64) &&
-			writes[1].previousReceipt === "receipt-6" && writes[1].confirmed === true, "second click binds only to the newer review");
-		check(!agree() && !byKey("copy-mission-draft-approve") && !root.textContent.includes("Agreed, revision 7"), "an issued receipt is not agreement and cannot be retried");
-		mission = recorded(mission, 7, "host-administrator");
-		byKey("mission-draft-refresh").click();
-		await wait(() => root.textContent.includes("Agreed, revision 7"), "recorded host-administrator attribution");
-		check(root.textContent.includes("by the host administrator.") && !root.textContent.includes("by you."),
-			"a receipt alone cannot override the recorded approver");
-
-		mission = proposal(8, "c", "receipt-7");
-		byKey("mission-draft-refresh").click();
-		await wait(() => agree()?.textContent === "Agree to revision 8", "distinct later proposal");
-		pendingStatusRead = (resolve) => { heldStatusRead = resolve; };
-		agree().click();
-		await wait(() => heldStatusRead && root.textContent.includes("Checking the recorded agreement."), "in-flight receipt status check");
-		heldStatusRead(mission);
-		await wait(() => root.textContent.includes("The agreement is not recorded in the current status."), "reconciled receipt but still proposed");
-		check(root.textContent.includes("receipt-8") && !root.textContent.includes("Checking the recorded agreement.") &&
-			!agree() && !byKey("copy-mission-draft-approve") && writes.length === 3, "settled read shows honest pending receipt without reapproval or replay");
-		byKey("nav-mission").click();
-		check(!byKey("copy-mission-approve"), "the Mission page also suppresses the issued revision's terminal command");
-		byKey("open-mission-draft").click();
-		mission = recorded(mission, 8, "local-creator");
-		byKey("mission-draft-refresh").click();
-		await wait(() => root.textContent.includes("Agreed, revision 8"), "recorded agreement after explicit status refresh");
-		check(root.textContent.includes("by you. This did not start work.") &&
-			!root.textContent.includes("not recorded in the current status") && writes.length === 3, "verified local-creator agreement matches this tab's issued approval");
-		byKey("signout").click();
-		check(!document.querySelector("#composer") && root.textContent.includes("Signed out locally"), "local sign-out removes protected content immediately");
-		resolveLogout("unconfirmed");
-		await wait(() => root.textContent.includes("Remote revocation could not be confirmed"), "unconfirmed remote logout");
+		await wait(() => root.textContent.includes("Agreed, revision 8"), "recorded developer-local approval");
+		check(writes.length === 2 && writes[1].revision === 8 && writes[1].digest === "b".repeat(64) &&
+			!("previousReceipt" in writes[1]) && root.textContent.includes("by you. This did not start work."),
+			"only the explicit second click sends the newer legacy review; attribution follows the recorded approval");
 	} finally {
 		unmount();
 	}

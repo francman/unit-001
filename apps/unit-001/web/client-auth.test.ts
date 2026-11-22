@@ -1,86 +1,48 @@
-// Exercises pairing, same-origin bearer restoration and stale response cleanup.
+// Exercises gateway metadata validation without browser credentials.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { pairBrowserSession, restoreBrowserSession } from "./client-auth.ts";
-
-const sessionToken = "a".repeat(64);
-const csrfToken = "b".repeat(64);
-const expiresAt = Date.now() + 1_800_000;
-const credentials = { sessionToken, csrfToken, expiresAt };
-const valid = { authenticated: true, csrfToken, expiresAt };
-const storageKey = "unit-001.session";
+import { readGatewaySession, WorkspaceChanged } from "./client-auth.ts";
 
 afterEach(() => vi.unstubAllGlobals());
 
-function storage(initial?: string) {
-	const values = new Map<string, string>(initial ? [[storageKey, initial]] : []);
-	vi.stubGlobal("navigator", { locks: { request: async (_name: string, update: () => void) => update() } });
-	vi.stubGlobal("localStorage", {
-		getItem: (key: string) => values.get(key) ?? null,
-		setItem: (key: string, value: string) => values.set(key, value),
-		removeItem: (key: string) => values.delete(key),
-	});
-	return values;
-}
+const workspaceId = "ae12".repeat(16);
+const headers = { "X-Unit-Workspace": workspaceId };
 
-describe("browser bearer session", () => {
-	it("redeems the code once, stores only the bearer and restores from another tab's auth call", async () => {
-		const values = storage();
-		const fetch = vi.fn<typeof globalThis.fetch>()
-			.mockResolvedValueOnce(Response.json({ ...valid, sessionToken }))
-			.mockResolvedValueOnce(Response.json(valid));
+describe("gateway metadata", () => {
+	it("reads the identity and token with a credential-free same-origin GET", async () => {
+		const csrfToken = "b".repeat(64);
+		const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(Response.json({ csrfToken }, { headers }));
 		vi.stubGlobal("fetch", fetch);
-		expect(await pairBrowserSession("once")).toEqual({ state: "paired", session: credentials });
-		expect([...values]).toEqual([[storageKey, sessionToken]]);
-		expect(await restoreBrowserSession()).toEqual(credentials);
-		expect(fetch).toHaveBeenCalledTimes(2);
-		expect(fetch).toHaveBeenNthCalledWith(1, "/api/v1/session", expect.objectContaining({
-			method: "POST", credentials: "omit", redirect: "error", headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ secret: "once" }),
-		}));
-		expect(fetch).toHaveBeenNthCalledWith(2, "/api/v1/session", expect.objectContaining({
-			credentials: "omit", headers: { Authorization: `Bearer ${sessionToken}` },
-		}));
+		await expect(readGatewaySession()).resolves.toEqual({ workspaceId, csrfToken });
+		expect(fetch).toHaveBeenCalledExactlyOnceWith("/api/v1/session", {
+			cache: "no-store", credentials: "omit", mode: "same-origin", redirect: "error", signal: expect.any(AbortSignal),
+		});
 	});
 
-	it("starts unauthenticated without sending a bearer when storage is empty", async () => {
-		storage();
-		const fetch = vi.fn(async () => Response.json({ authenticated: false }));
-		vi.stubGlobal("fetch", fetch);
-		expect(await restoreBrowserSession()).toBeNull();
-		expect(fetch).toHaveBeenCalledExactlyOnceWith("/api/v1/session", expect.objectContaining({
-			credentials: "omit", headers: undefined,
-		}));
+	it.each([null, [], {}, { csrfToken: "" }, { csrfToken: 42 }, { csrfToken: "a\n" }, { csrfToken: "a", authenticated: true }].map((body) => ({ body })))(
+		"rejects malformed metadata $body",
+		async ({ body }) => {
+			vi.stubGlobal("fetch", vi.fn(async () => Response.json(body, { headers })));
+			await expect(readGatewaySession()).rejects.toThrow("Invalid gateway metadata.");
+		},
+	);
+
+	it.each([undefined, "", "a".repeat(63), "A".repeat(64), `${workspaceId}, ${workspaceId}`])(
+		"rejects a missing, malformed or repeated identity: %s",
+		async (id) => {
+			vi.stubGlobal("fetch", vi.fn(async () => Response.json({ csrfToken: "token" }, {
+				headers: id === undefined ? {} : { "X-Unit-Workspace": id },
+			})));
+			await expect(readGatewaySession()).rejects.toThrow("Invalid workspace identity.");
+		},
+	);
+
+	it("reports a changed identity without trusting the new session body", async () => {
+		vi.stubGlobal("fetch", vi.fn(async () => new Response("not JSON", { headers })));
+		await expect(readGatewaySession(undefined, "f".repeat(64))).rejects.toBeInstanceOf(WorkspaceChanged);
 	});
 
-	it.each([false, true])("clears only the bearer the delayed false response rejected (newer token: %s)", async (replace) => {
-		const values = storage(sessionToken);
-		let finishRequest!: (response: Response) => void;
-		const reply = new Promise<Response>((resolve) => { finishRequest = resolve; });
-		vi.stubGlobal("fetch", vi.fn(() => reply));
-		const restoring = restoreBrowserSession();
-		const newer = "c".repeat(64);
-		if (replace) values.set(storageKey, newer);
-		finishRequest(Response.json({ authenticated: false }));
-		expect(await restoring).toBeNull();
-		expect(values.get(storageKey)).toBe(replace ? newer : undefined);
-	});
-
-	it("discards a returned expiry in the past but keeps the bearer on an inconclusive check", async () => {
-		const values = storage(sessionToken);
-		const fetch = vi.fn<typeof globalThis.fetch>()
-			.mockRejectedValueOnce(new Error("Offline"))
-			.mockResolvedValueOnce(Response.json({ ...valid, expiresAt: 1 }));
-		vi.stubGlobal("fetch", fetch);
-		await expect(restoreBrowserSession()).rejects.toThrow("Offline");
-		expect(values.get(storageKey)).toBe(sessionToken);
-		expect(await restoreBrowserSession()).toBeNull();
-		expect(values.has(storageKey)).toBe(false);
-	});
-
-	it.each([[401, "wrong"], [429, "limited"], [503, "unreachable"]])("reports a pairing failure without changing storage (%s)", async (status, state) => {
-		const values = storage(sessionToken);
-		vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status })));
-		expect(await pairBrowserSession("code")).toEqual({ state });
-		expect(values.get(storageKey)).toBe(sessionToken);
+	it("rejects a non-success response even if its body has a token", async () => {
+		vi.stubGlobal("fetch", vi.fn(async () => Response.json({ csrfToken: "token" }, { status: 503 })));
+		await expect(readGatewaySession()).rejects.toThrow("Gateway metadata is unavailable.");
 	});
 });

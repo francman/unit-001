@@ -1,10 +1,9 @@
-// Connects the workspace to the paired loopback gateway without replaying mutations.
+// Connects the workspace to the local operator gateway without replaying mutations.
 import { parseMissionRefusalCode } from "../src/missions/refusal.ts";
-import { type BrowserSession, browserApiFetch, checkBrowserSession, clearBrowserSession } from "./client-auth.ts";
+import { browserApiFetch, type GatewaySession, readGatewaySession, requireWorkspaceIdentity, WorkspaceChanged } from "./client-auth.ts";
 import { readEventStream } from "./client-stream.ts";
 import type {
 	ChatHistoryPage,
-	LogoutOutcome,
 	MemoryGraphEdgeView,
 	MemoryGraphView,
 	MemoryStatsView,
@@ -23,54 +22,40 @@ type JsonObject = Record<string, unknown>;
 
 class GatewayRejection extends Error {}
 
-/** Creates a bearer-authenticated port whose writes are never retried. */
-export function browserWorkspacePort({ sessionToken, csrfToken, expiresAt }: BrowserSession): WorkspacePort {
-	let closed: { state: "expired" | "signed-out"; clearing: Promise<void> } | null = null;
-	let logoutResult: Promise<LogoutOutcome> | null = null;
-	let watcher: { controller: AbortController; listener: Parameters<WorkspacePort["watch"]>[0] } | null = null;
-	const pending = new AbortController();
-	const authorization = { Authorization: `Bearer ${sessionToken}` };
-	const writeHeaders = { ...authorization, "Content-Type": "application/json", "X-Unit-CSRF": csrfToken };
-
-	function close(state: "expired" | "signed-out"): Promise<void> {
-		if (closed !== null) return closed.clearing;
-		const clearing = clearBrowserSession(sessionToken);
-		closed = { state, clearing };
-		pending.abort();
-		const previous = watcher;
-		watcher = null;
-		previous?.controller.abort();
-		if (state === "expired") previous?.listener({ type: "connection", state });
-		return clearing;
-	}
-
-	function active(): boolean {
-		if (Date.now() >= expiresAt) void close("expired");
-		return closed === null;
-	}
+/** Pins this page to one workspace and only authorizes requests after a matching live view. */
+export function browserWorkspacePort(initialSession: GatewaySession): WorkspacePort {
+	const { workspaceId } = initialSession;
+	let candidate: GatewaySession | null = initialSession;
+	let active: { csrfToken: string; invalidate: () => void } | null = null;
+	let workspaceChanged = false;
+	let watcher: AbortController | null = null;
 
 	const requestEnvelope = async (operation: JsonObject, requestId: string): Promise<JsonObject> => {
-		if (!active()) throw new GatewayRejection("Session ended. Reload and pair again.");
+		const connection = active;
+		if (!connection) throw new GatewayRejection("The workspace connection is not verified. No request was sent.");
 		const response = await browserApiFetch("/api/v1/requests", {
 			method: "POST",
-			headers: writeHeaders,
+			headers: { "Content-Type": "application/json", "X-Unit-CSRF": connection.csrfToken },
 			body: JSON.stringify({ requestId, operation }),
-			signal: AbortSignal.any([pending.signal, AbortSignal.timeout(125_000)]),
+			signal: AbortSignal.timeout(125_000),
 		});
 		if (!response.ok) {
-			if (response.status === 401) await close("expired");
 			// Only statuses the gateway uses before dispatch can establish that the owner was not called.
-			if (![400, 401, 403, 409, 429].includes(response.status)) throw new Error("Owner outcome is unknown.");
+			if (![400, 403, 409, 429].includes(response.status)) throw new Error("Owner outcome is unknown.");
+			if (response.status === 403 && active === connection) connection.invalidate();
 			throw new GatewayRejection(
-				response.status === 401
-					? "Session expired. Restart the operator web command, reload, and enter the new pairing code."
-					: response.status === 429
-						? "Request capacity reached. Wait for active requests; if the action budget is exhausted, restart the web command and pair again."
-						: "The gateway rejected this request before dispatch. Check its size and arguments.",
+				response.status === 429
+					? "Request capacity reached. Wait for active requests; if the action budget is exhausted, restart the web command."
+					: "The gateway rejected this request before dispatch. Check the connection, request size and arguments.",
 			);
 		}
+		if (active !== connection) {
+			void response.body?.cancel().catch(() => {});
+			throw new Error("The workspace connection changed before the reply arrived.");
+		}
 		const result = object(await response.json());
-		if (!active() || result.requestId !== requestId) throw new Error("Owner outcome is unknown.");
+		if (active !== connection) throw new Error("The workspace connection changed before the reply arrived.");
+		if (result.requestId !== requestId) throw new Error("Owner outcome is unknown.");
 		return result;
 	};
 	const request = async (operation: JsonObject, requestId: string = crypto.randomUUID()): Promise<JsonObject> => {
@@ -96,75 +81,74 @@ export function browserWorkspacePort({ sessionToken, csrfToken, expiresAt }: Bro
 	}
 	return {
 		watch(listener) {
-			watcher?.controller.abort();
-			if (closed !== null) {
-				if (closed.state === "expired") listener({ type: "connection", state: closed.state });
-				return () => {};
-			}
+			watcher?.abort();
 			const controller = new AbortController();
 			const { signal } = controller;
-			const current = { controller, listener };
-			watcher = current;
-			let expiryTimer: ReturnType<typeof setTimeout>;
+			watcher = controller;
 			let retryTimer: ReturnType<typeof setTimeout> | undefined;
 			signal.addEventListener("abort", () => {
-				clearTimeout(expiryTimer);
 				clearTimeout(retryTimer);
+				active = null;
 			}, { once: true });
-			const armExpiry = () => {
-				if (active()) expiryTimer = setTimeout(armExpiry, Math.min(expiresAt - Date.now(), 2_147_483_647));
-			};
-			armExpiry();
-			void connect();
+			if (workspaceChanged) listener({ type: "connection", state: "workspace-changed" });
+			else void connect();
 			return () => {
-				if (watcher === current) watcher = null;
+				if (watcher === controller) watcher = null;
 				controller.abort();
 			};
 
 			async function connect(): Promise<void> {
-				if (signal.aborted || !active()) return;
+				const stream = new AbortController();
+				const streamSignal = AbortSignal.any([signal, stream.signal]);
+				function invalidate(): void {
+					active = null;
+					stream.abort();
+					listener({ type: "connection", state: "offline" });
+				}
 				try {
+					const session = candidate ?? await readGatewaySession(streamSignal, workspaceId);
+					streamSignal.throwIfAborted();
+					candidate = null;
 					const response = await browserApiFetch("/api/v1/events", {
-						headers: { ...authorization, Accept: "text/event-stream" },
-						signal,
+						headers: { Accept: "text/event-stream" },
+						signal: streamSignal,
 					});
-					if (response.status === 401 || signal.aborted || !active()) {
+					try {
+						streamSignal.throwIfAborted();
+						if (!response.ok) throw new Error("Invalid event stream.");
+						requireWorkspaceIdentity(response, workspaceId);
+						const type = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+						if (type !== "text/event-stream" || !response.body) throw new Error("Invalid event stream.");
+					} catch (error) {
 						void response.body?.cancel().catch(() => {});
-						if (!signal.aborted && response.status === 401) await close("expired");
-						return;
+						throw error;
 					}
-					const type = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
-					if (!response.ok || type !== "text/event-stream" || !response.body) {
-						void response.body?.cancel().catch(() => {});
-						throw new Error("Invalid event stream.");
-					}
-					await readEventStream(response.body, signal, (event, data) => {
-						if (!active()) return;
+					await readEventStream(response.body, streamSignal, (event, data) => {
 						if (event === "connecting") {
+							active = null;
 							listener({ type: "connection", state: "connecting" });
 						} else if (event === "view") {
 							let view: WorkspaceView;
 							try {
 								view = parseWorkspaceView(JSON.parse(data));
 							} catch {
-								listener({ type: "connection", state: "offline" });
+								invalidate();
 								return;
 							}
+							active ??= { csrfToken: session.csrfToken, invalidate };
 							listener({ type: "view", view });
 						}
 					});
-				} catch {
-					// Network failures and invalid streams are both recoverable; never replay writes.
+				} catch (error) {
+					if (!signal.aborted && error instanceof WorkspaceChanged) {
+						workspaceChanged = true;
+						listener({ type: "connection", state: "workspace-changed" });
+						return;
+					}
 				}
-				if (signal.aborted || !active()) return;
-				listener({ type: "connection", state: "offline" });
-				try {
-					const session = await checkBrowserSession(sessionToken, signal);
-					if (!signal.aborted && session === null) await close("expired");
-				} catch {
-					// While the gateway is unreachable, wait for the next reconnect attempt or expiry.
-				}
-				if (!signal.aborted && active()) retryTimer = setTimeout(() => void connect(), 3000);
+				if (signal.aborted) return;
+				if (!stream.signal.aborted) invalidate();
+				if (!signal.aborted) retryTimer = setTimeout(() => void connect(), 3000);
 			}
 		},
 		async history(before) {
@@ -174,10 +158,18 @@ export function browserWorkspacePort({ sessionToken, csrfToken, expiresAt }: Bro
 		mission: loadMission,
 		async mutateMission(change, requestId): Promise<MissionMutationOutcome> {
 			try {
+				if (change.operation === "agree") {
+					const connection = active;
+					if (!connection || "previousReceipt" in change) return { state: "rejected" };
+					// Recheck authority at the click, not from prior UI state, and never carry the click across a reconnect.
+					const mission = await loadMission().catch(() => null);
+					if (active !== connection || !mission?.canAgree || !mission.formationAvailable) return { state: "rejected" };
+					if (mission.draft?.status !== "proposed" || mission.draft.revision !== change.revision)
+						return { state: "refused", code: "stale-revision" };
+					if (mission.draft.digest !== change.digest) return { state: "refused", code: "stale-digest" };
+				}
 				const result = await requestEnvelope({ type: "mission", request: change }, requestId);
 				if (result.state === "refused") return { state: "refused", code: parseMissionRefusalCode(result.code) };
-				if (result.state === "issued" && change.operation === "agree" && change.previousReceipt !== undefined)
-					return { state: "issued", receiptId: missionIdentity(result.receiptId), reconciled: boolean(result.reconciled) };
 				if (result.state === "completed") {
 					const reply = object(result.response);
 					if (reply.type === "mission") {
@@ -187,8 +179,8 @@ export function browserWorkspacePort({ sessionToken, csrfToken, expiresAt }: Bro
 							(change.operation === "draft" && draft?.status === "editing" && draft.revision > change.expectedRevision) ||
 							(change.operation === "propose" && draft?.status === "proposed" && draft.revision === change.expectedRevision) ||
 							// The gateway emits completed for Agree only after checking the owner's exact revision and digest.
-							(change.operation === "agree" && change.previousReceipt === undefined && mission.authority === "developer-local" &&
-								mission.agreementValid && mission.agreement?.revision === change.revision && draft === null)
+							(change.operation === "agree" && mission.authority === "developer-local" && mission.agreementValid &&
+								mission.agreement?.approvedBy === "developer-local" && mission.agreement.revision === change.revision && draft === null)
 						) return { state: "completed", mission };
 					}
 				}
@@ -287,25 +279,6 @@ export function browserWorkspacePort({ sessionToken, csrfToken, expiresAt }: Bro
 				if (error instanceof GatewayRejection) return { state: "failed", message: error.message };
 				return { state: "unknown", message: "Forget outcome not confirmed. Inspect memory before acting again." };
 			}
-		},
-		logout() {
-			logoutResult ??= (async () => {
-				const clearing = close("signed-out");
-				try {
-					const response = await browserApiFetch("/api/v1/logout", {
-						method: "POST",
-						headers: writeHeaders,
-						body: "{}",
-						signal: AbortSignal.timeout(10_000),
-					});
-					return response.ok || response.status === 401 ? "revoked" : "unconfirmed";
-				} catch {
-					return "unconfirmed";
-				} finally {
-					await clearing;
-				}
-			})();
-			return logoutResult;
 		},
 	};
 }
@@ -462,12 +435,12 @@ function parseMission(value: unknown): WorkspaceDetails["mission"] {
 		agreement: formation.agreement === null ? null : parseAgreement(formation.agreement),
 		run: mission.runtime == null ? null : parseRun(mission.runtime),
 		creator: mission.creator === null ? null : parseCreator(mission.creator),
-		// The authority kind identifies the wire variant; only canAgree grants browser capability.
 		authority,
 		agreementValid: boolean(mission.agreementValid),
 		authorityError: mission.authorityError === null ? null : oneOf(mission.authorityError, ["invalid-authority"]),
 		formationAvailable: typeof mission.canAgree === "boolean" && matchingReview && (draft === null || draft.terms !== undefined),
-		canAgree: mission.canAgree === true && matchingReview,
+		canAgree: authority === "developer-local" && mission.authorityError === null && mission.canAgree === true &&
+			previousReceipt === undefined && matchingReview,
 		previousReceipt,
 		draft,
 		review: matchingReview ? review : null,

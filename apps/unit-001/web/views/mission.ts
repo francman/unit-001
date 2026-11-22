@@ -15,7 +15,7 @@ const approvers: Record<MissionAgreementView["approvedBy"], string> = {
 	"developer-local": "a developer in a local source checkout",
 };
 
-const creators = { human: "you", elder: "an elder", organization: "an organization" } as const;
+const creators = { human: "a human creator", elder: "an elder", organization: "an organization" } as const;
 
 /** Opens Mission authoring only when the shell supplies a working entry point. */
 export function renderMission(ctx: Ctx, openDraft?: () => void): HTMLElement {
@@ -53,10 +53,11 @@ export function missionApprovalCommand(ctx: Ctx, revision: number, digest: strin
 	return `${sudo}${terminal(ctx, `mission approve --revision ${revision} --digest ${digest}`)}`;
 }
 
-/** Uses only the digest the gateway bound to the managed proposal; a pre-upgrade owner digest is not enough. */
-export function missionProposalDigest({ draft, review, authority, previousReceipt }: WorkspaceDetails["mission"]): string | null {
-	if (draft?.status !== "proposed") return null;
-	if (authority !== "managed-administrator") return draft.digest;
+/** Uses only an exact proposal digest for a known authority, never an unverified managed owner digest. */
+export function missionProposalDigest({ draft, review, authority, authorityError, previousReceipt }: WorkspaceDetails["mission"]): string | null {
+	if (draft?.status !== "proposed" || authorityError) return null;
+	if (authority === "developer-local") return draft.digest;
+	if (authority !== "managed-administrator") return null;
 	return review && review.missionId === draft.missionId && review.revision === draft.revision &&
 		review.digest === draft.digest && review.previousReceipt === previousReceipt ? review.digest : null;
 }
@@ -112,16 +113,16 @@ function purposeSection(ctx: Ctx, details: WorkspaceDetails, canOpenDraft: boole
 		children.push(panel(el("div", surfaces.panelBody, facts(rows))));
 		if (!agreement && !proposed) children.push(el("p", text.description, canOpenDraft ? "Not approved yet." : "Not approved yet. Approval happens in a terminal."));
 	}
-	if (proposed && ctx.ui.missionReceipt?.revision === proposed.revision)
-		children.push(el("p", text.description, "Approval receipt issued. Check the recorded agreement before acting again."));
+	if (proposed && (ctx.ui.connection !== "connected" || ctx.ui.detailsFailed))
+		children.push(el("p", text.description, `Revision ${proposed.revision} was last reported as proposed. Check fresh mission status before acting.`));
 	else if (proposed && digest !== null)
 		children.push(
 			callout({
 				tone: "info",
-				title: "Waiting for your approval.",
+				title: "Awaiting approval.",
 				body: canOpenDraft
-					? `Draft revision ${proposed.revision} is proposed. Open the draft to review it, or approve it in a terminal.`
-					: `Draft revision ${proposed.revision} is proposed. Approving it is a step you take in a terminal.`,
+					? `Draft revision ${proposed.revision} is proposed. Open the draft to review the terms.`
+					: `Draft revision ${proposed.revision} is proposed. Inspect the current mission in a terminal.`,
 				children: [command(missionApprovalCommand(ctx, proposed.revision, digest), "copy-mission-approve", ctx.act.copy)],
 			}),
 		);

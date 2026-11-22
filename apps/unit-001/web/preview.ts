@@ -3,7 +3,6 @@ import type { Connection, MemoryGraphView, MissionDraftTerms, MissionRunView, Wo
 import { sampleMemoryGraph } from "./preview-memory-graph.ts";
 import { mountWorkspace } from "./shell.ts";
 import { sections } from "./state.ts";
-import { renderPairing } from "./views/pairing.ts";
 
 /*
  * URL switches (combine freely):
@@ -18,15 +17,13 @@ import { renderPairing } from "./views/pairing.ts";
  *   ?unconfigured=1  no model is configured
  *   ?norun=1       no work run exists
  *   ?mission=new|unarmed   start without a mission, or with managed web approval unavailable
- *   ?connection=connecting|offline|expired   the connection state after load
+ *   ?connection=connecting|offline   the connection state after load
  *   ?unknown=1     sending returns an unknown outcome
  *   ?send=1        sends a sample message after load (with ?unknown=1: the uncertain-delivery notice)
- *   ?signedout=1   signs out after load
  *   ?nav=1         opens the phone menu after load (below 768 px)
  *   ?memory=1      the memory page shows search results
  *   ?forget=1      the forget dialog is open (with ?section=memory&memory=1)
  *   ?graph=empty|small|mid|limited|large|failed   the memory map with no memories, 8 (no brain), 30, the newest 40 of 1,204, 300, or a failed read (the default is 60); the map forms again on every reload
- *   ?pairing=1     the pairing screen
  *   ?theme=light|dark   a fixed theme instead of the system setting
  */
 const params = new URL(location.href).searchParams;
@@ -178,7 +175,6 @@ let listener: Parameters<WorkspacePort["watch"]>[0] | null = null;
 let unknown = flag("unknown");
 let detailsAvailable = params.get("details") !== "none";
 let timer: ReturnType<typeof setInterval> | undefined;
-let remount: (() => void) | undefined;
 const emit = () => listener?.({ type: "view", view });
 // The workspace re-reads details when a run ends, so a short busy cycle shows a changed fixture.
 const refresh = () => {
@@ -194,7 +190,7 @@ const port: WorkspacePort = {
 		queueMicrotask(() => {
 			emit();
 			const state = params.get("connection");
-			if (state === "connecting" || state === "offline" || state === "expired") callback({ type: "connection", state });
+			if (state === "connecting" || state === "offline") callback({ type: "connection", state });
 		});
 		return () => {
 			listener = null;
@@ -317,10 +313,6 @@ const port: WorkspacePort = {
 		if (params.get("graph") === "failed") throw new Error("The memory map is not available in this fixture.");
 		return graph;
 	},
-	async logout() {
-		listener = null;
-		return "revoked";
-	},
 };
 
 function previewMissingTerms(terms: MissionDraftTerms): string[] {
@@ -398,6 +390,13 @@ if (flag("unconfigured")) {
 }
 if (flag("memory")) details.memory.records = memories;
 
+const root = document.querySelector<HTMLElement>("#app");
+if (!root) throw new Error("Workspace mount element is missing.");
+// "channels" is the old name of the Connections page; keep old preview links working.
+const requested = params.get("section") === "channels" ? "connections" : params.get("section");
+const section = sections.find((entry) => entry.id === requested)?.id;
+let unmount = mountWorkspace(root, port, { preview: true, section });
+
 window.unitPreview = {
 	connection(state) {
 		listener?.({ type: "connection", state });
@@ -409,7 +408,8 @@ window.unitPreview = {
 		retainedEntries.length = 0;
 		view = { ...view, ...chatWindow() };
 		// The workspace keeps seen rows across frames, so a new sample conversation needs a new mount.
-		remount?.();
+		unmount();
+		unmount = mountWorkspace(root, port, { preview: true, section });
 	},
 	held(value) {
 		if (details.owner) details.owner.held = value;
@@ -436,39 +436,19 @@ window.unitPreview = {
 	},
 };
 
-const root = document.querySelector<HTMLElement>("#app");
-if (!root) throw new Error("Workspace mount element is missing.");
-if (flag("pairing"))
-	renderPairing(root, {
-		async submit(code) {
-			return code === "000000" ? "paired" : "wrong";
-		},
-		onPaired: () => location.assign(location.pathname),
-	});
-else {
-	// "channels" is the old name of the Connections page; keep old preview links working.
-	const requested = params.get("section") === "channels" ? "connections" : params.get("section");
-	const section = sections.find((entry) => entry.id === requested)?.id;
-	let unmount = mountWorkspace(root, port, { preview: true, section });
-	remount = () => {
-		unmount();
-		unmount = mountWorkspace(root, port, { preview: true, section });
-	};
-	if (params.get("draft") === "long")
-		window.unitPreview.draft(
-			Array.from({ length: 30 }, (_, index) => `Line ${index + 1} of a long draft that keeps going to check how tall the composer may grow.`).join("\n"),
-		);
-	// Clicks what a person would click once the first view has rendered.
-	const click = (key: string) => setTimeout(() => document.querySelector<HTMLButtonElement>(`[data-key="${key}"]`)?.click(), 100);
-	if (flag("send")) {
-		window.unitPreview.draft("Did the undici patch land?");
-		click("send");
-	}
-	if (flag("signedout")) click("signout");
-	if (flag("nav")) click("menu");
-	if (flag("forget")) {
-		const first = memories[0];
-		// Waits for the memory page to render its rows, then opens the dialog for the first one.
-		if (first) setTimeout(() => document.querySelector<HTMLButtonElement>(`[data-key="forget-${first.id}"]`)?.click(), 100);
-	}
+if (params.get("draft") === "long")
+	window.unitPreview.draft(
+		Array.from({ length: 30 }, (_, index) => `Line ${index + 1} of a long draft that keeps going to check how tall the composer may grow.`).join("\n"),
+	);
+// Clicks what a person would click once the first view has rendered.
+const click = (key: string) => setTimeout(() => document.querySelector<HTMLButtonElement>(`[data-key="${key}"]`)?.click(), 100);
+if (flag("send")) {
+	window.unitPreview.draft("Did the undici patch land?");
+	click("send");
+}
+if (flag("nav")) click("menu");
+if (flag("forget")) {
+	const first = memories[0];
+	// Waits for the memory page to render its rows, then opens the dialog for the first one.
+	if (first) setTimeout(() => document.querySelector<HTMLButtonElement>(`[data-key="forget-${first.id}"]`)?.click(), 100);
 }

@@ -1,22 +1,30 @@
 // Exercises the browser trust boundary against a synthetic owner without model or storage access.
 import { once } from "node:events";
-import { request } from "node:http";
+import { mkdtemp, rmdir } from "node:fs/promises";
+import { createServer, type OutgoingHttpHeaders, request } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ServiceRequest, ServiceResponse } from "../src/service.ts";
 import type { ServiceClient } from "../src/service-client.ts";
 import { parseWebRequest } from "../src/web/contract.ts";
-import { createWebGateway, type ManagedWebAgreement } from "../src/web/gateway.ts";
+import { createWebGateway, type WebGatewayOptions } from "../src/web/gateway.ts";
 
+const directories: string[] = [];
 const servers: ReturnType<typeof createWebGateway>[] = [];
 
 afterEach(async () => {
 	vi.restoreAllMocks();
 	await Promise.all(servers.map((gateway) => gateway.close()));
 	servers.length = 0;
+	await Promise.all(directories.splice(0).map((dir) => rmdir(dir)));
 });
 
-async function unpairedFixture(managedAgreement?: ManagedWebAgreement, managed = false) {
+async function startGateway(
+	options: Pick<WebGatewayOptions, "managed" | "managedReview"> = {},
+	transport: "tcp" | "unix" = "tcp",
+) {
 	const requests: ServiceRequest[] = [];
 	const client: ServiceClient = {
 		session: "default",
@@ -30,51 +38,56 @@ async function unpairedFixture(managedAgreement?: ManagedWebAgreement, managed =
 		},
 	};
 	// Reserve an ephemeral port first so the gateway can enforce its exact configured origin.
-	const reservation = createWebGateway({
-		client,
-		origin: "http://127.0.0.1:1",
-		secret: "a".repeat(32),
-		assets: new Map(),
-	});
-	reservation.server.listen(0, "127.0.0.1");
-	await once(reservation.server, "listening");
-	const port = (reservation.server.address() as AddressInfo).port;
-	await reservation.close();
+	const reservation = createServer().listen(0, "127.0.0.1");
+	await once(reservation, "listening");
+	const port = (reservation.address() as AddressInfo).port;
+	await new Promise<void>((resolve) => reservation.close(() => resolve()));
 	const origin = `http://127.0.0.1:${port}`;
 	const server = createWebGateway({
 		client,
 		origin,
-		secret: "a".repeat(32),
-		managedAgreement,
-		managed,
+		...options,
 		assets: new Map([
 			["/", { contentType: "text/html; charset=utf-8", body: Buffer.from("<title>Workspace</title>") }],
 		]),
 	});
 	servers.push(server);
-	server.server.listen(port, "127.0.0.1");
+	let socketPath: string | undefined;
+	if (transport === "unix") {
+		const dir = await mkdtemp(join(tmpdir(), "unit-web-"));
+		directories.push(dir);
+		socketPath = join(dir, "web.sock");
+		server.server.listen(socketPath);
+	} else server.server.listen(port, "127.0.0.1");
 	await once(server.server, "listening");
-	const pairWith = (secret: string) =>
-		fetch(`${origin}/api/v1/session`, {
-			method: "POST",
-			headers: { Origin: origin, "Content-Type": "application/json" },
-			body: JSON.stringify({ secret }),
+	const call = (path: string, headers: OutgoingHttpHeaders = {}, body?: string) =>
+		new Promise<{ status: number | undefined; body: string }>((resolve, reject) => {
+			const req = request(
+				new URL(path, origin),
+				{ socketPath, method: body === undefined ? "GET" : "POST", headers },
+				(res) => {
+					let text = "";
+					res.setEncoding("utf8");
+					res.on("data", (chunk: string) => {
+						text += chunk;
+					});
+					res.once("error", reject);
+					res.once("end", () => resolve({ status: res.statusCode, body: text }));
+				},
+			);
+			req.once("error", reject);
+			req.end(body);
 		});
-	return { origin, requests, client, pairWith };
+	return { origin, requests, client, call };
 }
 
-async function fixture(managedAgreement?: ManagedWebAgreement, managed = false) {
-	const f = await unpairedFixture(managedAgreement, managed);
-	const pair = await f.pairWith("a".repeat(32));
-	expect(pair.status).toBe(200);
-	const body = (await pair.json()) as { sessionToken: string; csrfToken: string; expiresAt: number };
-	const headers = {
-		Origin: f.origin,
-		"Content-Type": "application/json",
-		Authorization: `Bearer ${body.sessionToken}`,
-		"X-Unit-CSRF": body.csrfToken,
-	};
-	return { ...f, headers, pair, body };
+async function fixture() {
+	const f = await startGateway();
+	const response = await fetch(`${f.origin}/api/v1/session`);
+	expect(response.status).toBe(200);
+	const session = (await response.json()) as { csrfToken: string };
+	const headers = { Origin: f.origin, "Content-Type": "application/json", "X-Unit-CSRF": session.csrfToken };
+	return { ...f, headers, session };
 }
 
 // Put a harmless marker on every object layer, including nested rows.
@@ -132,7 +145,7 @@ describe("web gateway", () => {
 			});
 			expect(rejected.status).toBe(403);
 			expect(JSON.parse(rejected.body)).toEqual({
-				error: `Origin is not permitted. Open ${origin} exactly. SSH forwarding must use the same local and remote port.`,
+				error: `Origin is not permitted. Open ${origin} exactly.`,
 			});
 			expect(rejected.body).not.toContain(host);
 		}
@@ -201,22 +214,6 @@ describe("web gateway", () => {
 			response: status,
 		});
 	});
-	it("#65 enforces one bounded cooldown across concurrent pairing attempts", async () => {
-		const f = await unpairedFixture();
-		const now = Date.now();
-		const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-		const failures = await Promise.all(Array.from({ length: 6 }, () => f.pairWith("wrong")));
-		expect(failures.map((reply) => reply.status).sort()).toEqual([401, 401, 401, 401, 429, 429]);
-		for (const reply of failures.filter((reply) => reply.status === 429))
-			expect(reply.headers.get("retry-after")).toBe("60");
-		clock.mockReturnValue(now + 59_999);
-		const waiting = await f.pairWith("a".repeat(32));
-		expect(waiting.status).toBe(429);
-		expect(waiting.headers.get("retry-after")).toBe("1");
-		clock.mockReturnValue(now + 60_000);
-		const valid = await Promise.all([f.pairWith("a".repeat(32)), f.pairWith("a".repeat(32))]);
-		expect(valid.map((reply) => reply.status).sort()).toEqual([200, 429]);
-	});
 	it("#65 read-only refreshes do not exhaust mutation receipts and rejected UTF-8 prompts never dispatch", async () => {
 		const { origin, headers, requests } = await fixture();
 		for (let index = 0; index < 40; index++) {
@@ -261,7 +258,7 @@ describe("web gateway", () => {
 			).status,
 		).toBe(200);
 	});
-	it("requires authenticated exact-origin JSON and a per-session CSRF token", async () => {
+	it("requires exact-origin JSON and the launcher CSRF token", async () => {
 		const { origin, headers, requests } = await fixture();
 		const body = JSON.stringify({ requestId: "cancel-1", operation: { type: "cancel" } });
 		expect(
@@ -272,7 +269,7 @@ describe("web gateway", () => {
 					body,
 				})
 			).status,
-		).toBe(401);
+		).toBe(403);
 		expect(
 			(
 				await fetch(`${origin}/api/v1/requests`, {
@@ -303,101 +300,39 @@ describe("web gateway", () => {
 		expect(
 			(await fetch(`${origin}/api/v1/session`, { headers: { "X-Forwarded-Host": "trusted.example" } })).status,
 		).toBe(403);
+		const { Origin: _origin, ...missingOrigin } = headers;
+		for (const invalid of [missingOrigin, { ...headers, "Content-Type": "text/plain" }]) {
+			expect((await fetch(`${origin}/api/v1/requests`, { method: "POST", headers: invalid, body })).status).toBe(403);
+		}
 		expect(requests).toEqual([]);
 	});
 
-	it("issues a bearer only on pairing and requires it for session metadata and streams", async () => {
-		const { origin, headers, pair, body } = await fixture();
-		expect(body).toEqual({
-			authenticated: true,
-			sessionToken: expect.stringMatching(/^[0-9a-f]{64}$/),
-			csrfToken: expect.stringMatching(/^[0-9a-f]{64}$/),
-			expiresAt: expect.any(Number),
-		});
-		expect(body.sessionToken).not.toBe(body.csrfToken);
-		expect(pair.headers.get("set-cookie")).toBeNull();
-		expect(pair.headers.get("cache-control")).toBe("no-store");
-		for (const credentials of [
-			new Headers(),
-			new Headers({ Authorization: "Bearer invalid" }),
-			new Headers({ Cookie: `unit_session=${body.sessionToken}` }),
-		]) {
-			const session = await fetch(`${origin}/api/v1/session`, { headers: credentials });
-			expect(session.status).toBe(200);
-			expect(await session.json()).toEqual({ authenticated: false });
-			expect((await fetch(`${origin}/api/v1/events`, { headers: credentials })).status).toBe(401);
+	it("serves only GET session, with a CSRF token stable for the launch", async () => {
+		const f = await fixture();
+		const excess = Object.fromEntries(Array.from({ length: 33 }, (_, i) => [`X-Fixture-${i}`, "1"]));
+		expect((await f.call("/api/v1/session", { Host: new URL(f.origin).host, ...excess })).status).toBe(431);
+		expect(f.session).toEqual({ csrfToken: expect.stringMatching(/^[0-9a-f]{64}$/) });
+		vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3_600_000);
+		const response = await fetch(`${f.origin}/api/v1/session`);
+		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(response.headers.get("set-cookie")).toBeNull();
+		expect(await response.json()).toEqual(f.session);
+		const next = await fixture();
+		expect(next.session.csrfToken).not.toBe(f.session.csrfToken);
+		for (const path of ["/api/v1/session", "/api/v1/logout"]) {
+			expect((await fetch(f.origin + path, { method: "POST", headers: f.headers, body: "{}" })).status).toBe(404);
 		}
-		const credentials = { Authorization: headers.Authorization };
-		expect(await (await fetch(`${origin}/api/v1/session`, { headers: credentials })).json()).toEqual({
-			authenticated: true,
-			csrfToken: body.csrfToken,
-			expiresAt: body.expiresAt,
-		});
-		const controller = new AbortController();
-		const events = await fetch(`${origin}/api/v1/events`, { headers: credentials, signal: controller.signal });
-		expect(events.status).toBe(200);
-		expect(events.headers.get("content-type")).toBe("text/event-stream");
-		controller.abort();
-		const logout = await fetch(`${origin}/api/v1/logout`, { method: "POST", headers });
-		expect(logout.status).toBe(200);
-		expect(logout.headers.get("set-cookie")).toBeNull();
-		expect(await logout.json()).toEqual({ authenticated: false });
-		expect((await fetch(`${origin}/api/v1/events`, { headers: credentials })).status).toBe(401);
+		for (const suffix of ["/", "?query=1"])
+			expect((await fetch(`${f.origin}/api/v1/session${suffix}`)).status).toBe(404);
 	});
 
-	it("drops a view at session expiry before the cleanup timer runs", async () => {
-		const { client, origin, headers, body } = await fixture();
-		const watching = Promise.withResolvers<Parameters<ServiceClient["watch"]>>();
-		client.watch = (listener, signal) => {
-			watching.resolve([listener, signal]);
-			return new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-		};
-		const events = await fetch(`${origin}/api/v1/events`, { headers });
-		if (!events.body) throw new Error("Expected an event stream.");
-		const reader = events.body.getReader();
-		const [emit, signal] = await watching.promise;
-		emit({ type: "connecting", message: "fixture" });
-		expect(new TextDecoder().decode((await reader.read()).value)).toContain("event: connecting");
-		// No timer can run between advancing the clock and delivering this callback.
-		vi.spyOn(Date, "now").mockReturnValue(body.expiresAt);
-		expect(signal.aborted).toBe(false);
-		emit({
-			type: "view",
-			view: {
-				name: "fixture",
-				version: "fixture",
-				pid: 1,
-				installationId: null,
-				model: null,
-				usage: null,
-				entries: [],
-				tools: [],
-				busy: false,
-				text: "expired",
-				textTruncated: false,
-				historyTruncated: false,
-			},
-		});
-		expect(signal.aborted).toBe(true);
-		await expect(reader.read()).rejects.toThrow();
-	});
-
-	it("consumes pairing once and expires authenticated sessions", async () => {
-		const { origin, headers } = await fixture();
-		expect(
-			(
-				await fetch(`${origin}/api/v1/session`, {
-					method: "POST",
-					headers,
-					body: JSON.stringify({ secret: "a".repeat(32) }),
-				})
-			).status,
-		).toBe(429);
-		const now = Date.now();
-		vi.spyOn(Date, "now").mockReturnValue(now + 1_800_001);
-		expect(await (await fetch(`${origin}/api/v1/session`, { headers })).json()).toEqual({
-			authenticated: false,
-		});
+	it("refuses mismatched listener transports before serving assets or session data", async () => {
+		for (const f of [await startGateway({ managed: true }, "tcp"), await startGateway({}, "unix")]) {
+			expect((await f.call("/")).status).toBe(403);
+			expect((await f.call("/api/v1/session")).status).toBe(403);
+			expect((await f.call("/api/v1/events")).status).toBe(403);
+			expect(f.requests).toEqual([]);
+		}
 	});
 
 	it("deduplicates stable IDs and refuses cross-agent or privileged input", async () => {
@@ -416,6 +351,28 @@ describe("web gateway", () => {
 		expect((await send({ type: "mission", request: { operation: "approve-local" } })).status).toBe(400);
 	});
 
+	it("bounds concurrent requests and shares an in-flight mutation with retries", async () => {
+		const f = await fixture();
+		const finish = Promise.withResolvers<void>();
+		f.client.request = async (request) => {
+			f.requests.push(request);
+			await finish.promise;
+			return { type: "cancelled" };
+		};
+		const cancel = (id: number) =>
+			f.call("/api/v1/requests", f.headers, JSON.stringify({ requestId: String(id), operation: { type: "cancel" } }));
+		const pending = [0, 1, 2, 3].map(cancel);
+		try {
+			await expect.poll(() => f.requests.length).toBe(4);
+			pending.push(cancel(0));
+			expect((await cancel(4)).status).toBe(429);
+		} finally {
+			finish.resolve();
+		}
+		expect((await Promise.all(pending)).map((reply) => reply.status)).toEqual([200, 200, 200, 200, 200]);
+		expect(f.requests).toHaveLength(4);
+	});
+
 	it("returns an unknown outcome without replaying a failed owner request", async () => {
 		const { origin, headers, client, requests } = await fixture();
 		client.request = async (request) => {
@@ -430,13 +387,13 @@ describe("web gateway", () => {
 		expect(requests).toHaveLength(1);
 	});
 
-	it("dispatches the read-only memory graph only through an authenticated CSRF-checked session", async () => {
+	it("dispatches the read-only memory graph only with a valid CSRF token", async () => {
 		const { origin, headers, requests } = await fixture();
 		const body = (request: unknown) => JSON.stringify({ requestId: "graph", operation: { type: "memory", request } });
 		const post = (init: { headers: Record<string, string>; body: string }) =>
 			fetch(`${origin}/api/v1/requests`, { method: "POST", ...init });
-		const { Authorization: _authorization, ...anonymous } = headers;
-		expect((await post({ headers: anonymous, body: body({ operation: "graph" }) })).status).toBe(401);
+		const { "X-Unit-CSRF": _csrf, ...anonymous } = headers;
+		expect((await post({ headers: anonymous, body: body({ operation: "graph" }) })).status).toBe(403);
 		expect(
 			(await post({ headers: { ...headers, "X-Unit-CSRF": "wrong" }, body: body({ operation: "graph" }) })).status,
 		).toBe(403);
@@ -459,9 +416,7 @@ describe("web gateway", () => {
 	it("replays a closed mission refusal without repeating the owner operation", async () => {
 		const f = await fixture();
 		const operation = { type: "mission", request: { operation: "propose", expectedRevision: 2 } };
-		const dispatch = vi.fn(
-			async (): Promise<ServiceResponse> => ({ type: "mission-refused", code: "stale-revision" }),
-		);
+		const dispatch = vi.fn(async (): Promise<ServiceResponse> => ({ type: "mission-refused", code: "stale-revision" }));
 		f.client.request = dispatch;
 		for (let attempt = 0; attempt < 2; attempt++)
 			expect(await postOwnerReply(f, "propose-once", operation)).toEqual({
@@ -472,63 +427,105 @@ describe("web gateway", () => {
 		expect(dispatch).toHaveBeenCalledTimes(1);
 	});
 
-	it("requires the reviewed receipt head for managed agreement and preserves pending reconciliation", async () => {
-		const receiptId = "11111111-2222-4333-8444-555555555555";
-		const agree = vi.fn<ManagedWebAgreement["agree"]>(async () => ({
-			status: "issued",
-			receiptId,
-			reconciled: false,
-		}));
-		const lookup = vi.fn<NonNullable<ManagedWebAgreement["lookup"]>>(async () => ({
-			status: "issued",
-			receiptId,
-			reconciled: true,
-		}));
-		const f = await fixture({ review: async () => undefined, agree, lookup });
-		const request = { operation: "agree", revision: 2, digest: "b".repeat(64), confirmed: true };
-		const operation = { type: "mission", request };
-		expect(await postOwnerReply(f, "missing-head", operation)).toEqual({
-			requestId: "missing-head",
-			state: "refused",
-			code: "stale-authority",
-		});
-		const approved = { ...operation, request: { ...request, previousReceipt: null } };
-		expect(await postOwnerReply(f, "approve-once", approved)).toEqual({
-			requestId: "approve-once",
-			state: "issued",
-			receiptId,
-			reconciled: false,
-		});
-		expect(await postOwnerReply(f, "approve-once", approved)).toMatchObject({ state: "issued", reconciled: true });
-		expect(agree).toHaveBeenCalledTimes(1);
-		expect(lookup).toHaveBeenCalledTimes(1);
-		expect(agree.mock.calls[0]?.[0]).toEqual({
-			requestId: "approve-once",
-			revision: 2,
-			digest: request.digest,
-			previousReceipt: null,
-		});
+	it("dispatches only explicitly confirmed developer-local agreement with the exact revision and digest", async () => {
+		const f = await fixture();
+		const agree = { operation: "agree", revision: 2, digest: "a".repeat(64) };
+		const post = (confirmed: boolean) =>
+			f.call(
+				"/api/v1/requests",
+				f.headers,
+				JSON.stringify({ requestId: "approve", operation: { type: "mission", request: { ...agree, confirmed } } }),
+			);
+		expect((await post(false)).status).toBe(400);
 		expect(f.requests).toEqual([]);
-	});
-
-	it("never sends agreement to the service owner on an unarmed managed launch", async () => {
-		const f = await fixture(undefined, true);
-		const operation = {
-			type: "mission",
-			request: { operation: "agree", revision: 2, digest: "b".repeat(64), confirmed: true },
+		f.client.request = async (request) => {
+			f.requests.push(request);
+			return { type: "mission-refused", code: "stale-digest" };
 		};
-		expect(await postOwnerReply(f, "approve", operation)).toEqual({
+		expect(JSON.parse((await post(true)).body)).toEqual({
 			requestId: "approve",
 			state: "refused",
-			code: "not-enabled",
+			code: "stale-digest",
 		});
-		expect(
-			await postOwnerReply(f, "reviewed-before-restart", {
-				...operation,
-				request: { ...operation.request, previousReceipt: null },
-			}),
-		).toMatchObject({ state: "unknown" });
+		expect(f.requests).toEqual([{ type: "mission", request: { ...agree, requestId: "approve" } }]);
+	});
+
+	it("accepts a managed filesystem socket for review and locally denies every browser agreement", async () => {
+		const proposal = {
+			missionId: "mission-one",
+			revision: 2,
+			digest: "b".repeat(64),
+			authorityRevision: 1,
+			previousReceipt: null,
+		};
+		const review = vi.fn(async () => ({ armed: true, proposal }));
+		const f = await startGateway({ managed: true, managedReview: review }, "unix");
+		const session = await f.call("/api/v1/session");
+		expect(session.status).toBe(200);
+		expect(JSON.parse(session.body)).toEqual({ csrfToken: expect.any(String) });
+		const headers = { Origin: f.origin, "Content-Type": "application/json" };
+		const post = (requestId: string, action: unknown, extra: Record<string, string>) =>
+			f.call(
+				"/api/v1/requests",
+				{ ...headers, ...extra },
+				JSON.stringify({ requestId, operation: { type: "mission", request: action } }),
+			);
+		const status = { operation: "status" };
+		expect((await post("read", status, {})).status).toBe(403);
+		const csrf = { "X-Unit-CSRF": JSON.parse(session.body).csrfToken as string };
+		for (const bad of [
+			{ Host: "localhost" },
+			{ Origin: "https://other.example" },
+			{ Forwarded: "for=127.0.0.1" },
+			{ "X-Forwarded-For": "127.0.0.1" },
+		] as const)
+			expect((await f.call("/api/v1/session", bad)).status).toBe(403);
+		for (const [id, extra] of [
+			["simple", {}],
+			["reviewed", { previousReceipt: null }],
+		] as const) {
+			const denied = await post(
+				id,
+				{ operation: "agree", revision: 2, digest: proposal.digest, confirmed: true, ...extra },
+				csrf,
+			);
+			expect(denied.status).toBe(200);
+			expect(JSON.parse(denied.body)).toEqual({ requestId: id, state: "refused", code: "not-enabled" });
+		}
 		expect(f.requests).toEqual([]);
+		expect(review).not.toHaveBeenCalled();
+		f.client.request = async () => ({
+			type: "mission",
+			result: {
+				stage: "awaiting_approval",
+				formation: {
+					nextRevision: 3,
+					lastOperation: null,
+					agreement: null,
+					draft: { missionId: proposal.missionId, revision: 2, status: "proposed", terms: {}, digest: "a".repeat(64) },
+				},
+				creator: null,
+				authority: "managed-administrator",
+				authorityError: null,
+				agreementValid: true,
+				missing: [],
+				execution: "not-implemented",
+				tools: [],
+			},
+		});
+		const projected = await post("read", status, csrf);
+		expect(JSON.parse(projected.body)).toMatchObject({
+			state: "completed",
+			response: {
+				result: {
+					canAgree: false,
+					agreementValid: false,
+					review: proposal,
+					formation: { draft: { digest: proposal.digest } },
+				},
+			},
+		});
+		expect(review).toHaveBeenCalledOnce();
 	});
 
 	describe("browser POST response projection", () => {

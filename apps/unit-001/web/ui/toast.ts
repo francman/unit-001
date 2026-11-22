@@ -5,8 +5,8 @@ import { icon } from "./icons.ts";
 /** How long a toast stays; long enough to read two short sentences. */
 const toastMs = 6000;
 
-/** Creates the toast stack; `show` adds a toast, `clear` removes all. The stack is not a live region: announce separately. */
-export function createToaster(): { root: HTMLElement; show(text: string): void; clear(): void } {
+/** Creates the toast stack. It is not a live region: announce separately. */
+export function createToaster(): { root: HTMLElement; show(text: string): void } {
 	const root = el(
 		"div",
 		"pointer-events-none fixed top-11 right-3 z-50 flex w-[min(22rem,calc(100vw-1.5rem))] flex-col items-end gap-2 max-md:top-13 max-md:right-auto max-md:left-1/2 max-md:-translate-x-1/2",
@@ -22,9 +22,6 @@ export function createToaster(): { root: HTMLElement; show(text: string): void; 
 			);
 			root.append(toast);
 			setTimeout(() => toast.remove(), toastMs);
-		},
-		clear() {
-			root.replaceChildren();
 		},
 	};
 }

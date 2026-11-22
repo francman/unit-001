@@ -15,7 +15,7 @@ import { acquireSessionLock } from "../src/lock.ts";
 import { requestService, runService, serviceEndpoint } from "../src/service.ts";
 import { runWebWorkspace } from "../src/web/launcher.ts";
 
-it("#65 pairs packaged assets with the sole owner, streams, deduplicates and forgets explicitly", async () => {
+it("#65 serves packaged assets from the sole owner, streams, deduplicates and forgets explicitly", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "u1-web-"));
 	const file = join(directory, "session.sqlite");
 	const release = await acquireSessionLock(`${file}.lock`);
@@ -77,24 +77,21 @@ it("#65 pairs packaged assets with the sole owner, streams, deduplicates and for
 		);
 		await Promise.race([listening, web]);
 		const origin = `http://127.0.0.1:${port}`;
-		const secret = /One-time pairing code: ([A-Za-z0-9_-]+)/.exec(printed)?.[1];
-		expect(secret).toHaveLength(43);
+		expect(printed).toContain(`Browser workspace: ${origin}`);
 		const page = await (await fetch(origin)).text();
 		expect(page).toContain("bootstrap.js");
 		const bundle = await (await fetch(`${origin}/bootstrap.js`)).text();
 		expect(bundle).not.toContain("unitPreview");
 		expect(bundle).toContain("/api/v1/events");
 		expect((await fetch(`${origin}/preview.js`)).status).toBe(404);
-		const paired = await fetch(`${origin}/api/v1/session`, {
-			method: "POST",
-			headers: { Origin: origin, "Content-Type": "application/json" },
-			body: JSON.stringify({ secret }),
-		});
-		const session = (await paired.json()) as { sessionToken: string; csrfToken: string };
+		const metadata = await fetch(`${origin}/api/v1/session`);
+		const workspaceId = metadata.headers.get("x-unit-workspace");
+		expect(workspaceId).toMatch(/^[a-f0-9]{64}$/);
+		const session = (await metadata.json()) as { csrfToken: string };
+		expect(session).toEqual({ csrfToken: expect.stringMatching(/^[a-f0-9]{64}$/) });
 		const headers = {
 			Origin: origin,
 			"Content-Type": "application/json",
-			Authorization: `Bearer ${session.sessionToken}`,
 			"X-Unit-CSRF": session.csrfToken,
 		};
 		const call = async (requestId: string, operation: unknown) => {
@@ -107,6 +104,7 @@ it("#65 pairs packaged assets with the sole owner, streams, deduplicates and for
 			return await response.json();
 		};
 		const events = await fetch(`${origin}/api/v1/events`, { headers });
+		expect(events.headers.get("x-unit-workspace")).toBe(workspaceId);
 		stream = events.body!.getReader();
 		expect(new TextDecoder().decode((await stream.read()).value)).toContain("event: view");
 		const send = { type: "send", prompt: "Give the verified answer." };
@@ -155,11 +153,11 @@ it("#65 pairs packaged assets with the sole owner, streams, deduplicates and for
 			(
 				await fetch(`${origin}/api/v1/requests`, {
 					method: "POST",
-					headers: { ...headers, Authorization: "" },
-					body: JSON.stringify({ requestId: "anonymous-graph", operation: graph }),
+					headers: { ...headers, "X-Unit-CSRF": "wrong" },
+					body: JSON.stringify({ requestId: "wrong-csrf-graph", operation: graph }),
 				})
 			).status,
-		).toBe(401);
+		).toBe(403);
 		expect(
 			await call("forget", {
 				type: "memory",
@@ -170,8 +168,9 @@ it("#65 pairs packaged assets with the sole owner, streams, deduplicates and for
 			response: { result: { operation: "graph", nodes: [], edges: [], total: 0, limited: false } },
 		});
 		await expect(acquireSessionLock(`${file}.lock`)).rejects.toThrow("already running");
-		await fetch(`${origin}/api/v1/logout`, { method: "POST", headers, body: "{}" });
-		expect((await fetch(`${origin}/api/v1/events`, { headers })).status).toBe(401);
+		stopWeb.abort();
+		await web;
+		await expect(fetch(`${origin}/api/v1/session`)).rejects.toThrow();
 		expect(faux.state.callCount).toBe(1);
 	} finally {
 		await stream?.cancel().catch(() => {});

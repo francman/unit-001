@@ -21,6 +21,8 @@ if (
 	process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH ?? "/usr/sbin:/usr/bin:/sbin:/bin"}`;
 	const controller = new AbortController();
 	for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => controller.abort());
+	// SSH can close the operator PTY without delivering Ctrl+C.
+	if (operator && args[0] === "web") process.once("SIGHUP", () => controller.abort());
 	process.exitCode = await main(
 		args,
 		{ ...processRuntime(), managed: { id, name, state, ...(operator ? { access: "operator" as const } : {}) } },

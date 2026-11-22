@@ -39,27 +39,22 @@ async function fixture() {
 			});
 		},
 	};
-	const gateway = createWebGateway({ client, origin, secret: "fixture-secret-".repeat(4), assets: new Map() });
+	const gateway = createWebGateway({ client, origin, assets: new Map() });
 	gateways.push(gateway);
 	gateway.server.listen(port, "127.0.0.1");
 	await once(gateway.server, "listening");
-	const pair = await fetch(`${origin}/api/v1/session`, {
-		method: "POST",
-		headers: { Origin: origin, "Content-Type": "application/json" },
-		body: JSON.stringify({ secret: "fixture-secret-".repeat(4) }),
-	});
-	expect(pair.status).toBe(200);
-	const session = (await pair.json()) as { sessionToken: string; csrfToken: string };
+	const response = await fetch(`${origin}/api/v1/session`);
+	expect(response.status).toBe(200);
+	const session = (await response.json()) as { csrfToken: string };
 	const headers = {
 		Origin: origin,
 		"Content-Type": "application/json",
-		Authorization: `Bearer ${session.sessionToken}`,
 		"X-Unit-CSRF": session.csrfToken,
 	};
 	return { gateway, origin, headers, client, streamAborted: () => streamAborted };
 }
 
-describe("independent browser session lifecycle acceptance", () => {
+describe("gateway streams and shutdown", () => {
 	it("#65 detaches a stream whose queued bytes reach the fixed bound", async () => {
 		const f = await fixture();
 		let publish = () => {};
@@ -125,18 +120,6 @@ describe("independent browser session lifecycle acceptance", () => {
 		await reader.cancel();
 		await second.body?.cancel();
 	});
-	it("logout aborts an open event stream and invalidates its session token", async () => {
-		const f = await fixture();
-		const stream = await fetch(`${f.origin}/api/v1/events`, { headers: f.headers });
-		const reader = stream.body?.getReader();
-		expect((await reader?.read())?.value?.length).toBeGreaterThan(0);
-		const logout = await fetch(`${f.origin}/api/v1/logout`, { method: "POST", headers: f.headers, body: "{}" });
-		expect(logout.status).toBe(200);
-		expect(f.streamAborted()).toBe(true);
-		await reader?.read().catch(() => undefined);
-		expect((await fetch(`${f.origin}/api/v1/events`, { headers: f.headers })).status).toBe(401);
-	});
-
 	it("shutdown aborts an open event stream before waiting for HTTP closure", async () => {
 		const f = await fixture();
 		const stream = await fetch(`${f.origin}/api/v1/events`, { headers: f.headers });
@@ -146,17 +129,7 @@ describe("independent browser session lifecycle acceptance", () => {
 		gateways.splice(gateways.indexOf(f.gateway), 1);
 	}, 3000);
 
-	it("expiry closes existing event streams without another client request", async () => {
-		const f = await fixture();
-		const stream = await fetch(`${f.origin}/api/v1/events`, { headers: f.headers });
-		const reader = stream.body?.getReader();
-		await reader?.read();
-		vi.spyOn(Date, "now").mockReturnValue(Date.now() + 1_800_001);
-		await reader?.read().catch(() => undefined);
-		expect(f.streamAborted()).toBe(true);
-	}, 4000);
-
-	it("logout aborts a pending owner wait and denies its late response without exposing errors", async () => {
+	it("shutdown aborts a pending owner request", async () => {
 		const f = await fixture();
 		let started!: () => void;
 		const ready = new Promise<void>((resolve) => {
@@ -181,13 +154,11 @@ describe("independent browser session lifecycle acceptance", () => {
 			headers: f.headers,
 			body: JSON.stringify({ requestId: "pending", operation: { type: "status" } }),
 		});
+		const disconnected = expect(pending).rejects.toThrow();
 		await ready;
-		await fetch(`${f.origin}/api/v1/logout`, { method: "POST", headers: f.headers, body: "{}" });
-		const response = await pending;
-		const result = await response.text();
+		await f.gateway.close();
+		await disconnected;
 		expect(aborted).toBe(true);
-		expect(response.status).toBe(200);
-		expect(JSON.parse(result)).toMatchObject({ state: "unknown", requestId: "pending" });
-		expect(result).not.toContain("private fixture credential");
+		gateways.splice(gateways.indexOf(f.gateway), 1);
 	});
 });

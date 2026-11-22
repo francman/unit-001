@@ -15,7 +15,7 @@ const executable = process.env.UNIT_001_BROWSER_EXECUTABLE;
 const fixtureAssets = process.env.UNIT_001_TEST_WEB_ASSETS;
 
 test(
-	"#65 live browser pairing, retained history, outcomes, focus, stable forget, responsive layout and sign-out",
+	"#65 code-free browser startup, retained history, outcomes, focus, stable forget, responsive layout and workspace continuity",
 	{ skip: !executable, timeout: 90000 },
 	async () => {
 		await assertFreshWebAssets(fixtureAssets);
@@ -26,25 +26,27 @@ test(
 		const port = reservation.address().port;
 		await new Promise((resolve) => reservation.close(resolve));
 		const origin = `http://127.0.0.1:${port}`;
-		const owner = spawn(
-			process.execPath,
-			[
-				"--conditions=source",
-				fileURLToPath(new URL("fixtures/web-workspace.ts", import.meta.url)),
-				join(directory, "owner"),
-				String(port),
-				...(fixtureAssets ? [fixtureAssets] : []),
-			],
-			{ stdio: ["ignore", "pipe", "pipe"] },
-		);
 		let output = "",
 			errors = "";
-		owner.stdout.on("data", (chunk) => {
-			output += chunk;
-		});
-		owner.stderr.on("data", (chunk) => {
-			errors += chunk;
-		});
+		function startOwner(folder, label = "") {
+			const child = spawn(
+				process.execPath,
+				[
+					"--conditions=source",
+					fileURLToPath(new URL("fixtures/web-workspace.ts", import.meta.url)),
+					join(directory, folder),
+					String(port),
+					fixtureAssets ?? "",
+					label,
+				],
+				{ stdio: ["ignore", "pipe", "pipe"] },
+			);
+			child.stdout.on("data", (chunk) => { output += chunk; });
+			child.stderr.on("data", (chunk) => { errors += chunk; });
+			return child;
+		}
+		const owner = startOwner("owner");
+		let replacement;
 		const browser = spawn(
 			executable,
 			[
@@ -61,17 +63,16 @@ test(
 		);
 		let socket;
 		const stop = async (child) => {
-			if (child.exitCode !== null || child.signalCode !== null) return;
+			if (!child || child.exitCode !== null || child.signalCode !== null) return;
 			const exited = once(child, "exit");
 			child.kill("SIGTERM");
 			await exited;
 		};
 		try {
 			await until(
-				() => /One-time pairing code: ([A-Za-z0-9_-]+)/.test(output),
+				() => output.includes(`Browser workspace: ${origin}`),
 				() => errors,
 			);
-			const secret = /One-time pairing code: ([A-Za-z0-9_-]+)/.exec(output)[1];
 			let debugPort;
 			await until(async () => {
 				try {
@@ -146,16 +147,18 @@ test(
 				source: String.raw`
 					window.cspViolations = [];
 					window.historyReads = [];
+					window.sentByBrowser = [];
+					window.postsByBrowser = 0;
 					document.addEventListener("securitypolicyviolation", (event) =>
 						window.cspViolations.push(event.violatedDirective + " " + event.blockedURI));
 					const nativeFetch = window.fetch.bind(window);
 					window.fetch = async (path, init) => {
+						const operation = path === "/api/v1/requests" && typeof init?.body === "string" ? JSON.parse(init.body).operation : null;
+						if (operation) window.postsByBrowser++;
+						if (operation?.type === "send") window.sentByBrowser.push(operation.prompt);
 						const response = await nativeFetch(path, init);
-						if (path === "/api/v1/requests" && typeof init?.body === "string") {
-							const { operation } = JSON.parse(init.body);
-							if (operation.type === "chat-history")
-								window.historyReads.push({ before: operation.before, status: response.status, result: await response.clone().json() });
-						}
+						if (operation?.type === "chat-history")
+							window.historyReads.push({ before: operation.before, status: response.status, result: await response.clone().json() });
 						if (path !== "/api/v1/events" || !response.ok || !response.body) return response;
 						const encoder = new TextEncoder();
 						const decoder = new TextDecoder();
@@ -190,17 +193,12 @@ test(
 			await until(() => has("Origin is not permitted."));
 			assert.equal(await has(origin), true);
 			await call("Page.navigate", { url: origin });
-			await until(() => has("Connect to your agent"));
-			await fill('#pairing-code', "wrong");
-			await click("Connect");
-			await until(() => has("Pairing failed."));
-			await fill('#pairing-code', secret);
-			await click("Connect");
 			await until(() => evaluate(`document.querySelector('#composer')!==null`));
 			await evaluate(`window.beforeHistoryReload = true`);
 			await call("Page.reload");
 			await until(() => evaluate(`!window.beforeHistoryReload && window.lastView?.historyTruncated && document.querySelector('#composer') !== null`));
-			assert.equal(await has("Connect to your agent"), false, "reload restores the real paired session without a code");
+			assert.equal(await evaluate(`document.querySelector('input[type="password"], [data-key="signout"]')`), null);
+			assert.deepEqual(await evaluate(`[localStorage.length, sessionStorage.length]`), [0, 0], "a clean profile stores no gateway credentials");
 			const sentinel = "Retained browser message 1: oldest SQLite sentinel";
 			const transcript = () =>
 				evaluate(`[...document.querySelectorAll('#thread article')].flatMap(row => [...row.innerText.matchAll(/Retained browser message (\\d+)/g)].map(match => Number(match[1])))`);
@@ -701,10 +699,9 @@ test(
 			);
 			await evaluate(
 				`(async()=>{
-					const Authorization='Bearer '+localStorage.getItem('unit-001.session');
-					const session=await (await window.originalFetch('/api/v1/session',{credentials:'omit',headers:{Authorization}})).json();
+					const {csrfToken}=await (await window.originalFetch('/api/v1/session',{credentials:'omit'})).json();
 					const reply=await window.originalFetch('/api/v1/requests',{
-						method:'POST',credentials:'omit',headers:{Authorization,'Content-Type':'application/json','X-Unit-CSRF':session.csrfToken},
+						method:'POST',credentials:'omit',headers:{'Content-Type':'application/json','X-Unit-CSRF':csrfToken},
 						body:JSON.stringify({requestId:crypto.randomUUID(),operation:{type:'cancel'}}),
 					});
 					if(!reply.ok)throw Error('Authorized fixture cancellation failed: '+reply.status);
@@ -906,26 +903,66 @@ test(
 			assert.deepEqual(await evaluate(`window.cspViolations`), []);
 			const mobile = await call("Page.captureScreenshot", { format: "png" });
 			await writeFile(join(directory, "mobile.png"), Buffer.from(mobile.data, "base64"));
-			// On a phone the sidebar opens from the top bar's Menu button and closes on navigation; Sign out lives in it.
+			// On a phone the sidebar opens from the top bar's Menu button and closes on navigation.
 			await click("Menu");
 			await click("Memory");
 			assert.equal(await evaluate(`document.querySelector('#sidebar').offsetParent===null`), true, "the menu closes after navigating");
+
 			await click("Menu");
-			await click("Sign out");
-			await until(() => has("Signed out. Your agent keeps running."));
-			assert.equal(await has("Verified browser answer."), false);
-			// Signing out drops the map's theme observer and media listeners (codex review).
-			await until(async () => {
-				const out = await subscriptions();
-				return out.observers === beforeMap.observers && out.media === beforeMap.media;
-			});
+			await click("Chat");
+			const draftAfterRestart = "Reply after the browser gateway restarts";
+			await fill("#composer", draftAfterRestart);
+			await evaluate(`window.composerBeforeRestart = document.querySelector('#composer')`);
+			const sendsBeforeRestart = await evaluate("window.sentByBrowser");
+			const workspaceHeader = async () => (await fetch(`${origin}/api/v1/session`)).headers.get("X-Unit-Workspace");
+			const ownerId = await workspaceHeader();
+			assert.match(ownerId, /^[a-f0-9]{64}$/);
+			assert.equal(owner.kill("SIGUSR2"), true, "restart only the fixture gateway");
+			await until(() => has("Cannot reach the agent."));
+			await until(() => output.split(`Browser workspace: ${origin}`).length === 3, () => errors);
+			await until(() => evaluate(`document.querySelector('footer[aria-label="Status bar"]').innerText.includes('Connected')`));
+			assert.equal(await workspaceHeader(), ownerId, "a gateway restart keeps the owner's endpoint identity");
+			assert.equal(await evaluate("window.composerBeforeRestart === document.querySelector('#composer')"), true);
+			assert.equal(await evaluate("document.querySelector('#composer').value"), draftAfterRestart);
+			assert.equal(await has("Verified browser answer."), true, "owner state survives the gateway restart");
+			assert.deepEqual(await evaluate("window.sentByBrowser"), sendsBeforeRestart, "reconnecting does not send or replay anything");
+			await click("Send message");
+			await until(() => has("Verified browser answer after gateway restart."));
+			assert.deepEqual(await evaluate("window.sentByBrowser"), [...sendsBeforeRestart, draftAfterRestart]);
+
+			const wrongOwnerDraft = "This unsent draft belongs to the first owner";
+			await fill("#composer", wrongOwnerDraft);
+			await stop(owner);
+			await until(() => has("Cannot reach the agent."));
+			const postsBeforeSwitch = await evaluate("window.postsByBrowser");
+			replacement = startOwner("peer", "Second owner");
+			await until(() => output.split(`Browser workspace: ${origin}`).length === 4, () => errors);
+			const replacementId = await workspaceHeader();
+			assert.match(replacementId, /^[a-f0-9]{64}$/);
+			assert.notEqual(replacementId, ownerId);
+			await until(() => has("A different workspace answered."));
+			assert.equal(await evaluate("window.composerBeforeRestart === document.querySelector('#composer')"), true);
+			assert.equal(await evaluate("document.querySelector('#composer').value"), wrongOwnerDraft);
+			assert.equal(await evaluate(`document.querySelector('[data-key="send"]').disabled`), true);
+			await evaluate(`document.querySelector('#composer').form.requestSubmit()`);
+			assert.equal(await evaluate("window.postsByBrowser"), postsBeforeSwitch);
+			assert.equal(await has("Verified browser answer after gateway restart."), true);
+			assert.equal(await has("Second owner: Retained browser message 28"), false);
+
+			await call("Page.reload");
+			await until(() => has("Second owner: Retained browser message 28"));
+			assert.equal(await has("Verified browser answer after gateway restart."), false);
+			assert.equal(await evaluate("document.querySelector('#composer').value"), "");
+			assert.deepEqual(await evaluate("window.sentByBrowser"), [], "a deliberate reload starts fresh and never sends the old draft");
 			console.log(`Browser acceptance screenshots: ${directory}`);
 		} finally {
 			socket?.close();
 			await stop(browser);
 			await stop(owner);
+			await stop(replacement);
 			// Keep screenshots when requested, without retaining the synthetic SQLite state.
 			await rm(join(directory, "owner"), { recursive: true, force: true });
+			await rm(join(directory, "peer"), { recursive: true, force: true });
 			await rm(join(directory, "browser"), { recursive: true, force: true });
 			if (process.env.UNIT_001_KEEP_BROWSER_EVIDENCE !== "1") await rm(directory, { recursive: true, force: true });
 		}

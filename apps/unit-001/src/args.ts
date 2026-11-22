@@ -84,7 +84,7 @@ export const USAGE = `Usage: agent [options]
        agent service-status [options]    inspect the running service
        agent cancel [options]            cancel chat: abort all work in the chat, including queued inputs
        agent remote --help               connect this terminal to a named remote installation
-       agent web [--port 4317] [options]  open a paired browser workspace on private loopback
+       agent web [--port 4317] [options]  open the browser workspace on a trusted workstation
        agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]
        agent mission [status|setup|draft|propose|creator|approve|start|pause|resume|stop] [options]
        agent channels [status] [options] show available adapters and observed channel state

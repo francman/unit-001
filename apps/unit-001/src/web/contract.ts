@@ -32,7 +32,7 @@ export type WebOperation =
 
 export type WebRequest = { requestId: string; operation: WebOperation };
 
-export type WebSession = { authenticated: false } | { authenticated: true; csrfToken: string; expiresAt: number };
+export type WebSession = { csrfToken: string };
 
 /** Validates browser input and reconstructs owner requests without accepting authority claims. */
 export function parseWebRequest(value: unknown): {

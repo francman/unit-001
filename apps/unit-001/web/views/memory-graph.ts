@@ -42,6 +42,7 @@ type Mode = "graph" | "list";
 
 interface Widget {
 	ctx: Ctx;
+	canForget: boolean;
 	data: ReturnType<typeof readGraph> | null;
 	signature: string;
 	mode: Mode | null;
@@ -83,6 +84,11 @@ export function memoryMap(ctx: Ctx): MemoryMap {
 	const living = widget;
 	living.ctx = ctx;
 	const restore = keepFocus(living);
+	const canForget = ctx.ui.connection === "connected";
+	if (living.canForget !== canForget) {
+		living.canForget = canForget;
+		fillPanel(living);
+	}
 	if (ctx.ui.graph) adopt(living, ctx.ui.graph);
 	show(living);
 	applyHighlight(living, ctx.ui.query);
@@ -150,6 +156,7 @@ function createWidget(ctx: Ctx): Widget {
 	heading.id = "memory-map-title";
 	const widget: Widget = {
 		ctx,
+		canForget: ctx.ui.connection === "connected",
 		data: null,
 		signature: "",
 		mode: null,
@@ -480,6 +487,7 @@ function fillPanel(widget: Widget): void {
 			conversations: data.conversations,
 			name: widget.ctx.name,
 			focused: widget.focus?.id === node.id,
+			canForget: widget.canForget,
 			onSelect: (id) => select(widget, id),
 			onClose: () => {
 				const opener = widget.listOpener;

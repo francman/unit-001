@@ -135,7 +135,7 @@ function privacySection(ctx: Ctx): HTMLElement {
 			? `To reply, ${ctx.name} sends the conversation to its model provider, ${provider}.`
 			: `To reply, ${ctx.name} sends the conversation to its model provider. No model is configured yet.`,
 		"This browser keeps your theme choice and, until you leave the page, an unsent draft. Nothing else is stored here.",
-		"The browser reaches the agent only through a private connection on this computer, and a pairing code you enter once.",
+		"The workspace trusts this computer as the operator. Use it only on a trusted computer, through loopback or your private SSH tunnel.",
 	];
 	return section({ title: "Data and privacy", icon: "lock", children: [panel(el("div", surfaces.panelBody, bullets(items)))] });
 }

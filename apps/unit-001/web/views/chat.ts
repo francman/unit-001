@@ -466,7 +466,7 @@ function createComposer(context: () => Ctx): { row: HTMLElement; input: HTMLText
 			srOnly(running ? "Cancel chat" : "Send message"),
 		);
 		send.title = running ? "Cancel chat" : "Send (Enter)";
-		send.disabled = running ? false : !ctx.ui.draft.trim() || ctx.ui.sending || ctx.ui.connection !== "connected";
+		send.disabled = ctx.ui.connection !== "connected" || (!running && (!ctx.ui.draft.trim() || ctx.ui.sending));
 		send.setAttribute("aria-disabled", String(running && ctx.ui.cancelling));
 	};
 

@@ -1,7 +1,7 @@
 // Defines the browser workspace projection independently of private owner storage.
 import type { MissionRefusalCode } from "../src/missions/refusal.ts";
 
-export type Connection = "connected" | "connecting" | "offline" | "expired";
+export type Connection = "connected" | "connecting" | "offline" | "workspace-changed";
 
 /** Conversation-scope token usage; the cost is an estimate or unknown, never billing. */
 export interface WorkspaceUsage {
@@ -85,17 +85,13 @@ export type MissionReviewView = {
 export type MissionMutation =
 	| { operation: "draft"; expectedRevision: number; terms: MissionDraftTerms }
 	| { operation: "propose"; expectedRevision: number }
-	| { operation: "agree"; revision: number; digest: string; confirmed: true; previousReceipt?: string | null };
+	| { operation: "agree"; revision: number; digest: string; confirmed: true };
 
 export type MissionMutationOutcome =
 	| { state: "completed"; mission: WorkspaceDetails["mission"] }
-	| { state: "issued"; receiptId: string; reconciled: boolean }
 	| { state: "refused"; code: MissionRefusalCode }
 	| { state: "rejected" }
 	| { state: "unknown" };
-
-/** The port always ends the local session, even when the gateway cannot confirm revocation. */
-export type LogoutOutcome = "revoked" | "unconfirmed";
 
 /** The one bounded work run the owner reports; it is not the purpose and not a planner. */
 export interface MissionRunView {
@@ -178,9 +174,9 @@ export interface WorkspaceDetails {
 		authority: "managed-administrator" | "developer-local" | "unconfigured" | "invalid";
 		agreementValid: boolean;
 		authorityError: string | null;
-		/** True only when the authenticated gateway projects the formation protocol. */
+		/** True only when the gateway projects the formation protocol. */
 		formationAvailable: boolean;
-		/** Affirmative authenticated server capability; an absent flag is false. */
+		/** Affirmative server capability for legacy developer-local browser approval only. */
 		canAgree: boolean;
 		/** The gateway's current protected receipt binding, if projected. */
 		previousReceipt?: string | null;
@@ -228,5 +224,4 @@ export interface WorkspacePort {
 		id: string,
 		requestId: string,
 	): Promise<{ state: "completed" } | { state: "unknown" | "failed"; message: string }>;
-	logout(): Promise<LogoutOutcome>;
 }

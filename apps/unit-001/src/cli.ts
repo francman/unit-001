@@ -625,7 +625,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 		let code: number;
 		if (command.kind === "web") {
 			if (!runtime.interactive)
-				throw new UsageError("Web pairing requires an operator terminal; pairing codes must not enter logs.");
+				throw new UsageError("The web workspace requires an operator terminal.");
 			if (runtime.managed !== undefined && runtime.managed.access !== "operator")
 				throw new ConfigurationError("Run the web command as an authorized operator without sudo.");
 			const endpoint =

@@ -44,7 +44,6 @@ async function gateway(view: ServiceView) {
 	const reservation = createWebGateway({
 		client,
 		origin: "http://127.0.0.1:1",
-		secret: "a".repeat(32),
 		assets: new Map(),
 	});
 	reservation.server.listen(0, "127.0.0.1");
@@ -52,25 +51,17 @@ async function gateway(view: ServiceView) {
 	const port = (reservation.server.address() as AddressInfo).port;
 	await reservation.close();
 	const origin = `http://127.0.0.1:${port}`;
-	const server = createWebGateway({ client, origin, secret: "a".repeat(32), assets: new Map() });
+	const server = createWebGateway({ client, origin, assets: new Map() });
 	servers.push(server);
 	server.server.listen(port, "127.0.0.1");
 	await once(server.server, "listening");
-	const pair = await fetch(`${origin}/api/v1/session`, {
-		method: "POST",
-		headers: { Origin: origin, "Content-Type": "application/json" },
-		body: JSON.stringify({ secret: "a".repeat(32) }),
-	});
-	expect(pair.ok).toBe(true);
-	const { sessionToken } = (await pair.json()) as { sessionToken: unknown };
-	if (typeof sessionToken !== "string" || sessionToken.length === 0) throw new Error("Expected a session token.");
-	return { origin, sessionToken };
+	return origin;
 }
 
-async function firstViewFrame(origin: string, sessionToken: string): Promise<string> {
+async function firstViewFrame(origin: string): Promise<string> {
 	const abort = new AbortController();
 	const response = await fetch(`${origin}/api/v1/events`, {
-		headers: { Origin: origin, Authorization: `Bearer ${sessionToken}` },
+		headers: { Origin: origin },
 		signal: abort.signal,
 	});
 	const reader = (response.body as ReadableStream<Uint8Array>).getReader();
@@ -92,8 +83,8 @@ async function firstViewFrame(origin: string, sessionToken: string): Promise<str
 
 describe("browser frame projection", () => {
 	it("forwards only workspace fields: no failure, retry, tool reason or owner PID", async () => {
-		const { origin, sessionToken } = await gateway(ownerFrame);
-		const data = JSON.parse(await firstViewFrame(origin, sessionToken)) as Record<string, unknown>;
+		const origin = await gateway(ownerFrame);
+		const data = JSON.parse(await firstViewFrame(origin)) as Record<string, unknown>;
 		expect(Object.keys(data).sort()).toEqual(
 			[
 				"busy",

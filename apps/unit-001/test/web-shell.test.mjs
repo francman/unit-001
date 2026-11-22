@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 
 const executable = process.env.UNIT_001_BROWSER_EXECUTABLE;
 
-test("workspace startup and bearer restore, Escape, mobile drawer, elapsed label and Purpose navigation", { skip: !executable, timeout: 45_000 }, async () => {
+test("workspace identity, gateway reconnect, managed review, mobile drawer and Purpose navigation", { skip: !executable, timeout: 45_000 }, async () => {
 	const directory = await mkdtemp(join(tmpdir(), "unit-web-shell-"));
 	const assets = {
 		"/": ["index.html", "text/html"],
@@ -22,13 +22,31 @@ test("workspace startup and bearer restore, Escape, mobile drawer, elapsed label
 	const moduleReady = Promise.withResolvers();
 	const sessionRequested = Promise.withResolvers();
 	const sessionReady = Promise.withResolvers();
-	const token = "a".repeat(64);
-	const csrf = "b".repeat(64);
-	const bearer = `Bearer ${token}`;
-	const expiry = Date.now() + 1_800_000;
+	let csrf = "b".repeat(64);
+	const originalId = "a".repeat(64);
+	const otherId = "f".repeat(64);
+	let sessionId;
+	let streamId = originalId;
+	let malformedMetadata = false;
 	const requests = [];
-	let paired = false;
+	const eventStreams = new Set();
 	let cancellations = 0;
+	const agreeRequests = [];
+	const digest = "e".repeat(64);
+	const review = { missionId: "fixture-mission", revision: 4, digest, authorityRevision: 7, previousReceipt: null };
+	const mission = {
+		stage: "awaiting_approval", creator: { kind: "human", id: "fixture-creator" },
+		authority: "managed-administrator", canAgree: true, agreementValid: false, authorityError: null,
+		execution: "not-started", missing: [], tools: [], previousReceipt: null, review,
+		formation: { agreement: null, draft: { missionId: review.missionId, revision: review.revision, digest, status: "proposed", terms: {
+			objective: "Managed mission review sentinel", scope: "Local test", successCriteria: ["Inspect terms"], approvalBoundary: [],
+			reviewEveryMs: 60_000, policy: { allowedTools: [], maxCycles: 2, maxRequests: 3, maxRetries: 0, maxConsecutiveNoProgress: 1, deadlineAt: 1_893_456_000_000 },
+		} } },
+	};
+	const view = {
+		name: "Test agent", version: "0.0.0", installationId: null, busy: true, model: { provider: "test", modelId: "test" },
+		usage: null, entries: [], tools: [], text: "", textTruncated: false, historyTruncated: false,
+	};
 	const server = createServer(async (request, response) => {
 		const asset = assets[request.url];
 		if (asset) {
@@ -41,43 +59,47 @@ test("workspace startup and bearer restore, Escape, mobile drawer, elapsed label
 			return;
 		}
 		if (!request.url?.startsWith("/api/v1/")) return response.writeHead(404).end();
-		const { authorization, cookie } = request.headers;
-		requests.push({ path: request.url, method: request.method, authorization, cookie });
-		const authenticated = paired && authorization === bearer;
+		const { authorization, cookie, origin, "x-unit-csrf": requestCsrf } = request.headers;
+		requests.push({ path: request.url, method: request.method, authorization, cookie, requestCsrf });
 		const json = (status, value) =>
 			response.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(value));
-		if (request.url === "/api/v1/session") {
-			if (request.method === "POST") {
-				let body = "";
-				for await (const chunk of request) body += chunk;
-				if (paired || authorization || JSON.parse(body).secret !== "fixture-code") return json(401, {});
-				paired = true;
-				return json(200, { authenticated: true, sessionToken: token, csrfToken: csrf, expiresAt: expiry });
-			}
+		if (request.url === "/api/v1/session" && request.method === "GET") {
 			sessionRequested.resolve();
 			await sessionReady.promise;
-			return json(200, authenticated ? { authenticated: true, csrfToken: csrf, expiresAt: expiry } : { authenticated: false });
+			if (sessionId) response.setHeader("X-Unit-Workspace", sessionId);
+			return json(200, malformedMetadata ? { csrfToken: csrf, unexpected: true } : { csrfToken: csrf });
 		}
-		if (!authenticated) return json(401, {});
-		if (request.method === "POST" && request.headers["x-unit-csrf"] !== csrf) return json(403, {});
-		if (request.url === "/api/v1/logout") {
-			paired = false;
-			return json(200, { authenticated: false });
-		} else if (request.url === "/api/v1/events") {
-			const view = {
-				name: "Test agent", version: "0.0.0", installationId: null, busy: true, model: { provider: "test", modelId: "test" },
-				usage: null, entries: [], tools: [], text: "", textTruncated: false, historyTruncated: false,
-			};
+		if (request.url === "/api/v1/events" && request.method === "GET") {
+			if (streamId) response.setHeader("X-Unit-Workspace", streamId);
 			response.writeHead(200, { "Content-Type": "text/event-stream" });
-			response.write(`event: view\ndata: ${JSON.stringify(view)}\n\n`);
-		} else if (request.url === "/api/v1/requests") {
+			const shown = streamId === originalId ? view : { ...view, name: "Unverified other owner",
+				entries: [{ id: 1, role: "assistant", text: "Unverified history sentinel", truncated: false }] };
+			response.write(`event: view\ndata: ${JSON.stringify(shown)}\n\n`);
+			eventStreams.add(response);
+			response.once("close", () => eventStreams.delete(response));
+		} else if (request.url === "/api/v1/requests" && request.method === "POST") {
+			if (origin !== `http://127.0.0.1:${request.socket.localPort}` || requestCsrf !== csrf ||
+				request.headers["content-type"] !== "application/json") return json(403, {});
 			let body = "";
 			for await (const chunk of request) body += chunk;
 			const { operation, requestId } = JSON.parse(body);
+			const complete = (reply) => json(200, { requestId, state: "completed", response: reply });
 			if (operation.type === "cancel") {
 				cancellations++;
 				response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ requestId, state: "completed", response: { type: "cancelled" } }));
+				for (const stream of eventStreams)
+					stream.write(`event: view\ndata: ${JSON.stringify({ ...view, busy: false })}\n\n`);
+			} else if (operation.type === "mission" && operation.request.operation === "status") {
+				return complete({ type: "mission", result: mission });
+			} else if (operation.type === "status") {
+				return complete({ type: "status", runtime: { configuration: "configured", uptimeMs: 0 }, maintenance: { state: "open" }, inhibited: false });
+			} else if (operation.type === "memory" && operation.request.operation === "stats") {
+				return complete({ type: "memory", result: { operation: "stats", working: 0, episodic: 0, tombstones: 0,
+					pendingCaptures: 0, failedCaptures: 0, consolidation: "idle" } });
+			} else if (operation.type === "channels") {
+				return complete({ type: "channels", result: { operation: "status", view: { channels: [] } } });
 			} else {
+				if (operation.type === "mission" && operation.request.operation === "agree") agreeRequests.push(operation);
 				response.writeHead(503).end();
 			}
 		} else {
@@ -86,7 +108,7 @@ test("workspace startup and bearer restore, Escape, mobile drawer, elapsed label
 	});
 	let browser;
 	let socket;
-	let restoredSocket;
+	let secondSocket;
 	try {
 		execFileSync(process.execPath, [fileURLToPath(new URL("../scripts/build-web.mjs", import.meta.url)), directory], { stdio: "inherit" });
 		server.listen(0, "127.0.0.1");
@@ -127,22 +149,29 @@ test("workspace startup and bearer restore, Escape, mobile drawer, elapsed label
 		await call("Emulation.setTouchEmulationEnabled", { enabled: true });
 		const origin = `http://127.0.0.1:${server.address().port}/`;
 		await call("Page.navigate", { url: origin });
-		const checking = () => evaluate(`document.querySelector('#app [role="status"]')?.innerText === 'Checking your session…'`);
+		const checking = () => evaluate(`document.querySelector('#app [role="status"]')?.innerText === 'Connecting to your workspace…'`);
 		await until(checking);
 		moduleReady.resolve();
 		await sessionRequested.promise;
 		assert.ok(await checking(), "checking stays visible while the request is outstanding");
 		sessionReady.resolve();
-		await until(() => evaluate("document.querySelector('#pairing-code') !== null"));
-		await evaluate(`document.querySelector('#pairing-code').value = 'fixture-code'; document.querySelector('[data-key="pairing-connect"]').click()`);
+		await until(() => evaluate(`document.querySelector('#app [role="status"]')?.innerText.includes('Cannot reach the workspace.')`));
+		assert.match(await evaluate(`document.querySelector('#app [role="status"]').innerText`), /ssh unit-001.*bob web/);
+		assert.deepEqual(requests.map(({ method, path }) => [method, path]), [["GET", "/api/v1/session"]]);
+		sessionId = originalId;
+		malformedMetadata = true;
+		await call("Page.reload");
+		await until(() => evaluate(`document.querySelector('#app [role="status"]')?.innerText.includes('Cannot reach the workspace.')`));
+		assert.deepEqual(requests.map(({ method, path }) => [method, path]), [
+			["GET", "/api/v1/session"], ["GET", "/api/v1/session"],
+		], "a missing identity and invalid JSON shape both prevent opening the stream");
+		malformedMetadata = false;
+		await call("Page.reload");
 		const footer = `document.querySelector('footer[aria-label="Status bar"]')`;
 		await until(() => evaluate(`${footer}?.innerText.includes('Replying')`));
 		assert.equal(await checking(), false);
 		assert.equal(await evaluate("document.cookie"), "test_cookie=ignored");
-		assert.deepEqual(requests.filter((request) => request.path === "/api/v1/session").slice(0, 2), [
-			{ path: "/api/v1/session", method: "GET", authorization: undefined, cookie: undefined },
-			{ path: "/api/v1/session", method: "POST", authorization: undefined, cookie: undefined },
-		]);
+		assert.equal(await evaluate(`document.querySelector('input[type="password"], [data-key="signout"]')`), null);
 
 		const menu = '[data-key="menu"]';
 		await click(menu);
@@ -151,7 +180,7 @@ test("workspace startup and bearer restore, Escape, mobile drawer, elapsed label
 		assert.ok(await evaluate(`(() => {const nav = document.querySelector('#sidebar nav'); return nav.scrollHeight > nav.clientHeight && getComputedStyle(nav).overflowY === 'auto';})()`));
 		await evaluate(`document.querySelector('[data-key="nav-close"]').focus()`);
 		await key("Tab", 9, 8);
-		assert.equal(await focused(), "signout");
+		assert.equal(await focused(), "theme");
 		await key("Tab", 9);
 		assert.equal(await focused(), "nav-close");
 		await key("Escape", 27);
@@ -169,6 +198,28 @@ test("workspace startup and bearer restore, Escape, mobile drawer, elapsed label
 		assert.equal(await focused(), "memory-query");
 		assert.equal(await evaluate(`${footer}.innerText.includes('Stopping')`), false);
 		assert.equal(cancellations, 0);
+
+		await click("#nav-chat");
+		await click('[data-key="send"]');
+		await until(() => cancellations === 1);
+		await until(() => evaluate(`${footer}?.innerText.includes('Ready')`));
+		// New gateway lifetime: the old stream ends and future actions need the new token.
+		csrf = "c".repeat(64);
+		streamId = null;
+		const eventsBeforeRestart = requests.filter(({ path }) => path === "/api/v1/events").length;
+		for (const stream of eventStreams) stream.end();
+		await until(() => evaluate(`Array.from(document.querySelectorAll('[role="status"]')).some(e => e.innerText.includes('Cannot reach the agent.') && e.innerText.includes('bob web'))`));
+		await until(() => requests.filter(({ path }) => path === "/api/v1/events").length === eventsBeforeRestart + 1);
+		assert.equal(await evaluate(`document.querySelector('[data-key="send"]').disabled`), true);
+		assert.equal(await evaluate(`document.body.innerText.includes('Unverified history sentinel')`), false);
+		streamId = originalId;
+		await until(() => evaluate(`${footer}?.innerText.includes('Replying')`));
+		assert.equal(cancellations, 1, "the previous cancellation was not replayed");
+		await click('[data-key="send"]');
+		await until(() => cancellations === 2);
+		await until(() => evaluate(`${footer}?.innerText.includes('Ready')`));
+		for (const stream of eventStreams) stream.write(`event: view\ndata: ${JSON.stringify(view)}\n\n`);
+		await until(() => evaluate(`${footer}?.innerText.includes('Replying')`));
 
 		await click("#nav-about");
 		await until(() => evaluate(`document.querySelector('[data-key="about-purpose"]')?.innerText === 'Open Mission'`));
@@ -193,47 +244,54 @@ test("workspace startup and bearer restore, Escape, mobile drawer, elapsed label
 		await budgetExpired;
 		assert.ok(await evaluate(`shellTick.page === document.querySelector('h1')`), "the former 30-second refresh does not replace content");
 		await call("Emulation.setVirtualTimePolicy", { policy: "pauseIfNetworkFetchesPending" });
-		await click("#nav-chat");
-		await click('[data-key="send"]');
-		await until(() => cancellations === 1);
 
-		const restoredTab = await (await fetch(`http://127.0.0.1:${debugPort}/json/new?about:blank`, { method: "PUT" })).json();
-		restoredSocket = new WebSocket(restoredTab.webSocketDebuggerUrl);
-		await once(restoredSocket, "open");
-		const restored = debugCommands(restoredSocket);
-		await restored("Page.navigate", { url: origin });
+		const secondTab = await (await fetch(`http://127.0.0.1:${debugPort}/json/new?about:blank`, { method: "PUT" })).json();
+		secondSocket = new WebSocket(secondTab.webSocketDebuggerUrl);
+		await once(secondSocket, "open");
+		const second = debugCommands(secondSocket);
+		await second("Page.navigate", { url: origin });
 		await until(async () => {
-			const { result } = await restored("Runtime.evaluate", {
+			const { result } = await second("Runtime.evaluate", {
 				expression: `${footer}?.innerText.includes('Replying') ?? false`,
 				returnByValue: true,
 			});
 			return result.value === true;
 		});
-		assert.deepEqual(requests.filter((request) => request.path === "/api/v1/session").slice(2), [
-			{ path: "/api/v1/session", method: "GET", authorization: bearer, cookie: undefined },
-		]);
-		assert.equal(requests.filter((request) => request.path === "/api/v1/events").length, 2);
-		await click('[data-key="signout"]');
-		await until(() => evaluate("document.body.innerText.includes('Signed out.')"));
-		assert.equal(paired, false);
-		assert.deepEqual(requests.filter(({ path, cookie, authorization }) =>
-			cookie !== undefined || (path !== "/api/v1/session" && authorization !== bearer)), []);
-		assert.ok(requests.every(({ path }) => !path.includes("?") && !path.includes(token)));
-		await restored("Page.reload");
-		await until(async () => {
-			const { result } = await restored("Runtime.evaluate", {
-				expression: "document.querySelector('#pairing-code') !== null",
-				returnByValue: true,
-			});
-			return result.value === true;
-		});
-		assert.deepEqual(requests.filter((request) => request.path === "/api/v1/session").at(-1), {
-			path: "/api/v1/session", method: "GET", authorization: undefined, cookie: undefined,
-		});
+		assert.equal(requests.filter(({ method, path }) => method === "GET" && path === "/api/v1/session").length, 6);
+		assert.equal(requests.filter(({ method, path }) => method === "GET" && path === "/api/v1/events").length, 4);
+		assert.ok(requests.every(({ authorization, cookie }) => authorization === undefined && cookie === undefined));
+		assert.ok(requests.every(({ path }) => ["/api/v1/session", "/api/v1/events", "/api/v1/requests"].includes(path)));
+
+		// Even an affirmative flag in a valid managed projection must not produce browser Agree.
+		await click('[data-key="open-mission-draft"]');
+		await until(() => evaluate(`!!document.querySelector('[data-key="copy-mission-draft-approve"]')`));
+		assert.equal(await evaluate(`document.querySelector('[data-key^="mission-draft-agree-"]')`), null);
+		assert.equal(await evaluate(`document.querySelector('[data-scroll="mission-draft"]').innerText.includes("Managed mission review sentinel")`), true);
+		assert.equal(agreeRequests.length, 0);
+
+		const setDraft = `const composer = document.querySelector('#composer'); composer.value = "Keep this draft"; composer.dispatchEvent(new Event('input', { bubbles: true }));`;
+		await evaluate(`{ ${setDraft} }`);
+		const posts = requests.filter(({ method }) => method === "POST").length;
+		// Reproduce a switch between matching metadata and the stream on the same browser origin.
+		streamId = otherId;
+		for (const stream of eventStreams) stream.end();
+		await until(() => evaluate(`document.body.innerText.includes('Cannot reach the agent.')`));
+		await call("Emulation.setVirtualTimePolicy", { policy: "advance", budget: 4000 });
+		await until(() => evaluate(`document.body.innerText.includes('A different workspace answered.')`));
+		assert.equal(await evaluate(`document.querySelector('#composer').value`), "Keep this draft");
+		assert.equal(await evaluate(`document.querySelector('[data-key="send"]').disabled`), true, "a prior busy view cannot stop the other owner");
+		assert.equal(await evaluate(`document.querySelector('[data-key="mission-draft-edit"]').disabled`), true);
+		assert.equal(await evaluate(`document.querySelector('[data-key="copy-mission-draft-approve"]')`), null);
+		assert.equal(await evaluate(`document.body.innerText.includes('Unverified history sentinel')`), false);
+		assert.equal(await evaluate(`document.querySelector('[data-scroll="mission-draft"]').innerText.includes("Managed mission review sentinel")`), true);
+		await evaluate(`document.querySelector('#composer').form.requestSubmit()`);
+		await click("#nav-mission");
+		assert.equal(await evaluate(`document.querySelector('[data-key="copy-mission-approve"]')`), null);
+		assert.equal(requests.filter(({ method }) => method === "POST").length, posts);
 	} finally {
 		moduleReady.resolve();
 		sessionReady.resolve();
-		restoredSocket?.close();
+		secondSocket?.close();
 		socket?.close();
 		if (browser?.exitCode === null && browser.signalCode === null) {
 			const exited = once(browser, "exit");

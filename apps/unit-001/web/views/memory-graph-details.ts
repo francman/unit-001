@@ -70,6 +70,7 @@ export interface DetailsOptions {
 	onClose(): void;
 	/** Shows only this memory and its neighbours, or all memories again when it already does. */
 	onFocus(): void;
+	canForget: boolean;
 	onForget(node: GraphNode, openerKey: string): void;
 }
 
@@ -89,7 +90,7 @@ export function renderDetails(options: DetailsOptions): HTMLElement {
 	);
 	const body = el("p", `${text.strong} whitespace-pre-wrap`, node.content);
 	const forgetKey = `graph-forget-${node.id}`;
-	const forget = button({ label: "Forget", key: forgetKey, onClick: () => options.onForget(node, forgetKey) });
+	const forget = button({ label: "Forget", key: forgetKey, disabled: !options.canForget, onClick: () => options.onForget(node, forgetKey) });
 	forget.setAttribute("aria-label", `Forget memory: ${preview(node, 60)}`);
 	return attrs(
 		el(

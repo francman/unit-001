@@ -1,5 +1,5 @@
 // Runs the real browser gateway and SQLite owner with synthetic data for manual browser acceptance.
-import { randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { chmod, chown, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -14,7 +14,7 @@ import { localServiceClient } from "../../src/service-client.ts";
 import { createWebGateway } from "../../src/web/gateway.ts";
 import { runWebWorkspace } from "../../src/web/launcher.ts";
 
-const [directory, portText, assetsDirectory] = process.argv.slice(2);
+const [directory, portText, assetsDirectory, ownerLabel] = process.argv.slice(2);
 if (!directory || !portText) throw new Error("Supply a temporary directory and loopback port.");
 const port = Number(portText);
 await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -35,6 +35,7 @@ faux.setResponses([
 		new Promise((_resolve, reject) =>
 			options?.signal?.addEventListener("abort", () => reject(new Error("fixture cancellation")), { once: true }),
 		),
+	fauxAssistantMessage([fauxText("Verified browser answer after gateway restart.")]),
 ]);
 const models = createModels();
 models.setProvider(faux.provider);
@@ -52,7 +53,7 @@ try {
 					await tx.appendEntry(hidden, root.id, { data: { detail: "Not a chat message" } });
 				}
 			}
-			const text = `Retained browser message ${index}${index === 1 ? ": oldest SQLite sentinel" : ""}`;
+			const text = `${ownerLabel ? `${ownerLabel}: ` : ""}Retained browser message ${index}${index === 1 ? ": oldest SQLite sentinel" : ""}`;
 			if (index % 2 === 1)
 				await tx.appendEntry(UserEntry, root.id, { model: [{ role: "user", content: text, timestamp: index }] });
 			else await tx.appendEntry(AssistantEntry, root.id, { model: [fauxAssistantMessage([fauxText(text)])] });
@@ -85,6 +86,8 @@ await mkdir(operatorDirectory, { mode: 0o750 });
 await chmod(operatorDirectory, 0o750);
 await chown(operatorDirectory, process.getuid!(), process.getgid!());
 const endpoint = join(operatorDirectory, "default.sock");
+// Stable across gateway lifetimes, distinct for each fixture owner regardless of the browser origin.
+const workspaceId = createHash("sha256").update(endpoint).digest("hex");
 let ready!: () => void;
 const listening = new Promise<void>((resolve) => {
 	ready = resolve;
@@ -99,11 +102,20 @@ const owner = runService(
 	endpoint,
 );
 void owner.catch(() => {});
+let restart: AbortController | undefined;
+const requestRestart = () => restart?.abort();
+process.on("SIGUSR2", requestRestart);
 try {
 	await Promise.race([owner, listening]);
-	if (assetsDirectory) await runIsolatedWorkspace(assetsDirectory);
-	else await runWebWorkspace(endpoint, port, (text) => process.stdout.write(text), controller.signal);
+	// Reopen only the browser gateway, retaining the owner and its SQLite state.
+	while (!controller.signal.aborted) {
+		restart = new AbortController();
+		const signal = AbortSignal.any([controller.signal, restart.signal]);
+		if (assetsDirectory) await runIsolatedWorkspace(assetsDirectory, signal);
+		else await runWebWorkspace(endpoint, port, (text) => process.stdout.write(text), signal);
+	}
 } finally {
+	process.off("SIGUSR2", requestRestart);
 	controller.abort();
 	await owner;
 	await agent.close(BACKGROUND_CONTEXT);
@@ -112,9 +124,8 @@ try {
 }
 
 // Isolated browser checks can serve their own production build without touching the shared web-dist.
-async function runIsolatedWorkspace(directory: string): Promise<void> {
+async function runIsolatedWorkspace(directory: string, signal: AbortSignal): Promise<void> {
 	const origin = `http://127.0.0.1:${port}`;
-	const secret = randomBytes(32).toString("base64url");
 	const assets = new Map<string, { contentType: string; body: Uint8Array }>();
 	for (const [path, filename, contentType] of [
 		["/", "index.html", "text/html; charset=utf-8"],
@@ -123,15 +134,15 @@ async function runIsolatedWorkspace(directory: string): Promise<void> {
 	]) {
 		assets.set(path, { contentType, body: await readFile(join(directory, filename)) });
 	}
-	const gateway = createWebGateway({ client: localServiceClient(endpoint), origin, secret, assets });
+	const gateway = createWebGateway({ client: localServiceClient(endpoint), origin, assets, workspaceId });
 	try {
 		await new Promise<void>((resolve, reject) => {
 			gateway.server.once("error", reject);
 			gateway.server.listen(port, "127.0.0.1", resolve);
 		});
-		process.stdout.write(`Browser workspace: ${origin}\nOne-time pairing code: ${secret}\n`);
-		if (!controller.signal.aborted)
-			await new Promise<void>((resolve) => controller.signal.addEventListener("abort", () => resolve(), { once: true }));
+		process.stdout.write(`Browser workspace: ${origin}\n`);
+		if (!signal.aborted)
+			await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
 	} finally {
 		await gateway.close();
 	}

@@ -61,7 +61,7 @@ export function renderForgetDialog(ctx: Ctx): HTMLElement {
 		label: forgetting ? "Forgetting" : "Forget memory",
 		key: "dialog-forget",
 		variant: "danger",
-		disabled: busy,
+		disabled: busy || ctx.ui.connection !== "connected",
 		onClick: () => ctx.act.confirmForget(),
 	});
 	const quote = el(
@@ -105,6 +105,7 @@ function searchForm(ctx: Ctx, highlight: (query: string) => void): HTMLElement {
 		key: "memory-search",
 		variant: "primary",
 		type: "submit",
+		disabled: ui.connection !== "connected",
 		// The form's submit handler does the work.
 		onClick: () => undefined,
 	});
@@ -118,7 +119,7 @@ function searchForm(ctx: Ctx, highlight: (query: string) => void): HTMLElement {
 
 function memoryRow(ctx: Ctx, record: MemoryRecord): HTMLLIElement {
 	const key = `forget-${record.id}`;
-	const forget = button({ label: "Forget", key, variant: "ghost", onClick: () => ctx.act.askForget(record.id, record.content, key) });
+	const forget = button({ label: "Forget", key, variant: "ghost", disabled: ctx.ui.connection !== "connected", onClick: () => ctx.act.askForget(record.id, record.content, key) });
 	forget.setAttribute("aria-label", `Forget memory: ${record.content.slice(0, 60)}`);
 	return listRow({ title: record.content, meta: sourceLabel(record.source), trailing: [forget] });
 }

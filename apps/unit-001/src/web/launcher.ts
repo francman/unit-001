@@ -1,20 +1,19 @@
-// Starts a private browser client as the authorized operator, never as the agent owner.
-import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { readFile } from "node:fs/promises";
+// Starts a browser workspace as the authorized operator.
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import type { BigIntStats } from "node:fs";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, rmdir, unlink } from "node:fs/promises";
+import { userInfo } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { ConfigurationError } from "../errors.ts";
 import { matchingApproval, readMissionAuthority } from "../missions/authority.ts";
-import {
-	agreementInvocation,
-	agreementReview,
-	browserAgreementArmed,
-	lookupIssuedAgreement,
-	parseAgreementOutcome,
-} from "../missions/browser-agreement.ts";
+import { agreementReview } from "../missions/browser-agreement.ts";
+import type { MissionView } from "../missions/contract.ts";
 import { localServiceClient } from "../service-client.ts";
-import { createWebGateway, type ManagedWebAgreement } from "./gateway.ts";
+import { createWebGateway } from "./gateway.ts";
+import type { ManagedMissionReview } from "./post-response.ts";
 
-/** Serves packaged browser assets until interrupted; restarting provisions a new one-time code. */
+/** Serves packaged browser assets until interrupted. */
 export async function runWebWorkspace(
 	endpoint: string,
 	port: number,
@@ -23,9 +22,11 @@ export async function runWebWorkspace(
 	installationId?: string,
 ): Promise<number> {
 	if (signal.aborted) return 130;
+	const managed = installationId === undefined ? undefined : managedListener(installationId);
 	const client = localServiceClient(endpoint);
 	const status = await client.request({ type: "status" }, signal);
-	if (status.type !== "status") throw new ConfigurationError("The operator owner is unavailable.");
+	if (status.type !== "status" || status.installationId !== (installationId ?? null))
+		throw new ConfigurationError("The operator owner is unavailable.");
 	const assets = new Map<string, { contentType: string; body: Uint8Array }>();
 	for (const [path, contentType] of [
 		["/", "text/html; charset=utf-8"],
@@ -43,111 +44,127 @@ export async function runWebWorkspace(
 		);
 		assets.set(path, { contentType, body });
 	}
-	const secret = randomBytes(32).toString("base64url");
 	const origin = `http://127.0.0.1:${port}`;
-	let managedAgreement: ManagedWebAgreement | undefined;
-	let discloseAgreement = false;
-	if (installationId !== undefined && client.session === "default" && status.installationId === installationId) {
-		const uid = process.getuid?.();
-		const authority = () =>
-			readMissionAuthority({ kind: "managed", installationId, session: "default" }).catch(() => null);
-		const initial = await authority();
-		const initialRevision = initial?.revision;
-		const generation = initial?.browserAgreement?.generation;
-		let armed = uid !== undefined && browserAgreementArmed(initial, uid);
-		discloseAgreement = armed;
-		// A revoked or replaced generation cannot rearm a paired gateway.
-		const isArmed = (current: Awaited<ReturnType<typeof authority>>) => {
-			armed =
-				armed &&
-				uid !== undefined &&
-				current?.revision === initialRevision &&
-				generation !== undefined &&
-				current?.browserAgreement?.generation === generation &&
-				browserAgreementArmed(current, uid);
-			return armed;
-		};
-		managedAgreement = {
-			async lookup(click, requestSignal) {
-				const reply = await client
-					.request({ type: "mission", request: { operation: "status" } }, requestSignal)
-					.catch(() => null);
-				const current = await authority();
-				if (requestSignal.aborted) return { status: "unknown" };
-				return lookupIssuedAgreement(click, current, uid, reply?.type === "mission" ? reply.result : null);
-			},
-			async review(view) {
-				const current = await authority();
-				const enabled = isArmed(current);
-				if (current === null) return undefined;
-				const active = view.formation.agreement;
-				const verifiedApproval =
-					active !== null && active.terms.policy.deadlineAt > Date.now()
-						? matchingApproval(
-								current,
-								active.approval.receiptId,
-								active.missionId,
-								active.revision,
-								active.terms,
-							)
-						: undefined;
-				return { armed: enabled, proposal: agreementReview(view.formation.draft, current), verifiedApproval };
-			},
-			async agree(click, requestSignal, isLive) {
-				const reply = await client
-					.request({ type: "mission", request: { operation: "status" } }, requestSignal)
-					.catch(() => null);
-				const current = await authority();
-				if (!isLive()) return { status: "unknown" };
-				const enabled = isArmed(current);
-				const observed = lookupIssuedAgreement(
-					click,
-					current,
-					uid,
-					reply?.type === "mission" ? reply.result : null,
-				);
-				if (observed !== undefined) return observed;
-				if (!enabled || current === null) return { status: "refused", code: "not-enabled" };
-				if (reply?.type !== "mission") return { status: "refused", code: "unavailable" };
-				const review = agreementReview(reply.result.formation.draft, current);
-				if (review?.revision !== click.revision || review.digest !== click.digest)
-					return { status: "refused", code: "stale-digest" };
-				const call = agreementInvocation(installationId, click, click.requestId);
-				if (!isLive()) return { status: "unknown" };
-				return await new Promise((resolve) => {
-					execFile(
-						call.file,
-						call.args,
-						{ env: call.env, shell: false, timeout: 10_000, maxBuffer: 8192, signal: requestSignal },
-						(error, stdout) => resolve(parseAgreementOutcome(stdout, error === null ? 0 : null)),
-					);
-				});
-			},
-		};
-	}
 	const gateway = createWebGateway({
 		client,
+		workspaceId: createHash("sha256").update(JSON.stringify([installationId ?? null, endpoint])).digest("hex"),
 		origin,
-		secret,
 		assets,
-		managed: installationId !== undefined,
-		managedAgreement,
+		managed: managed !== undefined,
+		managedReview:
+			installationId !== undefined && client.session === "default"
+				? (view) => reviewManagedMission(installationId, view)
+				: undefined,
 	});
+	let staging: string | undefined;
+	let published: BigIntStats | undefined;
 	try {
-		await new Promise<void>((resolve, reject) => {
-			gateway.server.once("error", reject);
-			gateway.server.listen(port, "127.0.0.1", () => {
-				gateway.server.off("error", reject);
-				resolve();
+		if (managed === undefined) {
+			gateway.server.listen(port, "127.0.0.1");
+			await once(gateway.server, "listening");
+		} else {
+			const directory = await prepareManagedDirectory(managed.home, managed.uid);
+			staging = await mkdtemp(join(directory, ".listener-"));
+			const bindPath = join(staging, "s");
+			// Node unlinks its bound path on close. Give it a separate name so cleanup cannot unlink a replacement at the public path.
+			const mask = process.umask();
+			process.umask(mask | 0o077);
+			try {
+				// A filesystem path is bound synchronously. Never hold a process-wide umask across an await.
+				gateway.server.listen({ path: bindPath, exclusive: true });
+			} finally {
+				process.umask(mask);
+			}
+			await once(gateway.server, "listening");
+			await chmod(bindPath, 0o600);
+			const socket = await lstat(bindPath, { bigint: true });
+			await link(bindPath, managed.path).catch((error: NodeJS.ErrnoException) => {
+				if (error.code !== "EEXIST") throw error;
+				throw new ConfigurationError(
+					`Managed web socket path already exists: ${managed.path}. Stop its launcher, or confirm the path is stale before removing it.`,
+				);
 			});
-		});
+			published = socket;
+		}
 		write(
-			`Browser workspace: ${origin}\nOne-time pairing code: ${secret}\nPairing grants this operator's conversation and coding authority.${discloseAgreement ? " It also grants approval of proposed mission revisions." : ""} Keep the code private.\nSession lasts 30 minutes. Restart this command to pair again. Ctrl+C detaches the web workspace; agent work continues.\n`,
+			`Browser workspace: ${origin}\n${managed === undefined ? "" : `Managed socket: ${managed.path}\n`}Ctrl+C detaches the web workspace; agent work continues.\n`,
 		);
 		if (!signal.aborted)
 			await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
 		return 0;
 	} finally {
-		await gateway.close();
+		try {
+			// Keep the staging link until after this identity check so the inode cannot be reused.
+			if (managed !== undefined && published !== undefined) await removePublishedSocket(managed.path, published);
+		} finally {
+			try {
+				await gateway.close();
+			} finally {
+				if (staging !== undefined) await rmdir(staging);
+			}
+		}
 	}
+}
+
+function managedListener(installationId: string): { home: string; uid: number; path: string } {
+	const uid = process.getuid?.();
+	if (
+		uid === undefined ||
+		uid === 0 ||
+		uid !== process.geteuid?.() ||
+		["SUDO_UID", "SUDO_USER", "SUDO_GID", "SUDO_COMMAND"].some((key) => process.env[key] !== undefined)
+	)
+		throw new ConfigurationError("Run the web command as an authorized operator without sudo.");
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(installationId))
+		throw new ConfigurationError("Invalid operator installation identity.");
+	const { homedir: home } = userInfo();
+	if (!home.startsWith("/") || home === "/" || resolve(home) !== home)
+		throw new ConfigurationError("The operator requires a protected, absolute account home directory.");
+	const path = join(home, ".unit-001", "web", `${installationId}.sock`);
+	if (Buffer.byteLength(path) > 103) throw new ConfigurationError("The managed web socket path is too long.");
+	return { home, uid, path };
+}
+
+async function prepareManagedDirectory(home: string, uid: number): Promise<string> {
+	let directory = "/";
+	for (const component of ["", ...home.slice(1).split("/")]) {
+		directory = join(directory, component);
+		const entry = await lstat(directory);
+		if (
+			!entry.isDirectory() ||
+			(entry.mode & 0o022) !== 0 ||
+			(entry.uid !== uid && (directory === home || entry.uid !== 0))
+		)
+			throw new ConfigurationError(`The operator home path is not protected: ${directory}.`);
+	}
+	for (const component of [".unit-001", "web"]) {
+		directory = join(directory, component);
+		await mkdir(directory, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+			if (error.code !== "EEXIST") throw error;
+		});
+		const entry = await lstat(directory);
+		if (!entry.isDirectory() || entry.uid !== uid || (entry.mode & 0o7777) !== 0o700)
+			throw new ConfigurationError(`The web socket directory must be operator-owned with mode 0700: ${directory}.`);
+	}
+	return directory;
+}
+
+async function removePublishedSocket(path: string, published: BigIntStats): Promise<void> {
+	try {
+		const entry = await lstat(path, { bigint: true });
+		if (entry.isSocket() && entry.dev === published.dev && entry.ino === published.ino) await unlink(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
+async function reviewManagedMission(installationId: string, view: MissionView): Promise<ManagedMissionReview | undefined> {
+	const authority = await readMissionAuthority({ kind: "managed", installationId, session: "default" }).catch(() => null);
+	if (authority === null) return undefined;
+	const active = view.formation.agreement;
+	const verifiedApproval =
+		active !== null && active.terms.policy.deadlineAt > Date.now()
+			? matchingApproval(authority, active.approval.receiptId, active.missionId, active.revision, active.terms)
+			: undefined;
+	return { armed: false, proposal: agreementReview(view.formation.draft, authority), verifiedApproval };
 }

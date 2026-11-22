@@ -39,9 +39,6 @@ export interface Ui {
 		/** A completed developer-local approval from this browser, not a receipt still awaiting status. */
 		localAgreementRevision: number | null;
 	} | null;
-	/** An issued protected receipt is not the owner's recorded agreement. */
-	missionReceipt: { revision: number; receiptId: string; reconciled: boolean } | null;
-	logoutNotice: string;
 	draft: string;
 	sending: boolean;
 	cancelling: boolean;
@@ -73,7 +70,6 @@ export interface Ui {
 	graph: MemoryGraphView | null;
 	/** True when the last graph read failed. */
 	graphFailed: boolean;
-	signedOut: boolean;
 	/** The sidebar overlay below 768 px. */
 	navOpen: boolean;
 	theme: ThemeChoice;
@@ -107,7 +103,6 @@ export interface Actions {
 	notify(text: string): void;
 	setTheme(choice: ThemeChoice): void;
 	setNav(open: boolean): void;
-	signOut(): void;
 }
 
 /** What every view receives: read-only state, the actions and the agent's display name. */
@@ -139,8 +134,6 @@ export function createStore(initial: { section?: Section; preview?: boolean; the
 		details: null,
 		detailsFailed: false,
 		missionDraft: null,
-		missionReceipt: null,
-		logoutNotice: "",
 		draft: "",
 		sending: false,
 		cancelling: false,
@@ -159,7 +152,6 @@ export function createStore(initial: { section?: Section; preview?: boolean; the
 		recall: { kind: "idle" },
 		graph: null,
 		graphFailed: false,
-		signedOut: false,
 		navOpen: false,
 		theme: initial.theme,
 		preview: initial.preview ?? false,
@@ -230,7 +222,7 @@ export type Tone = "idle" | "working" | "waiting" | "attention" | "blocked";
  * must do, then scheduled work. Only the highest-precedence state is shown, so two places never disagree.
  */
 export function agentState(ui: Readonly<Ui>, now: number): { tone: Tone; text: string } {
-	if (ui.connection === "expired") return { tone: "blocked", text: "Session ended" };
+	if (ui.connection === "workspace-changed") return { tone: "blocked", text: "Workspace changed" };
 	if (ui.connection === "offline") return { tone: "blocked", text: "Offline" };
 	if (ui.connection === "connecting") return { tone: "waiting", text: "Reconnecting" };
 	if (ui.cancelling) return { tone: "working", text: "Stopping" };
@@ -251,6 +243,10 @@ export function agentState(ui: Readonly<Ui>, now: number): { tone: Tone; text: s
 
 /** The agent's display name before the owner reports one. */
 export const unnamed = "Your agent";
+
+/** Recovery instructions do not derive a terminal command from the agent's display name. */
+export const workspaceRecovery =
+	"Check that your installation's web command is running. For managed Bob, open the SSH tunnel with ssh unit-001, then run bob web in that terminal.";
 
 /** The terminal command of the installation: the lowercase name ("Bob" runs as `bob`), `agent` until it is named. */
 export function commandName(name: string): string {

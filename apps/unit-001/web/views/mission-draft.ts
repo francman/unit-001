@@ -23,7 +23,7 @@ export interface MissionDraftEditor {
 	update(mode: "ready" | "local-only" | "locked"): void;
 }
 
-/** Options for the pinned Chat review; disabling mutations does not hide terms or the terminal fallback. */
+/** Options for the pinned Chat review; stale terms remain readable without an approval action. */
 export type MissionDraftCardOptions = (
 	| {
 			kind: "review";
@@ -33,10 +33,11 @@ export type MissionDraftCardOptions = (
 			terms: MissionDraftTerms;
 			binding: { kind: "developer-local" } | { kind: "managed"; review: Pick<MissionReviewView, "authorityRevision" | "previousReceipt"> } | null;
 			previous?: { revision: number; terms: MissionDraftTerms };
-			/** Choose `web` only from affirmative capability in authenticated server state. */
+			/** Choose `web` only for affirmative developer-local capability in a verified session. */
 			approval:
 				| { kind: "web"; onAgree: (request: { revision: number; digest: string; confirmed: true }) => void }
 				| { kind: "terminal"; line: string; copy: (value: string, label: string) => Promise<boolean> }
+				| { kind: "stale" }
 				| { kind: "unavailable" };
 			onEdit: () => void;
 	  }
@@ -290,6 +291,10 @@ function review(options: Review): HTMLElement {
 		button({ label: "Edit draft", key: "mission-draft-edit", disabled, onClick: options.onEdit }),
 	);
 	content.append(actions);
+	if (approval.kind === "stale") {
+		content.append(callout({ tone: "info", body: "Check fresh mission status before acting on these terms." }));
+		return content;
+	}
 	if (digest === null || approval.kind === "unavailable") {
 		content.append(callout({ tone: "info", body: "No reviewed digest is available in this session. Inspect mission status in a terminal." }));
 		return content;
@@ -301,7 +306,7 @@ function review(options: Review): HTMLElement {
 		content.append(callout({ tone: "warn", role: "status", body: "The complete proposal is not available to review. Refresh the draft or inspect it in a terminal." }));
 		return content;
 	}
-	if (approval.kind === "web") {
+	if (approval.kind === "web" && binding?.kind === "developer-local") {
 		actions.append(button({
 			label: `Agree to revision ${revision}`,
 			key: `mission-draft-agree-${revision}-${digest}`,
@@ -309,10 +314,10 @@ function review(options: Review): HTMLElement {
 			disabled,
 			onClick: () => approval.onAgree({ revision, digest, confirmed: true }),
 		}));
-	} else {
+	} else if (approval.kind === "terminal") {
 		content.append(callout({
 			tone: "info",
-			body: "Web agreement is unavailable. To approve this revision, use the terminal command.",
+			body: "Browser agreement is unavailable. Approval requires the appropriate terminal authority.",
 			children: [command(approval.line, "copy-mission-draft-approve", approval.copy)],
 		}));
 	}
