@@ -90,11 +90,11 @@ it("#65 pairs packaged assets with the sole owner, streams, deduplicates and for
 			headers: { Origin: origin, "Content-Type": "application/json" },
 			body: JSON.stringify({ secret }),
 		});
-		const session = (await paired.json()) as { csrfToken: string };
+		const session = (await paired.json()) as { sessionToken: string; csrfToken: string };
 		const headers = {
 			Origin: origin,
 			"Content-Type": "application/json",
-			Cookie: paired.headers.get("set-cookie")!.split(";")[0],
+			Authorization: `Bearer ${session.sessionToken}`,
 			"X-Unit-CSRF": session.csrfToken,
 		};
 		const call = async (requestId: string, operation: unknown) => {
@@ -155,7 +155,7 @@ it("#65 pairs packaged assets with the sole owner, streams, deduplicates and for
 			(
 				await fetch(`${origin}/api/v1/requests`, {
 					method: "POST",
-					headers: { ...headers, Cookie: "" },
+					headers: { ...headers, Authorization: "" },
 					body: JSON.stringify({ requestId: "anonymous-graph", operation: graph }),
 				})
 			).status,

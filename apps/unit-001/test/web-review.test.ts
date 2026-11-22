@@ -49,11 +49,11 @@ async function fixture() {
 		body: JSON.stringify({ secret: "fixture-secret-".repeat(4) }),
 	});
 	expect(pair.status).toBe(200);
-	const session = (await pair.json()) as { csrfToken: string };
+	const session = (await pair.json()) as { sessionToken: string; csrfToken: string };
 	const headers = {
 		Origin: origin,
 		"Content-Type": "application/json",
-		Cookie: pair.headers.get("set-cookie")?.split(";")[0] ?? "",
+		Authorization: `Bearer ${session.sessionToken}`,
 		"X-Unit-CSRF": session.csrfToken,
 	};
 	return { gateway, origin, headers, client, streamAborted: () => streamAborted };
@@ -125,7 +125,7 @@ describe("independent browser session lifecycle acceptance", () => {
 		await reader.cancel();
 		await second.body?.cancel();
 	});
-	it("logout aborts an open event stream and invalidates its cookie", async () => {
+	it("logout aborts an open event stream and invalidates its session token", async () => {
 		const f = await fixture();
 		const stream = await fetch(`${f.origin}/api/v1/events`, { headers: f.headers });
 		const reader = stream.body?.getReader();
