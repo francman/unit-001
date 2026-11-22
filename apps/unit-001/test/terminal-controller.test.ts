@@ -321,6 +321,143 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 		expect(controller.submit("next").status).toBe("submitted");
 	});
 
+	// #26 review, blocker 1: the caller makes the ID durable before the request leaves this client.
+	it("dispatches a send only after its beforeDispatch work has finished", async () => {
+		const owner = await server();
+		owner.respond(() => {});
+		const { controller } = await connect(owner);
+		const saved = Promise.withResolvers<"dispatch">();
+		const seen: unknown[] = [];
+		const result = controller.submit("durable first", {
+			beforeDispatch: (send) => {
+				seen.push(send);
+				return saved.promise;
+			},
+		});
+		if (result.status !== "submitted") throw new Error("expected a submitted send");
+		expect(seen).toEqual([{ requestId: result.requestId, digest: result.digest }]);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(owner.requests).toEqual([{ type: "watch" }]);
+		saved.resolve("dispatch");
+		await expect.poll(() => owner.requests.length).toBe(2);
+		expect(owner.requests[1]).toEqual({ type: "send", prompt: "durable first", requestId: result.requestId });
+	});
+
+	// #26 v2 review, blocker 1: a send whose ID could not be made durable never leaves the client.
+	it("never dispatches a send its beforeDispatch work held, and does not keep its ID unresolved", async () => {
+		const owner = await server();
+		const { controller } = await connect(owner);
+		const result = controller.submit("not durable", { beforeDispatch: async () => "hold" });
+		if (result.status !== "submitted") throw new Error("expected a submitted send");
+		await expect.poll(() => controller.state.sending).toBe(false);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(owner.requests).toEqual([{ type: "watch" }]);
+		expect(controller.state.unresolvedRequestIds).toEqual([]);
+		expect(controller.state.returnedSends).toBeUndefined();
+		expect(controller.state.notices.at(-1)?.text).toBe(`Request ${result.requestId} was not sent.`);
+	});
+
+	// #26 v3 review: a held retry of a send whose reply was lost dropped that send's still unresolved ID.
+	it("keeps an unresolved ID unresolved when a retry under it is held", async () => {
+		const owner = await server();
+		owner.respond((_request, socket) => socket.destroy());
+		const { controller } = await connect(owner);
+		const first = controller.submit("lost reply");
+		if (first.status !== "submitted") throw new Error("expected a submitted send");
+		await expect.poll(() => controller.state.sending).toBe(false);
+		expect(controller.state.unresolvedRequestIds).toEqual([first.requestId]);
+		const retry = controller.submit("lost reply", {
+			replayRequestId: first.requestId,
+			beforeDispatch: async () => "hold",
+		});
+		expect(retry).toMatchObject({ status: "submitted", requestId: first.requestId });
+		await expect.poll(() => controller.state.sending).toBe(false);
+		expect(owner.requests.filter((request) => request.type === "send")).toHaveLength(1);
+		expect(controller.state.unresolvedRequestIds).toEqual([first.requestId]);
+		expect(controller.state.notices.at(-1)?.text).toBe(`Request ${first.requestId} was not sent.`);
+	});
+
+	// #26 review, blocker 2: a wire error alone never settles a send; the owner's record does.
+	describe("settling a send the owner answered with an error", () => {
+		const errorWithLookup = (owner: Awaited<ReturnType<typeof server>>, admission: object) =>
+			owner.respond((request, socket) =>
+				socket.end(
+					`${JSON.stringify(request.type === "admission" ? { type: "admission", admission } : { type: "error", message: "Service response exceeds 1 MiB." })}\n`,
+				),
+			);
+
+		it("acknowledges an admitted send as admitted, not refused, after a post-commit error", async () => {
+			const owner = await server();
+			errorWithLookup(owner, { status: "admitted", source: "model", binding: "exact", outcome: "answered" });
+			const { controller } = await connect(owner);
+			const result = controller.submit("big reply");
+			if (result.status !== "submitted") throw new Error("expected a submitted send");
+			await expect.poll(() => controller.state.sending).toBe(false);
+			expect(owner.requests[2]).toEqual({ type: "admission", requestId: result.requestId, digest: result.digest });
+			expect(controller.state.unresolvedRequestIds).toEqual([]);
+			expect(controller.state.returnedSends).toBeUndefined();
+			expect(controller.state.notices.at(-1)?.text).toContain("admitted request");
+		});
+
+		it.each([
+			[{ status: "not-found" }, "not-found"],
+			[{ status: "rejected", reason: "different-prompt" }, "rejected"],
+		])("returns the text of a send the owner answered %o, as %s", async (admission, reason) => {
+			const owner = await server();
+			errorWithLookup(owner, admission);
+			const { controller } = await connect(owner);
+			const result = controller.submit("refused");
+			if (result.status !== "submitted") throw new Error("expected a submitted send");
+			await expect.poll(() => controller.state.sending).toBe(false);
+			expect(controller.state.returnedSends).toEqual([{ requestId: result.requestId, reason }]);
+			expect(controller.state.notices.at(-1)?.text).toContain("Not sent");
+		});
+
+		// #26 v2 review, blocker 3: an admitted ID does not show the admitted prompt was this text.
+		it("returns the text of a send admitted with an unverified binding, settling its ID", async () => {
+			const owner = await server();
+			errorWithLookup(owner, { status: "admitted", source: "model", binding: "unverified", outcome: "answered" });
+			const { controller } = await connect(owner);
+			const result = controller.submit("evicted replay");
+			if (result.status !== "submitted") throw new Error("expected a submitted send");
+			await expect.poll(() => controller.state.sending).toBe(false);
+			expect(controller.state.unresolvedRequestIds).toEqual([]);
+			expect(controller.state.returnedSends).toEqual([{ requestId: result.requestId, reason: "unverified" }]);
+			expect(controller.state.notices.at(-1)?.text).toContain("cannot confirm it was this text");
+		});
+
+		// #26 v2 review, blocker 2: the first attempt's refusal must not outlive a later success under the same ID.
+		it("drops an earlier refusal when a retry under the same ID is answered", async () => {
+			const owner = await server();
+			errorWithLookup(owner, { status: "not-found" });
+			const { controller } = await connect(owner);
+			const first = controller.submit("retried");
+			if (first.status !== "submitted") throw new Error("expected a submitted send");
+			await expect.poll(() => controller.state.sending).toBe(false);
+			expect(controller.state.returnedSends).toEqual([{ requestId: first.requestId, reason: "not-found" }]);
+			owner.respond((_request, socket) =>
+				socket.end(`${JSON.stringify({ type: "reply", reply: { status: "answered", text: "ok" } })}\n`),
+			);
+			const retry = controller.submit("retried", { replayRequestId: first.requestId });
+			expect(retry).toMatchObject({ status: "submitted", requestId: first.requestId });
+			await expect.poll(() => controller.state.sending).toBe(false);
+			expect(owner.requests.at(-1)).toEqual({ type: "send", prompt: "retried", requestId: first.requestId });
+			expect(controller.state.unresolvedRequestIds).toEqual([]);
+			expect(controller.state.returnedSends).toEqual([]);
+		});
+
+		it("keeps the request ID unresolved when the lookup itself fails", async () => {
+			const owner = await server();
+			owner.respond((_request, socket) => socket.end('{"type":"error","message":"Owner busy."}\n'));
+			const { controller } = await connect(owner);
+			const result = controller.submit("unknown");
+			if (result.status !== "submitted") throw new Error("expected a submitted send");
+			await expect.poll(() => controller.state.sending).toBe(false);
+			expect(controller.state.unresolvedRequestIds).toEqual([result.requestId]);
+			expect(controller.state.returnedSends).toBeUndefined();
+		});
+	});
+
 	it("reports bounded remote failures without mutating the authoritative transcript", async () => {
 		const owner = await server();
 		owner.respond((_request, socket) =>
@@ -427,6 +564,17 @@ describe("foreground terminal controller", () => {
 		await expect.poll(() => controller.state.view?.entries.at(-1)?.text).toBe("A local answer");
 		controller.submit("/help");
 		expect(controller.state.notices.at(-1)?.text).toContain("closes this foreground session");
+	});
+
+	// #26 review: a foreground refusal settles through the owner's record, like a wire error.
+	it("settles a foreground send the owner refused before admission as a reusable refusal", async () => {
+		const { agent, controller } = await foreground([]);
+		await agent.enterMaintenance("op-1", 0, BACKGROUND_CONTEXT);
+		const result = controller.submit("While held");
+		if (result.status !== "submitted") throw new Error("expected a submitted send");
+		await expect.poll(() => controller.state.sending).toBe(false);
+		expect(controller.state.returnedSends).toEqual([{ requestId: result.requestId, reason: "not-found" }]);
+		expect(controller.state.notices.at(-1)?.text).toContain("held for maintenance");
 	});
 
 	it("closing the view does not cancel or close its caller-owned Agent", async () => {

@@ -13,6 +13,7 @@ import { commandCatalog } from "./commands/catalog.ts";
 import { isOperatingSystemQuestion } from "./commands/facts.ts";
 import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
 import { FileCredentialStore } from "./credentials.ts";
+import { createDraftStore, type DraftStore } from "./draft-store.ts";
 import { ConfigurationError, UsageError } from "./errors.ts";
 import { describeInspection } from "./introspection/command.ts";
 import { acquireSessionLock } from "./lock.ts";
@@ -108,6 +109,20 @@ function resolveDirectory(dataDir: string | undefined, runtime: Runtime): string
 	return dataDir === undefined
 		? dataDirectory({ platform: runtime.platform, env: runtime.env, home: runtime.home })
 		: resolve(runtime.cwd, dataDir);
+}
+
+/**
+ * Drafts are client-side state under the invoking OS user's data directory, never the installation's. The managed
+ * administrator path runs as the service account, whose home is the installation's state the agent can read, so it
+ * keeps no drafts.
+ */
+export function draftsFor(runtime: Runtime, installationId: string, session: string): DraftStore | undefined {
+	if (runtime.managed !== undefined && runtime.managed.access !== "operator") return undefined;
+	return createDraftStore({
+		directory: join(dataDirectory({ platform: runtime.platform, env: runtime.env, home: runtime.home }), "drafts"),
+		installationId,
+		session,
+	});
 }
 
 function terminalFor(runtime: Runtime): Terminal {
@@ -261,6 +276,7 @@ async function run(
 			? await runRepl(agent, terminal, signal)
 			: await runRichForeground(agent, options.session, await version(), rich, signal, {
 					colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+					drafts: draftsFor(runtime, runtime.managed?.id ?? `local:${directory}`, options.session),
 					missionSetup: (flowSignal) =>
 						runMissionSetup(
 							terminalFor(runtime),
@@ -431,6 +447,11 @@ async function control(
 		if (terminal === undefined) return runAttach(endpoint, terminalFor(runtime), signal);
 		return runRichAttach(endpoint, terminal, signal, {
 			colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+			drafts: draftsFor(
+				runtime,
+				runtime.managed?.id ?? `local:${resolveDirectory(command.options.dataDir, runtime)}`,
+				command.options.session,
+			),
 			missionSetup: (flowSignal) =>
 				runMissionSetup(
 					terminalFor(runtime),

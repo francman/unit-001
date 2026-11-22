@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "../src/agent.ts";
 import { parseArguments } from "../src/args.ts";
 import { acquireSessionLock } from "../src/lock.ts";
+import { sendDigest } from "../src/send-receipt.ts";
 import { requestService, runService, type ServiceView, serviceEndpoint, watchService } from "../src/service.ts";
 
 let directory: string;
@@ -702,6 +703,82 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 		});
 		expect(JSON.parse(response)).toEqual({ type: "error", message: "Invalid service prompt." });
 		expect(service.faux.state.callCount).toBe(0);
+	});
+
+	// #26: the lookup is a read over the socket; it must never admit, and a same-ID send with new text is refused.
+	it("answers send admission by request ID without admitting, and refuses a conflicting replay", async () => {
+		const service = await launch([reply("Paris.")]);
+		const lookup = (digest?: string) =>
+			requestService(
+				service.path,
+				{ type: "admission", requestId: "r1", ...(digest === undefined ? {} : { digest }) },
+				signal(),
+			);
+		expect(await lookup(sendDigest("Capital?"))).toEqual({ type: "admission", admission: { status: "not-found" } });
+		expect(service.faux.state.callCount).toBe(0);
+		await requestService(service.path, { type: "send", prompt: "Capital?", requestId: "r1" }, signal());
+		expect(await lookup(sendDigest("Capital?"))).toEqual({
+			type: "admission",
+			admission: { status: "admitted", source: "model", binding: "exact", outcome: "answered" },
+		});
+		expect(await requestService(service.path, { type: "send", prompt: "Other?", requestId: "r1" }, signal())).toEqual({
+			type: "error",
+			message: "Request ID already identifies a send with a different prompt; use a new request ID.",
+		});
+		const raw = (line: string) =>
+			new Promise<unknown>((resolve, reject) => {
+				const socket = createConnection(service.path, () => socket.write(`${line}\n`));
+				let text = "";
+				socket.setEncoding("utf8");
+				socket.on("data", (chunk: string) => {
+					text += chunk;
+				});
+				socket.once("end", () => resolve(JSON.parse(text)));
+				socket.once("error", reject);
+			});
+		expect(await raw('{"type":"admission","requestId":"r1","prompt":"Capital?"}')).toMatchObject({ type: "error" });
+		expect(await raw('{"type":"admission","requestId":"r1","digest":"nope"}')).toEqual({
+			type: "error",
+			message: "Invalid prompt digest.",
+		});
+		expect(service.faux.state.callCount).toBe(1);
+	});
+
+	// #26 review: a held owner refuses sends before admission, yet operators can still settle earlier ones.
+	it("answers admission lookups over the operator socket while held for maintenance", async () => {
+		const service = await launch([reply("Paris.")], undefined, join(directory, "operator"));
+		const operatorPath = service.operatorPath!;
+		await requestService(operatorPath, { type: "send", prompt: "Capital?", requestId: "before" }, signal());
+		expect(
+			await requestService(service.path, { type: "maintenance-enter", operationId: "hold", timeoutMs: 0 }, signal()),
+		).toMatchObject({ state: "held" });
+		expect(await requestService(operatorPath, { type: "send", prompt: "Held?", requestId: "during" }, signal())).toEqual({
+			type: "error",
+			message: "Service is held for maintenance.",
+		});
+		const lookup = (requestId: string, prompt: string) =>
+			requestService(operatorPath, { type: "admission", requestId, digest: sendDigest(prompt) }, signal());
+		expect(await lookup("before", "Capital?")).toEqual({
+			type: "admission",
+			admission: { status: "admitted", source: "model", binding: "exact", outcome: "answered" },
+		});
+		expect(await lookup("during", "Held?")).toEqual({ type: "admission", admission: { status: "not-found" } });
+		expect(service.faux.state.callCount).toBe(1);
+	});
+
+	// #26 review, blocker 2: the owner replaces a reply over 1 MiB with an error after the send was admitted.
+	it("reports a send admitted even when its reply was replaced by an oversize error", async () => {
+		const service = await launch([reply("x".repeat(1_100_000))]);
+		expect(await requestService(service.path, { type: "send", prompt: "Long?", requestId: "big" }, signal())).toEqual({
+			type: "error",
+			message: "Service response exceeds 1 MiB.",
+		});
+		expect(
+			await requestService(service.path, { type: "admission", requestId: "big", digest: sendDigest("Long?") }, signal()),
+		).toEqual({
+			type: "admission",
+			admission: { status: "admitted", source: "model", binding: "exact", outcome: "answered" },
+		});
 	});
 
 	it("rejects oversized wire input and continues serving valid controls", async () => {

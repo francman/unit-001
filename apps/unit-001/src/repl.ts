@@ -18,7 +18,7 @@ export interface Terminal {
 }
 
 const HELP =
-	"Commands: /help, /status, /mission, /memory [stats|recall <query>|remember <text>|forget <id>|sleep], /exit (or Ctrl+D). Ctrl+C stops the current run.";
+	"Commands: /help, /status, /mission, /memory [stats|recall <query>|remember <text>|forget <id>|sleep], /exit (or Ctrl+D). Ctrl+C cancels the chat.";
 
 /** Runs one prompt, streaming the answer to `terminal.out` and tool use to `terminal.err`. */
 async function turn(agent: Agent, prompt: string, terminal: Terminal, signal: AbortSignal): Promise<Reply> {
@@ -99,7 +99,7 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 			readline.close();
 			return;
 		}
-		terminal.err("\n^C stopping the run\n");
+		terminal.err("\n^C cancelling the chat\n");
 		current.abort();
 		stopping ??= agent.abort(BACKGROUND_CONTEXT).catch(() => {});
 	});

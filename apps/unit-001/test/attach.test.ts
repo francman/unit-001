@@ -262,6 +262,57 @@ describe.skipIf(process.platform === "win32")("service terminal", () => {
 		await io.running;
 	});
 
+	// #26 review, blocker 2: an error that follows the admission commit must not read as a refusal.
+	it("asks the owner about a send answered with an error and says whether it was admitted", async () => {
+		const service = await server(base);
+		const io = await attach(service);
+		service.respond((request, socket) =>
+			socket.end(
+				`${JSON.stringify(
+					request.type === "admission"
+						? { type: "admission", admission: { status: "admitted", source: "model", binding: "exact", outcome: "answered" } }
+						: { type: "error", message: "Service response exceeds 1 MiB." },
+				)}\n`,
+			),
+		);
+		io.input.write("prompt\n");
+		await expect.poll(io.err).toContain("anyway; do not send it again");
+		service.respond((request, socket) =>
+			socket.end(
+				`${JSON.stringify(request.type === "admission" ? { type: "error", message: "busy" } : { type: "error", message: "held" })}\n`,
+			),
+		);
+		io.input.write("again\n");
+		await expect.poll(io.err).toContain("may have been admitted; retry only with --request-id");
+		io.input.write("/exit\n");
+		await io.running;
+	});
+
+	// #26 v2 review: not-found is absence at the read, and an unverified admission does not confirm this prompt.
+	it.each([
+		[{ status: "not-found" }, "has no record of request", "as of now; retry only with --request-id"],
+		[{ status: "rejected", reason: "other-operation" }, "belongs to another prompt or operation", "not admitted"],
+		[
+			{ status: "admitted", source: "model", binding: "unverified", outcome: "answered" },
+			"cannot confirm it was this prompt",
+			"only under a new request ID",
+		],
+	])("describes a lookup answer of %o after a send error", async (admission, first, second) => {
+		const service = await server(base);
+		const io = await attach(service);
+		service.respond((request, socket) =>
+			socket.end(
+				`${JSON.stringify(request.type === "admission" ? { type: "admission", admission } : { type: "error", message: "held" })}\n`,
+			),
+		);
+		io.input.write("prompt\n");
+		await expect.poll(io.err).toContain(first);
+		expect(io.err()).toContain(second);
+		expect(io.err()).not.toContain("was not admitted.");
+		io.input.write("/exit\n");
+		await io.running;
+	});
+
 	it("marks truncation and does not duplicate a shorter committed prefix after long live output", async () => {
 		const service = await server({ ...base, busy: true, text: "a".repeat(8192), textTruncated: true });
 		const io = await attach(service);
@@ -391,6 +442,52 @@ describe.skipIf(process.platform === "win32")("service terminal", () => {
 		expect(service.requests).toEqual([{ type: "watch" }]);
 	});
 
+	it("prints failure reasons and retry state once, and fetches evidence only on /evidence (#26)", async () => {
+		const service = await server();
+		const evidence = {
+			kind: "found",
+			callId: "toolu_plain_1",
+			name: "bash",
+			status: "failed",
+			arguments: { text: '{"command":"make"}', bytes: 18, truncated: false, redacted: false },
+			output: { text: "make: *** error", bytes: 15, truncated: false, redacted: false },
+			diff: null,
+			withheld: null,
+			redaction: "pattern-only",
+			sourceTruncated: false,
+		};
+		service.respond((request, socket) => {
+			socket.end(
+				request.type === "tool-evidence"
+					? `${JSON.stringify({ type: "tool-evidence", evidence })}\n`
+					: '{"type":"cancelled"}\n',
+			);
+		});
+		const io = await attach(service);
+		const reason = { code: "exit_code", exitCode: 2 } as const;
+		const failed = { callId: "toolu_plain_1", name: "bash", status: "failed" as const, reason };
+		service.view({ ...base, tools: [failed] });
+		service.view({ ...base, tools: [failed] });
+		service.view({
+			...base,
+			tools: [failed],
+			failure: { reason: "model_error", problem: "overloaded" },
+			retry: { attempt: 2, at: 1_700_000_000_000, problem: "rate_limited" },
+		});
+		await expect.poll(io.err).toContain("[retrying, attempt 2: provider rate limited]");
+		expect(io.err().match(/\[bash: failed - Exited with code 2\.\]/g)).toHaveLength(1);
+		service.view({ ...base, tools: [failed], failure: { reason: "model_error", problem: "overloaded" } });
+		await expect.poll(io.err).toContain("[request failed: model_error - provider overloaded]");
+		// Watch frames never trigger an evidence request.
+		expect(service.requests.filter((request) => request.type === "tool-evidence")).toEqual([]);
+		io.input.write("/evidence\n");
+		await expect.poll(io.err).toContain("make: *** error");
+		expect(service.requests.filter((request) => request.type === "tool-evidence")).toEqual([
+			{ type: "tool-evidence", callId: "toolu_plain_1" },
+		]);
+		io.input.write("/exit\n");
+		expect(await io.running).toBe(0);
+	});
 	it("times out a peer that never provides initial state", async () => {
 		const service = await server(null);
 		const io = terminal();

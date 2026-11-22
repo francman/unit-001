@@ -10,8 +10,11 @@ import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-cont
 import { describeMission } from "./missions/command.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import type { Terminal } from "./repl.ts";
+import { sendDigest } from "./send-receipt.ts";
 import type { ServiceView } from "./service.ts";
 import { localServiceClient, type ServiceClient } from "./service-client.ts";
+import { providerProblemSummary, runFailureSummary, toolFailureSummary } from "./service-view.ts";
+import { evidenceLines } from "./tool-evidence.ts";
 
 const MAX_INPUT_BYTES = 16_384;
 
@@ -78,6 +81,23 @@ export async function runServiceAttach(
 		local.abort();
 		reader?.close();
 	};
+	// A wire error can follow the admission commit (a reply over 1 MiB becomes an error), so only the owner's record
+	// says whether the send ran; until it answers, the ID must be kept for an explicit retry.
+	const settleRefusal = async (requestId: string, prompt: string): Promise<string> => {
+		const answer = await client
+			.request({ type: "admission", requestId, digest: sendDigest(prompt) }, local.signal)
+			.catch(() => undefined);
+		if (answer?.type !== "admission")
+			return `request ${requestId} may have been admitted; retry only with --request-id ${requestId}.`;
+		const { admission } = answer;
+		// Not-found is absence at the read only: the request can still commit, so only the same ID retries it safely.
+		if (admission.status === "not-found")
+			return `the owner has no record of request ${requestId} as of now; retry only with --request-id ${requestId}.`;
+		if (admission.status === "rejected") return `request ${requestId} belongs to another prompt or operation; this prompt was not admitted under it.`;
+		return admission.binding === "exact"
+			? `the owner admitted request ${requestId} anyway; do not send it again.`
+			: `the owner admitted request ${requestId} but cannot confirm it was this prompt; send it again only under a new request ID.`;
+	};
 	const onSignal = () => detach();
 	signal.addEventListener("abort", onSignal, { once: true });
 	const cancel = () => {
@@ -101,7 +121,7 @@ export async function runServiceAttach(
 						err(
 							response.type === "error"
 								? `${response.message}\n`
-								: "Cancellation requested; waiting for service state.\n",
+								: "Cancellation requested for all work in this chat, including queued inputs; waiting for service state.\n",
 						);
 				},
 				(error: unknown) => {
@@ -220,6 +240,22 @@ export async function runServiceAttach(
 			} catch (error) {
 				err(`Inspection: ${describeError(error)}\n`);
 			}
+		} else if (text === "/evidence" || text.startsWith("/evidence ")) {
+			const callId = text.slice(9).trim() || view?.tools.at(-1)?.callId;
+			if (callId === undefined || /\s/.test(callId) || callId.length > 200)
+				err("Use /evidence CALL_ID after a tool has run.\n");
+			else
+				void client.request({ type: "tool-evidence", callId }, local.signal).then(
+					(response) => {
+						if (!local.signal.aborted)
+							err(
+								`${response.type === "tool-evidence" ? evidenceLines(response.evidence).join("\n") : response.type === "error" ? response.message : "Unexpected evidence response."}\n`,
+							);
+					},
+					(error: unknown) => {
+						if (!local.signal.aborted) err(`Evidence: ${describeError(error)}\n`);
+					},
+				);
 		} else if (text === "/memory" || text.startsWith("/memory ")) {
 			try {
 				const match = /^\/memory(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/.exec(text);
@@ -253,9 +289,9 @@ export async function runServiceAttach(
 			void Promise.resolve()
 				.then(() => client.request({ type: "send", prompt: text, requestId }, local.signal))
 				.then(
-					(response) => {
+					async (response) => {
 						if (local.signal.aborted) return;
-						if (response.type === "error") err(`${response.message}\n`);
+						if (response.type === "error") err(`${response.message}; ${await settleRefusal(requestId, text)}\n`);
 						else if (response.type === "reply" && response.reply.status === "failed")
 							err(
 								`Unanswered: ${response.reply.reason}${response.reply.detail === undefined ? "" : ` (${response.reply.detail})`}\n`,
@@ -366,6 +402,7 @@ class AttachedOutput {
 	#committedText = "";
 	#busy: boolean | undefined;
 	#tools = new Map<string, string>();
+	#problem = "";
 	#historyNotice = false;
 	#liveNotice = false;
 
@@ -439,9 +476,23 @@ class AttachedOutput {
 			tools.set(tool.callId, tool.status);
 			if (this.#tools.get(tool.callId) === tool.status) continue;
 			this.finish();
-			this.#terminal.err(`[${sanitizeTerminalText(tool.name)}: ${tool.status}]\n`);
+			this.#terminal.err(
+				`[${sanitizeTerminalText(tool.name)}: ${tool.status}${tool.reason === undefined ? "" : ` - ${sanitizeTerminalText(toolFailureSummary(tool.reason, tool.callId))}`}]\n`,
+			);
 		}
 		this.#tools = tools;
+		// A failed run or a waiting provider retry is shown once per change, for every attached observer.
+		const problem =
+			view.retry !== undefined
+				? `[retrying, attempt ${view.retry.attempt}: ${providerProblemSummary(view.retry.problem)}]`
+				: view.failure !== undefined && !view.busy
+					? `[request failed: ${view.failure.reason} - ${runFailureSummary(view.failure)}]`
+					: "";
+		if (problem !== "" && problem !== this.#problem) {
+			this.finish();
+			this.#terminal.err(`${problem}\n`);
+		}
+		this.#problem = problem;
 		if (view.busy !== this.#busy) {
 			this.finish();
 			this.#terminal.err(view.busy ? "[working]\n" : "[ready]\n");

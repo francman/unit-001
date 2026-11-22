@@ -36,6 +36,15 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		effect: "read",
 	},
 	{
+		id: "evidence",
+		surfaces: ["slash"],
+		invocation: "evidence",
+		summary: "Show one tool call's bounded, redacted arguments, output and diff",
+		aliases: [],
+		keywords: ["tool", "arguments", "output", "diff", "failure"],
+		effect: "read",
+	},
+	{
 		id: "help",
 		surfaces: ["cli", "slash"],
 		invocation: "help",

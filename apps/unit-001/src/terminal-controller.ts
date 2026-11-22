@@ -13,9 +13,11 @@ import { describeMemory, type MemoryRequest, type MemoryResult, memoryCommand } 
 import { describeMission } from "./missions/command.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import type { RuntimeFacts } from "./orientation.ts";
+import { type SendAdmission, sendDigest } from "./send-receipt.ts";
 import type { ServiceView } from "./service.ts";
 import { localServiceClient, type ServiceClient } from "./service-client.ts";
 import { serviceView } from "./service-view.ts";
+import type { ToolEvidence } from "./tool-evidence.ts";
 
 export interface TerminalNotice {
 	readonly kind: "info" | "error";
@@ -32,23 +34,61 @@ export interface TerminalState {
 	readonly suggestions?: readonly CommandDefinition[];
 	readonly suggesting?: boolean;
 	readonly unresolvedRequestIds?: readonly string[];
+	/** Sends whose text goes back to the user (newest eight); each left `unresolvedRequestIds` on its latest attempt. */
+	readonly returnedSends?: readonly ReturnedSend[];
+	/** The latest explicitly requested tool evidence; it never arrives in watch frames. */
+	readonly evidence?: ToolEvidence;
+}
+
+/**
+ * A send answered with an error whose text goes back to the user, and what the owner's record said about its ID:
+ * `not-found`, no record, so the same text may go again under the ID and is still admitted at most once; `rejected`,
+ * the ID belongs to another prompt or operation; `unverified`, the ID was admitted but the owner cannot show it was
+ * this text. After `rejected` or `unverified` a resend needs a new ID.
+ */
+export interface ReturnedSend {
+	readonly requestId: string;
+	readonly reason: "not-found" | "rejected" | "unverified";
+}
+
+/** One send as dispatched: its request ID and the digest of the exact prompt the owner receives. */
+export interface PendingSend {
+	readonly requestId: string;
+	readonly digest: string;
 }
 
 /** A rejected input must stay in the editor; commands and admitted sends may clear it. */
 export type TerminalInputResult =
-	| { readonly status: "submitted"; readonly requestId: string }
+	| ({ readonly status: "submitted" } & PendingSend)
 	| { readonly status: "command" }
 	| { readonly status: "mission-setup" }
 	| { readonly status: "rejected" };
+
+/** How a prompt is sent; both fields are optional. */
+export interface SendOptions {
+	/** Resends an unconfirmed prompt under its own ID; the owner admits it at most once. */
+	readonly replayRequestId?: string | undefined;
+	/**
+	 * Runs once the ID is chosen and before the request leaves this client, so the caller can make the ID durable: a
+	 * client that crashes after the owner admits the send must still find the ID on the next attach. `hold` means it
+	 * could not, and the send never leaves; the caller keeps its text. A held retry of an ID whose earlier attempt is
+	 * still unresolved leaves that ID unresolved.
+	 */
+	readonly beforeDispatch?: (send: PendingSend) => Promise<"dispatch" | "hold">;
+}
 
 /** Owns client connections only; detaching never aborts service work. */
 export interface TerminalController {
 	readonly state: TerminalState;
 	readonly closed: Promise<number>;
-	submit(text: string): TerminalInputResult;
+	/** Runs a command or sends a prompt; see `SendOptions` for replaying an unconfirmed send. */
+	submit(text: string, options?: SendOptions): TerminalInputResult;
+	/** Cancels all work in the chat, including other clients' queued inputs; it is not scoped to one send. */
 	cancel(): void;
 	detach(): void;
 	dismissSuggestions(): void;
+	/** Asks the owner whether a send was admitted, without resending or waiting for it. */
+	admission(requestId: string, digest: string | undefined): Promise<SendAdmission>;
 }
 
 /** Connects a terminal controller without opening storage or creating another agent owner. */
@@ -86,6 +126,13 @@ export function createServiceTerminalController(
 				const response = await client.request({ type: "cancel" }, signal);
 				if (response.type === "error") throw new Error(response.message);
 			},
+			async admission(requestId, digest, signal) {
+				const request = { type: "admission", requestId, ...(digest === undefined ? {} : { digest }) } as const;
+				const response = await client.request(request, signal);
+				if (response.type === "error") throw new Error(response.message);
+				if (response.type !== "admission") throw new Error("Unexpected admission response.");
+				return response.admission;
+			},
 			async memory(request, signal) {
 				const response = await client.request({ type: "memory", request }, signal);
 				if (response.type === "error") throw new OwnerRequestError(response.message);
@@ -103,6 +150,12 @@ export function createServiceTerminalController(
 				if (response.type === "error") throw new Error(response.message);
 				if (response.type !== "inspection") throw new Error("Unexpected inspection response.");
 				return response.report;
+			},
+			async toolEvidence(callId, signal) {
+				const response = await client.request({ type: "tool-evidence", callId }, signal);
+				if (response.type === "error") throw new Error(response.message);
+				if (response.type !== "tool-evidence") throw new Error("Unexpected tool evidence response.");
+				return response.evidence;
 			},
 			async mission(request, signal) {
 				const response = await client.request({ type: "mission", request }, signal);
@@ -158,11 +211,18 @@ export function createForegroundTerminalController(
 			},
 			async send(prompt, requestId, signal) {
 				signal.throwIfAborted();
-				return agent.ask(prompt, BACKGROUND_CONTEXT, { requestId });
+				// The owner finished handling the send, as with a wire error; its outcome is settled the same way.
+				return agent.ask(prompt, BACKGROUND_CONTEXT, { requestId }).catch((error: unknown) => {
+					throw new OwnerRequestError(describeError(error));
+				});
 			},
 			async cancel(signal) {
 				signal.throwIfAborted();
 				await agent.abort(BACKGROUND_CONTEXT);
+			},
+			async admission(requestId, digest, signal) {
+				signal.throwIfAborted();
+				return agent.admission(requestId, digest, BACKGROUND_CONTEXT);
 			},
 			async memory(request, signal) {
 				signal.throwIfAborted();
@@ -171,6 +231,10 @@ export function createForegroundTerminalController(
 			async runtime(signal) {
 				signal.throwIfAborted();
 				return (await agent.status(BACKGROUND_CONTEXT)).runtime;
+			},
+			async toolEvidence(callId, signal) {
+				signal.throwIfAborted();
+				return agent.toolEvidence(callId, BACKGROUND_CONTEXT);
 			},
 			async mission(request, signal) {
 				signal.throwIfAborted();
@@ -198,16 +262,18 @@ interface ConversationTransport {
 	): Promise<void>;
 	send(prompt: string, requestId: string, signal: AbortSignal): Promise<Reply>;
 	cancel(signal: AbortSignal): Promise<void>;
+	admission(requestId: string, digest: string | undefined, signal: AbortSignal): Promise<SendAdmission>;
 	memory(request: MemoryRequest, signal: AbortSignal): Promise<MemoryResult>;
 	runtime(signal: AbortSignal): Promise<RuntimeFacts>;
 	mission(request: MissionRequest, signal: AbortSignal): Promise<MissionView>;
 	inspect(query: InspectionQuery, signal: AbortSignal): Promise<InspectionWireReport>;
+	toolEvidence(callId: string, signal: AbortSignal): Promise<ToolEvidence>;
 	resolveCommand(input: string, signal: AbortSignal): Promise<CommandInterpretation>;
 }
 
 const HELP = `${ATTACH_HELP}\nDefault rich controls: PageUp/PageDown scroll; Ctrl+Shift+F searches the displayed transcript when forwarded by the terminal; Enter/Shift+Enter moves between matches; Esc closes search.\nUsage covers conversation-model estimates, excluding tool/subagent costs and subscription billing.`;
 const FOREGROUND_HELP =
-	"/help /status /mission [setup] /memory [stats|recall <query>|remember <text>|forget <id>|sleep] /cancel /exit. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
+	"/help /status /evidence [CALL_ID|close] /mission [setup] /memory [stats|recall <query>|remember <text>|forget <id>|sleep] /cancel /exit. /cancel stops all work in this chat, including queued inputs, not only your latest send. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
 const MAX_INPUT_BYTES = 16_384;
 
 // A wire error acknowledges the request; transport failures leave its outcome unknown.
@@ -227,6 +293,8 @@ class OwnerTerminalController implements TerminalController {
 	#startup: ReturnType<typeof setTimeout> | undefined;
 	#forget: { readonly id: string; readonly requestId: string } | undefined;
 	#interpretation: AbortController | undefined;
+	/** Sequence of the newest evidence request; a reply carrying an older number is stale. */
+	#evidenceRequest = 0;
 
 	constructor(transport: ConversationTransport, onChange: (state: TerminalState) => void, signal: AbortSignal) {
 		this.#transport = transport;
@@ -253,7 +321,7 @@ class OwnerTerminalController implements TerminalController {
 		return this.#state;
 	}
 
-	submit(input: string): TerminalInputResult {
+	submit(input: string, options: SendOptions = {}): TerminalInputResult {
 		if (this.#finished) return { status: "rejected" };
 		let text = input.trim();
 		if (this.#forget !== undefined) {
@@ -296,6 +364,7 @@ class OwnerTerminalController implements TerminalController {
 			return { status: "command" };
 		}
 		if (text === "/mission setup") return { status: "mission-setup" };
+		if (text === "/evidence" || text.startsWith("/evidence ")) return this.#evidenceCommand(text.slice(9).trim());
 		if ((text === "/inspect" || text.startsWith("/inspect ")) && !isOperatingSystemQuestion(text)) {
 			try {
 				void this.#inspect(inspectionText(text));
@@ -355,19 +424,31 @@ class OwnerTerminalController implements TerminalController {
 			this.#notice("Prompt exceeds 16 KiB; it was not submitted.");
 			return { status: "rejected" };
 		}
-		const requestId = randomUUID();
+		const requestId = options.replayRequestId ?? randomUUID();
 		if (Buffer.byteLength(`${JSON.stringify({ type: "send", prompt: text, requestId })}\n`) > 65_536) {
 			this.#notice("Encoded prompt exceeds 64 KiB; it was not submitted.");
 			return { status: "rejected" };
 		}
+		this.#evidenceRequest++;
+		const unresolved = this.#state.unresolvedRequestIds ?? [];
+		// A retry of a send whose outcome is still unknown must keep its ID unresolved if this attempt is held.
+		const earlier = unresolved.includes(requestId) ? "unresolved" : "settled";
 		this.#state = {
 			...this.#state,
 			sending: true,
-			unresolvedRequestIds: [...(this.#state.unresolvedRequestIds ?? []), requestId],
+			evidence: undefined,
+			unresolvedRequestIds: [...unresolved.filter((id) => id !== requestId), requestId],
 		};
 		this.#notice(`Submitting request ${requestId}; retry with this --request-id after a disconnect.`);
-		void this.#send(text, requestId);
-		return { status: "submitted", requestId };
+		const send = { requestId, digest: sendDigest(text) };
+		void this.#send(text, send, earlier, options.beforeDispatch);
+		return { status: "submitted", ...send };
+	}
+
+	admission(requestId: string, digest: string | undefined): Promise<SendAdmission> {
+		if (this.#finished || this.#state.connection !== "attached")
+			return Promise.reject(new Error("Not attached; the owner was not asked."));
+		return this.#transport.admission(requestId, digest, this.#local.signal);
 	}
 
 	/** Cancels only auxiliary interpretation and removes its suggestions; conversation work is unaffected. */
@@ -466,8 +547,26 @@ class OwnerTerminalController implements TerminalController {
 		}
 	}
 
-	async #send(text: string, requestId: string): Promise<void> {
+	// A held attempt never left this client, so the ID keeps the state it had before it: an earlier attempt whose outcome
+	// is unknown stays unresolved, because dropping it would let the caller forget an ID the owner may have admitted.
+	async #send(
+		text: string,
+		send: PendingSend,
+		earlier: "unresolved" | "settled",
+		beforeDispatch: SendOptions["beforeDispatch"],
+	): Promise<void> {
+		const { requestId } = send;
 		try {
+			if ((await beforeDispatch?.(send)) === "hold") {
+				if (earlier === "settled") this.#acknowledge(requestId);
+				if (!this.#finished) this.#notice(`Request ${requestId} was not sent.`);
+				return;
+			}
+			// A new attempt under the ID supersedes an earlier attempt's return: only the owner's latest answer counts.
+			this.#state = {
+				...this.#state,
+				returnedSends: this.#state.returnedSends?.filter((returned) => returned.requestId !== requestId),
+			};
 			const reply = await this.#transport.send(text, requestId, this.#local.signal);
 			this.#acknowledge(requestId);
 			if (this.#finished) return;
@@ -475,8 +574,8 @@ class OwnerTerminalController implements TerminalController {
 			if (reply.status === "failed")
 				this.#notice(`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`, "error");
 		} catch (error) {
-			if (error instanceof OwnerRequestError) this.#acknowledge(requestId);
-			if (!this.#finished) this.#notice(`Send failed; retry request ${requestId}: ${describeError(error)}`, "error");
+			if (error instanceof OwnerRequestError) await this.#settleRefusal(send, error);
+			else if (!this.#finished) this.#notice(`Send failed; retry request ${requestId}: ${describeError(error)}`, "error");
 		} finally {
 			this.#cancelAfterAdmission = false;
 			if (!this.#finished) {
@@ -489,7 +588,8 @@ class OwnerTerminalController implements TerminalController {
 	async #cancel(): Promise<void> {
 		try {
 			await this.#transport.cancel(this.#local.signal);
-			if (!this.#finished) this.#notice("Cancellation requested; waiting for service state.");
+			if (!this.#finished)
+				this.#notice("Cancelling all work in this chat, including queued inputs; waiting for service state.");
 		} catch (error) {
 			if (!this.#finished) this.#notice(`Cancel failed: ${describeError(error)}`, "error");
 		} finally {
@@ -539,10 +639,47 @@ class OwnerTerminalController implements TerminalController {
 		}
 	}
 
-	#acknowledge(requestId: string): void {
+	// A wire error ends the owner's handling of the request, yet it can follow the admission commit (a reply over 1 MiB
+	// is replaced by an error), so the owner's record decides; the error alone never discards the ID. With no record the
+	// ID stays reusable: an earlier client's request under it may still be in transit, and only the same ID keeps the
+	// owner from admitting the text twice. An admission settles the ID, but only an exact binding shows it was this text.
+	async #settleRefusal(send: PendingSend, error: OwnerRequestError): Promise<void> {
+		let admission: SendAdmission;
+		try {
+			admission = await this.#transport.admission(send.requestId, send.digest, this.#local.signal);
+		} catch (lookup) {
+			if (!this.#finished)
+				this.#notice(
+					`Send failed: ${describeError(error)}. Request ${send.requestId} stays unconfirmed; asking the owner about it failed: ${describeError(lookup)}`,
+					"error",
+				);
+			return;
+		}
+		if (admission.status === "admitted" && admission.binding === "exact") {
+			this.#acknowledge(send.requestId);
+			if (!this.#finished)
+				this.#notice(`The owner admitted request ${send.requestId} but replied with an error: ${describeError(error)}`, "error");
+			return;
+		}
+		if (admission.status === "admitted") {
+			this.#acknowledge(send.requestId, { requestId: send.requestId, reason: "unverified" });
+			if (!this.#finished)
+				this.#notice(
+					`The owner admitted request ${send.requestId} but cannot confirm it was this text, and replied with an error: ${describeError(error)}`,
+					"error",
+				);
+			return;
+		}
+		this.#acknowledge(send.requestId, { requestId: send.requestId, reason: admission.status });
+		if (!this.#finished) this.#notice(`Not sent: ${describeError(error)}`, "error");
+	}
+
+	// A returned send is recorded (newest eight) so a client can tell it from an answer and give the text back.
+	#acknowledge(requestId: string, returned?: ReturnedSend): void {
 		this.#state = {
 			...this.#state,
 			unresolvedRequestIds: this.#state.unresolvedRequestIds?.filter((id) => id !== requestId),
+			...(returned === undefined ? {} : { returnedSends: [...(this.#state.returnedSends ?? []), returned].slice(-8) }),
 		};
 		this.#publish();
 	}
@@ -565,6 +702,39 @@ class OwnerTerminalController implements TerminalController {
 			if (!this.#finished) this.#notice(describeInspection(report));
 		} catch (error) {
 			if (!this.#finished) this.#notice(`Inspection: ${describeError(error)}`, "error");
+		}
+	}
+
+	// `/evidence` names a call; with no argument it uses the newest tool card. The owner is asked only here.
+	#evidenceCommand(argument: string): TerminalInputResult {
+		if (argument === "close") {
+			this.#evidenceRequest++;
+			this.#state = { ...this.#state, evidence: undefined };
+			this.#publish();
+			return { status: "command" };
+		}
+		const callId = argument === "" ? this.#state.view?.tools.at(-1)?.callId : argument;
+		if (callId === undefined || /\s/.test(callId) || callId.length > 200) {
+			this.#notice(
+				callId === undefined ? "No tool call to inspect yet." : "Use /evidence [CALL_ID] or /evidence close.",
+				"error",
+			);
+			return { status: "rejected" };
+		}
+		void this.#evidence(callId, ++this.#evidenceRequest);
+		return { status: "command" };
+	}
+
+	// A reply for a request that a newer request, `/evidence close` or a submitted prompt superseded is dropped.
+	async #evidence(callId: string, request: number): Promise<void> {
+		try {
+			const evidence = await this.#transport.toolEvidence(callId, this.#local.signal);
+			if (this.#finished || request !== this.#evidenceRequest) return;
+			this.#state = { ...this.#state, evidence };
+			this.#publish();
+		} catch (error) {
+			if (!this.#finished && request === this.#evidenceRequest)
+				this.#notice(`Evidence: ${describeError(error)}`, "error");
 		}
 	}
 

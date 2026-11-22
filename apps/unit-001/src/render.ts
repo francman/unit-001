@@ -38,7 +38,15 @@ export function sanitizeTerminalText(text: string): string {
 		}
 		if (code === 0x09 || code === 0x0a || (code >= 0x20 && !(code >= 0x7f && code <= 0x9f))) output += text[index];
 	}
-	return output;
+	// Format characters (bidi overrides, zero-width marks) reorder or hide text without an escape sequence.
+	return output.replace(/\p{Cf}/gu, "");
+}
+
+/** Cuts text to at most `limit` UTF-16 code units without leaving half of a surrogate pair at the end. */
+export function cutText(text: string, limit: number): string {
+	if (text.length <= limit) return text;
+	const code = text.charCodeAt(limit - 1);
+	return text.slice(0, code >= 0xd800 && code <= 0xdbff ? limit - 1 : limit);
 }
 
 /** The text of the answer being generated, from the newest committed partial of a live conversation. */

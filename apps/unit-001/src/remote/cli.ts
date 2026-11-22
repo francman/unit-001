@@ -1,7 +1,9 @@
 // Routes local remote commands without loading provider credentials or opening the owner's storage.
 import { randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
 import type { Terminal as RichTerminal } from "@earendil-works/pi-tui";
 import { runServiceAttach } from "../attach.ts";
+import { createDraftStore } from "../draft-store.ts";
 import { runMissionSetup } from "../missions/setup.ts";
 import { sanitizeTerminalText } from "../render.ts";
 import type { Terminal } from "../repl.ts";
@@ -49,12 +51,19 @@ export async function runRemoteCommand(
 	}
 	const profile = await readRemoteProfile(directory, command.name);
 	terminal.err(`Connecting to ${profile.name} (${profile.host})…\n`);
-	const client = await connectRemoteClient(profile, command.session ?? profile.session, signal);
+	const session = command.session ?? profile.session;
+	const client = await connectRemoteClient(profile, session, signal);
 	try {
 		if (command.action === "connect") {
 			return !command.plain && context.richTerminal !== undefined
 				? await runRichServiceAttach(client, context.richTerminal, signal, {
 						colorMode: context.colorMode,
+						// Drafts sit beside the remote bookmarks, pinned to the profile's installation identity.
+						drafts: createDraftStore({
+							directory: join(dirname(directory), "drafts"),
+							installationId: profile.installationId,
+							session,
+						}),
 						missionSetup: async (flowSignal) => {
 							const status = await client.request({ type: "status" }, flowSignal);
 							if (status.type === "error") throw new Error(status.message);

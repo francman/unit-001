@@ -82,7 +82,7 @@ export const USAGE = `Usage: agent [options]
        agent attach [--plain] [options] chat with the running service; exiting detaches
        agent send <prompt> [options]     ask the running service (optional --request-id for safe retries)
        agent service-status [options]    inspect the running service
-       agent cancel [options]            abort its current run
+       agent cancel [options]            cancel chat: abort all work in the chat, including queued inputs
        agent remote --help               connect this terminal to a named remote installation
        agent web [--port 4317] [options]  open a paired browser workspace on private loopback
        agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]

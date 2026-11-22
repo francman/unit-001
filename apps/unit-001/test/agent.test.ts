@@ -1,12 +1,16 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout } from "node:timers/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Agent } from "../src/agent.ts";
+import { sendDigest } from "../src/send-receipt.ts";
+import { SideDoc } from "../src/side.ts";
 
 const context = BACKGROUND_CONTEXT;
 const model = { provider: "faux", modelId: "faux-1" };
@@ -127,6 +131,55 @@ describe("Agent", () => {
 		expect(seen).toContain("And of Germany?");
 	});
 
+	it("wires side creation, held listing and receipt replay across reopen, validating before scheduling", async () => {
+		const first = await launch([reply("Paris.")]);
+		const settled = await (await first.agent.submit("Capital of France?", context)).wait(context);
+		if (settled.status !== "done" || settled.type !== "input") throw new Error("Expected a completed input.");
+		await first.agent.idle(context);
+		const request = { operation: "start" as const, from: settled.answer, title: "  Research  ", requestId: "side-1" };
+		expect(await first.agent.side({ operation: "list" }, context)).toMatchObject({ sides: [] });
+		const created = await first.agent.side(request, context);
+		if (created.operation !== "start") throw new Error("Expected a side start.");
+		const listed = await first.agent.side({ operation: "list" }, context);
+		expect(listed).toMatchObject({
+			operation: "list",
+			main: { state: "idle" },
+			sides: [{ conversationId: created.conversationId, title: "Research", parent: { at: settled.answer }, state: "idle" }],
+		});
+		expect(first.faux.state.callCount).toBe(1);
+		await first.agent.enterMaintenance("side-reopen", 1000, context);
+		await expect(first.agent.side(request, context)).rejects.toThrow("maintenance");
+		await first.agent.close(context);
+		open.splice(open.indexOf(first.agent), 1);
+
+		const second = await launch([]);
+		expect(await second.agent.side({ operation: "list" }, context)).toEqual(listed);
+		await expect(second.agent.side(request, context)).rejects.toThrow("inhibited");
+		await second.agent.releaseMaintenance("side-reopen", context);
+		expect(await second.agent.side({ ...request, title: "Research" }, context)).toEqual(created);
+		expect(await second.agent.side({ operation: "list" }, context)).toEqual(listed);
+		expect(second.faux.state.callCount).toBe(0);
+		await second.agent.close(context);
+		open.splice(open.indexOf(second.agent), 1);
+
+		const models = createModels();
+		models.setProvider(second.faux.provider);
+		const harness = await Harness.open(await openNodeSqliteStorage(file), { models, registry: createRegistry() }, context);
+		try {
+			const root = await harness.root(context);
+			await root.commit(async (tx) => {
+				// An incomplete restore must fail Agent.open before its pending input can reach the provider.
+				(await tx.doc(SideDoc)).sides[0]!.conversationId = root.id;
+				await root.submit(tx, { type: "input", content: "Pending main input" });
+			}, context);
+		} finally {
+			await harness.close(context);
+		}
+		await expect(Agent.open({ storage: await openNodeSqliteStorage(file), models, model, cwd: directory }, context))
+			.rejects.toThrow("Side registry is inconsistent");
+		expect(second.faux.state.callCount).toBe(0);
+	});
+
 	it("resumes a run that was unfinished when the agent stopped", async () => {
 		// The first process is inside a model request that never completes, so the run is unfinished when it closes.
 		let started!: () => void;
@@ -186,5 +239,104 @@ describe("Agent", () => {
 		await agent.ask("Capital of France?", context);
 		await stop();
 		expect(states.length).toBeGreaterThan(0);
+	});
+});
+
+// #26: a client that lost its connection after submit settles the send from durable state instead of sending again.
+describe("send admission", () => {
+	// Equal in the first 2,000 code points, so only a full-prompt binding can tell them apart.
+	const prompt = `${"x".repeat(2100)} first`;
+	const other = `${"x".repeat(2100)} second`;
+
+	it("binds a request ID to the full prompt and refuses a replay with different text", async () => {
+		const { agent, faux } = await launch([reply("Paris.")]);
+		expect(await agent.ask(prompt, context, { requestId: "r1" })).toEqual({ status: "answered", text: "Paris." });
+		await expect(agent.ask(other, context, { requestId: "r1" })).rejects.toThrow("different prompt");
+		expect(await agent.ask(prompt, context, { requestId: "r1" })).toEqual({ status: "answered", text: "Paris." });
+		expect(faux.state.callCount).toBe(1);
+	});
+
+	// #26 review, blocker 3: before the fix, the prefix-only memory check let this replay return the original answer.
+	it("refuses a replay whose receipt 256 later sends evicted, across a reopen, without calling the model", async () => {
+		const first = await launch([reply("Paris."), ...Array.from({ length: 256 }, () => reply("ok"))]);
+		expect(await first.agent.ask(prompt, context, { requestId: "r1" })).toEqual({ status: "answered", text: "Paris." });
+		for (let index = 0; index < 256; index++)
+			await first.agent.submit(`later ${index}`, context, { requestId: `later-${index}` });
+		await first.agent.idle(context);
+		await first.agent.close(context);
+		open.splice(open.indexOf(first.agent), 1);
+
+		const { agent, faux } = await launch([reply("Wrong.")]);
+		await expect(agent.ask(other, context, { requestId: "r1" })).rejects.toThrow("can no longer be compared");
+		await expect(agent.ask(prompt, context, { requestId: "r1" })).rejects.toThrow("can no longer be compared");
+		expect(await agent.admission("r1", sendDigest(other), context)).toMatchObject({
+			status: "admitted",
+			binding: "unverified",
+		});
+		expect(faux.state.callCount).toBe(0);
+	});
+
+	it("answers admitted, rejected and not found from committed state, across a restart", async () => {
+		const first = await launch([reply("Paris.")]);
+		await first.agent.ask(prompt, context, { requestId: "r1" });
+		await first.agent.close(context);
+		open.splice(open.indexOf(first.agent), 1);
+
+		const { agent, faux } = await launch([]);
+		expect(await agent.admission("r1", sendDigest(prompt), context)).toEqual({
+			status: "admitted",
+			source: "model",
+			binding: "exact",
+			outcome: "answered",
+		});
+		expect(await agent.admission("r1", undefined, context)).toMatchObject({ status: "admitted", binding: "recorded" });
+		expect(await agent.admission("r1", sendDigest(other), context)).toEqual({
+			status: "rejected",
+			reason: "different-prompt",
+		});
+		expect(await agent.admission("never-sent", sendDigest(prompt), context)).toEqual({ status: "not-found" });
+		expect(faux.state.callCount).toBe(0);
+	});
+
+	it("binds a host-fact send by the input its entry recorded", async () => {
+		const { agent, faux } = await launch([]);
+		const question = "What operating system are you running?";
+		expect(await agent.ask(question, context, { requestId: "os-1" })).toMatchObject({ status: "answered" });
+		expect(await agent.admission("os-1", sendDigest(question), context)).toEqual({
+			status: "admitted",
+			source: "host",
+			binding: "exact",
+			outcome: "answered",
+		});
+		expect(await agent.admission("os-1", sendDigest("something else"), context)).toMatchObject({ status: "rejected" });
+		expect(faux.state.callCount).toBe(0);
+	});
+
+	it("reports a pre-receipt send as unverified while inhibited, without resuming it", async () => {
+		const faux = fauxProvider();
+		faux.setResponses([reply("Paris.")]);
+		const models = createModels();
+		models.setProvider(faux.provider);
+		const harness = await Harness.open(await openNodeSqliteStorage(file), { models, registry: createRegistry() }, context);
+		try {
+			const root = await harness.root(context);
+			await root.commit((tx) => root.submit(tx, { type: "input", content: prompt, requestId: "legacy" }), context);
+		} finally {
+			await harness.close(context);
+		}
+		const agent = await Agent.open(
+			{ storage: await openNodeSqliteStorage(file), models, model, cwd: directory, startup: { kind: "inhibited" } },
+			context,
+		);
+		open.push(agent);
+		expect(await agent.admission("legacy", sendDigest(prompt), context)).toEqual({
+			status: "admitted",
+			source: "model",
+			binding: "unverified",
+			outcome: "placed",
+		});
+		await setTimeout(50);
+		expect(await agent.admission("legacy", undefined, context)).toMatchObject({ outcome: "placed" });
+		expect(faux.state.callCount).toBe(0);
 	});
 });

@@ -25,7 +25,9 @@ import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import { parseMissionRequest, parseMissionView } from "./missions/wire.ts";
 import type { RuntimeFacts } from "./orientation.ts";
 import { validateSessionName } from "./paths.ts";
+import { isSendDigest, parseSendAdmission, type SendAdmission } from "./send-receipt.ts";
 import { parseServiceEvent, type ServiceView, serviceView } from "./service-view.ts";
+import { parseToolEvidence, type ToolEvidence } from "./tool-evidence.ts";
 
 export type { ServiceEvent, ServiceView } from "./service-view.ts";
 
@@ -36,6 +38,8 @@ export type ServiceRequest =
 	| { readonly type: "mission"; readonly request: MissionRequest }
 	| { readonly type: "memory"; readonly request: MemoryRequest }
 	| { readonly type: "send"; readonly prompt: string; readonly requestId?: string }
+	| { readonly type: "tool-evidence"; readonly callId: string }
+	| { readonly type: "admission"; readonly requestId: string; readonly digest?: string }
 	| { readonly type: "status" | "cancel" };
 
 export type MaintenanceRequest =
@@ -50,6 +54,8 @@ export type ServiceResponse =
 	| { readonly type: "memory"; readonly result: MemoryResult }
 	| MaintenanceResult
 	| { readonly type: "reply"; readonly reply: Reply }
+	| { readonly type: "tool-evidence"; readonly evidence: ToolEvidence }
+	| { readonly type: "admission"; readonly admission: SendAdmission }
 	| {
 			readonly type: "status";
 			readonly pid: number;
@@ -388,9 +394,29 @@ async function handleRequest(
 		value.type !== "mission" &&
 		value.type !== "channels" &&
 		value.type !== "resolve-command" &&
+		value.type !== "tool-evidence" &&
+		value.type !== "admission" &&
 		value.type !== "inspection"
 	)
 		throw new UsageError("This operation requires the administrator endpoint.");
+	if (value.type === "admission") {
+		if (Object.keys(value).some((key) => key !== "type" && key !== "requestId" && key !== "digest"))
+			throw new UsageError("Admission lookups accept only a request ID and a prompt digest.");
+		const requestId = "requestId" in value ? value.requestId : undefined;
+		if (typeof requestId !== "string" || requestId.length === 0 || requestId.length > 200)
+			throw new UsageError("Request ID must contain 1 to 200 characters.");
+		const digest = "digest" in value ? value.digest : undefined;
+		if (digest !== undefined && !isSendDigest(digest)) throw new UsageError("Invalid prompt digest.");
+		return { type: "admission", admission: await agent.admission(requestId, digest, BACKGROUND_CONTEXT) };
+	}
+	if (value.type === "tool-evidence") {
+		if (Object.keys(value).some((key) => key !== "type" && key !== "callId"))
+			throw new UsageError("Tool evidence requests accept only a call ID.");
+		const callId = "callId" in value ? value.callId : undefined;
+		if (typeof callId !== "string" || callId.length === 0 || callId.length > 200)
+			throw new UsageError("Tool call ID must contain 1 to 200 characters.");
+		return { type: "tool-evidence", evidence: await agent.toolEvidence(callId, BACKGROUND_CONTEXT) };
+	}
 	if (value.type === "inspection") {
 		if (!("query" in value)) throw new UsageError("Missing inspection query.");
 		return { type: "inspection", report: await agent.inspect(parseInspectionQuery(value.query), BACKGROUND_CONTEXT) };
@@ -523,6 +549,10 @@ export function parseServiceResponse(wire: string): ServiceResponse {
 					result: value.result,
 				};
 		}
+		if (value.type === "admission" && "admission" in value)
+			return { type: "admission", admission: parseSendAdmission(value.admission) };
+		if (value.type === "tool-evidence" && "evidence" in value)
+			return { type: "tool-evidence", evidence: parseToolEvidence(value.evidence) };
 		if (value.type === "cancelled") return { type: "cancelled" };
 		if (
 			value.type === "status" &&

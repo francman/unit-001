@@ -2,6 +2,7 @@
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { join, sep } from "node:path";
+import { redactJsonWebTokens } from "../evidence-redaction.ts";
 
 export type ImplementationExcerpt =
 	| {
@@ -98,7 +99,7 @@ function allowedPath(path: string): boolean {
 
 /** Removes common literal credential forms from otherwise public implementation excerpts. */
 export function redactImplementationText(text: string): string {
-	return text
+	const redacted = text
 		.replace(/[\p{Cc}\p{Cf}]/gu, (character) => (character === "\n" || character === "\t" ? character : "�"))
 		.replace(
 			/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
@@ -113,9 +114,8 @@ export function redactImplementationText(text: string): string {
 			"$1[redacted]",
 		)
 		.replace(/\bBearer[ \t]+[A-Za-z0-9._~+/-]{8,}=*/gi, "Bearer [redacted]")
-		.replace(
-			/(?:xox[baprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,})/g,
-			"[redacted credential]",
-		)
+		.replace(/(?:xox[baprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16})/g, "[redacted credential]")
 		.replace(/(\b[a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[redacted]@");
+	// A JWT can start anywhere inside a base64url run; the shared matcher reads each run once.
+	return redactJsonWebTokens(redacted);
 }

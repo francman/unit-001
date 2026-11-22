@@ -1,6 +1,6 @@
 import type { LiveState } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "vitest";
-import { DeltaPrinter, liveText, sanitizeTerminalText, ToolAnnouncer } from "../src/render.ts";
+import { cutText, DeltaPrinter, liveText, sanitizeTerminalText, ToolAnnouncer } from "../src/render.ts";
 
 function collect() {
 	const chunks: string[] = [];
@@ -20,6 +20,20 @@ describe("sanitizeTerminalText", () => {
 	it("keeps Unicode, tab and newline while dropping C0/C1 and DEL controls", () => {
 		expect(sanitizeTerminalText("héllo\t世界\n\r\b\x00\x07\x7f\x85\x9b31mend")).toBe("héllo\t世界\nend");
 		expect(sanitizeTerminalText("\x1b世界\x1b\n\x1b\t")).toBe("世界\n\t");
+	});
+
+	it("drops bidi overrides, isolates and zero-width format characters (#26, sec-ipc Low 2)", () => {
+		expect(sanitizeTerminalText("bash‮txt.exe⁦x⁩​‎﻿end")).toBe("bashtxt.exexend");
+		expect(sanitizeTerminalText("tag\u{E0041}s")).toBe("tags");
+	});
+});
+
+describe("cutText", () => {
+	it("cuts by UTF-16 length without leaving half of a surrogate pair (#26)", () => {
+		expect(cutText("ab😀", 3)).toBe("ab");
+		expect(cutText("ab😀", 4)).toBe("ab😀");
+		expect(cutText("abcd", 2)).toBe("ab");
+		expect(cutText("ab", 5)).toBe("ab");
 	});
 
 	it("withholds split escape tails in cumulative snapshots without leaking sequence payloads", () => {

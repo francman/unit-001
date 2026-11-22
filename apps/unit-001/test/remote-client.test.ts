@@ -90,6 +90,8 @@ async function owner() {
 			else if (request.type === "cancel") socket.end('{"type":"cancelled"}\n');
 			else if (request.type === "memory") memorySockets.add(socket);
 			else if (request.type === "send") sendSockets.add(socket);
+			// A rejected send was refused before admission, so the client's follow-up lookup finds no record.
+			else if (request.type === "admission") socket.end('{"type":"admission","admission":{"status":"not-found"}}\n');
 			// Sends deliberately remain unresolved, representing work admitted by the remote owner.
 		});
 	});

@@ -181,7 +181,7 @@ describe("runRepl", () => {
 		input.end("/status\n/exit\n");
 		expect(await running).toBe(0);
 		expect(abort).toHaveBeenCalledTimes(1);
-		expect(io.err()).toContain("^C stopping the run");
+		expect(io.err()).toContain("^C cancelling the chat");
 		expect(io.err()).toContain("agent: idle");
 	});
 

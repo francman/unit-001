@@ -9,9 +9,11 @@ import {
 	type Conversation,
 	type ConversationWatch,
 	createRegistry,
+	type Cursor,
 	defineEntry,
 	defineExtension,
 	defineTool,
+	type EntryRecord,
 	type Extension,
 	Harness,
 	LiveDoc,
@@ -19,9 +21,10 @@ import {
 	type Report,
 	type Storage,
 	type Submission,
+	type SubmissionId,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
-import { CodingTools, createPowerShellTool } from "@earendil-works/pi-durable/tools";
+import { createPowerShellTool } from "@earendil-works/pi-durable/tools";
 import {
 	createMemoryExtension,
 	forgetMemory,
@@ -46,6 +49,8 @@ import { HostFactEntry, isOperatingSystemQuestion } from "./commands/facts.ts";
 import { type CommandInterpretation, type InterpretationUsage, interpretCommand } from "./commands/interpretation.ts";
 import { resolveLocalCommand } from "./commands/resolution.ts";
 import { ConfigurationError } from "./errors.ts";
+import { environmentSecrets } from "./evidence-redaction.ts";
+import { recordedCodingTools } from "./file-provenance.ts";
 import type { InspectionQuery, InspectionReport } from "./introspection/contract.ts";
 import { introspectionExtension } from "./introspection/extension.ts";
 import { operatingSystemFacts, renderOperatingSystemFacts } from "./introspection/os.ts";
@@ -65,6 +70,17 @@ import { validLoop } from "./missions/purpose-loop.ts";
 import { isMissionHoldTask, MissionDoc, MissionFoundation } from "./missions/state.ts";
 import { createRuntimeFacts, orientationExtension, type RuntimeFacts } from "./orientation.ts";
 import type { ModelChoice } from "./provider.ts";
+import {
+	checkSendReplay,
+	recordSendReceipt,
+	type SendAdmission,
+	SendReceiptsDoc,
+	sendAdmission,
+	sendDigest,
+} from "./send-receipt.ts";
+import type { SideRequest, SideResult } from "./side-control.ts";
+import { controlSides, initializeSideRegistry, type SideOwner } from "./side.ts";
+import { type EvidenceScope, EVIDENCE_SCAN_ENTRIES, projectToolEvidence, type ToolEvidence } from "./tool-evidence.ts";
 
 export interface AgentOptions {
 	readonly storage: Storage;
@@ -112,10 +128,12 @@ export class Agent {
 	readonly #memory: MemoryService;
 	readonly #mission: MissionOwner;
 	readonly #channels: ChannelOwner;
+	readonly #sides: SideOwner;
 	readonly #configuration: "configured" | "unconfigured";
 	readonly #models: Models;
 	readonly #model: ModelChoice | null;
 	readonly #inspect: InspectionReader;
+	readonly #evidence: EvidenceScope;
 	readonly #interpretations = new Map<AbortController, Promise<void>>();
 	#inhibited: boolean;
 	#closing = false;
@@ -136,6 +154,7 @@ export class Agent {
 		models: Models,
 		model: ModelChoice | null,
 		inspect: InspectionReader,
+		evidence: EvidenceScope,
 	) {
 		this.name = name;
 		this.#harness = harness;
@@ -150,6 +169,8 @@ export class Agent {
 		this.#models = models;
 		this.#model = model;
 		this.#inspect = inspect;
+		this.#evidence = evidence;
+		this.#sides = { harness, root, model, requireActive: () => this.requireActive() };
 	}
 
 	/** Opens the session, resuming unfinished work only outside startup inhibition and persistent maintenance holds. */
@@ -165,11 +186,10 @@ export class Agent {
 		};
 		const missionAdmission = new MissionAdmission(missionLocation);
 		const missionExecution = missionController(missionAdmission, options.cwd);
-		const channels = defaultChannelHost(
-			missionLocation,
-			options.channelCredentialsDirectory ?? join(options.cwd, ".unit-channels"),
-		);
-		registry.install(CodingTools);
+		const channelDirectory = options.channelCredentialsDirectory ?? join(options.cwd, ".unit-channels");
+		const channels = defaultChannelHost(missionLocation, channelDirectory);
+		const credentialRoots = ["/etc/unit-001", channelDirectory];
+		registry.install(recordedCodingTools(credentialRoots));
 		if ((options.platform ?? process.platform) === "win32") {
 			registry.install(defineExtension({ name: "powershell", tools: [createPowerShellTool()] }));
 		}
@@ -263,6 +283,23 @@ export class Agent {
 				implementationRoot: fileURLToPath(new URL("../", import.meta.url)),
 			};
 			inspect = (query, ctx) => inspectAgent(query, inspectionHost, ctx);
+			const agent = new Agent(
+				harness,
+				root,
+				interrupted,
+				name,
+				inhibited,
+				runtime,
+				memory,
+				mission,
+				channelOwner,
+				options.model === null ? "unconfigured" : "configured",
+				options.models,
+				options.model,
+				inspect,
+				{ cwd: options.cwd, secrets: environmentSecrets(), credentialRoots },
+			);
+			await initializeSideRegistry(agent.#sides, context);
 			const legacy = (await harness.snapshot(MissionDoc, context))?.current ?? null;
 			const pending = options.model === null ? await harness.inspect(context) : undefined;
 			const canSchedule =
@@ -278,21 +315,7 @@ export class Agent {
 				);
 				harness.resume();
 			}
-			return new Agent(
-				harness,
-				root,
-				interrupted,
-				name,
-				inhibited,
-				runtime,
-				memory,
-				mission,
-				channelOwner,
-				options.model === null ? "unconfigured" : "configured",
-				options.models,
-				options.model,
-				inspect,
-			);
+			return agent;
 		} catch (error) {
 			await harness.close(context).catch(() => {});
 			memory.close();
@@ -302,7 +325,9 @@ export class Agent {
 
 	/**
 	 * Durably admits a prompt and returns without waiting for the answer. A `requestId` makes a retry after a restart
-	 * find the same submission instead of submitting twice.
+	 * find the same submission instead of submitting twice; a fresh one is bound to the exact prompt, so a retry with
+	 * different text is refused. A retry of an ID admitted without a receipt (before receipts, or evicted) is refused
+	 * too: nothing left can show that its prompt matches, and answering it could return another prompt's reply.
 	 */
 	async submit(text: string, context: Context, options: { readonly requestId?: string } = {}): Promise<Submission> {
 		this.requireActive();
@@ -310,14 +335,25 @@ export class Agent {
 			throw new ConfigurationError(
 				`No provider is configured. Run ${this.name} setup (sudo for a managed installation), then restart the owner. Mission drafting remains available without a provider.`,
 			);
+		const { requestId } = options;
 		const id = await this.#root.commit(async (tx) => {
 			if ((await tx.doc(MaintenanceDoc)).current.state === "held") throw new Error("Service is held for maintenance.");
+			let fresh: ((id: SubmissionId) => void) | undefined;
+			if (requestId !== undefined) {
+				const digest = sendDigest(text);
+				const receipts = await tx.doc(SendReceiptsDoc, this.#root.id);
+				// Read before admission writes, which would create the submission this checks for.
+				const admitted = (await tx.submissionByRequest(this.#root.id, requestId)) !== undefined;
+				checkSendReplay(receipts, requestId, digest, admitted);
+				if (!admitted) fresh = (id) => recordSendReceipt(receipts, requestId, digest, id);
+			}
 			const id = await this.#root.submit(tx, {
 				type: "input",
 				content: text,
 				entry: { kind: MemoryInputEntry.kind, data: { origin: "human" } },
-				...(options.requestId === undefined ? {} : { requestId: options.requestId }),
+				...(requestId === undefined ? {} : { requestId }),
 			});
+			fresh?.(id);
 			await recordMemoryInput(tx, this.#root.id, id, "human", text);
 			return id;
 		}, context);
@@ -451,10 +487,30 @@ export class Agent {
 		return this.#root.watch(context, { min: 20, max: 20 });
 	}
 
-	/** Aborts the current run and its tools; the conversation keeps its history. */
+	/**
+	 * Aborts all work in the chat: the current run, its tools and every queued input, whoever sent them. Durable has no
+	 * public operation that aborts only an observed run in one decision, so this is deliberately chat-wide.
+	 */
 	abort(context: Context): Promise<void> {
 		this.requireActive();
 		return this.#root.abort(context);
+	}
+
+	/**
+	 * Reports whether a send was admitted in this chat under `requestId`, from committed state only. It never waits on,
+	 * resumes or admits work, and works while held or inhibited. `digest` (of the client's prompt) checks the binding.
+	 */
+	async admission(requestId: string, digest: string | undefined, context: Context): Promise<SendAdmission> {
+		const found = await this.#harness.commit(async (tx) => {
+			const record = await tx.submissionByRequest(this.#root.id, requestId);
+			if (record?.type !== "write" || record.status !== "done") return { record };
+			return { record, hostInput: (await tx.entry(HostFactEntry, record.entry))?.data.input };
+		}, context);
+		if (found.record === undefined) return sendAdmission(undefined, undefined, undefined, digest);
+		// A receipt commits with its submission, so reading it after the submission cannot miss a fresh one.
+		const receipts = (await this.#harness.snapshot(SendReceiptsDoc, this.#root.id, context))?.receipts;
+		const receipt = receipts !== undefined && Object.hasOwn(receipts, requestId) ? receipts[requestId] : undefined;
+		return sendAdmission(found.record, receipt, found.hostInput, digest);
 	}
 
 	async close(context: Context): Promise<void> {
@@ -564,6 +620,11 @@ export class Agent {
 		return this.#mission.handle(request, context);
 	}
 
+	/** Lists or starts registered side chats through this owner, without submitting input or invoking a model. */
+	side(request: SideRequest, context: Context): Promise<SideResult> {
+		return controlSides(this.#sides, request, context);
+	}
+
 	/** Inspects channels or resumes exact creator-granted setup without granting permission or opening another writer. */
 	channels(request: ChannelCommand, context: Context): Promise<ChannelResult> {
 		if (request.operation !== "status") this.requireActive();
@@ -669,5 +730,18 @@ export class Agent {
 	/** Reads one bounded owner/host report without changing state, resuming work or invoking a provider. */
 	inspect(query: InspectionQuery, context: Context): Promise<InspectionReport> {
 		return this.#inspect(query, context);
+	}
+
+	/** Projects one call's bounded redacted evidence from the newest entries; read-only and only on explicit request. */
+	async toolEvidence(callId: string, context: Context): Promise<ToolEvidence> {
+		const entries: EntryRecord[] = [];
+		let cursor: Cursor | undefined;
+		while (entries.length < EVIDENCE_SCAN_ENTRIES) {
+			const page = await this.#root.entries({}, 50, cursor, context);
+			entries.push(...page.items);
+			if (page.next === undefined) break;
+			cursor = page.next;
+		}
+		return projectToolEvidence(entries, callId, this.#evidence);
 	}
 }

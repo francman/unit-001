@@ -438,9 +438,9 @@ function createComposer(context: () => Ctx): { row: HTMLElement; input: HTMLText
 			: "grid size-[26px] shrink-0 place-items-center rounded-full bg-accent text-on-accent transition-colors duration-100 hover:bg-accent/88 disabled:bg-fg-4 disabled:text-canvas pointer-coarse:size-11";
 		send.replaceChildren(
 			icon(running ? "stop" : "send", running ? "size-3 shrink-0" : "size-3.5 shrink-0"),
-			srOnly(running ? "Stop current work" : "Send message"),
+			srOnly(running ? "Cancel chat" : "Send message"),
 		);
-		send.title = running ? "Stop (Esc)" : "Send (Enter)";
+		send.title = running ? "Cancel chat (Esc)" : "Send (Enter)";
 		send.disabled = running ? false : !ctx.ui.draft.trim() || ctx.ui.sending || ctx.ui.connection !== "connected";
 		send.setAttribute("aria-disabled", String(running && ctx.ui.cancelling));
 	};
