@@ -101,7 +101,7 @@ describe("independent persistent memory acceptance", () => {
 			]);
 			await agent.ask("redis", context);
 			await agent.idle(context);
-			expect(observed).toContain("durable agent named bob");
+			expect(observed).toContain("You are bob, the agent of this unit-001 installation");
 			expect(observed).not.toContain("redis confidential preference");
 			expect((await agent.status(context)).busy).toBe(false);
 			expect(await agent.enterMaintenance("acceptance-update", 1000, context)).toMatchObject({ result: "drained" });

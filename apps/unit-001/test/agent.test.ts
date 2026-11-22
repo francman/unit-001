@@ -62,11 +62,36 @@ describe("Agent", () => {
 			"bob",
 		);
 		await agent.ask("Who are you and do you remember prior conversations?", context);
-		expect(requestText).toContain("unit-001, the durable agent named bob");
+		expect(requestText).toContain("You are bob, the agent of this unit-001 installation");
 		expect(requestText).toContain("configured model is faux/faux-1");
 		expect(requestText).toContain("persist in this session across restarts");
 		expect(requestText).toContain("An agreement alone does not start a mission");
 		expect(requestText).toContain("unit_status");
+	});
+
+	it("states the installation name, version, durable memory and agreed purpose in the identity section", async () => {
+		let requestText = "";
+		const faux = fauxProvider();
+		faux.setResponses([
+			(request) => {
+				requestText = JSON.stringify(request.messages);
+				return reply("I am ada.");
+			},
+		]);
+		const models = createModels();
+		models.setProvider(faux.provider);
+		const agent = await Agent.open(
+			{ storage: await openNodeSqliteStorage(file), models, model, cwd: directory, name: "ada", version: "9.8.7" },
+			context,
+		);
+		open.push(agent);
+		await agent.ask("who are you?", context);
+		expect(requestText).toContain("You are ada, the agent of this unit-001 installation (unit-001 9.8.7)");
+		expect(requestText).toContain("transport requirement, not your identity. Introduce yourself as ada.");
+		expect(requestText).not.toContain("terminal is where the owner approves");
+		expect(requestText).toContain("carries across conversations and restarts");
+		expect(requestText).not.toContain("session-scoped");
+		expect(requestText).toContain("Having no agreed purpose yet is a normal state");
 	});
 
 	it("reads authoritative owner process runtime through a local tool", async () => {
