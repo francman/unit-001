@@ -1,11 +1,23 @@
 // Defines the mission plan's terms (overall purpose, strategics, tacticals) and checks them; terms grant nothing.
-import { missionNumber, missionObject, missionText, missionTextList } from "./contract.ts";
+import { type MissionAuthority, missionNumber, missionObject, missionText, missionTextList } from "./contract.ts";
 import { type LoopState, loopAgreement } from "./purpose-loop.ts";
 
 export type PlanPriority = "high" | "normal" | "low";
 
+/**
+ * What the creator lets Bob spend on periodic plan reviews: lifetime requests across every revision, requests per review
+ * and an optional estimated spend cap. Null means reviews stay deterministic and never call a model.
+ */
+export type ReviewAllowance = { maxRequests: number; maxRequestsPerReview: number; maxEstimatedCost: number | null };
+
 /** The enduring purpose of the whole plan; `reviewEveryMs` is the assignment-review cadence, not the loop's. */
-export type PlanOverall = { purpose: string; scope: string; askFirst: string[]; reviewEveryMs: number };
+export type PlanOverall = {
+	purpose: string;
+	scope: string;
+	askFirst: string[];
+	reviewEveryMs: number;
+	reviewAllowance: ReviewAllowance | null;
+};
 
 /** A medium-horizon outcome; its signals are judged by review, never verified by the host. */
 export type PlanStrategic = { id: string; title: string; intent: string; signals: string[]; priority: PlanPriority };
@@ -37,11 +49,18 @@ export const MAX_STRATEGICS = 3;
 /** Most current tacticals one plan revision lists. */
 export const MAX_TACTICALS = 6;
 
+/** Most model requests one review turn may make: a status read, a draft and a final answer, with one spare. */
+export const MAX_REQUESTS_PER_REVIEW = 4;
+
 /** Parses plan terms crossing the wire or stored boundary: closed shapes, bounded text; semantic checks come later. */
 export function parsePlanTerms(value: unknown): PlanTerms {
 	const input = closed(value, ["overall", "strategics", "tacticals"], "plan");
 	if (Buffer.byteLength(JSON.stringify(input)) > 65536) throw new Error("Plan terms exceed 64 KiB.");
-	const overall = closed(input.overall, ["purpose", "scope", "askFirst", "reviewEveryMs"], "overall purpose");
+	const overall = closed(
+		input.overall,
+		["purpose", "scope", "askFirst", "reviewEveryMs", "reviewAllowance"],
+		"overall purpose",
+	);
 	if (!Array.isArray(input.strategics) || input.strategics.length > MAX_STRATEGICS)
 		throw new Error(`A plan lists at most ${MAX_STRATEGICS} strategics.`);
 	if (!Array.isArray(input.tacticals) || input.tacticals.length > MAX_TACTICALS)
@@ -52,6 +71,7 @@ export function parsePlanTerms(value: unknown): PlanTerms {
 			scope: missionText(overall.scope, 4096),
 			askFirst: missionTextList(overall.askFirst, 32, 2000),
 			reviewEveryMs: whole(overall.reviewEveryMs, 0),
+			reviewAllowance: overall.reviewAllowance === null ? null : parseAllowance(overall.reviewAllowance),
 		},
 		strategics: input.strategics.map(parseStrategic),
 		tacticals: input.tacticals.map(parseTactical),
@@ -98,6 +118,33 @@ export function planTermsDenial(terms: PlanTerms, loop: LoopState | undefined): 
 	if (!agreement || agreement.missionId !== binding.missionId || agreement.digest !== binding.purposeDigest)
 		return "The runnable tactical must bind an exact agreed purpose revision and digest.";
 	return undefined;
+}
+
+/** Why a review allowance exceeds the creator's purpose ceiling, if it does; reviews spend under the same authority. */
+export function reviewAllowanceDenial(terms: PlanTerms, authority: MissionAuthority): string | undefined {
+	const allowance = terms.overall.reviewAllowance;
+	if (allowance === null) return undefined;
+	const ceiling = authority.purposeCeiling;
+	if (!ceiling) return "Model reviews need the creator's purpose ceiling.";
+	if (allowance.maxRequests > ceiling.maxRequests) return "Review requests exceed the creator's purpose ceiling.";
+	if (
+		ceiling.maxEstimatedCost !== undefined &&
+		(allowance.maxEstimatedCost === null || allowance.maxEstimatedCost > ceiling.maxEstimatedCost)
+	)
+		return "Review spend exceeds the creator's purpose ceiling.";
+	return undefined;
+}
+
+function parseAllowance(value: unknown): ReviewAllowance {
+	const input = closed(value, ["maxRequests", "maxRequestsPerReview", "maxEstimatedCost"], "review allowance");
+	const perReview = whole(input.maxRequestsPerReview, 1);
+	if (perReview > MAX_REQUESTS_PER_REVIEW)
+		throw new Error(`A review makes at most ${MAX_REQUESTS_PER_REVIEW} model requests.`);
+	const cost = input.maxEstimatedCost === null ? null : missionNumber(input.maxEstimatedCost);
+	if (cost !== null && cost <= 0) throw new Error("A review spend cap must be positive.");
+	const maxRequests = whole(input.maxRequests, 1);
+	if (perReview > maxRequests) throw new Error("A review cannot make more requests than the whole review allowance.");
+	return { maxRequests, maxRequestsPerReview: perReview, maxEstimatedCost: cost };
 }
 
 function parseStrategic(value: unknown): PlanStrategic {

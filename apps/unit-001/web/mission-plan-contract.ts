@@ -2,9 +2,29 @@
 
 type Priority = "high" | "normal" | "low";
 
+/** Model review caps; null in the terms keeps reviews deterministic. */
+export interface ReviewAllowance {
+	maxRequests: number;
+	maxRequestsPerReview: number;
+	maxEstimatedCost: number | null;
+}
+
+/** Current review caps and lifetime usage across plan revisions. */
+export interface ReviewAllowanceView extends ReviewAllowance {
+	requests: number;
+	estimatedCost: number;
+	reservedCost: number;
+}
+
 /** The complete three-level plan terms, independent of approval and admission. */
 export interface PlanTerms {
-	overall: { purpose: string; scope: string; askFirst: readonly string[]; reviewEveryMs: number };
+	overall: {
+		purpose: string;
+		scope: string;
+		askFirst: readonly string[];
+		reviewEveryMs: number;
+		reviewAllowance: ReviewAllowance | null;
+	};
 	strategics: readonly { id: string; title: string; intent: string; signals: readonly string[]; priority: Priority }[];
 	tacticals: readonly ({
 		id: string;
@@ -35,6 +55,21 @@ export interface ReviewTrigger {
 	key: string;
 	subject: string | null;
 }
+
+/** Public review turn evidence, without provider or conversation identifiers. */
+export type ReviewTurnView = {
+	key: string;
+	planRevision: number;
+	trigger: ReviewTrigger;
+	reviewId: string | null;
+	requests: number;
+	at: number;
+} & (
+	| { state: "running"; reason: null; draftRevision: null }
+	| { state: "done"; reason: null; draftRevision: number | null }
+	| { state: "skipped"; reason: "budget" | "hold" | "unsettled"; draftRevision: null }
+	| { state: "blocked"; reason: "unknown_request_outcome" | "turn_failed" | "authority"; draftRevision: null }
+);
 
 /** A deterministic review snapshot, either computed and unsaved or recorded by the owner. */
 export interface ReviewNote {
@@ -91,6 +126,9 @@ export interface PlanView {
 	} | null;
 	gate: { state: "not-adopted" | "open" | "closed"; reason: "receipt" | "binding" | "reopen-needed" | "head-missing" | null };
 	runs: { used: number; limit: 32 };
+	allowance: ReviewAllowanceView | null;
+	turns: readonly ReviewTurnView[];
+	blocker: ReviewTurnView | null;
 	due: readonly ReviewTrigger[];
 	preview: ReviewNote | null;
 	reviews: readonly ReviewNote[];

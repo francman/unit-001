@@ -689,6 +689,8 @@ export class Agent {
 		const deadline = performance.now() + timeoutMs;
 		for (const controller of this.#interpretations.keys()) controller.abort();
 		this.#channels.abort();
+		// A review task parked between windows ends now; one mid-turn ends itself once its turn settles.
+		await this.#mission.endParkedReview(context);
 		for (;;) {
 			const inspection = await this.#harness.inspect(context);
 			const legacy = (await this.#harness.snapshot(MissionDoc, context))?.current ?? null;

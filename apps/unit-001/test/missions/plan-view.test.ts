@@ -5,6 +5,7 @@ import { missionPlanView } from "../../src/missions/plan-view.ts";
 import { MAX_DUE_TRIGGERS, parsePlanView } from "../../src/missions/plan-wire.ts";
 import { workDigest } from "../../src/missions/purpose-authority.ts";
 import type { LoopRun } from "../../src/missions/purpose-loop.ts";
+import type { ReviewState, ReviewTurn } from "../../src/missions/review-turn-state.ts";
 import { agreePlan, authority, emptyPlan, loopWithPurpose, planTerms } from "./fixtures/plan.ts";
 
 function viewWithReview() {
@@ -13,7 +14,7 @@ function viewWithReview() {
 	agreePlan(auth, plan, planTerms());
 	const loop = loopWithPurpose();
 	storeReview(plan, loop, "review-1", 11_000);
-	return { auth, plan, loop, view: missionPlanView(plan, loop, auth, 21_000) };
+	return { auth, plan, loop, view: missionPlanView(plan, loop, auth, undefined, 21_000) };
 }
 
 describe("plan view", () => {
@@ -39,15 +40,15 @@ describe("plan view", () => {
 			fromReview: null,
 			requestId: "d1",
 		};
-		expect(missionPlanView(plan, loopWithPurpose(), authority(), 1).draft!.missing).toEqual([]);
+		expect(missionPlanView(plan, loopWithPurpose(), authority(), undefined, 1).draft!.missing).toEqual([]);
 		// The bound purpose revision is no longer agreed in the loop the managed writer will check against.
 		const moved = loopWithPurpose();
 		moved.agreements[0] = { ...moved.agreements[0]!, digest: "c".repeat(64) };
-		expect(missionPlanView(plan, moved, authority(), 1).draft!.missing).toEqual([
+		expect(missionPlanView(plan, moved, authority(), undefined, 1).draft!.missing).toEqual([
 			"The runnable tactical must bind an exact agreed purpose revision and digest.",
 		]);
 		plan.draft.status = "editing";
-		expect(missionPlanView(plan, moved, authority(), 1).draft!.missing).toEqual([]);
+		expect(missionPlanView(plan, moved, authority(), undefined, 1).draft!.missing).toEqual([]);
 	});
 
 	it("judges the head from protected history even without a readable loop", () => {
@@ -56,18 +57,50 @@ describe("plan view", () => {
 		agreePlan(auth, plan, planTerms());
 		agreePlan(auth, plan, planTerms({ overall: { ...planTerms().overall, scope: "Two" } }));
 		agreePlan(auth, plan, planTerms({ overall: { ...planTerms().overall, scope: "Three" } }));
-		expect(missionPlanView(plan, undefined, auth, 1)).toMatchObject({ headValid: true, gate: { reason: "binding" } });
+		expect(missionPlanView(plan, undefined, auth, undefined, 1)).toMatchObject({ headValid: true, gate: { reason: "binding" } });
 		// The oldest binding is gone while the retained tail still matches.
 		const broken = { ...auth, planRequests: auth.planRequests!.slice(1) };
-		expect(missionPlanView(plan, undefined, broken, 1)).toMatchObject({
+		expect(missionPlanView(plan, undefined, broken, undefined, 1)).toMatchObject({
 			headValid: false,
 			gate: { state: "closed", reason: "receipt" },
 		});
-		expect(missionPlanView(plan, loopWithPurpose(), broken, 1).headValid).toBe(false);
+		expect(missionPlanView(plan, loopWithPurpose(), broken, undefined, 1).headValid).toBe(false);
+	});
+
+	it("pins only a finished turn with an unknown request as the blocker, never a running turn's in-flight request", () => {
+		const auth = authority();
+		const plan = emptyPlan();
+		agreePlan(auth, plan, planTerms());
+		const attempt = { attemptId: "a1", ceiling: null, status: "reserved" as const };
+		const turn = (key: string, state: ReviewTurn["state"]): ReviewTurn => ({
+			key,
+			planRevision: 1,
+			trigger: { kind: "cadence", key, subject: null },
+			reviewId: null,
+			conversation: null,
+			providerSession: null,
+			attempts: [{ ...attempt, attemptId: `${key}:a1` }],
+			state,
+			at: 1,
+		});
+		const ledger = { requests: 1, estimatedCost: 0, reservedCost: 0, unknownRequests: 1, unpricedResponses: 0, unboundedAttempts: 1 };
+		const running: ReviewState = { turns: [turn("1:cadence:w1", { status: "running" })], ledger, task: null };
+		expect(missionPlanView(plan, loopWithPurpose(), auth, running, 1).blocker).toBeNull();
+		const stuck: ReviewState = {
+			turns: [turn("1:cadence:w1", { status: "blocked", reason: "unknown_request_outcome" })],
+			ledger,
+			task: null,
+		};
+		expect(missionPlanView(plan, loopWithPurpose(), auth, stuck, 1).blocker).toMatchObject({
+			key: "1:cadence:w1",
+			state: "blocked",
+			reason: "unknown_request_outcome",
+			requests: 1,
+		});
 	});
 
 	it("reports the gate as not adopted before any agreement", () => {
-		expect(missionPlanView(emptyPlan(), loopWithPurpose(), authority(), 1).gate).toEqual({
+		expect(missionPlanView(emptyPlan(), loopWithPurpose(), authority(), undefined, 1).gate).toEqual({
 			state: "not-adopted",
 			reason: null,
 		});
@@ -96,7 +129,7 @@ describe("parsing the plan view", () => {
 				state: { status: "blocked", reason: "retry_limit" },
 				settlement: "settled",
 			} as LoopRun);
-		const view = missionPlanView(plan, loop, auth, 50_000);
+		const view = missionPlanView(plan, loop, auth, undefined, 50_000);
 		expect(view.due).toHaveLength(MAX_DUE_TRIGGERS);
 		expect(view.due[0]!.key).toBe("1:blocked:run-1");
 		expect(parsePlanView(JSON.parse(JSON.stringify(view)))).toEqual(view);
@@ -104,7 +137,7 @@ describe("parsing the plan view", () => {
 		const hidden = "1:blocked:run-17";
 		expect(view.due.map((trigger) => trigger.key)).not.toContain(hidden);
 		storeReview(plan, loop, "review-1", 50_000);
-		const next = missionPlanView(plan, loop, auth, 50_000);
+		const next = missionPlanView(plan, loop, auth, undefined, 50_000);
 		expect(next.due[0]!.key).toBe("1:blocked:run-2");
 		expect(next.due.map((trigger) => trigger.key)).toContain(hidden);
 		expect(next.due).toHaveLength(MAX_DUE_TRIGGERS);

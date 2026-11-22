@@ -1,6 +1,6 @@
 // Renders local charter authoring and exact proposal review; the caller owns freshness and writes.
 import type { WorkspaceDetails } from "../contract.ts";
-import type { PlanTerms, PlanView } from "../mission-plan-contract.ts";
+import type { PlanTerms, PlanView, ReviewAllowance } from "../mission-plan-contract.ts";
 import { callout, command } from "../ui/blocks.ts";
 import { fields, surfaces, text } from "../ui/classes.ts";
 import { button } from "../ui/controls.ts";
@@ -184,8 +184,62 @@ function overallFields(original: PlanTerms["overall"]): Field<PlanTerms["overall
 	const reviewEveryMs = numberField("review-every", "Review interval (milliseconds)", original.reviewEveryMs, 0,
 		(ms) => ms === 0 ? "0 ms" : `About ${duration(ms)}`);
 	reviewEveryMs.input.required = true;
-	return { root: fieldset("Overall", purpose.root, scope.root, askFirst.root, reviewEveryMs.root),
-		read: () => ({ purpose: purpose.read(), scope: scope.read(), askFirst: askFirst.read(), reviewEveryMs: reviewEveryMs.input.valueAsNumber }) };
+	const reviewAllowance = reviewAllowanceFields(original.reviewAllowance ?? null);
+	return {
+		root: fieldset("Overall", purpose.root, scope.root, askFirst.root, reviewEveryMs.root, reviewAllowance.root),
+		read: () => ({ purpose: purpose.read(), scope: scope.read(), askFirst: askFirst.read(),
+			reviewEveryMs: reviewEveryMs.input.valueAsNumber, reviewAllowance: reviewAllowance.read() }),
+	};
+}
+
+function reviewAllowanceFields(original: ReviewAllowance | null): Field<ReviewAllowance | null> {
+	const optIn = attrs(el("input", ""), { type: "checkbox", id: "mission-plan-draft-review-opt-in" });
+	optIn.checked = original !== null;
+	const maxRequests = attrs(el("input", fields.input), { type: "number", min: "1", max: String(Number.MAX_SAFE_INTEGER), step: "1", required: "" });
+	const maxPerReview = attrs(el("input", fields.input), {
+		type: "number", min: "1", step: "1", required: "", "aria-describedby": "mission-plan-draft-review-per-review-hint",
+	});
+	const maxCost = attrs(el("input", fields.input), {
+		type: "number", step: "any", "aria-describedby": "mission-plan-draft-review-cost-hint",
+	});
+	if (original) {
+		maxRequests.value = String(original.maxRequests);
+		maxPerReview.value = String(original.maxRequestsPerReview);
+		maxCost.value = original.maxEstimatedCost === null ? "" : String(original.maxEstimatedCost);
+	}
+	const limits = fieldset("Model review allowance",
+		labelled("review-max-requests", "Lifetime review request limit", maxRequests),
+		labelled("review-max-per-review", "Requests per review limit", maxPerReview),
+		attrs(el("p", text.description, "Enter 1 to 4 requests, no more than the lifetime review request limit."), {
+			id: "mission-plan-draft-review-per-review-hint",
+		}),
+		labelled("review-max-cost", "Review estimated cost cap (USD)", maxCost),
+		attrs(el("p", text.description,
+			"Leave blank for no separate review cost cap; purpose limits still apply. If the creator set a purpose cost cap, you must enter a cap at or below it to propose the plan."), {
+			id: "mission-plan-draft-review-cost-hint",
+		}),
+	);
+	const sync = () => {
+		limits.hidden = limits.disabled = !optIn.checked;
+		maxPerReview.max = String(Math.min(4, maxRequests.valueAsNumber || 4));
+		maxCost.setCustomValidity(maxCost.value && !(maxCost.valueAsNumber > 0) ? "Enter a positive cost cap or leave it blank." : "");
+	};
+	const root = el("div", fieldLayout,
+		attrs(el("label", `flex items-center gap-2 ${fields.label}`, optIn, "Opt in to model reviews"), { for: optIn.id }),
+		el("p", text.description, "This sets the terms for model reviews. Saving or agreeing does not start one."),
+		limits,
+	);
+	root.addEventListener("input", sync);
+	root.addEventListener("change", sync);
+	sync();
+	return {
+		root,
+		read: () => optIn.checked ? {
+			maxRequests: maxRequests.valueAsNumber,
+			maxRequestsPerReview: maxPerReview.valueAsNumber,
+			maxEstimatedCost: maxCost.value === "" ? null : maxCost.valueAsNumber,
+		} : null,
+	};
 }
 
 function strategicFields(id: string, original?: Strategic): Field<Strategic> {

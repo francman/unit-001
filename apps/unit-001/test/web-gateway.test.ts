@@ -474,6 +474,9 @@ describe("web gateway", () => {
 			due: [],
 			preview: null,
 			reviews: [],
+			allowance: null,
+			turns: [],
+			blocker: null,
 		};
 		f.client.request = async () => ({
 			type: "mission",

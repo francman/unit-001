@@ -1,6 +1,7 @@
 // Applies protected lifecycle intent through the existing storage owner and drains mission-owned work.
 import type { Context } from "@earendil-works/chord/context";
-import type { Harness, Registry } from "@earendil-works/pi-durable";
+import type { Harness, Registry, TaskId, Tx } from "@earendil-works/pi-durable";
+import { MaintenanceDoc } from "../maintenance.ts";
 import type { ModelChoice } from "../provider.ts";
 import type { MissionAdmission } from "./admission.ts";
 import { type MissionLocation, matchingApproval, readMissionAuthority, writeMissionAuthority } from "./authority.ts";
@@ -12,7 +13,8 @@ import { missionExecutionView } from "./execution-view.ts";
 import { loopRollbackBlocker } from "./loop-drain.ts";
 import { PurposeOperation } from "./operation.ts";
 import { PlanFormation } from "./plan-formation.ts";
-import { type PlanState, readMissionPlan } from "./plan-state.ts";
+import { type PlanState, readMissionPlan, storedPlan } from "./plan-state.ts";
+import { readReviewState, storedReviewState, unresolvedTurn } from "./review-turn-state.ts";
 import { missionPlanView, proposalDraftView } from "./plan-view.ts";
 import { readMissionPurpose } from "./purpose.ts";
 import { PurposeFormation } from "./purpose-formation.ts";
@@ -72,6 +74,7 @@ export class MissionOwner {
 		await this.#plan.initialize(context);
 		// Restrictive operation intents apply before scheduling; open and acknowledgment wait for permission.
 		await this.#operation.initialize(context, scheduling);
+		await this.#armReview(context).catch(() => {});
 		const authority = await readMissionAuthority(this.#location).catch(() => null);
 		if (authority?.executionIntent) {
 			try {
@@ -110,7 +113,14 @@ export class MissionOwner {
 		if (!plan) return { plan: null, planError: null };
 		const loop = (await readMissionPurpose(this.#harness, context).catch(() => undefined))?.loop;
 		const authority = await readMissionAuthority(this.#location).catch(() => null);
-		return { plan: missionPlanView(plan, loop, authority, this.#now()), planError: null };
+		let reviews: Awaited<ReturnType<typeof readReviewState>>;
+		try {
+			reviews = await readReviewState(this.#harness, context);
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			return { plan: null, planError: reason.slice(0, 500) };
+		}
+		return { plan: missionPlanView(plan, loop, authority, reviews, this.#now()), planError: null };
 	}
 
 	// Status validates exactly what execution validates (`readMissionPurpose`, `validPurposeLoop`), and reports a
@@ -133,6 +143,61 @@ export class MissionOwner {
 		// task is terminal; rollback needs that completed, so it reports live until the drain record is gone.
 		const pending = loop.operation.drain !== null ? "live-loop" : loopRollback;
 		return { purpose: missionPurposeView(loop, live), purposeError: null, loopRollback: pending };
+	}
+
+	/**
+	 * Ends a review task parked between windows, for a maintenance hold: a release without review tasks then finds none
+	 * live. A task mid-turn is left to settle; it ends itself at its next check under the hold.
+	 */
+	async endParkedReview(context: Context): Promise<void> {
+		const reviews = await readReviewState(this.#harness, context).catch(() => undefined);
+		const task = reviews?.task;
+		if (!task || reviews.turns.some((turn) => turn.state.status === "running")) return;
+		const record = await this.#harness.getTask(task, context);
+		if (!record || record.state.status === "terminal") return;
+		await this.#harness.abortTask(task, context);
+		// Waiting runs the scheduler, which an inhibited owner must not do: it would wake unrelated persisted work.
+		if (this.#scheduling === "permitted") await this.#harness.waitForTask(task, context);
+	}
+
+	// Arms the one review task when the agreed plan grants a review allowance, scheduling is permitted and no review
+	// task is live; the task itself rechecks every condition before each turn and ends when they no longer hold.
+	async #armReview(context: Context): Promise<void> {
+		await this.#reconcileReviewTurns(context);
+		if (this.#scheduling !== "permitted" || this.#model === null || this.#location.session !== "default") return;
+		const model = this.#model;
+		const armed = await this.#harness.commit(async (tx) => {
+			if ((await tx.doc(MaintenanceDoc)).current.state === "held") return false;
+			const plan = await storedPlan(tx);
+			if (!plan?.agreed.at(-1)?.terms.overall.reviewAllowance) return false;
+			// Acquired only after the allowance check, so an install without reviews never stores a review document.
+			const reviews = await storedReviewState(tx);
+			if (!reviews || (await reviewTaskLive(tx, reviews.task))) return false;
+			const control = await tx.createConversation({ ownership: { kind: "ownerless" } });
+			reviews.task = await tx.createTask(
+				this.#engine.review,
+				{ model },
+				{ conversationId: control.id, ownership: { kind: "conversation" }, background: true },
+			);
+			return true;
+		}, context);
+		if (armed) this.#harness.resume();
+	}
+
+	// A turn still marked running whose task ended (crash, fault or abort without its handler) is finished here: an
+	// unknown request it holds becomes the visible blocker instead of hiding behind a running state. Read first without
+	// a transaction, so a Session that never had reviews is not given a review document.
+	async #reconcileReviewTurns(context: Context): Promise<void> {
+		const saved = await readReviewState(this.#harness, context).catch(() => undefined);
+		if (!saved?.turns.some((turn) => turn.state.status === "running")) return;
+		await this.#harness.commit(async (tx) => {
+			const reviews = await storedReviewState(tx);
+			if (!reviews || (await reviewTaskLive(tx, reviews.task))) return;
+			for (const turn of reviews.turns)
+				if (turn.state.status === "running")
+					turn.state = { status: "blocked", reason: unresolvedTurn(turn) ? "unknown_request_outcome" : "turn_failed" };
+			reviews.task = null;
+		}, context);
 	}
 
 	/** Routes formation normally and serializes exact protected lifecycle requests through the same owner. */
@@ -161,6 +226,9 @@ export class MissionOwner {
 				if (request.operation === "operate-local") await this.#operation.issueLocal(request, context);
 				await this.#operation.reconcile(request.requestId, context, this.#scheduling);
 			} else await this.#formation.handle(request, context);
+			// A newly recorded plan may grant a review allowance; arming is idempotent and a no-op without one.
+			if (request.operation === "plan-agree" || request.operation === "reconcile-plan")
+				await this.#armReview(context).catch(() => {});
 			return this.inspect(context);
 		});
 		this.#tail = work.catch(() => {});
@@ -327,4 +395,12 @@ export class MissionOwner {
 		await conversation.abort(context, { background: true });
 		await this.#harness.waitForTask(current.controller, context);
 	}
+}
+
+// A review task pointer counts as live only when the task exists and is not terminal: a dangling pointer to a task
+// that no longer exists must neither hide a running turn's unknown request nor block a new task.
+async function reviewTaskLive(tx: Tx, task: TaskId<null> | null): Promise<boolean> {
+	if (!task) return false;
+	const record = await tx.task(task);
+	return record !== undefined && record.state.status !== "terminal";
 }

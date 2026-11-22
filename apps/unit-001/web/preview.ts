@@ -167,7 +167,7 @@ const details: WorkspaceDetails = {
 
 const previewBinding = { missionId: "sample-purpose", purposeRevision: 2, purposeDigest: "a".repeat(64) };
 const planTerms: PlanTerms = {
-	overall: { purpose: "Keep Harbor secure without disrupting production.", scope: "Harbor only", askFirst: ["Merging"], reviewEveryMs: 7 * day },
+	overall: { purpose: "Keep Harbor secure without disrupting production.", scope: "Harbor only", askFirst: ["Merging"], reviewEveryMs: 7 * day, reviewAllowance: null },
 	strategics: [{ id: "supply-chain", title: "Reduce dependency risk", intent: "Keep known issues triaged.", signals: ["Advisories have owners"], priority: "high" }],
 	tacticals: [
 		{ id: "triage", strategic: "supply-chain", objective: "Triage Harbor advisories", successCriteria: ["Record affected versions"],
@@ -208,6 +208,7 @@ function previewPlan(variant: string): PlanView {
 		} : null,
 		gate: { state: "closed", reason: "reopen-needed" }, runs: { used: 4, limit: 32 },
 		due: [cadence], preview: previewReview(planHead, cadence, "sample-due-review"), reviews: [],
+		allowance: null, turns: [], blocker: null,
 	};
 }
 
@@ -310,6 +311,7 @@ const port: WorkspacePort = {
 		const plan: PlanView = mission.plan ?? {
 			missionId: "sample-charter", adopted: false, head: null, headValid: false, previous: null, history: [], draft: null,
 			gate: { state: "not-adopted", reason: null }, runs: { used: 0, limit: 32 }, due: [], preview: null, reviews: [],
+			allowance: null, turns: [], blocker: null,
 		};
 		const { draft, head } = plan;
 		const revision = draft?.revision ?? head?.revision ?? 0;

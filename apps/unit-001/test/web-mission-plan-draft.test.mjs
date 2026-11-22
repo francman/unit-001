@@ -27,7 +27,8 @@ function exercise(width) {
 	const mount = (root) => { document.body.replaceChildren(root); return root; };
 	const fit = (root) => check(innerWidth === width && root.scrollWidth <= width && document.documentElement.scrollWidth === width, `draft fits ${width}px`);
 	const terms = {
-		overall: { purpose: '<img src=x onerror="window.ran=true">\r\n\u202E a\u00A0b \\u000A', scope: "This workspace only", askFirst: ["publish\nexternally", ""], reviewEveryMs: 604800001 },
+		overall: { purpose: '<img src=x onerror="window.ran=true">\r\n\u202E a\u00A0b \\u000A', scope: "This workspace only", askFirst: ["publish\nexternally", ""], reviewEveryMs: 604800001,
+			reviewAllowance: { maxRequests: 7, maxRequestsPerReview: 3, maxEstimatedCost: 0.0125 } },
 		strategics: [{ id: "release-goal", title: "Release", intent: "Publish checked artifacts", signals: ["No missed releases \uD800 \\uD800"], priority: "high" }],
 		tacticals: [
 			{ id: "build", strategic: "release-goal", objective: "Package the build", successCriteria: ["bundle verifies"], priority: "low", deadlineAt: 1893456000123, mode: "runnable", binding: { missionId: "purpose-2", purposeRevision: 7, purposeDigest: "b".repeat(64) } },
@@ -121,14 +122,63 @@ function exercise(width) {
 		"editing a proposal does not offer an unchanged save or claim the draft is unsaved");
 	edit("scope", "Scope for the next revision");
 	action("save").click();
-	check(calls.pop()?.revision === 12 && calls.pop() === "dirty", "a changed proposal saves against its original revision");
+	const revised = calls.pop();
+	check(revised?.revision === 12 && revised.submitted.overall.reviewAllowance.maxEstimatedCost === 0.0125 && calls.pop() === "dirty",
+		"editing a proposed scope preserves its non-null review allowance and original revision");
+
+	const { reviewAllowance: _newField, ...legacyOverall } = terms.overall;
+	mount(createMissionPlanDraftEditor({ ...initial, terms: { ...terms, overall: legacyOverall }, draft: null }).root);
+	const optIn = field("review-opt-in");
+	const maxRequests = field("review-max-requests");
+	const maxPerReview = field("review-max-per-review");
+	const maxCost = field("review-max-cost");
+	check(!optIn.checked && maxRequests.matches(":disabled") && !maxRequests.getClientRects().length, "legacy terms do not opt in or reveal allowance inputs");
+	action("save").click();
+	check(calls.pop()?.submitted.overall.reviewAllowance === null, "saving without opt-in sends explicit null");
+	optIn.click();
+	check(calls.pop() === "dirty" && !maxRequests.matches(":disabled") && maxRequests.getClientRects().length &&
+		[maxRequests, maxPerReview, maxCost].every((input) => input.value === ""), "opt-in reveals blank allowance inputs and marks the draft dirty");
+	check(hint(maxPerReview).innerText.includes("1 to 4 requests") && hint(maxPerReview).innerText.includes("no more than the lifetime review request limit"),
+		"the per-review rule is accessible before submitting");
+	check(hint(maxCost).innerText.includes("purpose limits still apply") && hint(maxCost).innerText.includes("at or below it to propose"),
+		"the cost hint explains optional caps and the creator's proposal ceiling");
+	action("save").click();
+	check(!calls.length, "opt-in cannot silently supply default requests");
+	edit("review-max-requests", "5");
+	edit("review-max-per-review", "5");
+	action("save").click();
+	check(!calls.length, "requests per review cannot exceed four");
+	edit("review-max-per-review", "4");
+	edit("review-max-requests", "2");
+	action("save").click();
+	check(!calls.length, "requests per review cannot exceed the lifetime request allowance");
+	edit("review-max-per-review", "2");
+	edit("review-max-requests", "2.5");
+	action("save").click();
+	check(!calls.length, "lifetime request allowance must be an integer");
+	edit("review-max-requests", "2");
+	for (const value of ["0", "-0.01"]) {
+		edit("review-max-cost", value);
+		action("save").click();
+		check(!calls.length, "the cost cap must be positive when supplied");
+	}
+	edit("review-max-cost", "0.000125");
+	action("save").click();
+	check(calls.pop()?.submitted.overall.reviewAllowance.maxEstimatedCost === 0.000125, "fractional USD is transmitted without rounding");
+	edit("review-max-cost", "");
+	action("save").click();
+	check(JSON.stringify(calls.pop()?.submitted.overall.reviewAllowance) === JSON.stringify({ maxRequests: 2, maxRequestsPerReview: 2, maxEstimatedCost: null }),
+		"a blank cap means no separate cap within an opted-in allowance");
+	optIn.click();
+	action("save").click();
+	check(calls.pop()?.submitted.overall.reviewAllowance === null, "opting out sends null, not stale allowance fields");
 
 	const digest = "a".repeat(64);
 	const baseDigest = "c".repeat(64);
 	const proposed = {
 		missionId: "charter-001", draft: { revision: 12, baseRevision: 10, digest, terms, fromReview: "review-42", status: "proposed", missing: [], savedBy: "bob" },
 		head: { revision: 10, digest: baseDigest, receiptId: "receipt-10",
-			terms: { ...terms, overall: { ...terms.overall, scope: "Prior exact scope\n" } } },
+			terms: { ...terms, overall: { ...legacyOverall, scope: "Prior exact scope\n" } } },
 		currentEffect: "suspended", gate: { state: "closed", reason: "reopen-needed" }, authority: "developer-local",
 		creator: { kind: "human", id: "creator-42" }, session: "default", authorityRevision: 11,
 		approval: { kind: "web", revision: 12, digest, onAgree: (exact) => calls.push(exact) },
@@ -139,6 +189,13 @@ function exercise(width) {
 	diff.open = true;
 	check(diff.innerText.includes('Prior exact scope\\u000A') && diff.innerText.includes("This workspace only") &&
 		diff.innerText.includes("Affected tactics") && diff.innerText.includes('"build"'), "the agreement card shows the exact base diff and descendants");
+	const diffValues = (label) => [...diff.querySelectorAll("h4")].find((node) => node.textContent === label)?.nextElementSibling;
+	for (const [label, values] of Object.entries({
+		"Model review opt-in": ["Disabled", "Enabled"], "Lifetime review request limit": ["Not applicable: model reviews disabled", "7"],
+		"Requests per review limit": ["Not applicable: model reviews disabled", "3"],
+		"Review estimated cost cap (USD)": ["Not applicable: model reviews disabled", "0.0125"],
+	})) check(JSON.stringify([...diffValues(label).querySelectorAll("dd")].map((dd) => dd.textContent)) === JSON.stringify(values),
+		`the exact diff distinguishes old and new ${label}`);
 	fit(card);
 	check(!calls.length && !card.querySelector("img") && !window.ran, "projected proposal is literal, and rendering grants nothing");
 	const facts = (label) => [...card.querySelectorAll("dt")].filter((dt) => dt.textContent === label).map((dt) => dt.nextElementSibling.textContent);
@@ -148,6 +205,8 @@ function exercise(width) {
 		"Saved by": ['"Bob"'], "Drafted from review": ['"review-42"'], "Current privileged effect": ['"suspended"'], "Current plan admission": ['"closed"'],
 		"Admission reason": ['"reopen-needed"'], "Authority revision": ["11"], "Creator ID": ['"creator-42"'], Session: ['"default"'],
 		Scope: ['"This workspace only"'], "Ask first": ['"publish\\u000Aexternally"""'], "Review interval (milliseconds)": ["604800001"],
+		"Model review opt-in": ["Enabled"], "Lifetime review request limit": ["7"],
+		"Requests per review limit": ["3"], "Review estimated cost cap (USD)": ["0.0125"],
 		"Strategy ID": ['"release-goal"'], Title: ['"Release"'], Intent: ['"Publish checked artifacts"'],
 		"Success signals (reviewed, not host-verified)": ['"No missed releases \\uD800 \\\\uD800"'], Priority: ['"high"', '"low"', '"normal"'],
 		"Tactic ID": ['"build"', '"audit"'], "Parent strategy ID": ['"release-goal"', '"release-goal"'],
@@ -159,6 +218,18 @@ function exercise(width) {
 	check([...card.querySelectorAll("button")].every((button) => !/open|start/i.test(button.textContent)), "the card contains no Open or Start action");
 	agree().click();
 	check(JSON.stringify(calls.pop()) === JSON.stringify({ revision: 12, digest }), "the single explicit Agree callback targets the exact rendered proposal");
+
+	const noCap = { ...terms, overall: { ...terms.overall, reviewAllowance: { ...terms.overall.reviewAllowance, maxEstimatedCost: null } } };
+	const noCapCard = mount(renderMissionPlanDraftCard({ ...proposed, draft: { ...proposed.draft, terms: noCap },
+		head: { ...proposed.head, terms }, approval: { kind: "unavailable" } }));
+	const noCapDiff = noCapCard.querySelector("details");
+	noCapDiff.open = true;
+	const capValues = [...noCapCard.querySelectorAll("dt")].filter((dt) => dt.textContent === "Review estimated cost cap (USD)")
+		.map((dt) => dt.nextElementSibling.innerText);
+	check(JSON.stringify(capValues) === JSON.stringify(["No separate review cap (purpose limits apply)"]) &&
+		noCapDiff.innerText.includes("0.0125") && noCapDiff.innerText.includes("No separate review cap (purpose limits apply)"),
+		"the proposal and exact diff distinguish an enabled allowance with no separate cap from a numeric cap");
+	fit(noCapCard);
 
 	mount(renderMissionPlanDraftCard({ ...proposed, authority: "managed-administrator" }));
 	check(!agree(), "managed authority never shows browser Agree, even if presented a web callback");

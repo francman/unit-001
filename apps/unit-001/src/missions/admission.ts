@@ -26,9 +26,19 @@ import { type MissionLocation, matchingApproval, readMissionAuthority } from "./
 import type { MissionAuthority } from "./contract.ts";
 import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts";
 import { operationDenial } from "./loop.ts";
+import { planHeadValid } from "./plan-gate.ts";
 import { storedPlan } from "./plan-state.ts";
 import { MissionPurposeDoc, storedLoop } from "./purpose.ts";
 import { type LoopState, listedWork, loopAgreement } from "./purpose-loop.ts";
+import {
+	purposeUnsettled,
+	REVIEW_PROVIDER_PREFIX,
+	releaseReviewAttempt,
+	reserveReviewAttempt,
+	reviewRequestDenial,
+	settleReviewAttempt,
+	storedReviewState,
+} from "./review-turn-state.ts";
 import { WORK_TOOL } from "./work-tool.ts";
 
 export const MISSION_PROVIDER_PREFIX = "unit-mission:";
@@ -36,10 +46,14 @@ export const MISSION_PROVIDER_PREFIX = "unit-mission:";
 // A deferred handle would be polled later without the mission session, outside admission: never ask for one.
 type DispatchOptions = { signal: AbortSignal; maxRetries: 0; deferred: undefined };
 
-// One admitted attempt: one-shot work settles against its controller's ledger, a purpose run against its attempt ID.
+// One admitted attempt: one-shot work settles against its controller's ledger, a purpose run or review against its attempt ID.
 type Reservation =
 	| { kind: "legacy"; controller: TaskId<null>; amount: number; deadlineAt: number }
-	| { kind: "loop"; attemptId: string; amount: number; deadlineAt: number };
+	| { kind: "loop"; attemptId: string; amount: number; deadlineAt: number }
+	| { kind: "review"; attemptId: string; amount: number; deadlineAt: number };
+
+// A review request is one bounded model turn; it never waits on a purpose deadline.
+const REVIEW_REQUEST_MS = 10 * 60_000;
 
 /** Binds provider admission to the sole owner; ordinary requests keep their existing model service. */
 export class MissionAdmission {
@@ -429,6 +443,32 @@ export class MissionAdmission {
 		};
 	}
 
+	/**
+	 * Reserves one review-turn request in the caller's commit: the running turn owning this provider session, under the
+	 * current agreed head with a valid protected receipt, no hold, no effect of unknown outcome, and the plan's review
+	 * allowance (per review, lifetime, spend) charged with this attempt's own record.
+	 */
+	async #reserveReview(tx: Tx, sessionId: string, model: Model<Api>): Promise<Reservation> {
+		const reviews = await storedReviewState(tx);
+		const plan = await storedPlan(tx);
+		if (!reviews || !plan) throw new Error("Mission review records are invalid.");
+		const turn = reviews.turns.find((item) => item.providerSession === sessionId);
+		if (!turn || turn.state.status !== "running") throw new Error("Review admission is closed.");
+		if ((await tx.doc(MaintenanceDoc)).current.state === "held") throw new Error("Maintenance holds mission requests.");
+		const authority = await this.readAuthority();
+		const head = plan.agreed.at(-1);
+		const allowance = head?.terms.overall.reviewAllowance;
+		if (!authority || !head || !allowance || turn.planRevision !== head.revision || !planHeadValid(authority, plan))
+			throw new Error("Review authority is closed.");
+		const loop = await storedLoop(tx);
+		if (!loop || purposeUnsettled(loop)) throw new Error("Effects of unknown outcome block reviews.");
+		const ceiling = requestCostCeiling(model);
+		const denial = reviewRequestDenial(reviews, turn, allowance, ceiling);
+		if (denial) throw new Error(denial);
+		const attempt = reserveReviewAttempt(reviews, turn, ceiling);
+		return { kind: "review", attemptId: attempt.attemptId, amount: ceiling ?? 0, deadlineAt: this.#now() + REVIEW_REQUEST_MS };
+	}
+
 	private async forward(
 		models: Models,
 		model: Model<Api>,
@@ -444,6 +484,7 @@ export class MissionAdmission {
 			const harness = this.#harness;
 			if (!harness) throw new Error("Mission owner has not opened.");
 			reservation = await harness.commit(async (tx): Promise<Reservation | null> => {
+				if (options.sessionId?.startsWith(REVIEW_PROVIDER_PREFIX)) return this.#reserveReview(tx, options.sessionId, model);
 				const current = (await tx.doc(MissionExecutionDoc)).current;
 				if (current?.providerSession !== options.sessionId) return this.#reserveLoop(tx, options.sessionId, model);
 				if (
@@ -531,6 +572,13 @@ export class MissionAdmission {
 					if (loop) settleAttempt(loop, reserved.attemptId, unpriced ? null : cost);
 					return;
 				}
+				if (reserved.kind === "review") {
+					// The same rule for a review: without a terminal receipt the request stays unknown and blocks reviews.
+					if (terminal === undefined) return;
+					const reviews = await storedReviewState(tx);
+					if (reviews) settleReviewAttempt(reviews, reserved.attemptId, unpriced ? null : cost);
+					return;
+				}
 				// A terminal provider error is a receipt here; a partial response is none, so the request stays unknown.
 				if (received.stopReason === "pending") return;
 				const current = (await tx.doc(MissionExecutionDoc)).current;
@@ -559,6 +607,11 @@ export class MissionAdmission {
 						if (reserved.kind === "loop") {
 							const loop = await storedLoop(tx);
 							if (loop) releaseAttempt(loop, reserved.attemptId);
+							return;
+						}
+						if (reserved.kind === "review") {
+							const reviews = await storedReviewState(tx);
+							if (reviews) releaseReviewAttempt(reviews, reserved.attemptId);
 							return;
 						}
 						const current = (await tx.doc(MissionExecutionDoc)).current;

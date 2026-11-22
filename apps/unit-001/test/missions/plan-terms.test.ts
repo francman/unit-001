@@ -38,7 +38,7 @@ describe("missing plan terms", () => {
 	it("lists what a draft still needs and nothing for a complete one", () => {
 		expect(missingPlanTerms(planTerms())).toEqual([]);
 		const terms: PlanTerms = planTerms({
-			overall: { purpose: " ", scope: "", askFirst: [], reviewEveryMs: 0 },
+			overall: { purpose: " ", scope: "", askFirst: [], reviewEveryMs: 0, reviewAllowance: null },
 			tacticals: [planned({ objective: "" })],
 		});
 		expect(missingPlanTerms(terms)).toEqual(["purpose", "scope", "review cadence", "tactical readme"]);

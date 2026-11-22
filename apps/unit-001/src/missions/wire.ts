@@ -228,6 +228,7 @@ function parsePurposeRequest(input: Record<string, unknown>): MissionRequest | u
 				// The owner wire never speaks for the agent: only its own draft tool records "bob".
 				savedBy: "owner",
 				fromReview: input.fromReview === undefined || input.fromReview === null ? null : missionText(input.fromReview),
+				reviewConversation: null,
 			};
 		case "plan-propose":
 			only("expectedRevision", "requestId");

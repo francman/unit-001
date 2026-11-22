@@ -675,7 +675,10 @@ describe("browser operator details", () => {
 });
 
 const charter: PlanTerms = {
-	overall: { purpose: "Ship café", scope: "Repository", askFirst: ["deploy"], reviewEveryMs: 500 },
+	overall: {
+		purpose: "Ship café", scope: "Repository", askFirst: ["deploy"], reviewEveryMs: 500,
+		reviewAllowance: { maxRequests: 8, maxRequestsPerReview: 3, maxEstimatedCost: 1.25 },
+	},
 	strategics: [],
 	tacticals: [],
 };
@@ -694,6 +697,9 @@ const proposedCharter: PlanView = {
 	draft: { ...charterDraft, status: "proposed", digest: exactDigest },
 	gate: { state: "not-adopted", reason: null },
 	runs: { used: 0, limit: 32 },
+	allowance: null,
+	turns: [],
+	blocker: null,
 	due: [],
 	preview: null,
 	reviews: [],

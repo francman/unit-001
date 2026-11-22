@@ -4,8 +4,9 @@ import { planGate, planHeadValid, planIssued } from "./plan-gate.ts";
 import { dueTriggers, reviewNote } from "./plan-review.ts";
 import { type PlanAgreement, type PlanProposal, type PlanState, planAdopted } from "./plan-state.ts";
 import { missingPlanTerms, planTermsDenial } from "./plan-terms.ts";
-import type { PlanRevisionView, PlanView } from "./plan-wire.ts";
+import type { PlanRevisionView, PlanView, ReviewAllowanceView, ReviewTurnView } from "./plan-wire.ts";
 import { MAX_PURPOSE_WORKS } from "./purpose-authority.ts";
+import { type ReviewState, type ReviewTurn, unresolvedTurn } from "./review-turn-state.ts";
 import type { LoopState } from "./purpose-loop.ts";
 
 /** Builds the plan view from validated records and protected authority; reading it stores nothing. */
@@ -13,6 +14,7 @@ export function missionPlanView(
 	plan: PlanState,
 	loop: LoopState | undefined,
 	authority: MissionAuthority | null,
+	reviews: ReviewState | undefined,
 	now: number,
 ): PlanView {
 	const head = plan.agreed.at(-1);
@@ -32,6 +34,9 @@ export function missionPlanView(
 						: "receipt";
 	const due = dueTriggers(plan, loop, now);
 	const draft = plan.draft;
+	// A finished turn that still holds a request of unknown outcome blocks later reviews; it is shown on its own, so it
+	// stays visible after newer turns push it out of the list. A running turn's in-flight request is not a blocker.
+	const blocker = reviews?.turns.find((turn) => turn.state.status !== "running" && unresolvedTurn(turn));
 	return {
 		missionId: plan.missionId,
 		adopted: planAdopted(plan),
@@ -59,6 +64,9 @@ export function missionPlanView(
 		due,
 		preview: head && due[0] ? reviewNote(plan, head, loop, due[0], now) : null,
 		reviews: [...plan.reviews].reverse(),
+		allowance: allowanceView(head, reviews),
+		turns: [...(reviews?.turns ?? [])].reverse().map(turnView),
+		blocker: blocker ? turnView(blocker) : null,
 	};
 }
 
@@ -82,6 +90,33 @@ export function proposalDraftView(proposal: PlanProposal): NonNullable<PlanView[
 		savedBy: "owner",
 		fromReview: null,
 		missing: missingPlanTerms(proposal.terms),
+	};
+}
+
+function allowanceView(head: PlanAgreement | undefined, reviews: ReviewState | undefined): ReviewAllowanceView | null {
+	const allowance = head?.terms.overall.reviewAllowance;
+	if (!allowance) return null;
+	const ledger = reviews?.ledger;
+	return {
+		...allowance,
+		requests: ledger?.requests ?? 0,
+		estimatedCost: ledger?.estimatedCost ?? 0,
+		reservedCost: ledger?.reservedCost ?? 0,
+	};
+}
+
+function turnView(turn: ReviewTurn): ReviewTurnView {
+	const state = turn.state;
+	return {
+		key: turn.key,
+		planRevision: turn.planRevision,
+		trigger: turn.trigger,
+		state: state.status,
+		reason: state.status === "skipped" || state.status === "blocked" ? state.reason : null,
+		reviewId: turn.reviewId,
+		draftRevision: state.status === "done" ? state.draftRevision : null,
+		requests: turn.attempts.length,
+		at: turn.at,
 	};
 }
 

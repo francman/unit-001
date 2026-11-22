@@ -604,14 +604,71 @@ test("#72 a closed owner cannot drop the mission loop, and refuses before any ho
 	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.3");
 });
 
-test("#72 the shipped release declares both continuous operation and protected plan admission", () => {
+test("#72 the shipped release declares continuous operation, protected plan admission and review turns", () => {
 	const declared = JSON.parse(
 		readFileSync(fileURLToPath(new URL("../deploy/release-compatibility.json", import.meta.url)), "utf8"),
 	);
-	assert.deepEqual(declared.features, ["mission-loop", "mission-plan-gate"]);
+	assert.deepEqual(declared.features, ["mission-loop", "mission-plan-gate", "mission-review-turn"]);
 });
 
 const planCompatibility = { ...compatibility, features: ["mission-loop", "mission-plan-gate"] };
+const reviewCompatibility = { ...compatibility, features: [...planCompatibility.features, "mission-review-turn"] };
+
+async function reviewFixture() {
+	const fixture = setup("healthy", { baseline: "0.0.17", candidate: "0.0.18" });
+	release(fixture.root, "0.0.17", planCompatibility);
+	release(fixture.root, "0.0.18", reviewCompatibility);
+	const candidate = { ...fixture.candidate, compatibility: reviewCompatibility };
+	assert.equal((await activateUpdate(fixture.record, candidate, fixture.context)).status, "updated");
+	fixture.calls.length = 0;
+	const view = {
+		authority: "unconfigured",
+		authorityError: null,
+		purpose: null,
+		purposeError: null,
+		planError: null,
+		plan: { blocker: null, turns: [] },
+		loopRollback: "no-live-loop",
+	};
+	return { ...fixture, record: readInstallation(id, fixture.root), view };
+}
+
+test("#72 review downgrade refuses running or unknown attempts before changing the journal", async () => {
+	const { calls, context, record, root, view } = await reviewFixture();
+	const paths = updatePaths(id, root);
+	const committed = readFileSync(paths.journal);
+	for (const answer of [
+		{ ...view, plan: { blocker: { state: "blocked" }, turns: [] } },
+		{ ...view, plan: { blocker: null, turns: [{ state: "running" }] } },
+		{ ...view, plan: {} },
+		{ ...view, planError: "Untrusted review document" },
+		{ ...view, purpose: { operation: "open" } },
+		{ ...view, loopRollback: undefined },
+	]) {
+		context.missionStatus = () => answer;
+		assert.equal((await rollbackUpdate(record, context)).status, "deferred");
+	}
+	assert.deepEqual(readFileSync(paths.journal), committed);
+	assert.ok(!calls.some((call) => call[1] === "maintenance-enter" || call[1] === "stop"));
+});
+
+test("#72 review downgrade allows a plan-only owner after the held owner drains its parked task", async () => {
+	const { calls, context, record, root, view } = await reviewFixture();
+	const paths = updatePaths(id, root);
+	const committed = readFileSync(paths.journal);
+	context.missionStatus = () => ({ ...view, loopRollback: "live-loop" });
+	assert.equal((await rollbackUpdate(record, context)).status, "deferred");
+	assert.equal(calls.filter((call) => call[1] === "maintenance-enter").length, 1);
+	assert.equal(calls.filter((call) => call[1] === "maintenance-release").length, 1);
+	assert.deepEqual(readFileSync(paths.journal), committed);
+	assert.equal(readInstallation(id, root).releaseVersion, "0.0.18");
+
+	calls.length = 0;
+	context.missionStatus = () =>
+		calls.some((call) => call[1] === "maintenance-enter") ? view : { ...view, loopRollback: "live-loop" };
+	assert.equal((await rollbackUpdate(record, context)).status, "updated");
+	assert.equal(readInstallation(id, root).releaseVersion, "0.0.17");
+});
 
 async function planFixture() {
 	const fixture = setup("healthy", { baseline: "0.0.16", candidate: "0.0.17" });

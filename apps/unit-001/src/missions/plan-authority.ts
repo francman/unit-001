@@ -83,14 +83,25 @@ export function planReceiptsRecorded(authority: MissionAuthority): boolean {
 	});
 }
 
-// Fixed key order, so the digest depends on the terms and never on how a client ordered its JSON.
-function canonicalPlan(terms: PlanTerms): PlanTerms {
+// Fixed key order, so the digest depends on the terms and never on how a client ordered its JSON. A null or absent
+// review allowance is left out, so every plan agreed before allowances existed keeps its digest.
+function canonicalPlan(terms: PlanTerms) {
+	const allowance = terms.overall.reviewAllowance;
 	return {
 		overall: {
 			purpose: terms.overall.purpose,
 			scope: terms.overall.scope,
 			askFirst: terms.overall.askFirst,
 			reviewEveryMs: terms.overall.reviewEveryMs,
+			...(allowance == null
+				? {}
+				: {
+						reviewAllowance: {
+							maxRequests: allowance.maxRequests,
+							maxRequestsPerReview: allowance.maxRequestsPerReview,
+							maxEstimatedCost: allowance.maxEstimatedCost,
+						},
+					}),
 		},
 		strategics: terms.strategics.map((item) => ({
 			id: item.id,

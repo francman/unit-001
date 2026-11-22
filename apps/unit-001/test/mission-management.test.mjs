@@ -13,7 +13,7 @@ import { installationPaths, writeInstallation } from "../deploy/installation.mjs
 import { parseMissionAuthority, parseMissionCeiling } from "../src/missions/authority.ts";
 import { MANAGED_MISSION_ACTIONS, missionObject, parseMissionCreator } from "../src/missions/contract.ts";
 import { matchingPlanApproval, planDigest, planReceiptsRecorded } from "../src/missions/plan-authority.ts";
-import { missingPlanTerms } from "../src/missions/plan-terms.ts";
+import { missingPlanTerms, reviewAllowanceDenial } from "../src/missions/plan-terms.ts";
 import { MISSION, planTerms, PURPOSE_DIGEST } from "./missions/fixtures/plan.ts";
 
 const temporary = [];
@@ -270,9 +270,8 @@ function managedPlan() {
 		source.indexOf("async function owner(request)"),
 	);
 	assert.ok(body.includes("await withManagementLock(") && body.includes("async function approvePlan("));
-	state.propose = (revision) => {
+	state.propose = (revision, terms = planTerms()) => {
 		const plan = state.view.plan;
-		const terms = planTerms();
 		const digest = planDigest(terms, MISSION, revision, plan.head?.digest ?? null, state.auth);
 		plan.draft = { status: "proposed", revision, digest, baseRevision: plan.head?.revision ?? 0, terms, missing: [] };
 		return ["plan", "approve", "--revision", String(revision), "--digest", digest, "--request-id", `id-${revision}`];
@@ -312,6 +311,7 @@ function managedPlan() {
 			matchingPlanApproval,
 			planReceiptsRecorded,
 			missingPlanTerms,
+			reviewAllowanceDenial,
 			readMissionAuthority: () => {
 				assert.equal(state.locked, true);
 				return parseMissionAuthority(state.auth);
@@ -404,6 +404,14 @@ test("managed plan CAS publishes one receipt and keeps exact retries after evict
 	await assert.rejects(state.run(first.map((value) => (value === first[5] ? "0".repeat(64) : value))), /Conflicting/);
 	await assert.rejects(state.run(state.propose(33)), /limit/);
 	assert.equal(state.writes, 32);
+});
+
+test("#72 managed plan approval independently bounds the prepared review allowance", async () => {
+	const state = managedPlan();
+	const terms = planTerms();
+	terms.overall.reviewAllowance = { maxRequests: 2, maxRequestsPerReview: 1, maxEstimatedCost: null };
+	await assert.rejects(state.run(state.propose(1, terms)), /Model reviews need the creator's purpose ceiling/);
+	assert.equal(state.writes, 0);
 });
 
 test("managed approval checks the creator, OS service UID, hold, frozen terms and protected predecessor", async () => {

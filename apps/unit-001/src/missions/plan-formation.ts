@@ -2,12 +2,12 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { Context } from "@earendil-works/chord/context";
-import type { Harness, Tx } from "@earendil-works/pi-durable";
+import { type Harness, ProviderDoc, type Tx } from "@earendil-works/pi-durable";
 import { MaintenanceDoc } from "../maintenance.ts";
 import { type MissionLocation, readMissionAuthority, writeMissionAuthority } from "./authority.ts";
 import type { MissionApproval, MissionAuthority, MissionRequest, PlanRequestBinding } from "./contract.ts";
 import { matchingPlanApproval, planDigest, planReceiptsRecorded } from "./plan-authority.ts";
-import { planHistoryBound } from "./plan-gate.ts";
+import { planHeadValid, planHistoryBound } from "./plan-gate.ts";
 import { dismissReview, storeReview } from "./plan-review.ts";
 import {
 	MAX_PLAN_REVISIONS,
@@ -17,10 +17,11 @@ import {
 	readMissionPlan,
 	storedPlan,
 } from "./plan-state.ts";
-import { missingPlanTerms, parsePlanTerms, planTermsDenial } from "./plan-terms.ts";
+import { missingPlanTerms, parsePlanTerms, planTermsDenial, reviewAllowanceDenial } from "./plan-terms.ts";
 import type { LoopState } from "./purpose-loop.ts";
 import { readMissionPurpose, storedLoop } from "./purpose.ts";
 import { MissionRefusal } from "./refusal.ts";
+import { purposeUnsettled, REVIEW_PROVIDER_PREFIX, storedReviewState, unresolvedTurn } from "./review-turn-state.ts";
 import { MissionDoc } from "./state.ts";
 
 /**
@@ -72,6 +73,9 @@ export class PlanFormation {
 	async draft(request: Draft, context: Context): Promise<void> {
 		await this.#harness.commit(async (tx) => {
 			const plan = await writablePlan(tx);
+			if (request.reviewConversation !== null)
+				// Read inside this commit: a revocation published while it was queued still closes the draft.
+				await refuseOutsideReviewTurn(tx, plan, () => readMissionAuthority(this.#location).catch(() => null), request);
 			if (plan.draft?.requestId === request.requestId) {
 				if (!isDeepStrictEqual(plan.draft.terms, request.terms))
 					throw new MissionRefusal("conflicting-request", "That request ID already saved other plan terms.");
@@ -124,7 +128,7 @@ export class PlanFormation {
 				throw new MissionRefusal("incomplete", `The plan draft still needs: ${missing.join(", ")}.`);
 			if (plan.agreed.length >= MAX_PLAN_REVISIONS)
 				throw new MissionRefusal("plan-limit", "The mission plan has reached its limit of agreed revisions.");
-			const denial = planTermsDenial(draft.terms, await storedLoop(tx));
+			const denial = planTermsDenial(draft.terms, await storedLoop(tx)) ?? reviewAllowanceDenial(draft.terms, authority);
 			if (denial) throw new MissionRefusal("outside-authority", denial);
 			const digest = planDigest(draft.terms, plan.missionId!, draft.revision, headDigest(plan), authority);
 			draft.status = "proposed";
@@ -340,6 +344,55 @@ function proposalFor(plan: PlanState, revision: number, digest: string): PlanPro
 	return plan.proposals.find((proposal) => proposal.revision === revision && proposal.digest === digest);
 }
 
+// A draft saved from a review conversation is that turn's effect. The conversation is recognised by its stored provider
+// session, not by the turn list, so a turn record that is missing or evicted fails closed instead of passing as an
+// ordinary draft. The draft lands only while the turn runs under the current agreed head with a valid protected
+// receipt, nothing of unknown outcome is open, the per-review, lifetime and spend allowances are not exceeded (spending
+// exactly the cap is allowed: the last charged request may still draft), and only as an answer to that turn's note.
+async function refuseOutsideReviewTurn(
+	tx: Tx,
+	plan: PlanState,
+	readAuthority: () => Promise<MissionAuthority | null>,
+	request: Draft,
+): Promise<void> {
+	const conversation = request.reviewConversation!;
+	// The hold is already read in this same commit by `writablePlan`, which every plan write calls first.
+	const refuse = () => new MissionRefusal("stale-revision", "This review turn can no longer save a draft.");
+	// An unreadable provider record cannot show the conversation is not a review turn, so it fails closed.
+	const provider = await tx.doc(ProviderDoc, conversation).catch(() => null);
+	if (!provider) throw refuse();
+	const session = provider.sessionId;
+	if (!session?.startsWith(REVIEW_PROVIDER_PREFIX)) return;
+	const reviews = await storedReviewState(tx);
+	const turn = reviews?.turns.find((item) => item.conversation === conversation && item.providerSession === session);
+	const head = plan.agreed.at(-1);
+	const allowance = head?.terms.overall.reviewAllowance;
+	const loop = await storedLoop(tx);
+	const authority = await readAuthority();
+	if (
+		!reviews ||
+		!turn ||
+		turn.state.status !== "running" ||
+		!head ||
+		!allowance ||
+		turn.planRevision !== head.revision ||
+		!authority ||
+		!planHeadValid(authority, plan) ||
+		!loop ||
+		purposeUnsettled(loop) ||
+		reviews.turns.some(unresolvedTurn) ||
+		request.fromReview !== turn.reviewId
+	)
+		throw refuse();
+	const ledger = reviews.ledger;
+	if (
+		turn.attempts.length > allowance.maxRequestsPerReview ||
+		ledger.requests > allowance.maxRequests ||
+		(allowance.maxEstimatedCost !== null && ledger.estimatedCost + ledger.reservedCost > allowance.maxEstimatedCost)
+	)
+		throw refuse();
+}
+
 // The snapshot a receipt may agree now: retained, proposed on the current head, still bound to current authority,
 // valid against the stored loop, and operation not open. Each refusal names why before anything is written.
 function eligibleProposal(
@@ -358,7 +411,7 @@ function eligibleProposal(
 		throw new MissionRefusal("stale-digest", "The plan head or creator authority changed; inspect the plan again.");
 	if (loop?.operation.state.status === "open")
 		throw new MissionRefusal("execution-active", "Suspend or close operation before agreeing a plan revision.");
-	const denial = planTermsDenial(proposal.terms, loop);
+	const denial = planTermsDenial(proposal.terms, loop) ?? reviewAllowanceDenial(proposal.terms, authority);
 	if (denial) throw new MissionRefusal("outside-authority", denial);
 	return proposal;
 }

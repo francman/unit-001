@@ -63,6 +63,7 @@ function exercise(width) {
 		due: [trigger], preview: { ...note, reviewId: "computed", outcome: "attention" },
 		reviews: [note, { ...note, reviewId: "same-window" }, { ...note, reviewId: "stale", planRevision: 2, planDigest: previousDigest },
 			{ ...note, reviewId: "dismissed", disposition: { kind: "dismissed", at: ts, draftRevision: null } }],
+		allowance: null, turns: [], blocker: null,
 	};
 	const legacy = { purpose: "Legacy owner objective", scope: "Legacy scope" };
 	const terminalLine = `sudo release-bob mission plan approve --revision 5 --digest ${proposalDigest}`;
@@ -93,6 +94,7 @@ function exercise(width) {
 	check(disclose(section(root, "Plan draft"), "Diff from base revision 4").textContent.includes("No plan terms changed."), "an unchanged proposal is distinguished from an empty history or review");
 	const reviews = section(root, "Reviews");
 	check(reviews.textContent.includes("Review due") && reviews.textContent.includes("Unsaved review preview · Needs attention") && reviews.textContent.includes("Saved review · No change"), "due, unsaved and saved no-change are distinct");
+	check(!reviews.textContent.includes("Model review usage and history"), "an empty projection, including parsed legacy status, stays inert");
 	const evidence = disclose(reviews, "Read preview evidence");
 	check(fact(evidence, "Unsettled effects").textContent === "2" && fact(evidence, "Cited runs").textContent === '"run-31"' && fact(evidence, "Verified works").textContent === '"1 of 3"', "review evidence explains what was and was not verified");
 	check(fact(evidence, "Deadline distance").textContent === '"under 1 min left at review time"', "historical deadline distance is relative to review time");
@@ -120,6 +122,61 @@ function exercise(width) {
 	check(JSON.stringify(called) === JSON.stringify(["review", "dismiss:saved", "draft:saved", terminalLine, openLine]), "explicit controls delegate to supplied callbacks with the exact target");
 	root = mount({ plan: { ...plan, gate: { state: "open", reason: null }, due: [], preview: null, draft: null } });
 	check(!actionable(root) && section(root, "Strategies and tactics").textContent.includes("Runnable"), "ready plan does not invent an owner task");
+	const running = { key: "running", planRevision: 4, trigger, state: "running", reason: null, reviewId: "running-note", draftRevision: null, requests: 1, at: ts + 400 };
+	const done = { ...running, key: "done", state: "done", reviewId: "done-note", draftRevision: 8, requests: 2, at: ts + 300 };
+	const skipped = { ...running, key: "skipped", state: "skipped", reason: "hold", reviewId: null, requests: 0, at: ts + 200 };
+	const blocked = { ...running, key: "blocked", state: "blocked", reason: "authority", reviewId: null, at: ts + 100 };
+	const blocker = { ...blocked, key: "old-uncertain", planRevision: 2, reason: "unknown_request_outcome", at: ts - 100 };
+	const modelPlan = { ...plan, gate: { state: "open", reason: null }, due: [], preview: null, draft: null,
+		allowance: { maxRequests: 6, maxRequestsPerReview: 3, maxEstimatedCost: null, requests: 5, estimatedCost: 0.0125, reservedCost: 0.00125 },
+		turns: [running, done, skipped, blocked], blocker };
+	root = mount({ plan: modelPlan });
+	const model = section(root, "Reviews");
+	const pinned = section(root, "Needs you");
+	check(pinned.innerText.includes("Unresolved model review blocker") && pinned.innerText.includes("Plan revision 2") &&
+		pinned.innerText.includes("outcome is unknown") && !pinned.innerText.includes("unknown_request_outcome"),
+		"a projected blocker outside history explains the issue in plain language even with no due triggers and an open gate");
+	check(fact(disclose(pinned, "Read model review turn details"), "Reason code").textContent === '"unknown_request_outcome"', "the pinned blocker retains the exact reason code in details");
+	check(model.textContent.includes("pinned under Needs you") && !actions().length, "reading projected history offers no new operation");
+	for (const [label, value] of Object.entries({
+		"Lifetime review requests used": "5", "Lifetime review request limit": "6", "Requests per review limit": "3",
+		"Review estimated cost (USD)": "0.0125", "Review reserved cost (USD)": "0.00125",
+		"Review estimated cost cap (USD)": "No separate review cap (purpose limits apply)",
+	})) check(fact(model, label)?.textContent === value, `projected model review usage shows exact ${label}`);
+	const rows = [...model.querySelectorAll("summary")].filter((summary) => summary.textContent === "Read model review turn details");
+	check(rows.map((summary) => summary.parentElement.parentElement.querySelector("p").textContent.split(" · ")[0]).join() === "Running,Done,Skipped,Blocked",
+		"all turn states retain the server's newest-first order");
+	check(model.innerText.includes("The purpose is on hold.") && model.innerText.includes("The current authority did not allow"), "skipped and blocked rows explain their reasons");
+	for (const [index, reason] of [[2, "hold"], [3, "authority"]]) {
+		rows[index].click();
+		check(fact(rows[index].parentElement, "Reason code").textContent === `"${reason}"`, "turn details retain the verbatim reason code");
+	}
+	rows[1].click();
+	check(fact(rows[1].parentElement, "Draft revision").textContent === "8" && fact(rows[1].parentElement, "Review ID").textContent === '"done-note"',
+		"the done turn identifies its exact review and generated draft");
+	for (const details of root.querySelectorAll("details")) details.open = true;
+	check(document.documentElement.scrollWidth === width, `expanded turn history fits ${width}px`);
+	root = mount({ plan: { ...modelPlan, allowance: null, turns: [...modelPlan.turns, blocker] } });
+	check(actionable(root).includes("unknown_request_outcome") && !section(root, "Reviews").textContent.includes("unknown_request_outcome"),
+		"the blocker is shown once and survives removal of the active allowance");
+	check(section(root, "Reviews").innerText.includes("Model reviews are disabled in the agreed plan."), "history without an allowance does not imply active reviews");
+	root = mount({ plan: { ...modelPlan, blocker: done } });
+	check(actionable(root).includes("Done") && actionable(root).includes("receipt is still unresolved") &&
+		!section(root, "Reviews").textContent.includes("done-note"), "a finished turn with an unresolved receipt is pinned and deduplicated without relabelling it as blocked");
+	for (const turns of [[done, running, skipped], [done, skipped]]) {
+		root = mount({ plan: { ...modelPlan, turns, blocker: running } });
+		const inFlight = section(root, "Reviews");
+		check(!section(root, "Needs you") && !inFlight.innerText.includes("pinned under Needs you"), "a running reservation does not raise a Needs you alarm");
+		const firstTurn = [...inFlight.querySelectorAll("li")].find((item) => item.querySelector("summary")?.textContent === "Read model review turn details");
+		check(firstTurn.innerText.includes("Request in flight; outcome not yet known. Later reviews wait for it.") &&
+			firstTurn.innerText.includes("Running") && inFlight.textContent.split("running-note").length === 2,
+			"the running reservation is pinned once at the top of history, even if outside the list");
+	}
+	root = mount({ plan: { ...modelPlan, blocker: null, allowance: { ...modelPlan.allowance, requests: 6, maxEstimatedCost: 0.05 } } });
+	const exhausted = section(root, "Reviews");
+	check(fact(exhausted, "Review requests remaining")?.textContent === "No review requests left" &&
+		fact(exhausted, "Review estimated cost cap (USD)").textContent === "0.05" && !exhausted.innerText.includes("No separate review cap"),
+		"an exhausted allowance reports exhaustion without suggesting its separate cost cap is absent");
 	root = mount({ plan: { ...plan, gate: { state: "open", reason: null }, draft: null, runs: { used: 32, limit: 32 } } });
 	check(actionable(root).includes("lifetime run limit is exhausted") && section(root, "Strategies and tactics").textContent.includes("Blocked"), "budget exhaustion is visible even with open plan gate");
 	root = mount({ plan: { ...plan, history: Array.from({ length: 32 }, (_, index) => ({ ...head, revision: 32 - index })) } });

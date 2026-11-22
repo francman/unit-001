@@ -1,5 +1,5 @@
 // Renders the Mission plan, recorded reviews, and exact revision history without performing operations.
-import type { PlanTerms, PlanView, ReviewNote, ReviewTrigger } from "../mission-plan-contract.ts";
+import type { PlanTerms, PlanView, ReviewNote, ReviewTrigger, ReviewTurnView } from "../mission-plan-contract.ts";
 import { callout, command, tag } from "../ui/blocks.ts";
 import { surfaces, text } from "../ui/classes.ts";
 import { button } from "../ui/controls.ts";
@@ -7,7 +7,7 @@ import { attrs, type Child, el } from "../ui/dom.ts";
 import { duration } from "../ui/format.ts";
 import { facts, panel, section } from "../ui/page.ts";
 import {
-	encodePlanText, exactPlanTerms as exactTerms, overallRows, planDisclosure as disclosure, type PlanTerminalCommand,
+	encodePlanText, exactPlanTerms as exactTerms, noSeparateReviewCap, overallRows, planDisclosure as disclosure, type PlanTerminalCommand,
 	planTermRows as termRows, planTermsDiff as termsDiff, strategicRows, tacticalRows, visiblePlanText as visibleText,
 } from "./mission-plan-display.ts";
 
@@ -65,7 +65,11 @@ const gateReasons: Record<NonNullable<PlanView["gate"]["reason"]>, string> = {
 
 function needsYou(plan: PlanView, { terminalApproval, terminalOpen }: MissionPlanOptions): HTMLElement | null {
 	const items: Child[] = [];
-	const { draft, gate, runs } = plan;
+	const { blocker, draft, gate, runs } = plan;
+	if (blocker && blocker.state !== "running") items.push(el("li", "min-w-0",
+		el("h3", heading, "Unresolved model review blocker"),
+		blocker.state === "done" ? el("p", text.body, "A model request receipt is still unresolved. Later reviews wait for it.") : null,
+		reviewTurn(blocker)));
 	if (gate.state === "closed") items.push(el("li", "", gate.reason ? gateReasons[gate.reason] : "Plan admission is closed.",
 		gate.reason === "reopen-needed" && terminalOpen
 			? el("div", "mt-1 min-w-0", command(terminalOpen.line, "mission-plan-copy-open", terminalOpen.copy)) : null));
@@ -163,6 +167,7 @@ function reviewsSection(plan: PlanView, options: MissionPlanOptions): HTMLElemen
 			el("li", "", triggerWords[trigger.kind], trigger.subject === null ? null : el("span", "", ": ", visibleText(trigger.subject))))) : null,
 		options.onReviewNow ? el("div", "flex flex-wrap gap-2", button({ label: "Review now", key: "mission-plan-review-now", onClick: options.onReviewNow })) : null,
 		preview ? reviewNote(preview, "Unsaved review preview") : null,
+		modelReviews(plan),
 		el("h3", heading, "Saved reviews"),
 		reviews.length ? el("ul", "m-0 flex min-w-0 list-none flex-col gap-3 p-0", ...reviews.map((review) => {
 			const group = reviewNote(review, "Saved review");
@@ -184,6 +189,63 @@ function reviewsSection(plan: PlanView, options: MissionPlanOptions): HTMLElemen
 			return el("li", "min-w-0", group);
 		})) : el("p", text.description, "No reviews have been saved."),
 	] });
+}
+
+const turnStatus: Record<ReviewTurnView["state"], string> = {
+	skipped: "Skipped",
+	running: "Running",
+	done: "Done",
+	blocked: "Blocked",
+};
+
+const turnReasons: Record<NonNullable<ReviewTurnView["reason"]>, string> = {
+	budget: "The review budget did not allow another request.",
+	hold: "The purpose is on hold.",
+	unsettled: "Earlier effects have not settled.",
+	unknown_request_outcome: "A model request’s outcome is unknown. Later reviews wait for it.",
+	turn_failed: "The model review could not finish.",
+	authority: "The current authority did not allow the model review to continue.",
+};
+
+function modelReviews({ allowance, turns, blocker }: PlanView): HTMLElement | null {
+	if (!allowance && !turns.length && !blocker) return null;
+	const history = blocker ? turns.filter(({ key }) => key !== blocker.key) : turns;
+	const inFlight = blocker?.state === "running" ? blocker : null;
+	const pinned = blocker !== null && inFlight === null;
+	return el("div", stack,
+		el("h3", heading, "Model review usage and history"),
+		allowance ? el("div", stack,
+			el("p", text.description, "Lifetime usage carries across plan revisions."),
+			termRows([
+				["Lifetime review requests used", allowance.requests],
+				["Lifetime review request limit", allowance.maxRequests],
+				...(allowance.requests >= allowance.maxRequests ? [["Review requests remaining", { note: "No review requests left" }]] as const : []),
+				["Requests per review limit", allowance.maxRequestsPerReview],
+				["Review estimated cost (USD)", allowance.estimatedCost],
+				["Review reserved cost (USD)", allowance.reservedCost],
+				["Review estimated cost cap (USD)", allowance.maxEstimatedCost ?? noSeparateReviewCap],
+			]),
+		) : el("p", text.description, "Model reviews are disabled in the agreed plan."),
+		pinned ? el("p", text.description, "The unresolved turn is pinned under Needs you.") : null,
+		inFlight || history.length ? el("ol", "m-0 flex min-w-0 list-none flex-col gap-3 p-0",
+			inFlight ? el("li", "min-w-0",
+				el("p", text.body, "Request in flight; outcome not yet known. Later reviews wait for it."), reviewTurn(inFlight)) : null,
+			...history.map((turn) => el("li", "min-w-0", reviewTurn(turn))))
+			: el("p", text.description, pinned ? "No other model review turns are recorded." : "No model review turns are recorded."),
+	);
+}
+
+function reviewTurn(turn: ReviewTurnView): HTMLElement {
+	return el("div", `border-t border-stroke-3 pt-2 ${stack}`,
+		el("p", text.strong, `${turnStatus[turn.state]} · ${triggerWords[turn.trigger.kind]} · Plan revision ${turn.planRevision}`),
+		el("p", text.body, `${date(turn.at)} · Requests: ${turn.requests}`),
+		turn.reason === null ? null : el("p", text.body, turnReasons[turn.reason]),
+		el("details", "min-w-0", disclosure("Read model review turn details"),
+			termRows([
+				["Turn key", turn.key], ["Trigger subject", turn.trigger.subject], ["Review ID", turn.reviewId], ["Draft revision", turn.draftRevision],
+				...(turn.reason === null ? [] : [["Reason code", turn.reason]] as const),
+			])),
+	);
 }
 
 function reviewNote(note: ReviewNote, label: string): HTMLElement {

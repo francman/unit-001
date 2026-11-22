@@ -34,6 +34,17 @@ export function planDraftTool(handle: (request: MissionRequest, context: Context
 					scope: text("What is in and out of bounds."),
 					askFirst: texts("What to ask the owner first; [] means nothing extra."),
 					reviewEveryMs: Type.Integer({ minimum: 1, description: "How often to review the plan, in milliseconds." }),
+					reviewAllowance: Type.Union(
+						[
+							Type.Object({
+								maxRequests: Type.Integer({ minimum: 1, description: "Model requests for reviews over the mission's life." }),
+								maxRequestsPerReview: Type.Integer({ minimum: 1, maximum: 4, description: "Model requests per review." }),
+								maxEstimatedCost: Type.Union([Type.Number({ exclusiveMinimum: 0 }), Type.Null()]),
+							}),
+							Type.Null(),
+						],
+						{ description: "Keep exactly as unit_mission_status shows it unless the owner asked to change it; null means no model reviews." },
+					),
 				}),
 				strategics: Type.Array(
 					Type.Object({
@@ -79,6 +90,7 @@ export function planDraftTool(handle: (request: MissionRequest, context: Context
 					terms: parsePlanTerms(args.terms),
 					savedBy: "bob",
 					fromReview: args.fromReview ?? null,
+					reviewConversation: api.conversationId,
 				},
 				ctx,
 			);

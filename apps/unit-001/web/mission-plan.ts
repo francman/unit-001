@@ -1,14 +1,27 @@
 // Validates the gateway's closed mission plan and review projections before the browser uses them.
 import type { MissionPlanBinding } from "./contract.ts";
-import type { PlanRevisionView, PlanTerms, PlanView, ReviewNote, ReviewTrigger } from "./mission-plan-contract.ts";
+import type {
+	PlanRevisionView,
+	PlanTerms,
+	PlanView,
+	ReviewAllowance,
+	ReviewAllowanceView,
+	ReviewNote,
+	ReviewTrigger,
+	ReviewTurnView,
+} from "./mission-plan-contract.ts";
 
 const RUN_LIMIT = 32;
+const MAX_REVIEW_TURNS = 16;
+const MAX_REQUESTS_PER_REVIEW = 4;
+const REVIEW_PROJECTION_FIELDS = ["allowance", "turns", "blocker"] as const;
+const ALLOWANCE_CAP_FIELDS = ["maxRequests", "maxRequestsPerReview", "maxEstimatedCost"] as const;
 
 /** Parses the complete plan projection without inferring authority from its recorded history. */
 export function parsePlanView(value: unknown): PlanView {
 	const plan = closed(value, [
 		"missionId", "adopted", "head", "headValid", "previous", "history", "draft", "gate", "runs", "due", "preview", "reviews",
-	]);
+	], REVIEW_PROJECTION_FIELDS);
 	const missionId = nullable(plan.missionId, identity);
 	const adopted = flag(plan.adopted);
 	const head = nullable(plan.head, parseRevision);
@@ -27,6 +40,11 @@ export function parsePlanView(value: unknown): PlanView {
 	const runs = closed(plan.runs, ["used", "limit"]);
 	const used = count(runs.used);
 	if (runs.limit !== RUN_LIMIT || used > RUN_LIMIT) return invalid();
+	// Old gateway responses have no review turn projection and confer no model review capability.
+	const hasReviewProjection = Object.hasOwn(plan, "turns");
+	const allowance = hasReviewProjection ? nullable(plan.allowance, parseAllowanceView) : null;
+	const turns = hasReviewProjection ? list(plan.turns, MAX_REVIEW_TURNS, parseReviewTurn) : [];
+	const blocker = hasReviewProjection ? nullable(plan.blocker, parseReviewTurn) : null;
 	const due = list(plan.due, 16, parseTrigger);
 	const preview = nullable(plan.preview, parseReviewNote);
 	const reviews = list(plan.reviews, 12, parseReviewNote);
@@ -44,7 +62,10 @@ export function parsePlanView(value: unknown): PlanView {
 			return invalid();
 		reviewIds.add(note.reviewId);
 	}
-	return { missionId, adopted, head, headValid, previous, history, draft, gate, runs: { used, limit: RUN_LIMIT }, due, preview, reviews };
+	return {
+		missionId, adopted, head, headValid, previous, history, draft, gate, runs: { used, limit: RUN_LIMIT },
+		allowance, turns, blocker, due, preview, reviews,
+	};
 }
 
 /** Parses every field in a projected saved or preview review note. */
@@ -101,7 +122,7 @@ function parseRevision(value: unknown): PlanRevisionView {
 		revision: count(row.revision, 1),
 		digest: digest(row.digest),
 		previousDigest: nullable(row.previousDigest, digest),
-		terms: parsePlanTerms(row.terms),
+		terms: parseTerms(row.terms, "projection"),
 		agreedAt: count(row.agreedAt),
 		receiptId: identity(row.receiptId),
 	};
@@ -118,7 +139,7 @@ function parseDraft(value: unknown): NonNullable<PlanView["draft"]> {
 	if (revision <= baseRevision || (status === "editing" && proposalDigest !== null)) return invalid();
 	return {
 		revision, baseRevision, status,
-		terms: parsePlanTerms(row.terms),
+		terms: parseTerms(row.terms, "projection"),
 		digest: proposalDigest,
 		savedBy: oneOf(row.savedBy, ["bob", "owner"]),
 		fromReview: nullable(row.fromReview, identity),
@@ -137,16 +158,27 @@ function parseGate(value: unknown): PlanView["gate"] {
 const UTF8 = new TextEncoder();
 const PRIORITIES = ["high", "normal", "low"] as const;
 
-/** Validates and canonicalizes the closed terms shape without deciding whether it can be proposed. */
+/** Validates authored plan terms without deciding whether they can be proposed. */
 export function parsePlanTerms(value: unknown): PlanTerms {
+	return parseTerms(value, "authored");
+}
+
+function parseTerms(value: unknown, source: "authored" | "projection"): PlanTerms {
 	const input = closed(value, ["overall", "strategics", "tacticals"]);
-	const overall = closed(input.overall, ["purpose", "scope", "askFirst", "reviewEveryMs"]);
+	const overall = closed(
+		input.overall,
+		["purpose", "scope", "askFirst", "reviewEveryMs"],
+		["reviewAllowance"],
+	);
+	const legacy = !Object.hasOwn(overall, "reviewAllowance");
+	if (legacy && source === "authored") return invalid();
 	const terms: PlanTerms = {
 		overall: {
 			purpose: text(overall.purpose, 4096),
 			scope: text(overall.scope, 4096),
 			askFirst: list(overall.askFirst, 32, (value) => text(value, 2000)),
 			reviewEveryMs: count(overall.reviewEveryMs),
+			reviewAllowance: legacy ? null : nullable(overall.reviewAllowance, (row) => parseAllowanceCaps(closed(row, ALLOWANCE_CAP_FIELDS))),
 		},
 		strategics: list(input.strategics, 3, (value) => {
 			const row = closed(value, ["id", "title", "intent", "signals", "priority"]);
@@ -160,8 +192,34 @@ export function parsePlanTerms(value: unknown): PlanTerms {
 		}),
 		tacticals: list(input.tacticals, 6, parseTactical),
 	};
-	if (UTF8.encode(JSON.stringify(terms)).length > 65536) return invalid();
+	// Normalizing an omitted allowance must not make a legacy payload exceed its original byte limit.
+	const legacyBytes = legacy ? ',"reviewAllowance":null'.length : 0;
+	if (UTF8.encode(JSON.stringify(terms)).length > 65536 + legacyBytes) return invalid();
 	return terms;
+}
+
+function parseAllowanceView(value: unknown): ReviewAllowanceView {
+	const row = closed(value, [...ALLOWANCE_CAP_FIELDS, "requests", "estimatedCost", "reservedCost"]);
+	return {
+		...parseAllowanceCaps(row),
+		requests: count(row.requests),
+		estimatedCost: reviewCost(row.estimatedCost),
+		reservedCost: reviewCost(row.reservedCost),
+	};
+}
+
+function parseAllowanceCaps(row: Record<(typeof ALLOWANCE_CAP_FIELDS)[number], unknown>): ReviewAllowance {
+	const maxRequests = count(row.maxRequests, 1);
+	const maxRequestsPerReview = count(row.maxRequestsPerReview, 1);
+	const maxEstimatedCost = nullable(row.maxEstimatedCost, reviewCost);
+	if (maxRequestsPerReview > MAX_REQUESTS_PER_REVIEW || maxRequestsPerReview > maxRequests || maxEstimatedCost === 0)
+		return invalid();
+	return { maxRequests, maxRequestsPerReview, maxEstimatedCost };
+}
+
+function reviewCost(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return invalid();
+	return value;
 }
 
 function parseTactical(value: unknown): PlanTerms["tacticals"][number] {
@@ -187,6 +245,31 @@ function parseTrigger(value: unknown): ReviewTrigger {
 		key: identity(trigger.key, 400),
 		subject: nullable(trigger.subject, (value) => identity(value, 400)),
 	};
+}
+
+function parseReviewTurn(value: unknown): ReviewTurnView {
+	const row = closed(value, [
+		"key", "planRevision", "trigger", "state", "reason", "reviewId", "draftRevision", "requests", "at",
+	]);
+	const base = {
+		key: identity(row.key, 400),
+		planRevision: count(row.planRevision, 1),
+		trigger: parseTrigger(row.trigger),
+		reviewId: nullable(row.reviewId, identity),
+		requests: count(row.requests),
+		at: count(row.at),
+	};
+	const state = oneOf(row.state, ["running", "done", "skipped", "blocked"]);
+	if (state !== "done" && row.draftRevision !== null) return invalid();
+	if (state === "skipped")
+		return { ...base, state, reason: oneOf(row.reason, ["budget", "hold", "unsettled"]), draftRevision: null };
+	if (state === "blocked")
+		return {
+			...base, state, reason: oneOf(row.reason, ["unknown_request_outcome", "turn_failed", "authority"]), draftRevision: null,
+		};
+	if (row.reason !== null) return invalid();
+	if (state === "done") return { ...base, state, reason: null, draftRevision: nullable(row.draftRevision, (value) => count(value, 1)) };
+	return { ...base, state, reason: null, draftRevision: null };
 }
 
 function parseReviewItem(value: unknown): ReviewNote["items"][number] {
@@ -234,11 +317,19 @@ function parseDisposition(value: unknown): NonNullable<ReviewNote["disposition"]
 	return { kind, at, draftRevision: null };
 }
 
-function closed<const K extends string>(value: unknown, fields: readonly K[]): Record<K, unknown> {
+function closed<const K extends string, const E extends string = never>(
+	value: unknown,
+	fields: readonly K[],
+	extension?: readonly E[],
+): Record<K, unknown> & Partial<Record<E, unknown>> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return invalid();
-	if (Object.keys(value).length !== fields.length || fields.some((key) => !Object.hasOwn(value, key))) return invalid();
-	// Every required own JSON field is present; its value is still unknown.
-	return value as Record<K, unknown>;
+	const length = Object.keys(value).length;
+	if (fields.some((key) => !Object.hasOwn(value, key))) return invalid();
+	if (length !== fields.length && (
+		extension === undefined || length !== fields.length + extension.length || extension.some((key) => !Object.hasOwn(value, key))
+	)) return invalid();
+	// Required own fields are present; the legacy extension is either entirely absent or complete.
+	return value as Record<K, unknown> & Partial<Record<E, unknown>>;
 }
 
 function nullable<T>(value: unknown, parse: (value: unknown) => T): T | null {

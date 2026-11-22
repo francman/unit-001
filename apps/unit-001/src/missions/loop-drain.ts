@@ -33,9 +33,14 @@ export function isLoopTask(task: TaskInspection, loop: LoopState | undefined): b
 }
 
 /**
- * Whether a release without the loop task may open this Session: only with no live loop task, since such a release
- * leaves the loop blocked and its own drain then defers every later update.
+ * Whether a release without the loop or review task may open this Session: only with neither live, since such a
+ * release leaves the task blocked and its own drain then defers every later update. A maintenance hold ends a parked
+ * review task, so a held, drained Session reports none.
  */
 export function loopRollbackBlocker(inspection: HarnessInspection): "live-loop" | undefined {
-	return inspection.tasks.some((task) => task.record.kind === "unit.mission.loop") ? "live-loop" : undefined;
+	return inspection.tasks.some(
+		(task) => task.record.kind === "unit.mission.loop" || task.record.kind === "unit.mission.review",
+	)
+		? "live-loop"
+		: undefined;
 }

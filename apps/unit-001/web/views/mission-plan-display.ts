@@ -4,10 +4,14 @@ import { text } from "../ui/classes.ts";
 import { attrs, type Child, el } from "../ui/dom.ts";
 import { facts } from "../ui/page.ts";
 
-type TermRow = readonly [string, string | number | readonly string[] | null | undefined];
+type TermRow = readonly [string, string | number | readonly string[] | { readonly note: string } | null | undefined];
 
 /** A copy-only terminal instruction prepared by the caller for the current installation. */
 export type PlanTerminalCommand = { line: string; copy: (line: string, label: string) => Promise<boolean> };
+
+/** A null cap on an enabled allowance does not override the purpose limits. */
+export const noSeparateReviewCap = { note: "No separate review cap (purpose limits apply)" };
+const disabledReviewLimit = { note: "Not applicable: model reviews disabled" };
 
 const stack = "flex min-w-0 flex-col gap-3";
 const heading = `${text.heading} [overflow-wrap:anywhere]`;
@@ -32,7 +36,7 @@ export function visiblePlanText(value: string): HTMLElement {
 export function planTermRows(rows: readonly TermRow[]): HTMLDListElement {
 	return facts(rows.map(([label, value]) => [label,
 		value === undefined ? "Not reported" : value === null ? "None" : typeof value === "number" ? String(value) :
-			typeof value === "string" ? visiblePlanText(value) : value.length
+			typeof value === "string" ? visiblePlanText(value) : "note" in value ? value.note : value.length
 				? el("ol", "m-0 list-decimal pl-5", ...value.map((item) => el("li", "", visiblePlanText(item)))) : "None (empty list)",
 	]));
 }
@@ -91,7 +95,14 @@ export function planDisclosure(label: string): HTMLElement {
 
 /** Maps exact Overall terms to labelled rows. */
 export function overallRows(overall: PlanTerms["overall"]): TermRow[] {
-	return [["Purpose", overall.purpose], ["Scope", overall.scope], ["Ask first", overall.askFirst], ["Review interval (milliseconds)", overall.reviewEveryMs]];
+	const allowance = overall.reviewAllowance;
+	return [
+		["Purpose", overall.purpose], ["Scope", overall.scope], ["Ask first", overall.askFirst], ["Review interval (milliseconds)", overall.reviewEveryMs],
+		["Model review opt-in", { note: allowance ? "Enabled" : "Disabled" }],
+		["Lifetime review request limit", allowance?.maxRequests ?? disabledReviewLimit],
+		["Requests per review limit", allowance?.maxRequestsPerReview ?? disabledReviewLimit],
+		["Review estimated cost cap (USD)", allowance ? (allowance.maxEstimatedCost ?? noSeparateReviewCap) : disabledReviewLimit],
+	];
 }
 
 /** Maps exact strategic terms to labelled rows. */

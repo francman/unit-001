@@ -15,7 +15,7 @@ function setup() {
 	});
 	// The tool reads only the call identity from its API.
 	const call = (callId: string, args: Parameters<typeof tool.execute>[0]) =>
-		tool.execute(args, { taskId: "task-1", callId } as unknown as ToolExecutionApi, context);
+		tool.execute(args, { taskId: "task-1", callId, conversationId: "conversation-1" } as unknown as ToolExecutionApi, context);
 	return { requests, call };
 }
 
@@ -31,6 +31,7 @@ describe("unit_plan_draft", () => {
 				terms: planTerms(),
 				savedBy: "bob",
 				fromReview: "review-1",
+				reviewConversation: "conversation-1",
 			},
 		]);
 		const [first] = result.output ?? [];
@@ -49,5 +50,14 @@ describe("unit_plan_draft", () => {
 		const terms = planTerms({ tacticals: [{ ...planTerms().tacticals[0]!, id: "Not A Slug" }] });
 		await expect(call("c1", { expectedRevision: 0, terms })).rejects.toThrow("slugs");
 		expect(requests).toEqual([]);
+	});
+});
+
+describe("codex 1b HOLD item 8", () => {
+	it("lets Bob send the plan's review allowance, so a draft keeps the agreed value", () => {
+		const tool = planDraftTool(async () => ({}) as MissionView);
+		const overall = (tool.parameters as { properties: { terms: { properties: { overall: { properties: object } } } } })
+			.properties.terms.properties.overall.properties;
+		expect(Object.keys(overall)).toContain("reviewAllowance");
 	});
 });

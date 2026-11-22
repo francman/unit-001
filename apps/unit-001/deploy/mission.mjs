@@ -15,7 +15,7 @@ import {
 } from "../app/dist/missions/authority.js";
 import { MANAGED_MISSION_ACTIONS, missionObject, parseMissionCreator } from "../app/dist/missions/contract.js";
 import { matchingPlanApproval, planDigest, planReceiptsRecorded } from "../app/dist/missions/plan-authority.js";
-import { missingPlanTerms } from "../app/dist/missions/plan-terms.js";
+import { missingPlanTerms, reviewAllowanceDenial } from "../app/dist/missions/plan-terms.js";
 import { parsePurposeCeiling, purposeDigest, validatePurposeTerms } from "../app/dist/missions/purpose-authority.js";
 import { parseMissionView } from "../app/dist/missions/wire.js";
 import { installationPaths, readInstallation, withManagementLock } from "./installation.mjs";
@@ -385,6 +385,8 @@ async function approvePlan(previous) {
 		throw new Error("Stale plan proposal, predecessor or authority. Inspect the proposed plan again.");
 	if (draft.missing.length || missingPlanTerms(draft.terms).length)
 		throw new Error("The proposed plan is incomplete or its runnable purpose binding is unavailable.");
+	const allowanceDenial = reviewAllowanceDenial(draft.terms, previous);
+	if (allowanceDenial) throw new Error(allowanceDenial);
 	if (
 		view.purposeError !== null ||
 		view.purpose?.operation === "open" ||

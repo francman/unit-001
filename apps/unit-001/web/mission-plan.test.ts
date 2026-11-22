@@ -1,10 +1,10 @@
 // Exercises the closed Missions v2 browser projection, including stale heads and nested evidence.
 import { describe, expect, it } from "vitest";
-import type { PlanRevisionView, PlanTerms, PlanView, ReviewNote } from "./mission-plan-contract.ts";
-import { parsePlanView, parseReviewNote } from "./mission-plan.ts";
+import type { PlanRevisionView, PlanTerms, PlanView, ReviewNote, ReviewTurnView } from "./mission-plan-contract.ts";
+import { parsePlanTerms, parsePlanView, parseReviewNote } from "./mission-plan.ts";
 
 const terms: PlanTerms = {
-	overall: { purpose: "Record café\r\n<chart>", scope: "Repo", askFirst: ["shipping"], reviewEveryMs: 100 },
+	overall: { purpose: "Record café\r\n<chart>", scope: "Repo", askFirst: ["shipping"], reviewEveryMs: 100, reviewAllowance: null },
 	strategics: [{ id: "delivery", title: "Deliver", intent: "Build", signals: ["useful"], priority: "high" }],
 	tacticals: [{
 		id: "build", strategic: "delivery", objective: "Test", successCriteria: ["Green"], priority: "normal", deadlineAt: 500,
@@ -56,6 +56,9 @@ const plan: PlanView = {
 	draft,
 	gate: { state: "closed", reason: "receipt" },
 	runs: { used: 1, limit: 32 },
+	allowance: null,
+	turns: [],
+	blocker: null,
 	due: [trigger],
 	preview,
 	reviews: [review],
@@ -107,6 +110,79 @@ describe("plan projection", () => {
 		["too many saved notes", { reviews: Array(13).fill(review) }],
 	])("rejects %s", (_name, patch) => {
 		expect(() => parsePlanView({ ...plan, ...patch })).toThrow("Invalid mission plan projection.");
+	});
+});
+
+describe("model review projection", () => {
+	const allowance = { maxRequests: 10, maxRequestsPerReview: 4, maxEstimatedCost: null };
+	const blocker: ReviewTurnView = {
+		key: review.key, planRevision: review.planRevision, trigger: review.trigger, state: "blocked",
+		reason: "unknown_request_outcome", reviewId: review.reviewId, draftRevision: null, requests: 1, at: 135,
+	};
+	const newest: ReviewTurnView = {
+		key: trigger.key, planRevision: head.revision, trigger, state: "done",
+		reason: null, reviewId: null, draftRevision: 5, requests: 2, at: 300,
+	};
+	const projected = {
+		...plan,
+		allowance: { ...allowance, requests: 12, estimatedCost: 0.25, reservedCost: 0.125 },
+		turns: [newest],
+		blocker,
+	};
+	const { allowance: _allowance, turns: _turns, blocker: _blocker, ...legacy } = plan;
+
+	it("keeps the lifetime usage and a pinned blocker outside the retained turns", () => {
+		const turns = Array.from({ length: 16 }, (_, index) => {
+			const key = `cadence:${index}`;
+			return { ...newest, key, trigger: { ...trigger, key }, at: 300 - index };
+		});
+		expect(parsePlanView({ ...projected, turns })).toEqual({ ...projected, turns });
+	});
+
+	it("normalizes legacy omissions to inert fields without modifying an existing proposal's allowance", () => {
+		const { purpose, scope, askFirst, reviewEveryMs } = terms.overall;
+		const oldTerms = { ...terms, overall: { purpose, scope, askFirst, reviewEveryMs } };
+		const newTerms = { ...terms, overall: { ...terms.overall, reviewAllowance: allowance } };
+		const read = parsePlanView({ ...legacy, head: { ...head, terms: oldTerms }, draft: { ...draft, terms: newTerms } });
+		expect(read).toEqual({ ...plan, draft: { ...draft, terms: newTerms } });
+		expect(() => parsePlanTerms(oldTerms)).toThrow("Invalid mission plan projection.");
+		expect(parsePlanTerms(newTerms)).toEqual(newTerms);
+		expect(parsePlanTerms(terms).overall.reviewAllowance).toBeNull();
+	});
+
+	it("rejects a partial turn projection rather than treating it as legacy", () => {
+		expect(() => parsePlanView({ ...legacy, turns: [] })).toThrow("Invalid mission plan projection.");
+	});
+
+	it.each([
+		["undefined allowance", { allowance: undefined }],
+		["null turn list", { turns: null }],
+		["more than 16 turns", { turns: Array(17).fill(newest) }],
+		["unknown skip reason", { turns: [{ ...newest, state: "skipped", reason: "future", draftRevision: null }] }],
+		["wrong reason for state", { blocker: { ...blocker, reason: "budget" } }],
+		["unknown blocker state", { blocker: { ...blocker, state: "failed" } }],
+		["draft on running turn", { turns: [{ ...newest, state: "running" }] }],
+		["unsafe request count", { turns: [{ ...newest, requests: Number.MAX_SAFE_INTEGER + 1 }] }],
+		["nested provider data", { blocker: { ...blocker, providerSession: "private" } }],
+		["nested trigger data", { blocker: { ...blocker, trigger: { ...blocker.trigger, conversation: "private" } } }],
+		["negative reserved cost", { allowance: { ...projected.allowance, reservedCost: -0.01 } }],
+		["nonfinite cost", { allowance: { ...projected.allowance, estimatedCost: Infinity } }],
+	])("rejects %s", (_name, patch) => {
+		expect(() => parsePlanView({ ...projected, ...patch })).toThrow("Invalid mission plan projection.");
+	});
+
+	it.each([
+		["zero lifetime requests", { maxRequests: 0 }],
+		["fractional requests", { maxRequestsPerReview: 1.5 }],
+		["too many requests per turn", { maxRequestsPerReview: 5 }],
+		["per-turn requests over lifetime cap", { maxRequests: 3 }],
+		["zero spend cap", { maxEstimatedCost: 0 }],
+		["nonfinite spend cap", { maxEstimatedCost: Infinity }],
+		["unknown allowance field", { totalRequests: 12 }],
+	])("rejects authored allowance with %s", (_name, patch) => {
+		expect(() => parsePlanTerms({
+			...terms, overall: { ...terms.overall, reviewAllowance: { ...allowance, ...patch } },
+		})).toThrow("Invalid mission plan projection.");
 	});
 });
 

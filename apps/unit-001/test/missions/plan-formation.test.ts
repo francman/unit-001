@@ -148,7 +148,7 @@ async function withPurpose(host: Host, contents: string[]) {
 
 function plan(binding: { missionId: string; purposeRevision: number; purposeDigest: string }, scope = "The workspace"): PlanTerms {
 	return {
-		overall: { purpose: "Keep the reports current", scope, askFirst: [], reviewEveryMs: 10_000 },
+		overall: { purpose: "Keep the reports current", scope, askFirst: [], reviewEveryMs: 10_000, reviewAllowance: null },
 		strategics: [{ id: "reports", title: "Reports", intent: "Fresh reports", signals: [], priority: "high" }],
 		tacticals: [runnable({ binding }), planned()],
 	};
@@ -157,7 +157,7 @@ function plan(binding: { missionId: string; purposeRevision: number; purposeDige
 async function draft(host: Host, terms: PlanTerms, id: string, savedBy: "bob" | "owner" = "owner") {
 	const view = await host.request({ operation: "status" });
 	const expectedRevision = view.plan?.draft?.revision ?? view.plan?.head?.revision ?? 0;
-	return host.request({ operation: "plan-draft", expectedRevision, requestId: id, terms, savedBy, fromReview: null });
+	return host.request({ operation: "plan-draft", expectedRevision, requestId: id, terms, savedBy, fromReview: null, reviewConversation: null });
 }
 
 /** Drafts, proposes and agrees `terms`; returns the agreed head digest. */
@@ -205,12 +205,12 @@ describe("drafting and proposing a plan", () => {
 		expect(view.plan!.head).toBeNull();
 		expect((await readMissionAuthority(host.location))!.planApprovals).toBeUndefined();
 		await expect(
-			host.request({ operation: "plan-draft", expectedRevision: 0, requestId: "d2", terms: plan(binding), savedBy: "owner", fromReview: null }),
+			host.request({ operation: "plan-draft", expectedRevision: 0, requestId: "d2", terms: plan(binding), savedBy: "owner", fromReview: null, reviewConversation: null }),
 		).rejects.toMatchObject({ code: "stale-revision" });
 		// The same request ID is the same draft; with other terms it conflicts.
-		await host.request({ operation: "plan-draft", expectedRevision: 0, requestId: "d1", terms: plan(binding), savedBy: "owner", fromReview: null });
+		await host.request({ operation: "plan-draft", expectedRevision: 0, requestId: "d1", terms: plan(binding), savedBy: "owner", fromReview: null, reviewConversation: null });
 		await expect(
-			host.request({ operation: "plan-draft", expectedRevision: 1, requestId: "d1", terms: plan(binding, "Other"), savedBy: "owner", fromReview: null }),
+			host.request({ operation: "plan-draft", expectedRevision: 1, requestId: "d1", terms: plan(binding, "Other"), savedBy: "owner", fromReview: null, reviewConversation: null }),
 		).rejects.toMatchObject({ code: "conflicting-request" });
 	});
 
@@ -695,6 +695,7 @@ describe("codex gate review holds, second round", () => {
 				terms: plan(binding, "Three"),
 				savedBy: "bob",
 				fromReview: reviewId,
+				reviewConversation: null,
 			}),
 		).rejects.toMatchObject({ code: "stale-revision" });
 	});
@@ -725,6 +726,7 @@ describe("reviews through the owner", () => {
 			terms: plan(binding, "Narrower"),
 			savedBy: "bob",
 			fromReview: reviewId,
+			reviewConversation: null,
 		});
 		expect(drafted.plan!.draft).toMatchObject({ savedBy: "bob", fromReview: reviewId });
 		await host.request({ operation: "review-dismiss", reviewId, requestId: "dismiss-1" });

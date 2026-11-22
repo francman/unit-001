@@ -76,7 +76,7 @@ const MAX_REVIEW_REQUESTS = 32;
 /** The plan document: absent plans read as the empty state, which leaves the plan gate off. */
 export const MissionPlanDoc = defineDoc<PlanState>({
 	kind: "unit.mission.plan",
-	version: 1,
+	version: 2,
 	scope: "session",
 	initial: () => ({
 		missionId: null,
@@ -89,6 +89,21 @@ export const MissionPlanDoc = defineDoc<PlanState>({
 		reviewKeys: [],
 		reviewRequests: [],
 	}),
+	migrate: (value, fromVersion) => {
+		if (fromVersion !== 1) throw new Error(`Unsupported mission plan document version ${fromVersion}.`);
+		// Version one had no review allowance; null means none and is left out of the digest, so agreements still verify.
+		const plan = value as PlanState;
+		const withAllowance = (terms: PlanTerms): PlanTerms => ({
+			...terms,
+			overall: { ...terms.overall, reviewAllowance: null },
+		});
+		return {
+			...plan,
+			draft: plan.draft && { ...plan.draft, terms: withAllowance(plan.draft.terms) },
+			proposals: plan.proposals.map((proposal) => ({ ...proposal, terms: withAllowance(proposal.terms) })),
+			agreed: plan.agreed.map((agreement) => ({ ...agreement, terms: withAllowance(agreement.terms) })),
+		};
+	},
 	checkpointWhen: () => true,
 });
 
@@ -120,7 +135,16 @@ export function planAdopted(plan: PlanState): boolean {
 /** Records one more used review key, newest kept. */
 export function rememberReviewKey(plan: PlanState, key: string): void {
 	plan.reviewKeys.push(key);
-	if (plan.reviewKeys.length > MAX_REVIEW_KEYS) plan.reviewKeys.shift();
+	if (plan.reviewKeys.length <= MAX_REVIEW_KEYS) return;
+	// Only keys that can never fire again are dropped: another revision's, or a cadence window already past. Within one
+	// revision the live keys stay well under the bound (32 runs, 6 tacticals, runs-low, one cadence window).
+	const head = plan.agreed.at(-1)?.revision;
+	const windows = plan.reviewKeys.filter((item) => item.startsWith(`${head}:cadence:`));
+	const latest = windows.at(-1);
+	plan.reviewKeys = plan.reviewKeys.filter(
+		(item) => item.startsWith(`${head}:`) && (!item.startsWith(`${head}:cadence:`) || item === latest),
+	);
+	if (plan.reviewKeys.length > MAX_REVIEW_KEYS) throw new Error("Review keys exceed their bound; nothing was stored.");
 }
 
 /** Saves a review note and its request, dropping the oldest beyond the bounds. */

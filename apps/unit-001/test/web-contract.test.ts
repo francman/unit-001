@@ -52,7 +52,15 @@ describe("browser mission operations", () => {
 		const terms = planTerms();
 		expect(mission({ operation: "plan-draft", expectedRevision: 0, terms }).operation).toEqual({
 			type: "mission",
-			request: { operation: "plan-draft", expectedRevision: 0, requestId: "r-1", terms, savedBy: "owner", fromReview: null },
+			request: {
+				operation: "plan-draft",
+				expectedRevision: 0,
+				requestId: "r-1",
+				terms,
+				savedBy: "owner",
+				fromReview: null,
+				reviewConversation: null,
+			},
 		});
 		expect(mission({ operation: "plan-propose", expectedRevision: 2 }).operation).toEqual({
 			type: "mission", request: { operation: "plan-propose", expectedRevision: 2, requestId: "r-1" },
@@ -67,6 +75,9 @@ describe("browser mission operations", () => {
 			type: "mission", request: { operation: "review-dismiss", reviewId: "review-1", requestId: "r-1" },
 		});
 		expect(() => mission({ operation: "plan-draft", expectedRevision: 0, terms, savedBy: "bob" })).toThrow();
+		expect(() => mission({ operation: "plan-draft", expectedRevision: 0, terms, reviewConversation: "review-1" })).toThrow(
+			"Unknown request field",
+		);
 		expect(() => mission({ operation: "plan-agree", revision: 3, digest })).toThrow("explicit confirmation");
 		expect(() => mission({ operation: "plan-agree", revision: 3, digest, confirmed: true, previousReceipt: null })).toThrow();
 		expect(() => mission({ operation: "review-now", reviewId: "review-1" })).toThrow();

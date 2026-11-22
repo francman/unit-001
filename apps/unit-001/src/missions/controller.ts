@@ -21,6 +21,7 @@ import { MISSION_PROVIDER_PREFIX, type MissionAdmission } from "./admission.ts";
 import { MANAGED_MISSION_ACTIONS, type MissionExecutionIntent } from "./contract.ts";
 import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts";
 import { missionLoop } from "./loop.ts";
+import { missionReview } from "./review-turn.ts";
 import { storedLoop } from "./purpose.ts";
 import { MissionDoc } from "./state.ts";
 import { supportedMissionCriteria, verifyMissionFiles } from "./verification.ts";
@@ -179,12 +180,14 @@ export function missionController(admission: MissionAdmission, cwd: string) {
 			}, context),
 	});
 	const loop = missionLoop(admission, cwd);
+	const review = missionReview(admission);
 	return {
 		controller,
 		loop,
+		review,
 		extension: defineExtension({
 			name: "unit.mission.execution",
-			tasks: [controller, loop],
+			tasks: [controller, loop, review],
 			tools: [workWriteTool(cwd)],
 			hooks: [
 				hook(ToolTask, {

@@ -53,7 +53,7 @@ type PlanBinding = NonNullable<PlanTerms["tacticals"][number]["binding"]>;
 type ExactPlanProposal = { revision: number; digest: string };
 
 const newPlanTerms: PlanTerms = {
-	overall: { purpose: "", scope: "", askFirst: [], reviewEveryMs: 7 * 24 * 60 * 60 * 1000 },
+	overall: { purpose: "", scope: "", askFirst: [], reviewEveryMs: 7 * 24 * 60 * 60 * 1000, reviewAllowance: null },
 	strategics: [],
 	tacticals: [],
 };

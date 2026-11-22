@@ -3,6 +3,9 @@ import { missionNumber, missionObject, missionText, missionTextList } from "./co
 import type { ReviewFacts, ReviewItem, ReviewNote, ReviewTrigger } from "./plan-review.ts";
 import { type PlanTerms, parsePlanTerms } from "./plan-terms.ts";
 
+/** Most review turns the owner retains and status lists; an unresolved turn is never dropped. */
+export const MAX_REVIEW_TURNS = 16;
+
 /** Most due review triggers status lists; the producer keeps the most urgent ones, so a valid status always parses. */
 export const MAX_DUE_TRIGGERS = 16;
 
@@ -39,6 +42,32 @@ export type PlanView = {
 	due: ReviewTrigger[];
 	preview: ReviewNote | null;
 	reviews: ReviewNote[];
+	allowance: ReviewAllowanceView | null;
+	turns: ReviewTurnView[];
+	blocker: ReviewTurnView | null;
+};
+
+/** The agreed review allowance and what reviews have used of it over the mission's life. */
+export type ReviewAllowanceView = {
+	maxRequests: number;
+	maxRequestsPerReview: number;
+	maxEstimatedCost: number | null;
+	requests: number;
+	estimatedCost: number;
+	reservedCost: number;
+};
+
+/** One model review turn as status shows it; separate from saved notes and drafts. */
+export type ReviewTurnView = {
+	key: string;
+	planRevision: number;
+	trigger: ReviewTrigger;
+	state: "running" | "done" | "skipped" | "blocked";
+	reason: null | "budget" | "hold" | "unsettled" | "unknown_request_outcome" | "turn_failed" | "authority";
+	reviewId: string | null;
+	draftRevision: number | null;
+	requests: number;
+	at: number;
 };
 
 /**
@@ -78,6 +107,9 @@ export function parsePlanView(value: unknown): PlanView {
 		due: list(input.due, MAX_DUE_TRIGGERS).map(parseTrigger),
 		preview: input.preview === null ? null : parseReviewNote(input.preview),
 		reviews: list(input.reviews, 12).map(parseReviewNote),
+		allowance: input.allowance === null ? null : parseAllowanceView(input.allowance),
+		turns: list(input.turns, MAX_REVIEW_TURNS).map(parseTurnView),
+		blocker: input.blocker === null ? null : parseTurnView(input.blocker),
 	};
 }
 
@@ -209,6 +241,61 @@ function parseDisposition(value: unknown): NonNullable<ReviewNote["disposition"]
 		kind: member(input.kind, ["dismissed", "drafted"]) as "dismissed" | "drafted",
 		at: count(input.at),
 		draftRevision: input.draftRevision === null ? null : count(input.draftRevision),
+	};
+}
+
+function parseAllowanceView(value: unknown): ReviewAllowanceView {
+	const input = closed(value, [
+		"maxRequests",
+		"maxRequestsPerReview",
+		"maxEstimatedCost",
+		"requests",
+		"estimatedCost",
+		"reservedCost",
+	]);
+	return {
+		maxRequests: count(input.maxRequests),
+		maxRequestsPerReview: count(input.maxRequestsPerReview),
+		maxEstimatedCost: input.maxEstimatedCost === null ? null : amount(input.maxEstimatedCost),
+		requests: count(input.requests),
+		estimatedCost: amount(input.estimatedCost),
+		reservedCost: amount(input.reservedCost),
+	};
+}
+
+const TURN_STATES: readonly unknown[] = ["running", "done", "skipped", "blocked"];
+const TURN_REASONS: readonly unknown[] = [
+	null,
+	"budget",
+	"hold",
+	"unsettled",
+	"unknown_request_outcome",
+	"turn_failed",
+	"authority",
+];
+
+function parseTurnView(value: unknown): ReviewTurnView {
+	const input = closed(value, [
+		"key",
+		"planRevision",
+		"trigger",
+		"state",
+		"reason",
+		"reviewId",
+		"draftRevision",
+		"requests",
+		"at",
+	]);
+	return {
+		key: missionText(input.key, 400),
+		planRevision: count(input.planRevision),
+		trigger: parseTrigger(input.trigger),
+		state: member(input.state, TURN_STATES) as ReviewTurnView["state"],
+		reason: member(input.reason, TURN_REASONS) as ReviewTurnView["reason"],
+		reviewId: input.reviewId === null ? null : missionText(input.reviewId),
+		draftRevision: input.draftRevision === null ? null : count(input.draftRevision),
+		requests: count(input.requests),
+		at: count(input.at),
 	};
 }
 

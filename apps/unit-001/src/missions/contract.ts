@@ -1,5 +1,6 @@
 // Defines bounded mission formation data without granting execution authority.
 
+import type { ConversationId } from "@earendil-works/pi-durable";
 import type { MissionExecutionView } from "./execution-view.ts";
 import type { PlanTerms } from "./plan-terms.ts";
 import type { PlanView } from "./plan-wire.ts";
@@ -267,6 +268,8 @@ export type MissionRequest =
 			terms: PlanTerms;
 			savedBy: "bob" | "owner";
 			fromReview: string | null;
+			/** The conversation the agent's tool ran in; a review turn's draft is rechecked against that turn. */
+			reviewConversation: ConversationId | null;
 	  }
 	| { operation: "plan-propose"; expectedRevision: number; requestId: string }
 	/** The creator's explicit agreement to an exact proposed plan revision; the owner mints it only on developer-local. */

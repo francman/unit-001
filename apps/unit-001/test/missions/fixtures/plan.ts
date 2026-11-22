@@ -11,7 +11,7 @@ export const PURPOSE_DIGEST = "a".repeat(64);
 /** A complete plan: one strategic, one runnable tactical bound to purpose revision 1, one planned tactical. */
 export function planTerms(overrides: Partial<PlanTerms> = {}): PlanTerms {
 	return {
-		overall: { purpose: "Keep the reports current", scope: "The workspace", askFirst: [], reviewEveryMs: 10_000 },
+		overall: { purpose: "Keep the reports current", scope: "The workspace", askFirst: [], reviewEveryMs: 10_000, reviewAllowance: null },
 		strategics: [{ id: "reports", title: "Reports", intent: "Fresh reports", signals: ["Owner reads them"], priority: "high" }],
 		tacticals: [runnable(), planned()],
 		...overrides,

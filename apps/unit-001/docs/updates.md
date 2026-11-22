@@ -104,6 +104,10 @@ A deferral never leaves sticky state. Before the hold, the updater keeps the jou
 
 To roll back, run `sudo NAME mission operate close`. Wait until `NAME mission status` no longer shows `Rollback: close operation first`, then run `sudo NAME update rollback`.
 
+A release with model review turns also declares `mission-review-turn`. Before switching to a predecessor that lacks it, the updater checks the running owner's identity, protected purpose restriction and review status. A plan-only owner can proceed without a purpose Close when it has no purpose or protected operation intent. A running or unresolved review defers the switch. A settled review task may still be parked between cadence windows. The matching maintenance hold must end it and return affirmative no-live-task status before the updater changes the selected release.
+
+Qualify this downgrade with the actual current and recovery updater binaries and an exact v1 plan reader. A historical core may skip the review guard. A compatible predecessor must preserve the stored plan and review ledger through an owner write. Forward reopen must retain charges and keep admission closed if protected authority was lost.
+
 After rollback, the older release follows the purpose reader contract. The purpose history, work digests, acknowledgments and lifetime ledger are kept. Opening operation again needs fresh consent, because the older `deploy/mission.mjs` drops the purpose grant and operation intent when it rewrites the authority file. This was checked with the published 0.0.9 round trip ([Continuous operation](missions/purpose.md)).
 
 Rollback pins the selected previous version before activation so the next timer check cannot reinstall the rejected release. The pin remains if rollback fails. Inspect `update status`, recover as needed, and explicitly `unpin` when ready to follow stable again.
