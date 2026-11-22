@@ -2,14 +2,17 @@
 import {
 	type AgentState,
 	type ConversationView,
+	type Cursor,
 	type EntryRecord,
 	type LiveState,
+	type Page,
 	type RunFailureReason,
 	ToolResultEntry,
 	type UsageState,
 } from "@earendil-works/pi-durable";
 import { HostFactEntry } from "./commands/facts.ts";
 import { cutText } from "./render.ts";
+import { positiveId } from "./side-control.ts";
 
 type TextContent = string | readonly { readonly type: string; readonly text?: string }[];
 
@@ -61,16 +64,26 @@ export interface ServiceUsage {
 	readonly cost: { readonly kind: "estimate"; readonly usd: number } | { readonly kind: "unknown" };
 }
 
+type TranscriptRow = {
+	readonly id: number;
+	readonly role: "user" | "assistant";
+	readonly text: string;
+	readonly truncated: boolean;
+	readonly source?: "host";
+};
+
+export interface ChatHistoryPage {
+	readonly entries: readonly TranscriptRow[];
+	readonly nextBefore: number | null;
+}
+
+const CHAT_TEXT_LIMIT = 4096;
+const HISTORY_ROW_LIMIT = 5;
+
 export interface ServiceView extends ServiceIdentity {
 	readonly model: { readonly provider: string; readonly modelId: string } | null;
 	readonly usage: ServiceUsage | null;
-	readonly entries: readonly {
-		readonly id: number;
-		readonly role: "user" | "assistant";
-		readonly text: string;
-		readonly truncated: boolean;
-		readonly source?: "host";
-	}[];
+	readonly entries: readonly TranscriptRow[];
 	readonly busy: boolean;
 	readonly text: string;
 	readonly textTruncated: boolean;
@@ -97,16 +110,6 @@ export function serviceView(view: ConversationView, identity: ServiceIdentity): 
 	const tools = new Map<string, ServiceView["tools"][number]>();
 	const results = new Map<number, ServiceView["tools"][number]>();
 	for (const entry of view.entries.slice(-20)) {
-		if (HostFactEntry.is(entry)) {
-			entries.push({
-				id: entry.id,
-				role: entry.data.role,
-				text: cutText(entry.data.text, 4096),
-				truncated: entry.data.text.length > 4096,
-				source: "host",
-			});
-			continue;
-		}
 		const result = ToolResultEntry.is(entry) ? entry.model?.[0] : undefined;
 		if (result?.role === "toolResult") {
 			// Only a failed call's diagnostic code is read; no output or error text of any call is touched here.
@@ -121,22 +124,8 @@ export function serviceView(view: ConversationView, identity: ServiceIdentity): 
 			tools.set(result.toolCallId, tool);
 			results.set(entry.id, tool);
 		}
-		let role: "user" | "assistant" | undefined;
-		let text = "";
-		for (const message of entry.model ?? []) {
-			if (message.role !== "user" && message.role !== "assistant") continue;
-			role ??= message.role;
-			const part = textPrefix(message.content, 4097 - text.length);
-			if (part !== "") text += `${text === "" ? "" : "\n"}${part}`;
-			if (text.length > 4096) break;
-		}
-		if (text !== "" && role !== undefined)
-			entries.push({
-				id: entry.id,
-				role,
-				text: cutText(text, 4096),
-				truncated: text.length > 4096,
-			});
+		const row = transcriptRow(entry);
+		if (row !== undefined) entries.push(row);
 	}
 	const live = view.docs["pi.live"] as LiveState | undefined;
 	// These documents come from Durable's schema-checked in-process watch, not from the socket.
@@ -167,6 +156,43 @@ export function serviceView(view: ConversationView, identity: ServiceIdentity): 
 		historyTruncated: view.before !== undefined || entries.length > 20,
 		...runProblems(live),
 	};
+}
+
+/** Projects one descending raw page and advances across hidden records while retaining the sixth visible row. */
+export function projectChatHistoryPage({ items, next }: Page<EntryRecord, Cursor>): ChatHistoryPage {
+	const entries: TranscriptRow[] = [];
+	let lastConsumed: number | null = null;
+	for (const entry of items) {
+		const row = transcriptRow(entry);
+		if (row !== undefined) {
+			if (entries.length === HISTORY_ROW_LIMIT) return { entries: entries.reverse(), nextBefore: lastConsumed };
+			entries.push(row);
+		}
+		lastConsumed = entry.id;
+	}
+	return { entries: entries.reverse(), nextBefore: next === undefined ? null : lastConsumed };
+}
+
+function transcriptRow(entry: EntryRecord): TranscriptRow | undefined {
+	if (HostFactEntry.is(entry))
+		return {
+			id: entry.id,
+			role: entry.data.role,
+			text: cutText(entry.data.text, CHAT_TEXT_LIMIT),
+			truncated: entry.data.text.length > CHAT_TEXT_LIMIT,
+			source: "host",
+		};
+	let role: TranscriptRow["role"] | undefined;
+	let text = "";
+	for (const message of entry.model ?? []) {
+		if (message.role !== "user" && message.role !== "assistant") continue;
+		role ??= message.role;
+		const part = textPrefix(message.content, CHAT_TEXT_LIMIT + 1 - text.length);
+		if (part !== "") text += `${text === "" ? "" : "\n"}${part}`;
+		if (text.length > CHAT_TEXT_LIMIT) break;
+	}
+	if (role !== undefined && text !== "")
+		return { id: entry.id, role, text: cutText(text, CHAT_TEXT_LIMIT), truncated: text.length > CHAT_TEXT_LIMIT };
 }
 
 // Committed result entries are immutable and shared across watch values, so each is classified once.
@@ -354,6 +380,49 @@ function textPrefix(content: TextContent, limit: number): string {
 	return text;
 }
 
+/** Decodes the closed owner history page, including its ordering and exclusive bound when known. */
+export function parseChatHistoryPage(value: unknown, before?: number | null): ChatHistoryPage {
+	if (
+		!closed(value, ["entries", "nextBefore"]) ||
+		!Array.isArray(value.entries) ||
+		value.entries.length > HISTORY_ROW_LIMIT
+	)
+		throw new Error("Invalid service chat history page.");
+	const { nextBefore } = value;
+	const entries: TranscriptRow[] = [];
+	let previousId = 0;
+	for (const row of value.entries) {
+		if (
+			!closed(row, ["id", "role", "text", "truncated", "source"]) ||
+			!positiveId(row.id) ||
+			row.id <= previousId ||
+			(typeof before === "number" && row.id >= before) ||
+			(row.role !== "user" && row.role !== "assistant") ||
+			typeof row.text !== "string" ||
+			row.text.length > CHAT_TEXT_LIMIT ||
+			typeof row.truncated !== "boolean" ||
+			(row.source !== undefined && row.source !== "host")
+		)
+			throw new Error("Invalid service chat history row.");
+		entries.push({
+			id: row.id,
+			role: row.role,
+			text: row.text,
+			truncated: row.truncated,
+			...(row.source === "host" ? { source: row.source } : {}),
+		});
+		previousId = row.id;
+	}
+	if (
+		nextBefore !== null &&
+		(!positiveId(nextBefore) ||
+			(typeof before === "number" && nextBefore >= before) ||
+			(entries[0] !== undefined && nextBefore > entries[0].id))
+	)
+		throw new Error("Invalid service chat history continuation.");
+	return { entries, nextBefore };
+}
+
 /** Validates bounded untrusted socket frames before exposing them to terminal rendering. */
 export function parseServiceEvent(wire: string): ServiceEvent {
 	const event: unknown = JSON.parse(wire);
@@ -407,7 +476,7 @@ export function parseServiceEvent(wire: string): ServiceEvent {
 			!Number.isSafeInteger(entry.id) ||
 			(entry.role !== "user" && entry.role !== "assistant") ||
 			typeof entry.text !== "string" ||
-			entry.text.length > 4096 ||
+			entry.text.length > CHAT_TEXT_LIMIT ||
 			(entry.source !== undefined && entry.source !== "host") ||
 			typeof entry.truncated !== "boolean"
 		)
