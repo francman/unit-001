@@ -7,6 +7,7 @@ import {
 	constants,
 	cpSync,
 	existsSync,
+	fchmodSync,
 	fstatSync,
 	fsyncSync,
 	lstatSync,
@@ -155,19 +156,20 @@ export function listInstallations(root = "/") {
 		.map((id) => readInstallation(validateId(id), root));
 }
 
-function atomicFile(path, contents, mode, root) {
+function atomicFile(path, contents, mode, root, { exactMode = false } = {}) {
 	assertSafePath(path, root);
 	mkdirSync(dirname(path), { recursive: true, mode: 0o755 });
 	trustedParents(path, root);
 	const temporary = `${path}.${randomUUID()}.tmp`;
-	const fd = openSync(temporary, "wx", mode);
+	const fd = openSync(temporary, "wx", exactMode ? 0o600 : mode);
 	try {
-		writeFileSync(fd, contents);
-		fsyncSync(fd);
-	} finally {
-		closeSync(fd);
-	}
-	try {
+		try {
+			writeFileSync(fd, contents);
+			if (exactMode) fchmodSync(fd, mode);
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
 		renameSync(temporary, path);
 		const directory = openSync(dirname(path), "r");
 		try {
@@ -180,10 +182,12 @@ function atomicFile(path, contents, mode, root) {
 	}
 }
 
-/** Atomically publishes an administrator-owned record. */
+/** Atomically publishes an administrator-owned record readable by the service account. */
 export function writeInstallation(record, root = "/") {
 	validateRecord(record);
-	atomicFile(installationPaths(record.id, root).record, `${JSON.stringify(record, null, "\t")}\n`, 0o644, root);
+	atomicFile(installationPaths(record.id, root).record, `${JSON.stringify(record, null, "\t")}\n`, 0o644, root, {
+		exactMode: true,
+	});
 }
 
 // Exact service template shipped in 0.0.6 (d002562a); signed old updaters retain it during application updates.

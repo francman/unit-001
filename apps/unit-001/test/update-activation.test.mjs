@@ -1303,6 +1303,34 @@ test("#18 applying and restoring a unit keep its file mode", async () => {
 	assert.equal(statSync(fixture.paths.unitFile).mode & 0o777, 0o600);
 });
 
+test("unit-off.8 update activation and rollback publish a service-readable record under umask 077", async () => {
+	const { record, candidate, context, root, paths } = templateFixture(hardened);
+	chmodSync(paths.unitFile, 0o600);
+	const startModes = [];
+	const run = context.run;
+	context.run = async (command, args, ...rest) => {
+		if (command === "systemctl" && args[0] === "start")
+			startModes.push([
+				readInstallation(id, root).releaseVersion,
+				statSync(paths.record).mode & 0o777,
+				statSync(paths.unitFile).mode & 0o777,
+			]);
+		return run(command, args, ...rest);
+	};
+	const previousUmask = process.umask(0o077);
+	try {
+		assert.equal((await activateUpdate(record, candidate, context)).status, "updated");
+		assert.equal((await rollbackUpdate(readInstallation(id, root), context)).status, "updated");
+	} finally {
+		process.umask(previousUmask);
+	}
+	assert.deepEqual(startModes, [
+		[candidate.version, 0o644, 0o600],
+		[record.releaseVersion, 0o644, 0o600],
+	]);
+	assert.deepEqual(readInstallation(id, root), record);
+});
+
 test("#18 a unit with bytes outside the reviewed subset holds a template change", async () => {
 	const fixture = templateFixture(hardened);
 	const invalid = Buffer.concat([Buffer.from(fixture.previousUnit), Buffer.from([0x23, 0xff, 0x0a])]);

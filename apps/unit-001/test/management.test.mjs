@@ -714,6 +714,29 @@ test("#20 explicit start restores running intent and failed readiness leaves it 
 	assert.deepEqual(calls.at(-1), ["systemctl", "disable", "--now", installationPaths(id, root).unit]);
 });
 
+test("unit-off.8 named stop and start publish a service-readable record under umask 077", async () => {
+	const { context, record, root, paths } = await setup();
+	await writeFile(paths.environment, "UNIT_001_MODEL=faux/faux-1\n", { mode: 0o600 });
+	const modes = [];
+	const previousUmask = process.umask(0o077);
+	try {
+		await dispatchAgent(id, record.name, ["stop", "--yes"], context);
+		assert.equal(readInstallation(id, root).desiredState, "stopped");
+		modes.push((await stat(paths.record)).mode & 0o777);
+		await dispatchAgent(id, record.name, ["start", "--yes"], {
+			...context,
+			async ready() {
+				modes.push((await stat(paths.record)).mode & 0o777);
+			},
+		});
+	} finally {
+		process.umask(previousUmask);
+	}
+	assert.deepEqual(modes, [0o644, 0o644]);
+	assert.equal(readInstallation(id, root).desiredState, "running");
+	assert.equal((await stat(paths.environment)).mode & 0o777, 0o600);
+});
+
 test("#20 uninstall preserves unexpected helper bytes instead of recursively deleting them", async () => {
 	const { context, record, root, paths } = await setup();
 	const release = await software(record, root, paths);
