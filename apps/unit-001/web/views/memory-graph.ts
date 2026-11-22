@@ -256,11 +256,13 @@ function refreshModel(widget: Widget): void {
 	if (!data || !canvas) return;
 	const model = shownGraph(data.nodes, data.edges, data.degrees, widget.hidden, widget.focus, [widget.selected, widget.focus?.id ?? null]);
 	// Not only the shown ids and relations: a memory can change its size or text while the shape of what is shown stays the same.
-	const key = modelKey(model);
+	// The focus view is not a brain, so whether the map forms one is part of what changed.
+	const shape = widget.focus === null;
+	const key = `${shape ? "brain" : "plain"}|${modelKey(model)}`;
 	widget.model = model;
 	if (key !== widget.modelKey) {
 		widget.modelKey = key;
-		canvas.setModel(model);
+		canvas.setModel(model, { shape });
 		canvas.setSelected(widget.selected);
 		canvas.setMatches(matchesOf(widget));
 	}

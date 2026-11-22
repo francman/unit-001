@@ -3,7 +3,7 @@ import { once } from "node:events";
 import { request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ServiceRequest } from "../src/service.ts";
+import type { ServiceRequest, ServiceResponse } from "../src/service.ts";
 import type { ServiceClient } from "../src/service-client.ts";
 import { parseWebRequest } from "../src/web/contract.ts";
 import { createWebGateway } from "../src/web/gateway.ts";
@@ -79,6 +79,26 @@ async function fixture(wrongGuesses = 0) {
 	return { origin, headers, requests, client, pair, failedStatuses };
 }
 
+// Put a harmless marker on every object layer, including nested rows.
+function annotated(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(annotated);
+	if (typeof value !== "object" || value === null) return value;
+	return Object.fromEntries([
+		...Object.entries(value).map(([key, item]) => [key, annotated(item)]),
+		["annotation", "sample"],
+	]);
+}
+
+async function postOwnerReply(f: Awaited<ReturnType<typeof fixture>>, requestId: string, operation: unknown) {
+	const response = await fetch(`${f.origin}/api/v1/requests`, {
+		method: "POST",
+		headers: f.headers,
+		body: JSON.stringify({ requestId, operation }),
+	});
+	expect(response.status).toBe(200);
+	return response.json();
+}
+
 describe("web gateway", () => {
 	it("#65 permits direct navigation without Origin and explains rejected hostnames without reflecting them", async () => {
 		const { origin, requests } = await fixture();
@@ -105,18 +125,64 @@ describe("web gateway", () => {
 		}
 		expect(requests).toEqual([]);
 	});
-	it("#65 retains an oversized post-admission reply as unknown without redispatching", async () => {
+	it("#65 keeps send and cancel acknowledgements known when the discarded owner payload exceeds 128 KiB", async () => {
 		const f = await fixture();
+		const largeText = "x".repeat(140_000);
 		f.client.request = async (request) => {
 			f.requests.push(request);
-			return { type: "reply", reply: { status: "answered", text: "x".repeat(140000) } };
+			if (request.type === "send") return { type: "reply", reply: { status: "answered", text: largeText } };
+			const response = { type: "cancelled" as const, annotation: largeText };
+			return response;
 		};
-		const body = JSON.stringify({ requestId: "oversized-reply", operation: { type: "send", prompt: "work" } });
-		for (let attempt = 0; attempt < 2; attempt++) {
-			const response = await fetch(`${f.origin}/api/v1/requests`, { method: "POST", headers: f.headers, body });
-			expect(await response.json()).toMatchObject({ state: "unknown", requestId: "oversized-reply" });
+		for (const [operation, type] of [
+			[{ type: "send", prompt: "work" }, "sent"],
+			[{ type: "cancel" }, "cancelled"],
+		] as const) {
+			const expected = { requestId: type, state: "completed", response: { type } };
+			expect(await postOwnerReply(f, type, operation)).toEqual(expected);
+			expect(await postOwnerReply(f, type, operation)).toEqual(expected);
 		}
-		expect(f.requests).toHaveLength(1);
+		expect(f.requests).toHaveLength(2);
+	});
+	it("checks a non-graph read against the raw 128 KiB cap before dropping extra fields", async () => {
+		const f = await fixture();
+		const status = {
+			type: "status",
+			inhibited: false,
+			maintenance: { state: "open" },
+			runtime: { configuration: "configured", uptimeMs: 4 },
+		} as const;
+		const ownerStatus = {
+			...status,
+			pid: 1,
+			version: "fixture",
+			name: "fixture",
+			installationId: null,
+			busy: false,
+			maintenance: { ...status.maintenance, protocol: 1, operationId: null },
+			runtime: {
+				...status.runtime,
+				application: "unit-001",
+				name: "fixture",
+				provider: "faux",
+				modelId: "faux-1",
+				pid: 1,
+				startedAt: 1,
+				observedAt: 5,
+			},
+		} satisfies Extract<ServiceResponse, { type: "status" }>;
+		let annotation = "";
+		f.client.request = async () => {
+			const response = { ...ownerStatus, annotation };
+			return response;
+		};
+		const operation = { type: "status" };
+		expect(await postOwnerReply(f, "small-status", operation)).toMatchObject({ state: "completed", response: status });
+		annotation = "語".repeat(44_000);
+		expect(await postOwnerReply(f, "large-status", operation)).toMatchObject({
+			state: "unknown",
+			message: expect.stringContaining("exceeded the browser limit"),
+		});
 	});
 	it("#65 a valid pairing code remains usable after invalid local guesses", async () => {
 		const f = await fixture(6);
@@ -286,50 +352,253 @@ describe("web gateway", () => {
 		]);
 	});
 
+	describe("browser POST response projection", () => {
+		it("rebuilds status, mission and channel details down to the rendered fields", async () => {
+			const f = await fixture();
+			const status = {
+				type: "status",
+				inhibited: true,
+				maintenance: { state: "held" },
+				runtime: { configuration: "unconfigured", uptimeMs: 500 },
+			};
+			const mission = {
+				type: "mission",
+				result: {
+					stage: "agreed",
+					formation: {
+						agreement: {
+							revision: 1,
+							terms: {
+								objective: "Ship the change",
+								scope: "Unit",
+								successCriteria: ["Checked"],
+								approvalBoundary: ["Local"],
+								reviewEveryMs: 1000,
+								policy: {
+									maxCycles: 2,
+									maxRequests: 3,
+									maxRetries: 4,
+									maxConsecutiveNoProgress: 1,
+									deadlineAt: 5000,
+									maxEstimatedCost: 0.25,
+								},
+							},
+							approval: { approvedAt: 10, approvedBy: { kind: "developer-local" } },
+						},
+						draft: { revision: 2, status: "editing", digest: null, terms: { objective: "Next change" } },
+					},
+					creator: { kind: "human", id: "operator" },
+					authority: "developer-local",
+					authorityError: null,
+					agreementValid: true,
+					missing: [],
+					execution: "waiting",
+					runtime: {
+						status: "waiting",
+						blocker: "maintenance",
+						nextWakeAt: 999,
+						cycles: 1,
+						requests: 2,
+						retries: 1,
+						noProgress: 1,
+						estimatedCost: 0.125,
+						reservedCost: 0,
+						unknownRequests: 0,
+						unpricedResponses: 1,
+						uncertainTools: 0,
+						evidence: [{ criterion: "Checked", accepted: true, detail: "Passed", observedAt: 9 }],
+						observedAt: 10,
+					},
+					tools: Array.from({ length: 128 }, (_, index) => `tool-${index}`),
+				},
+			};
+			const channels = {
+				type: "channels",
+				result: {
+					operation: "status",
+					view: {
+						channels: [
+							{
+								request: { channelId: "alpha", adapter: "sample" },
+								outcome: { kind: "awaiting_creator", step: "grant" },
+								lastHealth: null,
+							},
+							{
+								request: { channelId: "beta", adapter: "sample" },
+								outcome: { kind: "failed", reason: "transport" },
+								lastHealth: { observedAt: 12, healthy: false },
+							},
+							{
+								request: { channelId: "gamma", adapter: "sample" },
+								outcome: { kind: "ready" },
+								lastHealth: null,
+							},
+							{
+								request: { channelId: "delta", adapter: "sample" },
+								outcome: { kind: "unknown" },
+								lastHealth: null,
+							},
+						],
+					},
+				},
+			};
+			for (const [operation, expected, owner] of [
+				[
+					{ type: "status" },
+					status,
+					{ ...status, pid: 42, maintenance: { ...status.maintenance, operationId: "sample" } },
+				],
+				[{ type: "mission", request: { operation: "status" } }, mission, mission],
+				[{ type: "channels", request: { operation: "status" } }, channels, channels],
+			] as const) {
+				// Only the expected browser fields and synthetic extra data are necessary for this boundary fixture.
+				f.client.request = async () => annotated(owner) as ServiceResponse;
+				expect(await postOwnerReply(f, expected.type, operation)).toEqual({
+					requestId: expected.type,
+					state: "completed",
+					response: expected,
+				});
+			}
+		});
+
+		it("keeps memory read rows and mutation outcomes but omits scores, counts not used by the page and reply text", async () => {
+			const f = await fixture();
+			const record = { id: "memory:a", content: "Example", origin: "user", tier: "working" };
+			const node = {
+				...record,
+				truncated: false,
+				kind: "fact",
+				importance: 0.25,
+				createdAt: 2,
+				conversation: "0123456789ab",
+			};
+			const stats = {
+				operation: "stats",
+				working: 1,
+				episodic: 1,
+				tombstones: 2,
+				pendingCaptures: 3,
+				failedCaptures: 4,
+				consolidation: "scheduled",
+			};
+			const recall = { operation: "recall", records: [record] };
+			const graph = {
+				operation: "graph",
+				nodes: [node, { ...node, id: "memory:b", tier: "episodic" }],
+				edges: [
+					{ from: "memory:b", to: "memory:a", kind: "summary" },
+					{ from: "memory:a", to: "memory:b", kind: "supports", derivation: "explicit" },
+				],
+				total: 3,
+				limited: true,
+			};
+			const forget = { operation: "forget", removed: false };
+			for (const [request, expected, owner] of [
+				[{ operation: "stats" }, stats, { ...stats, relations: 12 }],
+				[{ operation: "recall", query: "example" }, recall, { ...recall, records: [{ ...record, score: 0.5 }] }],
+				[{ operation: "graph" }, graph, graph],
+				[{ operation: "forget", id: record.id, confirmed: true }, forget, forget],
+			] as const) {
+				f.client.request = async () => annotated({ type: "memory", result: owner }) as ServiceResponse;
+				expect(await postOwnerReply(f, request.operation, { type: "memory", request })).toEqual({
+					requestId: request.operation,
+					state: "completed",
+					response: { type: "memory", result: expected },
+				});
+			}
+			for (const [operation, owner, response] of [
+				[
+					{ type: "send", prompt: "work" },
+					{ type: "reply", reply: { status: "answered", text: "Sample answer" } },
+					{ type: "sent" },
+				],
+				[{ type: "cancel" }, { type: "cancelled" }, { type: "cancelled" }],
+				[
+					{ type: "status" },
+					{ type: "error", message: "Sample rejection" },
+					{ type: "error", message: "Owner rejected the operation." },
+				],
+				[
+					{ type: "send", prompt: "work" },
+					{ type: "reply", reply: { status: "failed", reason: "sample", detail: "Sample detail" } },
+					{ type: "send-failed" },
+				],
+			] as const) {
+				const requestId = `outcome-${f.requests.length}`;
+				f.client.request = async (request) => {
+					f.requests.push(request);
+					return annotated(owner) as ServiceResponse;
+				};
+				expect(await postOwnerReply(f, requestId, operation)).toEqual({ requestId, state: "completed", response });
+			}
+		});
+
+		it("records owner errors and unexpected replies as unknown without redispatching mutations", async () => {
+			const f = await fixture();
+			const sent = { type: "send", prompt: "work" };
+			const forget = { type: "memory", request: { operation: "forget", id: "memory:a", confirmed: true } };
+			const rejected = { type: "error", message: "Sample owner error" };
+			for (const [requestId, operation, owner] of [
+				["wrong-type", sent, { type: "cancelled" }],
+				["wrong-memory-operation", forget, { type: "memory", result: { operation: "recall", records: [] } }],
+				["invalid-removal", forget, { type: "memory", result: { operation: "forget", removed: "sample" } }],
+				["bad-send", sent, { type: "reply", reply: { status: "answered" } }],
+				["owner-send-error", sent, rejected],
+				["owner-forget-error", forget, rejected],
+				["owner-cancel-error", { type: "cancel" }, rejected],
+			] as const) {
+				f.client.request = async (request) => {
+					f.requests.push(request);
+					return annotated(owner) as ServiceResponse;
+				};
+				const expected = {
+					requestId,
+					state: "unknown",
+					message: "Owner outcome is unknown. Inspect current state before acting again.",
+				};
+				expect(await postOwnerReply(f, requestId, operation)).toEqual(expected);
+				expect(await postOwnerReply(f, requestId, operation)).toEqual(expected);
+			}
+			expect(f.requests).toHaveLength(7);
+		});
+	});
+
 	it("allows a full memory graph past the general browser limit but not past the owner frame", async () => {
 		const f = await fixture();
-		let size = 400_000;
-		f.client.request = async (request) => {
-			f.requests.push(request);
-			const content = "x".repeat(size);
-			return request.type === "memory"
-				? {
-						type: "memory",
-						result: {
-							operation: "graph",
-							nodes: [
-								{
-									id: "memory:a",
-									content,
-									truncated: false,
-									kind: "fact",
-									tier: "working",
-									origin: "user",
-									importance: 0,
-									createdAt: 0,
-									conversation: "0123456789ab",
-								},
-							],
-							edges: [],
-							total: 1,
-							limited: false,
-						},
-					}
-				: { type: "reply", reply: { status: "answered", text: content } };
+		let annotation = "";
+		const content = "語".repeat(280);
+		f.client.request = async () => {
+			const response = {
+				type: "memory",
+				result: {
+					operation: "graph",
+					nodes: Array.from({ length: 300 }, (_, index) => ({
+						id: `memory:${index}`,
+						content,
+						truncated: true,
+						kind: "fact",
+						tier: "working",
+						origin: "user",
+						importance: 0,
+						createdAt: 0,
+						conversation: "0123456789ab",
+					})),
+					edges: [],
+					total: 300,
+					limited: false,
+				},
+				annotation,
+			} satisfies Extract<ServiceResponse, { type: "memory" }> & { annotation: string };
+			return response;
 		};
-		const post = (requestId: string, operation: unknown) =>
-			fetch(`${f.origin}/api/v1/requests`, {
-				method: "POST",
-				headers: f.headers,
-				body: JSON.stringify({ requestId, operation }),
-			}).then((response) => response.json());
-		expect(await post("graph", { type: "memory", request: { operation: "graph" } })).toMatchObject({
-			state: "completed",
-		});
-		expect(await post("status", { type: "status" })).toMatchObject({ state: "unknown" });
-		size = 1_100_000;
-		expect(await post("graph-2", { type: "memory", request: { operation: "graph" } })).toMatchObject({
+		const operation = { type: "memory", request: { operation: "graph" } };
+		const full = await postOwnerReply(f, "graph", operation);
+		expect(full).toMatchObject({ state: "completed", response: { result: { total: 300 } } });
+		expect(Buffer.byteLength(JSON.stringify(full))).toBeGreaterThan(131_072);
+		annotation = "x".repeat(1_048_576);
+		expect(await postOwnerReply(f, "graph-2", operation)).toMatchObject({
 			state: "unknown",
+			message: expect.stringContaining("exceeded the browser limit"),
 		});
 	});
 

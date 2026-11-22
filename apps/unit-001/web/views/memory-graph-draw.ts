@@ -1,4 +1,5 @@
 // Draws the memory map on a canvas 2D context: relations with arrowheads, nodes sized by degree, rings and labels, all in screen pixels.
+import { brain, brainHeight } from "./memory-graph-brain.ts";
 import type { EdgeKind, GraphNode } from "./memory-graph-details.ts";
 import { type Placed, screenRadius, squareCorner, type View } from "./memory-graph-geometry.ts";
 import type { GraphModel, ModelEdge } from "./memory-graph-model.ts";
@@ -13,6 +14,21 @@ export interface DrawnLabel {
 	alpha: number;
 	/** Selected, hovered and neighbour labels read in the strong text color. */
 	strong: boolean;
+}
+
+/** How far each memory and relation has appeared (0..1) while the map forms; both are indexed like the model. */
+export interface FormScene {
+	reveal: Float32Array;
+	edgeProgress: Float32Array;
+}
+
+/** The brain's outline: drawn in world units, `size` wide, centered on the origin. */
+export interface OutlineScene {
+	size: number;
+	/** Strength (0..1); nothing is drawn at 0. */
+	alpha: number;
+	/** How much of the outline's length has been drawn (0..1). */
+	trace: number;
 }
 
 /** Everything one frame needs. The caller decides what is hovered, selected or matched; this only paints it. */
@@ -34,6 +50,10 @@ export interface Scene {
 	/** The memory the keyboard is on. */
 	current: number | null;
 	labels: readonly DrawnLabel[];
+	/** Set while the map forms; null when everything is fully shown. */
+	form: FormScene | null;
+	/** Set while the memories are held in the brain; null otherwise. */
+	outline: OutlineScene | null;
 }
 
 /** Strength of a memory that is not the focus or next to it, and of a relation that does not touch the focus. */
@@ -88,22 +108,55 @@ export function edgeOpacity(scene: Pick<Scene, "focus" | "mix" | "matches">, edg
 export function draw(ctx: CanvasRenderingContext2D, scene: Scene): void {
 	ctx.setTransform(scene.dpr, 0, 0, scene.dpr, 0, 0);
 	ctx.clearRect(0, 0, scene.width, scene.height);
+	if (scene.outline) drawOutline(ctx, scene, scene.outline);
 	drawEdges(ctx, scene);
 	drawNodes(ctx, scene);
 	drawRings(ctx, scene);
 	drawLabels(ctx, scene);
 }
 
+// A hairline brain under everything else: the outline is drawn stroke by stroke while `trace` grows, the fissures follow.
+function drawOutline(ctx: CanvasRenderingContext2D, scene: Scene, outline: OutlineScene): void {
+	if (outline.alpha <= 0 || outline.trace <= 0) return;
+	const { view } = scene;
+	const scale = outline.size * view.k;
+	ctx.globalAlpha = outline.alpha;
+	ctx.strokeStyle = scene.theme.fg3;
+	ctx.lineWidth = 1;
+	ctx.lineCap = "round";
+	ctx.lineJoin = "round";
+	traceLine(ctx, brain.outline, scale, view.x, view.y, brain.outlineLength * scale, outline.trace);
+	brain.details.forEach((points, index) => traceLine(ctx, points, scale, view.x, view.y, (brain.detailLengths[index] ?? 0) * scale, outline.trace));
+	ctx.setLineDash([]);
+	ctx.globalAlpha = 1;
+}
+
+// Strokes a line of unit points around the world origin; a dash as long as `length * progress` followed by a gap shows only that much.
+function traceLine(ctx: CanvasRenderingContext2D, points: Float64Array, scale: number, x: number, y: number, length: number, progress: number): void {
+	ctx.setLineDash(progress >= 1 ? [] : [length * progress, length]);
+	ctx.beginPath();
+	for (let at = 0; at < points.length; at += 2) {
+		const px = (points[at] - 0.5) * scale + x;
+		const py = (points[at + 1] - brainHeight / 2) * scale + y;
+		if (at === 0) ctx.moveTo(px, py);
+		else ctx.lineTo(px, py);
+	}
+	ctx.stroke();
+}
+
 // Dimmed relations first, so the lit ones that touch the focus end up on top.
 function drawEdges(ctx: CanvasRenderingContext2D, scene: Scene): void {
-	const { model, view, bodies, focus } = scene;
+	const { model, view, bodies, focus, form } = scene;
 	const order = model.edges
-		.map((edge) => ({ edge, alpha: edgeOpacity(scene, edge), touches: focus !== null && (edge.from === focus || edge.to === focus) }))
+		.map((edge, index) => ({ edge, index, alpha: edgeOpacity(scene, edge), touches: focus !== null && (edge.from === focus || edge.to === focus) }))
 		.sort((a, b) => Number(a.touches) - Number(b.touches));
 	ctx.lineCap = "round";
-	for (const { edge, alpha, touches } of order) {
+	for (const { edge, index, alpha: rest, touches } of order) {
 		const from = bodies[edge.from];
 		const to = bodies[edge.to];
+		// While the map forms, a relation grows out of its first memory toward the second and strengthens as it goes.
+		const progress = form ? (form.edgeProgress[index] ?? 1) : 1;
+		const alpha = rest * progress;
 		if (!from || !to || alpha < 0.005) continue;
 		const style = edgeStyles[edge.kind];
 		const x1 = from.x * view.k + view.x;
@@ -116,6 +169,11 @@ function drawEdges(ctx: CanvasRenderingContext2D, scene: Scene): void {
 		const back = style.head === "none" ? 0 : screenRadius(to.radius, view.k) + 2;
 		x2 -= ux * back;
 		y2 -= uy * back;
+		// While the map forms the line grows toward where it will end, so it never jumps when the arrowhead appears.
+		if (progress < 1) {
+			x2 = x1 + (x2 - x1) * progress;
+			y2 = y1 + (y2 - y1) * progress;
+		}
 		ctx.globalAlpha = alpha;
 		ctx.strokeStyle = scene.theme[style.color];
 		ctx.fillStyle = ctx.strokeStyle;
@@ -125,7 +183,7 @@ function drawEdges(ctx: CanvasRenderingContext2D, scene: Scene): void {
 		ctx.moveTo(x1, y1);
 		ctx.lineTo(x2, y2);
 		ctx.stroke();
-		if (style.head !== "none") {
+		if (style.head !== "none" && progress >= 0.98) {
 			ctx.setLineDash([]);
 			drawHead(ctx, style.head, x2, y2, ux, uy);
 		}
@@ -166,7 +224,7 @@ function drawHead(ctx: CanvasRenderingContext2D, head: "triangle" | "chevron" | 
 
 // Dimmed memories first, then the lit ones on top. Working memories are circles, episodic ones rounded squares.
 function drawNodes(ctx: CanvasRenderingContext2D, scene: Scene): void {
-	const { model, view, bodies, theme } = scene;
+	const { model, view, bodies, theme, form } = scene;
 	const order = model.nodes.map((_, index) => ({ index, alpha: nodeOpacity(scene, index) })).sort((a, b) => a.alpha - b.alpha);
 	ctx.lineWidth = 1.5;
 	for (const { index, alpha } of order) {
@@ -176,9 +234,12 @@ function drawNodes(ctx: CanvasRenderingContext2D, scene: Scene): void {
 		const x = body.x * view.k + view.x;
 		const y = body.y * view.k + view.y;
 		if (x < -40 || y < -40 || x > scene.width + 40 || y > scene.height + 40) continue;
-		const radius = screenRadius(body.radius, view.k);
+		// While the map forms, a memory fades in and grows from 60% of its size.
+		const reveal = form ? (form.reveal[index] ?? 1) : 1;
+		if (reveal <= 0) continue;
+		const radius = screenRadius(body.radius, view.k) * (0.6 + 0.4 * reveal);
 		// Importance is the secondary cue: the more important a memory, the more solid it is.
-		ctx.globalAlpha = alpha * (0.68 + 0.32 * Math.min(1, Math.max(0, entry.node.importance)));
+		ctx.globalAlpha = alpha * reveal * (0.68 + 0.32 * Math.min(1, Math.max(0, entry.node.importance)));
 		ctx.fillStyle = kindColors[entry.node.kind](theme);
 		ctx.strokeStyle = theme.canvas;
 		shape(ctx, entry.node.tier === "working", x, y, radius);

@@ -1,5 +1,5 @@
 // Holds the workspace state, the router and the actions views may call; views read state, never write it.
-import type { Connection, MemoryGraphView, MissionRunView, WorkspaceDetails, WorkspaceView } from "./contract.ts";
+import type { Connection, MemoryGraphView, MissionRunView, SendOutcome, WorkspaceDetails, WorkspaceView } from "./contract.ts";
 import type { IconName } from "./ui/icons.ts";
 
 /** The pages of the workspace; Chat is home. */
@@ -150,6 +150,23 @@ export function createStore(initial: { section?: Section; preview?: boolean; the
 			return () => listeners.delete(listener);
 		},
 	};
+}
+
+/** Restores the sent text only when the gateway proves it never reached the owner. */
+export function settleSend(ui: Ui, outcome: SendOutcome, requestId: string, prompt: string): void {
+	ui.sending = false;
+	switch (outcome.state) {
+		case "completed":
+			break;
+		case "unknown":
+			ui.unknown = { requestId, prompt };
+			break;
+		case "failed":
+		case "failed-after-admission":
+			if (outcome.state === "failed" && !ui.draft.trim()) ui.draft = prompt;
+			ui.error = outcome.message;
+			break;
+	}
 }
 
 /** A missing model counts only once the view or the owner says so; unknown is not unconfigured. */

@@ -1,8 +1,10 @@
 // Creates a loopback-only browser gateway without opening agent state or granting creator authority.
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { ServiceView } from "../service.ts";
 import type { ServiceClient } from "../service-client.ts";
-import { parseWebRequest, type WebResult } from "./contract.ts";
+import { parseWebRequest } from "./contract.ts";
+import { projectWebResponse, type WebResult } from "./post-response.ts";
 
 export type WebGatewayOptions = {
 	client: ServiceClient;
@@ -153,7 +155,7 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 				}, 15_000);
 				try {
 					await options.client.watch((event) => {
-						const frame = `event: ${event.type}\ndata: ${JSON.stringify(event.type === "view" ? event.view : { message: "Owner reconnecting." })}\n\n`;
+						const frame = `event: ${event.type}\ndata: ${JSON.stringify(event.type === "view" ? browserView(event.view) : { message: "Owner reconnecting." })}\n\n`;
 						if (Buffer.byteLength(frame) + res.writableLength > 1_048_576) disconnected.abort();
 						else res.write(frame);
 					}, signal);
@@ -178,10 +180,9 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 				if (session.expiresAt <= Date.now() || session.abort.signal.aborted)
 					return json(res, 401, { error: "Session expired." });
 				const fingerprint = JSON.stringify(parsed.operation);
+				const acknowledgement = parsed.operation.type === "send" || parsed.operation.type === "cancel";
 				const mutation =
-					parsed.operation.type === "send" ||
-					parsed.operation.type === "cancel" ||
-					(parsed.operation.type === "memory" && parsed.operation.request.operation === "forget");
+					acknowledgement || (parsed.operation.type === "memory" && parsed.operation.request.operation === "forget");
 				// A full memory graph (300 nodes of 280 code points) exceeds the general browser limit; it stays within the owner's 1 MiB frame.
 				const limit =
 					parsed.operation.type === "memory" && parsed.operation.request.operation === "graph" ? 1_048_576 : 131_072;
@@ -195,20 +196,22 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 					const result = options.client
 						.request(parsed.operation, AbortSignal.any([session.abort.signal, AbortSignal.timeout(120_000)]))
 						.then<WebResult>((response) => {
-							if (Buffer.byteLength(JSON.stringify(response)) > limit)
+							// An owner error can follow a committed mutation; it does not prove refusal.
+							if (mutation && response.type === "error") throw new Error("Owner mutation outcome is unknown.");
+							// The owner already bounds its wire frame. The browser only receives the send/cancel acknowledgement.
+							const projected = acknowledgement ? projectWebResponse(parsed.operation, response) : undefined;
+							if (Buffer.byteLength(JSON.stringify(projected ?? response)) > limit)
 								return {
 									requestId: parsed.requestId,
 									state: "unknown",
 									message:
 										"Owner response exceeded the browser limit. Inspect current work before acting again.",
 								};
-							const safeResponse =
-								response.type === "error"
-									? { type: "error" as const, message: "Owner rejected the operation." }
-									: response.type === "reply" && response.reply.status === "failed"
-										? { type: "error" as const, message: "Owner could not complete the operation." }
-										: response;
-							return { requestId: parsed.requestId, state: "completed", response: safeResponse };
+							return {
+								requestId: parsed.requestId,
+								state: "completed",
+								response: projected ?? projectWebResponse(parsed.operation, response),
+							};
 						})
 						.catch(
 							(): WebResult => ({
@@ -239,6 +242,41 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 		res.writeHead(200, { "Content-Type": asset.contentType });
 		res.end(asset.body);
 	}
+}
+
+// The browser contract (web/contract.ts `WorkspaceView`) is closed: an owner frame field reaches the browser only when
+// it is named here, so owner-only fields (failure reasons, retry state, the owner's PID) never do by default.
+function browserView(view: ServiceView) {
+	const { usage, model } = view;
+	return {
+		name: view.name,
+		version: view.version,
+		installationId: view.installationId,
+		busy: view.busy,
+		model: model === null ? null : { provider: model.provider, modelId: model.modelId },
+		usage:
+			usage === null
+				? null
+				: {
+						input: usage.input,
+						output: usage.output,
+						cacheRead: usage.cacheRead,
+						cacheWrite: usage.cacheWrite,
+						totalTokens: usage.totalTokens,
+						cost: usage.cost.kind === "estimate" ? { kind: "estimate", usd: usage.cost.usd } : { kind: "unknown" },
+					},
+		entries: view.entries.map((entry) => ({
+			id: entry.id,
+			role: entry.role,
+			text: entry.text,
+			truncated: entry.truncated,
+			...(entry.source === undefined ? {} : { source: entry.source }),
+		})),
+		text: view.text,
+		textTruncated: view.textTruncated,
+		historyTruncated: view.historyTruncated,
+		tools: view.tools.map((tool) => ({ callId: tool.callId, name: tool.name, status: tool.status })),
+	};
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {

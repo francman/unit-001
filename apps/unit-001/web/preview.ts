@@ -24,7 +24,7 @@ import { renderPairing } from "./views/pairing.ts";
  *   ?nav=1         opens the phone menu after load (below 768 px)
  *   ?memory=1      the memory page shows search results
  *   ?forget=1      the forget dialog is open (with ?section=memory&memory=1)
- *   ?graph=empty|limited|large|failed   the memory map with no memories, the newest 40 of 1,204, or a failed read
+ *   ?graph=empty|small|mid|limited|large|failed   the memory map with no memories, 8 (no brain), 30, the newest 40 of 1,204, 300, or a failed read (the default is 60); the map forms again on every reload
  *   ?pairing=1     the pairing screen
  *   ?theme=light|dark   a fixed theme instead of the system setting
  */

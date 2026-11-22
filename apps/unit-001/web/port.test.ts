@@ -16,6 +16,11 @@ class Events {
 }
 afterEach(() => vi.unstubAllGlobals());
 
+function completed(init: RequestInit | undefined, response: unknown) {
+	const { requestId } = JSON.parse(String(init?.body));
+	return Response.json({ requestId, state: "completed", response });
+}
+
 describe("browser operator transport", () => {
 	it.each([400, 401, 403, 409, 429])("#65 distinguishes pre-dispatch HTTP %s from unknown delivery", async (status) => {
 		vi.stubGlobal(
@@ -35,33 +40,67 @@ describe("browser operator transport", () => {
 		expect(await port.forget("memory-id", "forget-stable")).toMatchObject({ state: "unknown" });
 		expect(fetch).toHaveBeenCalledTimes(2);
 	});
-	it("#65 distinguishes a known owner failure from a transport exception", async () => {
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () =>
-				Response.json({ state: "completed", response: { type: "error", message: "sanitized failure" } }),
-			),
-		);
-		expect(await browserWorkspacePort("csrf").send("work", "id")).toMatchObject({ state: "failed" });
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () => {
-				throw new Error("network lost");
-			}),
-		);
-		expect(await browserWorkspacePort("csrf").send("work", "id")).toMatchObject({ state: "unknown" });
-	});
-	it("#65 preserves explicitly supplied forget identities and never retries them automatically", async () => {
-		const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
-			Response.json({
-				state: "completed",
-				response: { type: "memory", result: { operation: "forget", removed: true } },
-			}),
+	it("distinguishes an admitted send that ended without an answer from generic owner and transport failures", async () => {
+		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+			completed(init, { type: "send-failed" }),
 		);
 		vi.stubGlobal("fetch", fetch);
 		const port = browserWorkspacePort("csrf");
-		await port.forget("memory-id", "same-explicit-id");
-		await port.forget("memory-id", "same-explicit-id");
+		expect(await port.send("work", "id")).toEqual({
+			state: "failed-after-admission",
+			message: "The owner could not complete this request. Your message was sent.",
+		});
+		expect(await port.forget("memory-id", "forget-id")).toMatchObject({ state: "unknown" });
+		fetch.mockImplementation(async (_input, init) => completed(init, { type: "error", message: "sample" }));
+		expect(await port.send("work", "id")).toMatchObject({ state: "unknown" });
+		expect(await port.forget("memory-id", "forget-id")).toMatchObject({ state: "unknown" });
+		await expect(port.cancel("cancel-id")).rejects.toThrow();
+		fetch.mockImplementation(async () => {
+			throw new Error("network lost");
+		});
+		expect(await port.send("work", "id")).toMatchObject({ state: "unknown" });
+		expect(fetch).toHaveBeenCalledTimes(6);
+	});
+	it("only accepts a matching operation acknowledgement for a mutation", async () => {
+		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => completed(init, { type: "sent" }));
+		vi.stubGlobal("fetch", fetch);
+		const port = browserWorkspacePort("csrf");
+		expect(await port.send("work", "send")).toEqual({ state: "completed" });
+		expect(await port.forget("memory-id", "forget")).toMatchObject({ state: "unknown" });
+		await expect(port.cancel("cancel")).rejects.toThrow("Unexpected operation response.");
+		fetch.mockImplementation(async (_input, init) =>
+			completed(init, { type: "memory", result: { operation: "stats" } }),
+		);
+		expect(await port.forget("memory-id", "forget")).toMatchObject({ state: "unknown" });
+		fetch.mockImplementation(async (_input, init) =>
+			completed(init, { type: "memory", result: { operation: "forget", removed: "no" } }),
+		);
+		expect(await port.forget("memory-id", "forget")).toMatchObject({ state: "unknown" });
+		fetch.mockImplementation(async (_input, init) =>
+			completed(init, { type: "memory", result: { operation: "forget", removed: false } }),
+		);
+		expect(await port.forget("memory-id", "forget")).toEqual({ state: "completed" });
+		expect(fetch).toHaveBeenCalledTimes(6);
+	});
+	it("keeps mismatched request IDs and unexpected HTTP failures unknown", async () => {
+		const fetch = vi.fn(async () =>
+			Response.json({ requestId: "other", state: "completed", response: { type: "error", message: "sample" } }),
+		);
+		vi.stubGlobal("fetch", fetch);
+		const port = browserWorkspacePort("csrf");
+		expect(await port.send("work", "send")).toMatchObject({ state: "unknown" });
+		fetch.mockImplementation(async () => new Response("{}", { status: 502 }));
+		expect(await port.send("work", "send")).toMatchObject({ state: "unknown" });
+		expect(fetch).toHaveBeenCalledTimes(2);
+	});
+	it("#65 preserves explicitly supplied forget identities and never retries them automatically", async () => {
+		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+			completed(init, { type: "memory", result: { operation: "forget", removed: true } }),
+		);
+		vi.stubGlobal("fetch", fetch);
+		const port = browserWorkspacePort("csrf");
+		expect(await port.forget("memory-id", "same-explicit-id")).toEqual({ state: "completed" });
+		expect(await port.forget("memory-id", "same-explicit-id")).toEqual({ state: "completed" });
 		expect(fetch).toHaveBeenCalledTimes(2);
 		for (const call of fetch.mock.calls)
 			expect(JSON.parse(String(call[1]?.body))).toMatchObject({
@@ -143,7 +182,7 @@ function stubOwner(replies: {
 		"fetch",
 		vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
 			const operation = JSON.parse(String(init?.body)).operation;
-			const reply = (response: unknown) => Response.json({ state: "completed", response });
+			const reply = (response: unknown) => completed(init, response);
 			if (operation.type === "status") return reply(replies.status ?? status("open", "configured"));
 			if (operation.type === "mission")
 				return reply({
@@ -178,6 +217,7 @@ function stubOwner(replies: {
 			return reply({
 				type: "channels",
 				result: {
+					operation: "status",
 					view: {
 						channels: replies.channels ?? [
 							{
@@ -217,6 +257,19 @@ describe("browser operator details", () => {
 		expect(() => parseWorkspaceView({ ...base, usage: { ...usage, input: -1 } })).toThrow();
 		expect(() => parseWorkspaceView({ ...base, usage: { ...usage, output: null } })).toThrow();
 		expect(() => parseWorkspaceView({ ...base, usage: { ...usage, cost: { kind: "billed" } } })).toThrow();
+	});
+	it("#26 accepts the gateway's closed tool shape and rejects owner-only failure fields", () => {
+		const tool = { callId: "toolu_1", name: "bash", status: "failed" };
+		expect(parseWorkspaceView({ ...base, usage: null, tools: [tool] }).tools).toEqual([tool]);
+		for (const patch of [
+			{ tools: [{ ...tool, reason: { code: "exit_code", exitCode: 2 } }] },
+			{ tools: [{ ...tool, reason: "exit 2: make failed" }] },
+			{ failure: { reason: "model_error", problem: "overloaded" } },
+			{ failure: { reason: "model_error", detail: "503 overloaded" } },
+			{ retry: { attempt: 1, at: 1, problem: "rate_limited" } },
+			{ retry: { attempt: 1, at: 1, error: "429 rate limited" } },
+		])
+			expect(() => parseWorkspaceView({ ...base, usage: null, ...patch })).toThrow();
 	});
 	it("maps status to owner including held and unconfigured", async () => {
 		stubOwner({});
@@ -258,6 +311,13 @@ describe("browser operator details", () => {
 			failedCaptures: 5,
 			consolidation: "idle",
 		});
+	});
+	it("keeps all mission tools in a full owner list and rejects an over-limit reply", async () => {
+		const tools = Array.from({ length: 128 }, (_, index) => `tool-${index}`);
+		stubOwner({ mission: { tools } });
+		expect((await browserWorkspacePort("csrf").details()).mission.tools).toEqual(tools);
+		stubOwner({ mission: { tools: [...tools, "extra"] } });
+		await expect(browserWorkspacePort("csrf").details()).rejects.toThrow("Invalid owner list.");
 	});
 	it("returns null agreement and run when absent", async () => {
 		stubOwner({});
@@ -318,8 +378,8 @@ describe("browser operator details", () => {
 	it("recall returns null stats", async () => {
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () =>
-				Response.json({ state: "completed", response: { type: "memory", result: { operation: "recall", records: [] } } }),
+			vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+				completed(init, { type: "memory", result: { operation: "recall", records: [] } }),
 			),
 		);
 		expect(await browserWorkspacePort("csrf").recall("q")).toEqual({ count: null, stats: null, records: [] });
@@ -351,8 +411,8 @@ describe("browser memory graph", () => {
 		limited: false,
 	};
 	it("requests the read-only graph operation and returns the parsed view", async () => {
-		const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
-			Response.json({ state: "completed", response: { type: "memory", result: graph } }),
+		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+			completed(init, { type: "memory", result: graph }),
 		);
 		vi.stubGlobal("fetch", fetch);
 		const view = await browserWorkspacePort("csrf").memoryGraph();
@@ -370,7 +430,9 @@ describe("browser memory graph", () => {
 	it("rejects owner errors and unknown outcomes like details", async () => {
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ state: "completed", response: { type: "error", message: "x" } })),
+			vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+				completed(init, { type: "error", message: "x" }),
+			),
 		);
 		await expect(browserWorkspacePort("csrf").memoryGraph()).rejects.toThrow();
 		vi.stubGlobal(
@@ -380,7 +442,9 @@ describe("browser memory graph", () => {
 		await expect(browserWorkspacePort("csrf").memoryGraph()).rejects.toThrow();
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ state: "completed", response: { type: "memory", result: { operation: "recall", records: [] } } })),
+			vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+				completed(init, { type: "memory", result: { operation: "recall", records: [] } }),
+			),
 		);
 		await expect(browserWorkspacePort("csrf").memoryGraph()).rejects.toThrow();
 	});

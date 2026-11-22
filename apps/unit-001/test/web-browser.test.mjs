@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { assertFreshWebAssets } from "../scripts/build-web-freshness.mjs";
 
 const executable = process.env.UNIT_001_BROWSER_EXECUTABLE;
 
@@ -16,6 +17,7 @@ test(
 	"#65 live browser pairing, outcomes, focus, stable forget, responsive layout and sign-out",
 	{ skip: !executable, timeout: 90000 },
 	async () => {
+		await assertFreshWebAssets();
 		const directory = await mkdtemp(join(tmpdir(), "unit-web-browser-"));
 		const reservation = createServer();
 		reservation.listen(0, "127.0.0.1");
@@ -184,6 +186,11 @@ test(
 			const mapLabel = () => evaluate(`document.querySelector('[data-graph] canvas')?.getAttribute('aria-label')??''`);
 			await until(async () => (await mapLabel()).startsWith("Map of 2 memories"));
 			assert.equal(await evaluate(`document.querySelector('[data-graph]').getAttribute('aria-label').startsWith('Memory graph: 2 memories')`), true);
+			// The map forms first (two memories only appear: too few for a brain); everything below starts once that is over.
+			const formed = () => evaluate(`document.querySelector('[data-graph]')?.dataset.formed==='true'`);
+			const shaped = () => evaluate(`document.querySelector('[data-graph]')?.dataset.shaped`);
+			await until(formed);
+			assert.equal(await shaped(), "false", "two memories do not form a brain");
 			// The frame itself and everything in it: no style attribute, which the page's CSP would block.
 			const styled = () => evaluate(`document.querySelectorAll('[data-graph][style], [data-graph] [style]').length`);
 			assert.equal(await styled(), 0, "the graph and its frame set no style attributes");
@@ -200,6 +207,12 @@ test(
 			await click("Memory");
 			await until(async () => (await mapLabel()).startsWith("Map of 2 memories"));
 			await until(async () => (await subscriptions()).observers === beforeMap.observers + 1);
+			// Coming back to the page does not play the animation again: the map is formed at once and stays formed
+			// (the animation sets this to false while it runs, for at least 680 ms).
+			for (let sample = 0; sample < 30; sample++) {
+				assert.equal(await formed(), true, "the map is formed again as soon as the page is, and does not replay its animation");
+				await setTimeout(25);
+			}
 			// Nodes are solid blobs on the canvas; thin lines pass no thickness test and the few pixels of label text are too small to count. Returns page coordinates.
 			const nodePoints = () =>
 				evaluate(`(()=>{const c=document.querySelector('[data-graph] canvas');const box=c.getBoundingClientRect();const w=c.width,h=c.height;
@@ -452,6 +465,74 @@ test(
 			await until(async () => (await mapLabel()).startsWith("Map of 1 memory"));
 			assert.equal(await styled(), 0, "the graph still sets no style attributes");
 			assert.equal(await evaluate(`window.cspViolations.length`), 0, "no CSP violation after the whole map flow");
+			// Many memories form a brain. The reader adds a chain of memories to the map's data, as many as `window.manyCount`.
+			await evaluate(
+				`(()=>{window.nativeFetch=window.fetch;window.manyCount=14;window.graphMany=true;window.fetch=async(...args)=>{const response=await window.nativeFetch(...args);let operation=null;try{operation=JSON.parse(args[1]?.body??'{}').operation??null}catch{}if(!window.graphMany||operation?.type!=='memory'||operation.request?.operation!=='graph')return response;const body=await response.clone().json();const graph=body.response.result;const extra=Array.from({length:window.manyCount},(_,i)=>({id:'many-'+i,content:'Synthetic memory '+i,truncated:false,kind:['fact','preference','decision','observation'][i%4],tier:i%5===0?'episodic':'working',origin:'tool',importance:0.5,createdAt:1000+i,conversation:'0123456789ab'}));graph.nodes=[...graph.nodes,...extra];graph.edges=[...graph.edges,...extra.slice(1).map((node,i)=>i%3===0?{from:node.id,to:extra[i].id,kind:'relates',derivation:'explicit'}:{from:node.id,to:extra[i].id,kind:'summary'})];graph.total=graph.nodes.length;graph.limited=false;return Response.json(body)}})()`,
+			);
+			await click("Chat");
+			await click("Memory");
+			await until(async () => (await mapLabel()).startsWith("Map of 15 memories"));
+			await until(formed);
+			assert.equal(await shaped(), "true", "fifteen memories form a brain");
+			await mouse("mouseMoved", 2, 2);
+			await until(async () => (await framesWhileIdle()) <= 1, () => "the formed brain keeps asking for frames");
+			const extent = (list) => {
+				const xs = list.map((point) => point.x);
+				const ys = list.map((point) => point.y);
+				return { x0: Math.min(...xs), y0: Math.min(...ys), width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
+			};
+			const mean = (list) => list.reduce((sum, point) => sum + point.y, 0) / list.length;
+			let brain = await nodePoints();
+			assert.equal(brain.length >= 14, true, `the brain draws its memories on the canvas, found ${brain.length}`);
+			// Roughly 5:4 side view, the front (left) higher on screen than the underside.
+			const box = extent(brain);
+			assert.equal(box.width / box.height > 1 && box.width / box.height < 1.6, true, `the memories sit in a brain-shaped box, ${box.width.toFixed(0)} x ${box.height.toFixed(0)}`);
+			const front = brain.filter((point) => point.x < box.x0 + box.width / 3);
+			const underside = brain.filter((point) => point.y > box.y0 + (box.height * 2) / 3);
+			assert.equal(front.length > 0 && underside.length > 0 && mean(front) < mean(underside), true, "the front of the brain is above its underside");
+			// A dragged memory goes back to its place once it is let go, and does not stay where it was dropped.
+			const dragged = brain[Math.floor(brain.length / 2)];
+			await drag(dragged, 10);
+			await call("Input.dispatchMouseEvent", { type: "mouseReleased", x: dragged.x + 120, y: dragged.y + 80, button: "left", buttons: 0, clickCount: 1 });
+			await mouse("mouseMoved", 2, 2);
+			await until(async () => (await framesWhileIdle()) <= 1, () => "the brain does not come to rest after a drag");
+			brain = await nodePoints();
+			assert.equal(Math.min(...brain.map((point) => Math.hypot(point.x - dragged.x, point.y - dragged.y))) <= 4, true, "the dragged memory returned to its place in the brain");
+			// Focus shows a few memories, which are not a brain; showing all forms the brain again.
+			await clickAt(brain[0]);
+			await until(() => evaluate(`document.querySelector('#graph-details')?.hidden===false`));
+			await focusKey("graph-focus");
+			await enter();
+			await until(async () => (await shaped()) === "false", () => "Focus keeps the brain");
+			await focusKey("graph-focus-off");
+			await enter();
+			await until(async () => (await shaped()) === "true", () => "showing all memories does not form the brain again");
+			await until(formed);
+			await focusKey("graph-close");
+			await enter();
+			await until(detailsHidden);
+			// Reduced motion shows the finished brain at once and asks for next to no frames.
+			await call("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
+			await evaluate(`window.manyCount=16`);
+			await click("Chat");
+			await click("Memory");
+			await until(async () => (await mapLabel()).startsWith("Map of 17 memories"));
+			assert.equal(await formed(), true, "with reduced motion the brain is formed as soon as the map shows");
+			assert.equal(await shaped(), "true");
+			const reducedFrames = await evaluate(`window.subs.frames`);
+			await setTimeout(500);
+			assert.equal((await evaluate(`window.subs.frames`)) - reducedFrames <= 3, true, "reduced motion draws the map without an animation");
+			// A pointer resting on a memory dims the others; park it outside the map and let the redraw finish before scanning.
+			await mouse("mouseMoved", 2, 2);
+			await until(async () => (await framesWhileIdle()) <= 1, () => "the finished brain keeps asking for frames");
+			const finished = await nodePoints();
+			assert.equal(finished.length >= 16, true, `the finished brain is drawn, found ${finished.length} of 17 memories`);
+			await call("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "no-preference" }] });
+			await evaluate(`window.graphMany=false;window.fetch=window.nativeFetch`);
+			await click("Chat");
+			await click("Memory");
+			await until(async () => (await mapLabel()).startsWith("Map of 1 memory"));
+			assert.equal(await evaluate(`window.cspViolations.length`), 0, "no CSP violation after the brain flow");
 			await fill("#memory-query", "violet");
 			await click("Search");
 			await until(() => has("Violet browser acceptance memory"));
@@ -479,7 +560,7 @@ test(
 			await click("Send message");
 			// The visible word and the screen-reader suffix are separate spans, so check the button's text, not innerText.
 			await until(() =>
-				evaluate(`[...document.querySelectorAll('button')].some(el=>el.offsetParent!==null&&el.textContent==='Stop current work')`),
+				evaluate(`[...document.querySelectorAll('button')].some(el=>el.offsetParent!==null&&el.textContent==='Cancel chat')`),
 			);
 			// Typing while the run streams must keep the same textarea, focus and selection, and the rail stays mounted.
 			await evaluate(

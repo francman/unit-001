@@ -12,6 +12,7 @@ import {
 	runBlocked,
 	type Section,
 	sections,
+	settleSend,
 	type ThemeChoice,
 	type Ui,
 	unknownResults,
@@ -134,15 +135,8 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 					outcome = { state: "unknown", message: "" };
 				}
 				if (destroyed || ui.signedOut) return;
-				set("state", (ui) => {
-					ui.sending = false;
-					if (outcome.state === "unknown") ui.unknown = { requestId, prompt: text };
-					if (outcome.state === "failed") {
-						ui.error = outcome.message;
-						if (!ui.draft.trim()) ui.draft = text;
-					}
-				});
-				if (outcome.state === "failed") announce(outcome.message);
+				set("state", (ui) => settleSend(ui, outcome, requestId, text));
+				if (outcome.state === "failed" || outcome.state === "failed-after-admission") announce(outcome.message);
 			})();
 		},
 		cancel() {

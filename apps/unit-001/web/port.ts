@@ -13,7 +13,7 @@ import type {
 
 type JsonObject = Record<string, unknown>;
 
-class OwnerRejection extends Error {}
+class GatewayRejection extends Error {}
 
 /** Creates a port whose CSRF credential stays in memory and whose writes are never retried. */
 export function browserWorkspacePort(csrfToken: string): WorkspacePort {
@@ -28,19 +28,33 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 			body: JSON.stringify({ requestId, operation }),
 			signal: AbortSignal.any([pending.signal, AbortSignal.timeout(125_000)]),
 		});
-		if (!response.ok)
-			throw new OwnerRejection(
+		if (!response.ok) {
+			// Only statuses the gateway uses before dispatch can establish that the owner was not called.
+			if (![400, 401, 403, 409, 429].includes(response.status)) throw new Error("Owner outcome is unknown.");
+			throw new GatewayRejection(
 				response.status === 401
 					? "Session expired. Restart the operator web command, reload, and enter the new pairing code."
 					: response.status === 429
 						? "Request capacity reached. Wait for active requests; if the action budget is exhausted, restart the web command and pair again."
 						: "The gateway rejected this request before dispatch. Check its size and arguments.",
 			);
+		}
 		const result = object(await response.json());
-		if (closed || result.state !== "completed") throw new Error("Owner outcome is unknown.");
+		if (closed || result.requestId !== requestId || result.state !== "completed")
+			throw new Error("Owner outcome is unknown.");
 		const reply = object(result.response);
-		if (reply.type === "error")
-			throw new OwnerRejection("The owner could not complete this request. Inspect current work before retrying.");
+		if (reply.type === "error" && typeof reply.message === "string")
+			throw new Error("The owner could not complete this request.");
+		if (operation.type === "send") {
+			if (reply.type !== "sent" && reply.type !== "send-failed") throw new Error("Unexpected operation response.");
+		} else if (reply.type !== (operation.type === "cancel" ? "cancelled" : operation.type)) {
+			throw new Error("Unexpected operation response.");
+		}
+		if (operation.type === "memory" || operation.type === "channels") {
+			const body = object(reply.result);
+			if (body.operation !== object(operation.request).operation) throw new Error("Unexpected operation response.");
+			if (body.operation === "forget") boolean(body.removed);
+		}
 		return reply;
 	};
 	return {
@@ -95,7 +109,7 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 					scope: typeof terms.scope === "string" ? terms.scope : null,
 					missing: Array.isArray(mission.missing) ? mission.missing.map(text) : [],
 					execution: text(mission.execution),
-					tools: list(mission.tools, 64, text),
+					tools: list(mission.tools, 128, text),
 					agreement: formation.agreement === null ? null : parseAgreement(formation.agreement),
 					run: mission.runtime === undefined || mission.runtime === null ? null : parseRun(mission.runtime),
 					creator: mission.creator === null ? null : parseCreator(mission.creator),
@@ -134,10 +148,15 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 		},
 		async send(prompt, requestId) {
 			try {
-				await request({ type: "send", prompt }, requestId);
+				const reply = await request({ type: "send", prompt }, requestId);
+				if (reply.type === "send-failed")
+					return {
+						state: "failed-after-admission",
+						message: "The owner could not complete this request. Your message was sent.",
+					};
 				return { state: "completed" };
 			} catch (error) {
-				if (error instanceof OwnerRejection) return { state: "failed", message: error.message };
+				if (error instanceof GatewayRejection) return { state: "failed", message: error.message };
 				return { state: "unknown", message: "Inspect the current conversation before sending again." };
 			}
 		},
@@ -172,7 +191,7 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 				await request({ type: "memory", request: { operation: "forget", id, confirmed: true } }, requestId);
 				return { state: "completed" };
 			} catch (error) {
-				if (error instanceof OwnerRejection) return { state: "failed", message: error.message };
+				if (error instanceof GatewayRejection) return { state: "failed", message: error.message };
 				return { state: "unknown", message: "Forget outcome not confirmed. Inspect memory before acting again." };
 			}
 		},
@@ -190,10 +209,19 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 	};
 }
 
+// Failure reasons and retry state are owner-terminal fields; the gateway's projection never forwards them.
+const OWNER_ONLY = ["failure", "retry"];
+
 /** Validates snapshots before displaying owner-provided text. */
 export function parseWorkspaceView(value: unknown): WorkspaceView {
 	const view = object(value);
-	if (!Array.isArray(view.entries) || view.entries.length > 20 || !Array.isArray(view.tools) || view.tools.length > 32)
+	if (
+		!Array.isArray(view.entries) ||
+		view.entries.length > 20 ||
+		!Array.isArray(view.tools) ||
+		view.tools.length > 32 ||
+		OWNER_ONLY.some((key) => key in view)
+	)
 		throw new Error("Invalid view.");
 	const model = view.model === null ? null : object(view.model);
 	return {
@@ -224,6 +252,8 @@ export function parseWorkspaceView(value: unknown): WorkspaceView {
 		}),
 		tools: view.tools.map((value: unknown) => {
 			const tool = object(value);
+			if (Object.keys(tool).some((key) => key !== "callId" && key !== "name" && key !== "status"))
+				throw new Error("Invalid tool.");
 			return { callId: text(tool.callId), name: text(tool.name), status: text(tool.status) };
 		}),
 	};

@@ -1,5 +1,5 @@
 // Restricts browser requests to an explicit subset of the existing operator protocol.
-import type { ServiceRequest, ServiceResponse } from "../service.ts";
+import type { ServiceRequest } from "../service.ts";
 
 export type WebOperation =
 	| { type: "status" | "cancel" }
@@ -15,10 +15,6 @@ export type WebOperation =
 	  };
 
 export type WebRequest = { requestId: string; operation: WebOperation };
-
-export type WebResult =
-	| { requestId: string; state: "completed"; response: ServiceResponse }
-	| { requestId: string; state: "unknown"; message: string };
 
 export type WebSession =
 	| { authenticated: false }

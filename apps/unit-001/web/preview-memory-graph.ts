@@ -202,11 +202,36 @@ function large(now: number): MemoryGraphView {
 	return { nodes, edges, total: nodes.length, limited: false };
 }
 
-/** The sample snapshot for `?graph=` (empty, limited, large or the default full sample). */
+// The first `count` memories reached from the newest one along relations (then the rest in order, if that is not enough), with the relations among them.
+function connectedPart(graph: MemoryGraphView, count: number): MemoryGraphView {
+	const next = new Map<string, string[]>();
+	for (const edge of graph.edges) {
+		next.set(edge.from, [...(next.get(edge.from) ?? []), edge.to]);
+		next.set(edge.to, [...(next.get(edge.to) ?? []), edge.from]);
+	}
+	const chosen = new Set<string>();
+	for (const first of graph.nodes) {
+		const queue = [first.id];
+		while (queue.length > 0 && chosen.size < count) {
+			const id = queue.shift() ?? "";
+			if (chosen.has(id)) continue;
+			chosen.add(id);
+			queue.push(...(next.get(id) ?? []));
+		}
+		if (chosen.size >= count) break;
+	}
+	const nodes = graph.nodes.filter((node) => chosen.has(node.id));
+	return { nodes, edges: graph.edges.filter((edge) => chosen.has(edge.from) && chosen.has(edge.to)), total: nodes.length, limited: false };
+}
+
+/** The sample snapshot for `?graph=` (empty, small, mid, limited, large or the default full sample). */
 export function sampleMemoryGraph(now: number, mode: string | null): MemoryGraphView {
 	if (mode === "empty") return { nodes: [], edges: [], total: 0, limited: false };
 	if (mode === "large") return large(now);
 	const { nodes, edges } = build(now);
+	// Too few memories for a brain (only the appearing animation), and enough for a brain whose outline carries the shape.
+	if (mode === "small") return connectedPart({ nodes, edges, total: nodes.length, limited: false }, 8);
+	if (mode === "mid") return connectedPart({ nodes, edges, total: nodes.length, limited: false }, 30);
 	if (mode === "limited") {
 		const shown = nodes.slice(0, 40);
 		const ids = new Set(shown.map((node) => node.id));

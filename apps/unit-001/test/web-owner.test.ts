@@ -110,9 +110,10 @@ it("#65 pairs packaged assets with the sole owner, streams, deduplicates and for
 		stream = events.body!.getReader();
 		expect(new TextDecoder().decode((await stream.read()).value)).toContain("event: view");
 		const send = { type: "send", prompt: "Give the verified answer." };
-		expect(await call("browser-send", send)).toMatchObject({
+		expect(await call("browser-send", send)).toEqual({
+			requestId: "browser-send",
 			state: "completed",
-			response: { type: "reply", reply: { text: "Verified browser answer." } },
+			response: { type: "sent" },
 		});
 		await call("browser-send", send);
 		expect(faux.state.callCount).toBe(1);

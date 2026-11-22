@@ -34,16 +34,31 @@ export interface Simulation {
 	step(): boolean;
 	/** Fixes a node at a place, as a drag does; the others react only after `reheat`. */
 	pin(index: number, x: number, y: number): void;
-	/** Keeps the layout warm (alpha target 0.3) so neighbours follow a dragged node. */
+	/** The heat the layout is held at: 0 while it cools, higher while a drag keeps it warm. */
+	readonly alphaTarget: number;
+	/** True while memories are pulled toward places (`attract` was given some). */
+	readonly shaped: boolean;
+	/** Keeps the layout warm so neighbours follow a dragged node: 0.3, or 0.1 while a shape holds the others in place. */
 	reheat(): void;
 	/** Lets a node go and lets the layout cool down to rest. */
 	release(index: number): void;
+	/**
+	 * Pulls every node toward its place in `targets` (`x, y, x, y, ...`, in node order) by `strength` of the distance per tick,
+	 * whatever the layout's heat. A layout that had rested starts moving again. `null` or 0 ends the pull.
+	 */
+	attract(targets: Float64Array | null, strength: number): void;
+	/** Puts every node exactly on its place and lets the layout rest. */
+	snap(targets: Float64Array): void;
 }
 
 const typedDistance = 120;
 const summaryDistance = 90;
 const centerStrength = 0.04;
 const dragAlpha = 0.3;
+// With a shape pulling everything back, a drag only needs to nudge the neighbours.
+const shapedDragAlpha = 0.1;
+// A layout that starts pulling toward a shape is at least this hot, so links and collisions keep sorting out overlaps on the way.
+const attractAlpha = 0.2;
 const settledAlpha = 0.001;
 const ticksLimit = 500;
 
@@ -109,6 +124,17 @@ export function createSimulation(
 		.stop();
 	let ticks = 0;
 	let active = bodies.length > 0;
+	let targets: Float64Array | null = null;
+	let pull = 0;
+	// Added to the velocity (not scaled by the layout's heat), so the pull still works while the layout cools.
+	simulation.force("shape", () => {
+		if (!targets || pull === 0) return;
+		for (let index = 0; index < bodies.length; index++) {
+			const body = bodies[index];
+			body.vx = (body.vx ?? 0) + (targets[index * 2] - body.x) * pull;
+			body.vy = (body.vy ?? 0) + (targets[index * 2 + 1] - body.y) * pull;
+		}
+	});
 
 	function step(): boolean {
 		if (!active) return false;
@@ -124,6 +150,12 @@ export function createSimulation(
 			return active;
 		},
 		step,
+		get alphaTarget() {
+			return simulation.alphaTarget();
+		},
+		get shaped() {
+			return targets !== null && pull > 0;
+		},
 		pin(index, x, y) {
 			const body = bodies[index];
 			if (!body) return;
@@ -133,8 +165,9 @@ export function createSimulation(
 			body.y = y;
 		},
 		reheat() {
-			simulation.alphaTarget(dragAlpha);
-			simulation.alpha(Math.max(simulation.alpha(), dragAlpha));
+			const heat = targets !== null && pull > 0 ? shapedDragAlpha : dragAlpha;
+			simulation.alphaTarget(heat);
+			simulation.alpha(Math.max(simulation.alpha(), heat));
 			ticks = 0;
 			active = true;
 		},
@@ -147,6 +180,27 @@ export function createSimulation(
 			simulation.alphaTarget(0);
 			ticks = 0;
 			active = bodies.length > 0;
+		},
+		attract(next, strength) {
+			const started = next !== null && strength > 0 && (targets !== next || pull === 0);
+			targets = next;
+			pull = next === null ? 0 : strength;
+			if (!started || bodies.length === 0) return;
+			// The pull is new, or it follows a rest: wake the layout.
+			simulation.alpha(Math.max(simulation.alpha(), attractAlpha));
+			ticks = 0;
+			active = true;
+		},
+		snap(places) {
+			for (let index = 0; index < bodies.length; index++) {
+				const body = bodies[index];
+				body.x = places[index * 2];
+				body.y = places[index * 2 + 1];
+				body.vx = 0;
+				body.vy = 0;
+			}
+			simulation.alpha(0);
+			active = false;
 		},
 	};
 }
@@ -195,8 +249,8 @@ function placeNewNextToKept(bodies: readonly Body[], edges: readonly LayoutEdge[
 	}
 }
 
-// A small seeded generator (mulberry32) so the starting positions are the same on every run.
-function seeded(seed: number): () => number {
+/** A small seeded generator (mulberry32): the same seed gives the same numbers on every run. */
+export function seeded(seed: number): () => number {
 	let state = seed >>> 0;
 	return () => {
 		state = (state + 0x6d2b79f5) >>> 0;

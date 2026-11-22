@@ -1,6 +1,8 @@
 // Checks that a reduced-motion settle of the 300-node preview fixture runs in time-bounded batches and reaches rest (codex review, medium).
 import { describe, expect, it } from "vitest";
 import { sampleMemoryGraph } from "./preview-memory-graph.ts";
+import { assignByBisection } from "./views/memory-graph-assign.ts";
+import { brainFrame, brainTargets, worldPoints } from "./views/memory-graph-brain.ts";
 import { createSimulation, type LayoutEdge, type LayoutNode, settleWithin } from "./views/memory-graph-layout.ts";
 import { degreesOf, nothingHidden, shownGraph } from "./views/memory-graph-model.ts";
 
@@ -64,5 +66,36 @@ describe("reduced-motion settle", () => {
 		// Budget zero: exactly one tick, never the full settle.
 		expect(settleWithin(simulation, 0)).toBe(false);
 		expect(simulation.active).toBe(true);
+	});
+
+	// The reduced-motion path with a brain: settle in batches to the side, then match to the brain and snap, all in one step.
+	it("ends a batched settle with every memory exactly on its place in the brain", () => {
+		const { nodes, edges } = fixture();
+		const simulation = createSimulation(nodes, edges);
+		let clock = 0;
+		while (!settleWithin(simulation, 8, () => (clock += 1))) expect(simulation.active).toBe(true);
+		const count = nodes.length;
+		const slots = worldPoints(brainTargets(count), brainFrame(nodes.map((node) => node.radius)));
+		const now = new Float64Array(count * 2);
+		simulation.bodies.forEach((body, index) => {
+			now[index * 2] = body.x;
+			now[index * 2 + 1] = body.y;
+		});
+		const slotOf = assignByBisection(now, slots);
+		const places = new Float64Array(count * 2);
+		for (let index = 0; index < count; index++) {
+			places[index * 2] = slots[(slotOf[index] ?? 0) * 2] ?? 0;
+			places[index * 2 + 1] = slots[(slotOf[index] ?? 0) * 2 + 1] ?? 0;
+		}
+		simulation.attract(places, 0.1);
+		simulation.snap(places);
+		expect(simulation.active).toBe(false);
+		expect(simulation.step()).toBe(false);
+		simulation.bodies.forEach((body, index) => {
+			expect(body.x).toBe(places[index * 2]);
+			expect(body.y).toBe(places[index * 2 + 1]);
+		});
+		// Every place is used once.
+		expect(new Set(slotOf).size).toBe(count);
 	});
 });

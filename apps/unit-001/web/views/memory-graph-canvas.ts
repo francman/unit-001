@@ -1,7 +1,10 @@
 // The map's canvas: owns the layout, the view, the hover and keyboard state and the frame loop; frames are drawn only while something moves.
 import { attrs, el } from "../ui/dom.ts";
 import type { GraphNode } from "./memory-graph-details.ts";
-import { type DrawnLabel, draw, nodeOpacity } from "./memory-graph-draw.ts";
+import { assignByBisection } from "./memory-graph-assign.ts";
+import { type BrainFrame, brainFrame, brainTargets, worldPoints } from "./memory-graph-brain.ts";
+import { type DrawnLabel, draw, type FormScene, nodeOpacity, type OutlineScene } from "./memory-graph-draw.ts";
+import { createForm, edgeProgressAt, fadeAt, type Form, holdStrength, outlineAlphaAt, type Plan, planFor, revealAt, startTimes, strengthAt, traceAt } from "./memory-graph-form.ts";
 import { fitBox, hitTest, nodeInDirection, panIntoView, screenRadius, toWorld, type View, zoomAt } from "./memory-graph-geometry.ts";
 import { type Input, type InputTarget, wireInput } from "./memory-graph-input.ts";
 import { type LabelCandidate, labelOrder, placeLabels, zoomFade } from "./memory-graph-labels.ts";
@@ -32,8 +35,11 @@ export interface GraphCanvas {
 	readonly frame: HTMLElement;
 	/** The one-line preview of the hovered memory, shown at the frame's bottom-left. */
 	readonly hover: HTMLElement;
-	/** Shows another set of memories; memories that stay keep their place. Any drag in progress ends first. */
-	setModel(model: GraphModel): void;
+	/**
+	 * Shows another set of memories; memories that stay keep their place. Any drag in progress ends first. With `shape` the
+	 * memories form a brain (when there are enough of them); without it they stay a plain layout, as in the focus view.
+	 */
+	setModel(model: GraphModel, options?: { shape: boolean }): void;
 	setSelected(id: string | null): void;
 	/** The ids that match the typed search, or null when nothing is typed. */
 	setMatches(ids: ReadonlySet<string> | null): void;
@@ -66,6 +72,9 @@ const mixSeconds = 0.14;
 const labelEase = 0.25;
 const maxZoomOnFit = 1.6;
 const ticksPerFrame = 2;
+// While the map forms, the layout runs by time instead of by frame, so it settles equally fast on a 120 Hz screen.
+const ticksPerSecond = 180;
+const mostTicksPerFrame = 6;
 // One batch of a reduced-motion settle: short enough that input and rendering stay responsive between batches.
 const settleBatchMs = 8;
 
@@ -75,6 +84,12 @@ interface Pending {
 	simulation: Simulation;
 	/** True when nothing was shown before, so the view fits the map even if it was moved. */
 	fresh: boolean;
+	/** Whether the memories are to form a brain. */
+	shape: boolean;
+	/** 1 for each memory that was not shown before. */
+	isNew: Uint8Array;
+	/** The share (0..1) of the memories that were shown before. */
+	kept: number;
 }
 
 /** Builds the canvas. It draws nothing until it has a model and a size. */
@@ -127,6 +142,22 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 	let relabelNeeded = true;
 	let announceTimer: ReturnType<typeof setTimeout> | null = null;
 	let dragging = false;
+	// How the map forms: the memories appear, then settle into a brain (see memory-graph-form.ts). Null when everything is shown.
+	let form: Form | null = null;
+	// Whether the shown memories are held in the brain, and whether the last model asked for that.
+	let shapeOn = false;
+	let wantShape = true;
+	// The map has drawn memories once; later changes re-form quickly instead of playing the intro again.
+	let played = false;
+	// Points of the brain for the largest map shown so far; fewer points are the start of more, so one cache serves every size.
+	let unitTargets: Float64Array = new Float64Array(0);
+	// Each memory's place in the brain (world units, in model order) and the size of the brain's box; set when they are matched.
+	let places: Float64Array | null = null;
+	let brainBox: BrainFrame | null = null;
+	let starts: Float32Array = new Float32Array(0);
+	let formScene: FormScene = { reveal: new Float32Array(0), edgeProgress: new Float32Array(0) };
+	const outlineScene: OutlineScene = { size: 0, alpha: 0, trace: 0 };
+	let tickDebt = 0;
 	// Label widths by text; cleared whenever the shown memories change so old memory text is not kept.
 	const widths = new Map<string, number>();
 	const labels = new Map<number, { alpha: number; target: number; text: string; strong: boolean; rest: boolean }>();
@@ -184,9 +215,18 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		invalidate(true);
 	}
 
-	// The box around the map, centered in the part of the frame no panel covers.
+	// The box around the map, centered in the part of the frame no panel covers. While the memories form a brain the box
+	// includes the whole brain from the start, so the view does not jump when they are handed to it and the stem is not cut off.
 	function fitView(layout: Simulation): View {
-		return fitBox(bounds(layout, 40), Math.max(1, width - reserved.right), Math.max(1, height - reserved.bottom), maxZoomOnFit);
+		const box = bounds(layout, 40);
+		if (brainBox) {
+			const margin = 40;
+			box.x0 = Math.min(box.x0, -brainBox.width / 2 - margin);
+			box.x1 = Math.max(box.x1, brainBox.width / 2 + margin);
+			box.y0 = Math.min(box.y0, -brainBox.height / 2 - margin);
+			box.y1 = Math.max(box.y1, brainBox.height / 2 + margin);
+		}
+		return fitBox(box, Math.max(1, width - reserved.right), Math.max(1, height - reserved.bottom), maxZoomOnFit);
 	}
 
 	function measure(text: string): number {
@@ -248,11 +288,13 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		lastTime = now;
 		if (theme === null) theme = probes.read();
 		if (frame.clientWidth !== width || frame.clientHeight !== height) resize();
+		if (form) advanceForm(seconds);
 		let moving = false;
 		// While a reduced-motion layout settles to the side, the shown one stands still.
 		if (simulation?.active && pending === null) {
 			moving = true;
-			for (let tick = 0; tick < ticksPerFrame && moving; tick++) moving = simulation.step();
+			const ticks = form ? tickBudget(seconds) : ticksPerFrame;
+			for (let tick = 0; tick < ticks && moving; tick++) moving = simulation.step();
 			if (!touched && !dragging) view = fitView(simulation);
 			ticksSinceLabels += 1;
 			// While the layout moves the kept labels stay; they are decided again now and then, and once it stops.
@@ -263,7 +305,8 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		const nextMix = mix < wanted ? Math.min(wanted, mix + stepMix) : Math.max(wanted, mix - stepMix);
 		const mixing = nextMix !== mix;
 		mix = nextMix;
-		if (relabelNeeded) relabel();
+		// Labels wait until the map has formed; deciding them while memories move and appear would only make them flicker.
+		if (relabelNeeded && form === null) relabel();
 		let fading = false;
 		const drawn: DrawnLabel[] = [];
 		const scene = { model, focus: focus() >= 0 ? focus() : null, mix, matches: found };
@@ -286,10 +329,112 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 				strong: label.strong,
 			});
 		}
-		if (context && simulation && theme && width > 0 && height > 0)
-			draw(context, { ...scene, width, height, dpr, view, theme, bodies: simulation.bodies, selected: selected() >= 0 ? selected() : null, current: current >= 0 ? current : null, labels: drawn });
-		if (moving || mixing || fading || dragging) schedule();
+		if (context && simulation && theme && width > 0 && height > 0) {
+			draw(context, {
+				...scene,
+				width,
+				height,
+				dpr,
+				view,
+				theme,
+				bodies: simulation.bodies,
+				selected: selected() >= 0 ? selected() : null,
+				current: current >= 0 ? current : null,
+				labels: drawn,
+				form: form ? formScene : null,
+				outline: outlineFor(),
+			});
+			if (model.nodes.length > 0) played = true;
+		}
+		if (moving || mixing || fading || dragging || form !== null) schedule();
 		else lastTime = 0;
+	}
+
+	// ── Forming: the memories appear, then settle into a brain ──
+
+	// The layout's ticks for one frame while the map forms: by time, at most a few at once, so a slow frame does not stall the page.
+	function tickBudget(seconds: number): number {
+		tickDebt += seconds * ticksPerSecond;
+		const ticks = Math.min(mostTicksPerFrame, Math.floor(tickDebt));
+		tickDebt = Math.min(1, tickDebt - ticks);
+		return ticks;
+	}
+
+	// Moves the clock on: hands the memories to the brain at the right moment, sets the pull and what has appeared so far.
+	function advanceForm(seconds: number): void {
+		const running = form;
+		if (!running || !simulation) return;
+		running.advance(seconds);
+		const { plan, elapsed } = running;
+		if (plan.shaped) {
+			if (!running.assigned && elapsed >= plan.freeMs) {
+				running.assigned = true;
+				assignPlaces(simulation);
+			}
+			if (running.assigned && places) simulation.attract(places, strengthAt(plan, elapsed));
+		}
+		for (let index = 0; index < formScene.reveal.length; index++) formScene.reveal[index] = revealAt(starts[index], elapsed);
+		model.edges.forEach((edge, index) => {
+			formScene.edgeProgress[index] = edgeProgressAt(Math.max(starts[edge.from], starts[edge.to]), elapsed);
+		});
+		if (running.done) {
+			form = null;
+			frame.dataset.formed = "true";
+			relabelNeeded = true;
+			if (places) simulation.attract(places, holdStrength);
+		}
+	}
+
+	// The outline of the brain, while the memories are held in it; null otherwise.
+	function outlineFor(): OutlineScene | null {
+		if (!shapeOn || brainBox === null) return null;
+		const trace = form ? traceAt(form.plan, form.elapsed) : 1;
+		outlineScene.size = brainBox.width;
+		outlineScene.trace = trace;
+		outlineScene.alpha = outlineAlphaAt(trace, form ? fadeAt(form.plan, form.elapsed) : 1);
+		return outlineScene;
+	}
+
+	// Matches each memory to a place in the brain by where it is now, and returns the places in model order.
+	function assignPlaces(layout: Simulation): Float64Array {
+		const count = layout.bodies.length;
+		prepareTargets(count);
+		const box = brainBox ?? brainFrame(layout.bodies.map((body) => body.radius));
+		const slots = worldPoints(unitTargets.subarray(0, count * 2), box);
+		const now = new Float64Array(count * 2);
+		layout.bodies.forEach((body, index) => {
+			now[index * 2] = body.x;
+			now[index * 2 + 1] = body.y;
+		});
+		const slotOf = assignByBisection(now, slots);
+		const mine = new Float64Array(count * 2);
+		for (let index = 0; index < count; index++) {
+			mine[index * 2] = slots[slotOf[index] * 2];
+			mine[index * 2 + 1] = slots[slotOf[index] * 2 + 1];
+		}
+		places = mine;
+		brainBox = box;
+		return mine;
+	}
+
+	// Choosing the brain's points is the one costly step (about 15 ms for 300 memories), so it is done when the memories arrive,
+	// before the animation's clock starts, and only when the map has grown past the points chosen so far.
+	function prepareTargets(count: number): void {
+		if (unitTargets.length < count * 2) unitTargets = brainTargets(count);
+	}
+
+	// Ends the animation where it was going: every memory in its place in the brain, at rest.
+	function settleIntoBrain(layout: Simulation): void {
+		const mine = places ?? assignPlaces(layout);
+		layout.attract(mine, holdStrength);
+		layout.snap(mine);
+	}
+
+	// The first pointer, wheel or key press during the animation skips to its end, so clicks and keys land on memories that are in place.
+	function skipForm(): void {
+		if (!form) return;
+		form.skip();
+		invalidate(false);
 	}
 
 	function setHovered(index: number): void {
@@ -358,10 +503,23 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 	}
 
 	// A layout for `next` that starts where the shown memories are now.
-	function layoutFor(next: GraphModel): Pending {
+	function layoutFor(next: GraphModel, shape: boolean): Pending {
 		const previous = new Map<string, { x: number; y: number }>();
 		if (simulation) for (const body of simulation.bodies) previous.set(body.id, { x: body.x, y: body.y });
-		return { model: next, simulation: createSimulation(layoutNodes(next), layoutEdges(next), previous), fresh: previous.size === 0 };
+		const isNew = new Uint8Array(next.nodes.length);
+		let kept = 0;
+		next.nodes.forEach((entry, index) => {
+			if (previous.has(entry.node.id)) kept += 1;
+			else isNew[index] = 1;
+		});
+		return {
+			model: next,
+			simulation: createSimulation(layoutNodes(next), layoutEdges(next), previous),
+			fresh: previous.size === 0,
+			shape,
+			isNew,
+			kept: next.nodes.length === 0 ? 0 : kept / next.nodes.length,
+		};
 	}
 
 	// Reduced motion: the layout runs to rest in short batches between frames, and only its final places are shown.
@@ -394,18 +552,38 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 	function commit(next: Pending): void {
 		const keepHovered = hovered >= 0 ? (model.nodes[hovered]?.node.id ?? null) : null;
 		const keepCurrent = current >= 0 ? (model.nodes[current]?.node.id ?? null) : null;
+		const plan = planFor({ played, kept: next.kept, wasShaped: shapeOn, nodeCount: next.model.nodes.length, wantShape: next.shape, reduced: reduced() });
 		model = next.model;
 		simulation = next.simulation;
 		hovered = keepHovered === null ? -1 : (model.indexOf.get(keepHovered) ?? -1);
 		current = keepCurrent === null ? -1 : (model.indexOf.get(keepCurrent) ?? -1);
 		describeModel();
 		labels.clear();
+		startForm(plan, next);
 		if (!touched || next.fresh) {
 			touched = false;
 			if (width > 0) fit(reserved);
 		}
 		for (const run of afterCommit.splice(0)) run();
 		invalidate(true);
+	}
+
+	// Starts how the new memories are presented: an animation, or at once their final places (reduced motion).
+	function startForm(plan: Plan, next: Pending): void {
+		shapeOn = plan.shaped;
+		places = null;
+		brainBox = plan.shaped ? brainFrame(next.model.nodes.map((entry) => entry.radius)) : null;
+		if (plan.shaped) prepareTargets(next.model.nodes.length);
+		form = null;
+		if (plan.shaped && !plan.animated) settleIntoBrain(next.simulation);
+		if (plan.animated && model.nodes.length > 0) {
+			form = createForm(plan);
+			starts = startTimes(plan, model, next.isNew);
+			formScene = { reveal: new Float32Array(model.nodes.length), edgeProgress: new Float32Array(model.edges.length) };
+			tickDebt = 0;
+		}
+		frame.dataset.formed = String(form === null);
+		frame.dataset.shaped = String(shapeOn);
 	}
 
 	// What follows from the shown memories alone: the busiest ones, the search matches, the map's description and the preview line.
@@ -449,8 +627,11 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 			dragging = false;
 			if (!simulation) return;
 			simulation.release(index);
-			// Reduced motion: a new layout starts warm from where everything is now and settles to the side.
-			if (reduced()) settleLater(layoutFor(model));
+			// Reduced motion: the dragged memory goes back to its place in the brain, or a new layout starts warm from where everything is now and settles to the side.
+			if (reduced() && shapeOn && places) {
+				simulation.attract(places, holdStrength);
+				simulation.snap(places);
+			} else if (reduced()) settleLater(layoutFor(model, shapeOn));
 			invalidate(true);
 		},
 		pan,
@@ -513,13 +694,29 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 				invalidate(true);
 			}),
 			watchMedia(reducedQuery, () => {
-				// Reduced motion switched on while the layout runs: it stops animating and settles to the side.
-				if (reduced() && simulation?.active && pending === null) settleLater(layoutFor(model));
+				if (!reduced()) return;
+				// Reduced motion switched on while the map forms: it ends where it was going. While a layout runs it settles to the side.
+				if (form) {
+					form = null;
+					frame.dataset.formed = "true";
+					relabelNeeded = true;
+					if (shapeOn && simulation) settleIntoBrain(simulation);
+					else if (simulation?.active && pending === null) settleLater(layoutFor(model, shapeOn));
+					invalidate(true);
+				} else if (simulation?.active && pending === null) settleLater(layoutFor(model, shapeOn));
 			}),
 			watchPixelRatio(resize),
+			skipOnInput(),
 		];
 		if (pending && settleTimer === null) settleTimer = setTimeout(settleBatch, 0);
 		invalidate(true);
+	}
+
+	// The listeners that skip the animation, as one thing to stop.
+	function skipOnInput(): () => void {
+		const listening = new AbortController();
+		for (const type of ["pointerdown", "wheel", "keydown"] as const) frame.addEventListener(type, skipForm, { capture: true, passive: true, signal: listening.signal });
+		return () => listening.abort();
 	}
 
 	function deactivate(): void {
@@ -556,11 +753,13 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 	return {
 		frame,
 		hover,
-		setModel(next) {
+		setModel(next, options = { shape: true }) {
 			// A drag holds an index into the shown model, which is about to change.
 			input?.cancel();
 			cancelPending();
-			if (simulation && sameLayout(model, next)) {
+			const sameShape = options.shape === wantShape;
+			wantShape = options.shape;
+			if (simulation && sameShape && sameLayout(model, next)) {
 				// Same places and sizes: only what is drawn on them changed (labels, kinds, importance), so nothing moves.
 				model = next;
 				describeModel();
@@ -568,7 +767,7 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 				invalidate(true);
 				return;
 			}
-			const laidOut = layoutFor(next);
+			const laidOut = layoutFor(next, options.shape);
 			if (reduced()) settleLater(laidOut);
 			else commit(laidOut);
 		},

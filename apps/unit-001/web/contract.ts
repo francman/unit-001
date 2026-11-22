@@ -144,15 +144,17 @@ export interface WorkspaceDetails {
 	}[];
 }
 
+/** Only `failed` proves the send did not reach the owner. */
+export type SendOutcome =
+	| { state: "completed" }
+	| { state: "failed" | "failed-after-admission" | "unknown"; message: string };
+
 export interface WorkspacePort {
 	watch(
 		listener: (event: { type: "view"; view: WorkspaceView } | { type: "connection"; state: Connection }) => void,
 	): () => void;
 	details(): Promise<WorkspaceDetails>;
-	send(
-		prompt: string,
-		requestId: string,
-	): Promise<{ state: "completed" } | { state: "unknown" | "failed"; message: string }>;
+	send(prompt: string, requestId: string): Promise<SendOutcome>;
 	cancel(requestId: string): Promise<void>;
 	recall(query: string): Promise<WorkspaceDetails["memory"]>;
 	/** Reads the bounded memory graph; rejects like `details()` on owner or wire failure. */

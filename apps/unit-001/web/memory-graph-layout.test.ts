@@ -214,3 +214,90 @@ describe("memory graph layout", () => {
 		expect(bounds(simulation, 10).x1).toBe(100);
 	});
 });
+
+describe("memory graph layout pulled toward a shape", () => {
+	const threeNodes = () => Array.from({ length: 3 }, (_, index) => ({ id: `n${index}`, radius: 6, degree: 0 }));
+	const places = Float64Array.of(-200, -50, 0, 120, 210, -40);
+
+	it("brings three nodes to within three units of their places", () => {
+		const simulation = createSimulation(threeNodes(), []);
+		simulation.attract(places, 0.1);
+		for (let tick = 0; tick < 400; tick++) simulation.step();
+		simulation.bodies.forEach((body, index) => {
+			expect(Math.hypot(body.x - (places[index * 2] ?? 0), body.y - (places[index * 2 + 1] ?? 0))).toBeLessThan(3);
+		});
+		expect(simulation.shaped).toBe(true);
+	});
+
+	it("pulls the same way every time", () => {
+		const { nodes, edges } = sample(40);
+		const targets = Float64Array.from({ length: 80 }, (_, at) => ((at * 37) % 400) - 200);
+		const run = () => {
+			const simulation = createSimulation(nodes, edges);
+			simulation.attract(targets, 0.1);
+			settleWithin(simulation, Infinity);
+			return positions(simulation);
+		};
+		expect(run()).toEqual(run());
+	});
+
+	it("stops pulling when the places are taken away", () => {
+		const simulation = createSimulation(threeNodes(), []);
+		settleWithin(simulation, Infinity);
+		simulation.attract(places, 0.1);
+		for (let tick = 0; tick < 100; tick++) simulation.step();
+		simulation.attract(null, 0);
+		expect(simulation.shaped).toBe(false);
+		simulation.reheat();
+		const before = positions(simulation);
+		for (let tick = 0; tick < 100; tick++) simulation.step();
+		// Held warm without a pull, the three unlinked nodes only drift apart; they do not return to the places.
+		const moved = simulation.bodies.map((body, index) => Math.hypot(body.x - (places[index * 2] ?? 0), body.y - (places[index * 2 + 1] ?? 0)));
+		expect(Math.max(...moved)).toBeGreaterThan(3);
+		expect(positions(simulation)).not.toEqual(before);
+	});
+
+	it("wakes a layout that had rested when the pull starts", () => {
+		const simulation = createSimulation(threeNodes(), []);
+		settleWithin(simulation, Infinity);
+		expect(simulation.active).toBe(false);
+		simulation.attract(places, 0);
+		expect(simulation.active).toBe(false);
+		simulation.attract(places, 0.05);
+		expect(simulation.active).toBe(true);
+	});
+
+	it("puts every node exactly on its place and rests", () => {
+		const simulation = createSimulation(threeNodes(), []);
+		simulation.snap(places);
+		expect(simulation.active).toBe(false);
+		expect(positions(simulation)).toEqual(Array.from(places));
+	});
+
+	it("holds a dragged layout less warm while a shape pulls everything back", () => {
+		const loose = createSimulation(threeNodes(), []);
+		loose.reheat();
+		expect(loose.alphaTarget).toBe(0.3);
+		const shaped = createSimulation(threeNodes(), []);
+		shaped.attract(places, 0.1);
+		shaped.reheat();
+		expect(shaped.alphaTarget).toBe(0.1);
+		shaped.release(0);
+		expect(shaped.alphaTarget).toBe(0);
+	});
+
+	it("springs a dragged node back to its place after it is let go", () => {
+		const { nodes, edges } = sample(30);
+		const simulation = createSimulation(nodes, edges);
+		const targets = Float64Array.from({ length: 60 }, (_, at) => (at % 2 === 0 ? ((at / 2) % 6) * 80 - 200 : Math.floor(at / 12) * 80 - 160));
+		simulation.attract(targets, 0.1);
+		settleWithin(simulation, Infinity);
+		simulation.pin(0, 600, 600);
+		simulation.reheat();
+		for (let tick = 0; tick < 60; tick++) simulation.step();
+		simulation.release(0);
+		settleWithin(simulation, Infinity);
+		const body = simulation.bodies[0];
+		expect(Math.hypot((body?.x ?? 0) - (targets[0] ?? 0), (body?.y ?? 0) - (targets[1] ?? 0))).toBeLessThan(25);
+	});
+});
