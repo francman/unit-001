@@ -1,0 +1,21 @@
+{
+	"name": "#64 workstream 4: isolated settled chat and retained capture/forget bookkeeping",
+	"hostClass": "412 MB candidate envelope (proposed, not qualified)",
+	"note": "Opt-in run card, not authorization to run a host. Review with --require-scope --dry-run; local unlimited checks are harness evidence only.",
+	"defaults": {
+		"records": 1000,
+		"tail": 63,
+		"memoryMax": "144M",
+		"memoryHigh": "129M",
+		"swapMax": "0"
+	},
+	"cells": [
+		{ "id": "control", "settledTurns": 0 },
+		{ "id": "chat-1000-q2000", "settledTurns": 1000, "queryChars": 2000 },
+		{ "id": "chat-5000-q200", "settledTurns": 5000, "queryChars": 200 },
+		{ "id": "chat-5000-q2000", "settledTurns": 5000, "queryChars": 2000 },
+		{ "id": "chat-20000-q200", "settledTurns": 20000, "queryChars": 200 },
+		{ "id": "churn-10000", "captureCycles": 10000 },
+		{ "id": "churn-30000", "captureCycles": 30000 }
+	]
+}

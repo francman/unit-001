@@ -1,0 +1,113 @@
+{
+	"name": "unit-001 native 412 MB host capacity matrix (research-64 section 1.3, scaled to the host)",
+	"hostClass": "412 MB host (stricter than the 512 MB target)",
+	"note": "Sized for unit-001-herdr: 412 MB RAM plus 1 GB swap, with the existing agent stopped. MemoryMax=224M leaves about 190 MB of physical RAM for the kernel, sshd, systemd and journald; the driver preflight still refuses to run if MemoryMax exceeds MemAvailable minus its reserve. Baseline: 1,000 records, 0 relations, tail 63, MemoryHigh=200M, MemorySwapMax=0. Cells that vary relations, tail, tombstones and mutation use 5,000 records because 10,000 records already peaks near the 224M limit (research-64: 244 MiB cgroup peak). Results are measured on a 412 MB host, which is stricter than the 512 MB target; do not present them as 512 MB numbers. Swap 0 is the pass/fail condition; swap 256M cells show where pressure starts. Repeat final candidates with --repeat 5. Disabled cells name the reason; select one explicitly with --only to run it anyway on a larger host.",
+	"defaults": {
+		"records": 1000,
+		"relations": 0,
+		"topology": "chain",
+		"tail": 63,
+		"forgotten": 0,
+		"memoryMax": "224M",
+		"memoryHigh": "200M",
+		"swapMax": "0",
+		"split": true,
+		"seedUnderLimit": true,
+		"repeat": 1
+	},
+	"cells": [
+		{ "id": "records-1000-swap0", "records": 1000 },
+		{ "id": "records-1000-swap256m", "records": 1000, "swapMax": "256M" },
+		{ "id": "records-2500-swap0", "records": 2500 },
+		{ "id": "records-2500-swap256m", "records": 2500, "swapMax": "256M" },
+		{ "id": "records-5000-swap0", "records": 5000 },
+		{ "id": "records-5000-swap256m", "records": 5000, "swapMax": "256M" },
+		{ "id": "records-10000-swap0", "records": 10000 },
+		{ "id": "records-10000-swap256m", "records": 10000, "swapMax": "256M" },
+		{
+			"id": "records-20000-swap0",
+			"records": 20000,
+			"disabled": "cannot fit MemoryMax=224M: the 20,000-record working set is about 330 MB (research-64), so the cgroup OOM kill is certain and adds no information; run with --only on a larger host"
+		},
+		{
+			"id": "records-20000-swap256m",
+			"records": 20000,
+			"swapMax": "256M",
+			"disabled": "cannot be enforced safely on the 412 MB host: a working set far above MemoryMax would thrash the shared 1 GB swap and can starve sshd; run with --only on a larger host"
+		},
+		{
+			"id": "records-30000-swap0",
+			"records": 30000,
+			"disabled": "cannot fit MemoryMax=224M: the 30,000-record working set is about 440 MB (research-64), so the cgroup OOM kill is certain and adds no information; run with --only on a larger host"
+		},
+		{
+			"id": "records-30000-swap256m",
+			"records": 30000,
+			"swapMax": "256M",
+			"disabled": "cannot be enforced safely on the 412 MB host: a working set far above MemoryMax would thrash the shared 1 GB swap and can starve sshd; run with --only on a larger host"
+		},
+		{
+			"id": "records-40000-swap0",
+			"records": 40000,
+			"disabled": "run only if records-30000-swap0 passes (research-64 1.3); cannot fit MemoryMax=224M on this host"
+		},
+		{ "id": "relations-5000-r0", "records": 5000, "relations": 0 },
+		{ "id": "relations-5000-r1000", "records": 5000, "relations": 1000 },
+		{ "id": "relations-5000-r4096", "records": 5000, "relations": 4096 },
+		{ "id": "relations-dense-5000-r4096", "records": 5000, "relations": 4096, "topology": "dense" },
+		{ "id": "tail-5000-t0", "records": 5000, "tail": 0 },
+		{ "id": "tail-5000-t32", "records": 5000, "tail": 32 },
+		{ "id": "tail-5000-t63", "records": 5000, "tail": 63 },
+		{ "id": "tombstones-5000-f1250", "records": 5000, "forgotten": 1250 },
+		{ "id": "tombstones-5000-f2500", "records": 5000, "forgotten": 2500 },
+		{
+			"id": "transcript-5000-e1000",
+			"records": 5000,
+			"disabled": "needs --transcript (spec item 6, not implemented)"
+		},
+		{
+			"id": "transcript-5000-e10000",
+			"records": 5000,
+			"disabled": "needs --transcript (spec item 6, not implemented)"
+		},
+		{
+			"id": "mutate-5000-remember-heavy",
+			"records": 5000,
+			"mutate": "remember-heavy",
+			"durationS": 300,
+			"mutateIntervalMs": 1000
+		},
+		{
+			"id": "mutate-5000-forget-heavy",
+			"records": 5000,
+			"mutate": "forget-heavy",
+			"durationS": 300,
+			"mutateIntervalMs": 1000
+		},
+		{
+			"id": "mutate-5000-mixed",
+			"records": 5000,
+			"mutate": "mixed",
+			"durationS": 300,
+			"mutateIntervalMs": 1000
+		},
+		{
+			"id": "mutate-5000-consolidation",
+			"records": 5000,
+			"disabled": "needs a consolidation mutate mode (spec items 3 and 8, not implemented)"
+		},
+		{
+			"id": "mutate-5000-checkpoint-boundary",
+			"records": 5000,
+			"tail": 62,
+			"mutate": "remember-heavy",
+			"mutateOps": 3,
+			"mutateIntervalMs": 0
+		},
+		{
+			"id": "heap70-5000-swap0",
+			"records": 5000,
+			"nodeArgs": ["--max-old-space-size=156"]
+		}
+	]
+}
