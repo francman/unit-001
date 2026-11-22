@@ -1,5 +1,7 @@
 {
 	"stateVersion": 1,
 	"minReaderVersion": 1,
-	"maintenanceProtocol": 1
+	"maintenanceProtocol": 1,
+	"serviceTemplate": 2,
+	"features": ["mission-loop"]
 }

@@ -43,7 +43,7 @@ export async function dispatchAgent(id, expectedName, args, context) {
 	if (
 		!service &&
 		action === "mission" &&
-		["creator", "approve", "start", "pause", "resume", "stop"].includes(args[1])
+		["creator", "approve", "approve-purpose", "operate", "start", "pause", "resume", "stop"].includes(args[1])
 	) {
 		if (context.uid !== 0)
 			throw new Error(
@@ -62,7 +62,9 @@ export async function dispatchAgent(id, expectedName, args, context) {
 	if (!service && action === "operator") {
 		if (context.uid !== 0) throw new Error(`Run sudo ${record.name} operator; access changes require root.`);
 		if (args.length !== 3 || !["add", "remove"].includes(args[1]))
-			throw new Error("Usage: NAME operator <add|remove> USER");
+			throw new Error(
+				"Usage: NAME operator <add|remove> USER\nOperators can read redacted arguments and output of any tool call in the shared session.",
+			);
 		const user = args[2];
 		if (!/^[a-z_][a-z0-9_-]*[$]?$/i.test(user)) throw new Error("Invalid operator account name.");
 		await context.account(user);
@@ -83,7 +85,7 @@ export async function dispatchAgent(id, expectedName, args, context) {
 			);
 			context.notice(
 				args[1] === "add"
-					? `Operator access granted to ${user}. ${servicePrepared ? `Service policy prepared; run sudo ${current.name} start. ` : ""}Reconnect SSH or log out and back in to refresh groups.\n`
+					? `Operator access granted to ${user}. Operators can read redacted arguments and output of any tool call in the shared session. ${servicePrepared ? `Service policy prepared; run sudo ${current.name} start. ` : ""}Reconnect SSH or log out and back in to refresh groups.\n`
 					: `Operator membership removed for ${user}. Existing sessions retain their groups until logout; close them to complete revocation.\n`,
 			);
 			return 0;

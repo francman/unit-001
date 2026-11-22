@@ -176,6 +176,8 @@ A full-system x86-64 guest has its own target kernel and systemd, unlike a userl
 
 Use a separately provisioned disposable guest, never the production VPS. Historical evidence qualifies its exact source and payload only. Physical-host sizing and capacity remain separate work in #64.
 
+On Ubuntu 24.04.4 x86-64 with systemd 255, the published 0.0.9 Linux archive passed the named lifecycle checks. A stopped test installation stayed disabled with PID 0 through reboot and returned to readiness after explicit start. Named kill removed the owner and its tool-process surrogate from the target cgroup while another installation kept the same PID and invocation. The killed unit remained disabled with stopped intent and systemd recorded `failed` with `Result=signal`. Uninstall retained closed SQLite state, synthetic credentials, workspace and account identity while removing the selected installation's software. The surviving installation stayed active. [Native lifecycle evidence](https://github.com/francman/unit-001/issues/20#issuecomment-7071779251)
+
 ### Build and publish without Actions
 
 Use a separate clean checkout at exact merged main and an isolated Linuxx64 build host/container. Review dependency locks and model-data provenance. Use the existing `apps/unit-001/scripts/build-release.mjs` with the approved public root's exact bytes. Build outside the source checkout, verify the packaged Node/runtime, help/version, file inventory and installer dry run, and retain artifact SHA256 plus dirty=false/source SHA. A macOS build is not Linux artifact proof. Never build or test on Bob's production VPS.
@@ -186,10 +188,13 @@ Keep private signing material outside the container and downloads. The existing 
 node apps/unit-001/scripts/update-repository.mjs fetch --out PREVIOUS
 node apps/unit-001/scripts/update-repository.mjs prepare \
   --archive ARCHIVE --root APPROVED_PUBLIC_ROOT --keys PROTECTED_ONLINE_KEYS \
-  --previous PREVIOUS --out PUBLICATION --source-commit EXACT_MERGED_SHA
+  --previous PREVIOUS --out PUBLICATION --source-commit EXACT_MERGED_SHA \
+  --rollback-qualification RECORD.json
 node apps/unit-001/scripts/update-repository.mjs publish \
   --out PUBLICATION --root APPROVED_PUBLIC_ROOT
 ```
+
+Repeat `--rollback-qualification RECORD.json` once per earlier published release. Each record comes from `test/rollback/qualify.mjs` run with this exact archive and that release's published archive; a new version is refused without them ([full-owner rollback qualification](updates.md#full-owner-rollback-qualification)). If the feed has lost its live `timestamp.json`, a renewal needs the same records (`renew --rollback-qualification`).
 
 Never upload the offline root private key or persist a broad personal token. Serialize publication, inspect remote state before retrying, preserve immutable asset identity and publish freshness last through the existing tool. Verify the bundle anonymously against TUF and compare immutable/latest/local bytes before normal signed production activation. Preserve settings, credentials, name, UUID and running/stopped intent; make no paid model requests for deployment checks.
 

@@ -46,6 +46,7 @@ async function release(version: string, bootstrap?: { root: string; feed: string
 		"lifecycle.mjs",
 		"activate.sh",
 		"check-ready.mjs",
+		"control.mjs",
 		"unit-001.service",
 	])
 		files[`deploy/${name}`] = await readFile(join(deployment, name), "utf8");
