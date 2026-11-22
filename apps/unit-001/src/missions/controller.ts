@@ -10,6 +10,7 @@ import {
 	ProviderDoc,
 	type Registry,
 	type TaskId,
+	type ToolRegistration,
 	ToolTask,
 	type Tx,
 } from "@earendil-works/pi-durable";
@@ -19,8 +20,11 @@ import type { ModelChoice } from "../provider.ts";
 import { MISSION_PROVIDER_PREFIX, type MissionAdmission } from "./admission.ts";
 import { MANAGED_MISSION_ACTIONS, type MissionExecutionIntent } from "./contract.ts";
 import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts";
+import { missionLoop } from "./loop.ts";
+import { storedLoop } from "./purpose.ts";
 import { MissionDoc } from "./state.ts";
 import { supportedMissionCriteria, verifyMissionFiles } from "./verification.ts";
+import { WORK_TOOL, workWriteTool } from "./work-tool.ts";
 
 type Checkpoint = { phase: "cycle" } | { phase: "observe"; requestId: string } | { phase: "wake"; until: number };
 
@@ -174,17 +178,25 @@ export function missionController(admission: MissionAdmission, cwd: string) {
 				return { status: "terminal", outcome: { status: "aborted" } };
 			}, context),
 	});
+	const loop = missionLoop(admission, cwd);
 	return {
 		controller,
+		loop,
 		extension: defineExtension({
 			name: "unit.mission.execution",
-			tasks: [controller],
+			tasks: [controller, loop],
+			tools: [workWriteTool(cwd)],
 			hooks: [
 				hook(ToolTask, {
 					beforeTool: admission.beforeTool.bind(admission),
 					afterTool: admission.afterTool.bind(admission),
 				}),
 			],
+			// Selected by default in every conversation, so fresh calls and saved mission checkpoints resolve the guarded tools.
+			wraps: [...MANAGED_MISSION_ACTIONS, WORK_TOOL].map((name) => ({
+				tool: name,
+				wrap: (tool: ToolRegistration) => admission.guard(tool),
+			})),
 		}),
 	};
 }
@@ -228,6 +240,11 @@ export async function startMissionExecution(
 			throw new Error("Mission agreement changed.");
 		const document = await tx.doc(MissionExecutionDoc);
 		if (document.current !== null) throw new Error("A mission execution already exists.");
+		// The one-shot engine and continuous operation never run together; each admits against its own ledger.
+		// A stored loop that fails validation cannot show that no loop is live, so it refuses the start too.
+		const operation = (await storedLoop(tx))?.operation;
+		if (!operation || operation.state.status === "open" || operation.drain !== null)
+			throw new Error("Suspend or close continuous operation, and let it drain, before starting one-shot work.");
 		const policyRevision = (intent?.expectedPolicyRevision ?? 0) + 1;
 		const scope = await createExecutionScope(
 			tx,

@@ -21,6 +21,7 @@ import {
 	parseMissionDraftTerms,
 } from "./contract.ts";
 import { MissionExecutionDoc } from "./execution-state.ts";
+import { importLegacyAgreements, readMissionPurpose, recordLegacyAgreement } from "./purpose.ts";
 import { MissionDoc } from "./state.ts";
 
 /** Owns one session's mission formation; it contains no controller, model request or execution admission. */
@@ -37,9 +38,14 @@ export class MissionControl {
 		this.#now = now;
 	}
 
-	/** Reconciles an already-issued exact approval after interruption; never creates authority itself. */
+	/** Imports saved agreements as purpose and work, then reconciles an issued approval; never creates authority itself. */
 	async initialize(context: Context): Promise<void> {
 		if (this.#location.session !== "default") return;
+		try {
+			await importLegacyAgreements(this.#harness, context);
+		} catch {
+			// Purpose records grant nothing yet; an unreadable or conflicting record must not block ordinary owner startup.
+		}
 		let authority: MissionAuthority | null;
 		try {
 			authority = await readMissionAuthority(this.#location);
@@ -123,8 +129,16 @@ export class MissionControl {
 
 	/** Commits one revision-checked draft operation or an approval already issued by its authenticated authority. */
 	async handle(request: MissionRequest, context: Context): Promise<MissionView> {
-		if (request.operation === "control-local" || request.operation === "reconcile-execution")
-			throw new Error("Mission execution changes belong to its runtime owner.");
+		if (
+			request.operation === "control-local" ||
+			request.operation === "reconcile-execution" ||
+			request.operation === "purpose-propose" ||
+			request.operation === "purpose-approve-local" ||
+			request.operation === "reconcile-purpose" ||
+			request.operation === "operate-local" ||
+			request.operation === "reconcile-operation"
+		)
+			throw new Error("Mission execution and purpose changes belong to its runtime owner.");
 		if (this.#location.session !== "default")
 			throw new Error("Mission formation belongs to the default owner session.");
 		if (request.operation === "status") return this.inspect(context);
@@ -145,6 +159,10 @@ export class MissionControl {
 				ceiling: request.ceiling,
 				approvals: [],
 				...(prior?.executionIntent ? { executionIntent: prior.executionIntent } : {}),
+				// The revision bump closes purpose receipts and the open intent; restrictive history stays for replay.
+				...(request.purposeCeiling ? { purposeCeiling: request.purposeCeiling } : {}),
+				...(prior?.operationIntent ? { operationIntent: prior.operationIntent } : {}),
+				...(prior?.operationAcknowledgments ? { operationAcknowledgments: prior.operationAcknowledgments } : {}),
 			});
 			return this.inspect(context);
 		}
@@ -184,6 +202,7 @@ export class MissionControl {
 			if (digest !== request.digest) throw new Error("Mission authority changed; propose the draft again.");
 			const previous = authority.approvals.find((item) => item.requestId === request.requestId);
 			if (previous && previous.digest !== digest) throw new Error("Conflicting approval request ID.");
+			if (!previous) await this.#requirePurpose(context);
 			const receipt = previous ?? {
 				receiptId: randomUUID(),
 				requestId: request.requestId,
@@ -208,6 +227,16 @@ export class MissionControl {
 			});
 			return this.handle({ operation: "reconcile", receiptId: receipt.receiptId }, context);
 		}
+		// A proposal is what the managed administrator command approves, so the purpose check also precedes its receipt.
+		if (request.operation === "propose") await this.#requirePurpose(context);
+		// An issued receipt reaches formation even when this release cannot record the purpose: the purpose document
+		// stays as stored, a newer one included, and the next compatible owner start imports the agreement from formation.
+		const recordPurpose =
+			request.operation === "reconcile" &&
+			(await readMissionPurpose(this.#harness, context).then(
+				() => true,
+				() => false,
+			));
 		const fingerprint = createHash("sha256").update(JSON.stringify(request)).digest("hex");
 		await this.#harness.commit(async (tx) => {
 			if ((await tx.doc(MaintenanceDoc)).current.state === "held")
@@ -233,15 +262,18 @@ export class MissionControl {
 				const receipt = matchingApproval(authority, request.receiptId, draft.missionId, draft.revision, terms);
 				if (!receipt || receipt.digest !== draft.digest)
 					throw new Error("Approval does not match this mission, revision and exact terms.");
-				formation.agreement = {
+				const agreement = {
 					missionId: draft.missionId,
 					revision: draft.revision,
 					terms,
 					digest: receipt.digest,
 					approval: receipt,
-					execution: "not-implemented",
+					execution: "not-implemented" as const,
 				};
+				formation.agreement = agreement;
 				formation.draft = null;
+				// The same commit records the agreed purpose and its one bounded work item.
+				if (recordPurpose) await recordLegacyAgreement(tx, agreement);
 				return;
 			}
 			if (formation.lastOperation?.requestId === request.requestId) {
@@ -283,5 +315,16 @@ export class MissionControl {
 			};
 		}, context);
 		return this.inspect(context);
+	}
+
+	// A new receipt closes the agreed revision at once, so it is issued only when this release can also record its purpose.
+	async #requirePurpose(context: Context): Promise<void> {
+		try {
+			await readMissionPurpose(this.#harness, context);
+		} catch (error) {
+			throw new Error(
+				`Mission purpose records are unreadable by this release; the agreed revision stays in force. ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
 }

@@ -59,6 +59,9 @@ import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import { MissionControl } from "./missions/control.ts";
 import { missionController } from "./missions/controller.ts";
 import { MissionOwner } from "./missions/owner.ts";
+import { isLoopTask, loopParkedForMaintenance } from "./missions/loop-drain.ts";
+import { MissionPurposeDoc } from "./missions/purpose.ts";
+import { validLoop } from "./missions/purpose-loop.ts";
 import { isMissionHoldTask, MissionDoc, MissionFoundation } from "./missions/state.ts";
 import { createRuntimeFacts, orientationExtension, type RuntimeFacts } from "./orientation.ts";
 import type { ModelChoice } from "./provider.ts";
@@ -604,10 +607,17 @@ export class Agent {
 		for (;;) {
 			const inspection = await this.#harness.inspect(context);
 			const legacy = (await this.#harness.snapshot(MissionDoc, context))?.current ?? null;
+			// An unreadable or invalid purpose document identifies no run work, so anything it would own stays busy.
+			const loop = validLoop((await this.#harness.snapshot(MissionPurposeDoc, context).catch(() => undefined))?.loop);
 			if (
 				inspection.tasks.every(
-					(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
+					(task) =>
+						isMemoryBackgroundTask(task.record) ||
+						isMissionHoldTask(task.record, legacy) ||
+						isLoopTask(task, loop),
 				) &&
+				// Drain only: a parked loop never permits scheduling of a model-null or inhibited owner.
+				loopParkedForMaintenance(inspection, loop) &&
 				inspection.submissions.length === 0 &&
 				this.#interpretations.size === 0 &&
 				this.#channels.pending === 0

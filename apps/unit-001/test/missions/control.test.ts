@@ -1,4 +1,5 @@
 // #14: Mission agreement persists without executing work or accepting conversation claims as authority.
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,8 +10,9 @@ import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { missionAuthorityPath, readMissionAuthority, writeMissionAuthority } from "../../src/missions/authority.ts";
-import type { MissionCeiling, MissionTerms } from "../../src/missions/contract.ts";
+import type { MissionApproval, MissionCeiling, MissionTerms } from "../../src/missions/contract.ts";
 import { MissionControl } from "../../src/missions/control.ts";
+import { MissionPurposeDoc, readMissionPurpose } from "../../src/missions/purpose.ts";
 import { MissionDoc, MissionFoundation } from "../../src/missions/state.ts";
 
 let directory: string;
@@ -143,24 +145,45 @@ describe("mission formation", () => {
 		).toEqual(agreed);
 	});
 
-	it("reconciles a protected pending receipt after a crash before the document commit", async () => {
+	it("#72 reconciles a protected receipt issued before either SQLite write after a crash", async () => {
 		const first = await launch();
 		const proposed = await propose(first.mission);
 		const draft = proposed.formation.draft!;
-		await first.mission.handle(
-			{ operation: "approve-local", expectedRevision: draft.revision, digest: draft.digest!, requestId: "issued" },
-			context,
-		);
-		// Restore only the uncommitted owner projection; the issued authority receipt is the crash boundary.
-		await first.harness.commit(async (tx) => {
-			const state = await tx.doc(MissionDoc);
-			state.formation = proposed.formation;
-		}, context);
+		const formation = await first.harness.snapshot(MissionDoc, context);
+		// The crash boundary: the protected receipt exists, and neither formation nor purpose recorded the approval.
+		const authority = (await readMissionAuthority(first.location))!;
+		const receipt: MissionApproval = {
+			receiptId: randomUUID(),
+			requestId: "issued",
+			installationId: null,
+			session: "default",
+			missionId: draft.missionId,
+			revision: draft.revision,
+			digest: draft.digest!,
+			creator: authority.creator,
+			authorityRevision: authority.revision,
+			approvedAt: now,
+			provenance: "developer-local",
+			approvedBy: { kind: "developer-local", uid: process.getuid?.() ?? null },
+		};
+		await writeMissionAuthority(first.location, { ...authority, approvals: [receipt] });
 		await first.harness.close(context);
 		opened.splice(opened.indexOf(first.harness), 1);
 		const second = await launch();
+		expect(await second.harness.snapshot(MissionDoc, context)).toEqual(formation);
+		expect(await second.harness.snapshot(MissionPurposeDoc, context)).toBeUndefined();
 		await second.mission.initialize(context);
-		expect((await second.mission.inspect(context)).agreementValid).toBe(true);
+		const agreed = await second.mission.inspect(context);
+		expect(agreed.agreementValid).toBe(true);
+		expect(agreed.formation.draft).toBeNull();
+		expect(agreed.formation.agreement?.approval).toEqual(receipt);
+		const purpose = await readMissionPurpose(second.harness, context);
+		expect(purpose?.purpose?.approval).toEqual({
+			kind: "legacy-agreement",
+			receiptId: receipt.receiptId,
+			digest: draft.digest,
+		});
+		expect(purpose?.work.map((work) => work.source.agreement)).toEqual([agreed.formation.agreement]);
 		expect(second.faux.state.callCount).toBe(0);
 	});
 

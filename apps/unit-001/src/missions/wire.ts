@@ -13,10 +13,14 @@ import {
 	parseMissionDraftTerms,
 } from "./contract.ts";
 import { parseMissionExecutionView } from "./execution-view.ts";
+import { parsePurposeCeiling, parsePurposeTerms } from "./purpose-authority.ts";
+import { parseMissionPurposeView } from "./purpose-view.ts";
 
 /** Validates owner commands without accepting caller-supplied managed approval or authenticated principal claims. */
 export function parseMissionRequest(value: unknown): MissionRequest {
 	const input = missionObject(value);
+	const purpose = parsePurposeRequest(input);
+	if (purpose) return purpose;
 	if (input.operation === "reconcile-execution") {
 		if (Object.keys(input).some((key) => key !== "operation" && key !== "requestId"))
 			throw new Error("Unknown mission command field.");
@@ -46,7 +50,7 @@ export function parseMissionRequest(value: unknown): MissionRequest {
 			: input.operation === "reconcile"
 				? ["operation", "receiptId"]
 				: input.operation === "configure-local"
-					? ["operation", "creator", "ceiling"]
+					? ["operation", "creator", "ceiling", "purposeCeiling"]
 					: input.operation === "draft"
 						? ["operation", "expectedRevision", "requestId", "terms"]
 						: input.operation === "approve-local"
@@ -60,6 +64,7 @@ export function parseMissionRequest(value: unknown): MissionRequest {
 			operation: "configure-local",
 			creator: parseMissionCreator(input.creator),
 			ceiling: parseMissionCeiling(input.ceiling),
+			...(input.purposeCeiling === undefined ? {} : { purposeCeiling: parsePurposeCeiling(input.purposeCeiling) }),
 		};
 	if (input.operation !== "draft" && input.operation !== "propose" && input.operation !== "approve-local")
 		throw new Error("Unknown mission operation.");
@@ -114,6 +119,9 @@ export function parseMissionView(value: unknown): MissionView {
 	const draft = formation.draft === null ? null : parseDraft(formation.draft);
 	const agreement = formation.agreement === null ? null : parseAgreement(formation.agreement);
 	const operation = formation.lastOperation === null ? null : missionObject(formation.lastOperation);
+	const loopRollback = input.loopRollback;
+	if (loopRollback !== undefined && loopRollback !== "no-live-loop" && loopRollback !== "live-loop")
+		throw new Error("Invalid loop rollback projection.");
 	return {
 		stage: input.stage,
 		formation: {
@@ -138,7 +146,68 @@ export function parseMissionView(value: unknown): MissionView {
 		...(input.runtime === undefined ? {} : { runtime }),
 		...(input.policyRevision === undefined ? {} : { policyRevision: revision(input.policyRevision, 0) }),
 		tools: missionTextList(input.tools, 128, 100),
+		...(input.purpose === undefined
+			? {}
+			: { purpose: input.purpose === null ? null : parseMissionPurposeView(input.purpose) }),
+		...(input.purposeError === undefined
+			? {}
+			: { purposeError: input.purposeError === null ? null : missionText(input.purposeError, 1000) }),
+		...(loopRollback === undefined ? {} : { loopRollback }),
 	};
+}
+
+// Purpose formation and operation commands; owner-wire callers name only exact revisions, digests and request IDs.
+function parsePurposeRequest(input: Record<string, unknown>): MissionRequest | undefined {
+	const only = (...fields: string[]) => {
+		if (Object.keys(input).some((key) => key !== "operation" && !fields.includes(key)))
+			throw new Error("Unknown mission command field.");
+	};
+	const requestId = () => {
+		const id = missionText(input.requestId);
+		if (!id.trim()) throw new Error("Mission changes need a request ID.");
+		return id;
+	};
+	switch (input.operation) {
+		case "purpose-propose":
+			only("expectedRevision", "requestId", "terms");
+			return {
+				operation: "purpose-propose",
+				expectedRevision: revision(input.expectedRevision, 0),
+				requestId: requestId(),
+				terms: parsePurposeTerms(input.terms),
+			};
+		case "purpose-approve-local":
+			only("revision", "digest", "requestId");
+			return {
+				operation: "purpose-approve-local",
+				revision: revision(input.revision, 1),
+				digest: digest(input.digest),
+				requestId: requestId(),
+			};
+		case "reconcile-purpose":
+			only("receiptId");
+			return { operation: "reconcile-purpose", receiptId: missionText(input.receiptId) };
+		case "reconcile-operation":
+			only("requestId");
+			return { operation: "reconcile-operation", requestId: requestId() };
+		case "operate-local": {
+			only("action", "expectedOperationRevision", "requestId", "runId");
+			const action = input.action;
+			if (action !== "open" && action !== "suspend" && action !== "close" && action !== "acknowledge")
+				throw new Error("Unknown mission operation action.");
+			if ((action === "acknowledge") !== (input.runId !== undefined))
+				throw new Error("Acknowledge needs exactly one --run ID; other operation actions take none.");
+			return {
+				operation: "operate-local",
+				action,
+				expectedOperationRevision: revision(input.expectedOperationRevision, 0),
+				requestId: requestId(),
+				...(input.runId === undefined ? {} : { runId: missionText(input.runId, 400) }),
+			};
+		}
+		default:
+			return undefined;
+	}
 }
 
 function parseDraft(value: unknown): MissionDraft {

@@ -9,6 +9,12 @@ import type { MissionControl } from "./control.ts";
 import { type missionController, resumeMissionExecution, startMissionExecution } from "./controller.ts";
 import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts";
 import { missionExecutionView } from "./execution-view.ts";
+import { loopRollbackBlocker } from "./loop-drain.ts";
+import { PurposeOperation } from "./operation.ts";
+import { readMissionPurpose } from "./purpose.ts";
+import { PurposeFormation } from "./purpose-formation.ts";
+import type { LoopState } from "./purpose-loop.ts";
+import { missionPurposeView } from "./purpose-view.ts";
 import { MissionDoc } from "./state.ts";
 import { verifyMissionFiles } from "./verification.ts";
 
@@ -22,6 +28,8 @@ export class MissionOwner {
 	readonly #engine: ReturnType<typeof missionController>;
 	readonly #model: ModelChoice | null;
 	readonly #cwd: string;
+	readonly #purpose: PurposeFormation;
+	readonly #operation: PurposeOperation;
 	#tail: Promise<unknown> = Promise.resolve();
 	#scheduling: "inhibited" | "permitted" = "inhibited";
 
@@ -34,6 +42,7 @@ export class MissionOwner {
 		engine: ReturnType<typeof missionController>,
 		model: ModelChoice | null,
 		cwd: string,
+		now: () => number = Date.now,
 	) {
 		this.#harness = harness;
 		this.#formation = formation;
@@ -43,6 +52,8 @@ export class MissionOwner {
 		this.#engine = engine;
 		this.#model = model;
 		this.#cwd = cwd;
+		this.#purpose = new PurposeFormation(harness, location, now);
+		this.#operation = new PurposeOperation(harness, location, engine.loop, model, now);
 	}
 
 	/** Replays only the latest protected intent after restart; agreement alone never starts execution. */
@@ -50,6 +61,9 @@ export class MissionOwner {
 		this.#scheduling = scheduling;
 		await this.#formation.initialize(context);
 		if (this.#location.session !== "default") return;
+		await this.#purpose.initialize(context);
+		// Restrictive operation intents apply before scheduling; open and acknowledgment wait for permission.
+		await this.#operation.initialize(context, scheduling);
 		const authority = await readMissionAuthority(this.#location).catch(() => null);
 		if (authority?.executionIntent) {
 			try {
@@ -71,7 +85,27 @@ export class MissionOwner {
 			runtime: current ? missionExecutionView(current, Date.now()) : null,
 			policyRevision:
 				current?.policyRevision ?? (intent?.expectedPolicyRevision ?? 0) + (intent?.action === "stop" ? 1 : 0),
+			...(await this.#purposeView(context)),
 		};
+	}
+
+	// Status validates exactly what execution validates (`readMissionPurpose`, `validPurposeLoop`), and reports a
+	// failure as such, not as "no purpose". The rollback answer comes from live task inspection, never from the
+	// document alone: invalid records project no purpose, yet a parked loop task can still be live.
+	async #purposeView(context: Context): Promise<Pick<MissionView, "purpose" | "purposeError" | "loopRollback">> {
+		const loopRollback = loopRollbackBlocker(await this.#harness.inspect(context)) ?? "no-live-loop";
+		let loop: LoopState | undefined;
+		try {
+			loop = (await readMissionPurpose(this.#harness, context))?.loop;
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			return { purpose: null, purposeError: reason.slice(0, 500), loopRollback };
+		}
+		if (!loop) return { purpose: null, purposeError: null, loopRollback };
+		let live = loopRollback === "live-loop";
+		for (const id of [loop.operation.loop, loop.operation.drain?.loop])
+			if (id && (await this.#harness.getTask(id, context))?.state.status !== "terminal") live = true;
+		return { purpose: missionPurposeView(loop, live), purposeError: null, loopRollback };
 	}
 
 	/** Routes formation normally and serializes exact protected lifecycle requests through the same owner. */
@@ -81,6 +115,12 @@ export class MissionOwner {
 			if (request.operation === "control-local" || request.operation === "reconcile-execution") {
 				if (request.operation === "control-local") await this.issueLocal(request, context);
 				await this.reconcile(request.requestId, context, this.#scheduling);
+			} else if (request.operation === "purpose-propose") await this.#purpose.propose(request, context);
+			else if (request.operation === "purpose-approve-local") await this.#purpose.approveLocal(request, context);
+			else if (request.operation === "reconcile-purpose") await this.#purpose.reconcile(request.receiptId, context);
+			else if (request.operation === "operate-local" || request.operation === "reconcile-operation") {
+				if (request.operation === "operate-local") await this.#operation.issueLocal(request, context);
+				await this.#operation.reconcile(request.requestId, context, this.#scheduling);
 			} else await this.#formation.handle(request, context);
 			return this.inspect(context);
 		});

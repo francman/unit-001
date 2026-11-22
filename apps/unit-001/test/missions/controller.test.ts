@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { Type } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, Type } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
@@ -17,6 +17,7 @@ import {
 	Harness,
 	hook,
 	type TaskId,
+	type ToolExecutionApi,
 	ToolTask,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
@@ -52,7 +53,12 @@ const criterion = (file: string, content: string) =>
 const write = (file: string, content: string) =>
 	fauxAssistantMessage(fauxToolCall("write", { path: file, content }), { stopReason: "toolUse" });
 
-async function launch(responses: Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0] = [], priced = false) {
+async function launch(
+	responses: Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0] = [],
+	priced = false,
+	retry: { enabled: false } | { enabled: true; maxRetries: number; baseDelayMs: number } = { enabled: false },
+	stream: { deferred?: true } = {},
+) {
 	const location = { kind: "developer-local" as const, directory, session: "default" };
 	const admission = new MissionAdmission(location, () => now);
 	const engine = missionController(admission, directory);
@@ -85,7 +91,7 @@ async function launch(responses: Parameters<ReturnType<typeof fauxProvider>["set
 			registry,
 			now: () => now,
 			setTimer: () => () => {},
-			settings: { retry: { enabled: false }, stream: { maxRetries: 0 } },
+			settings: { retry, stream: { maxRetries: 0, ...stream } },
 			env: () => new NodeExecutionEnv({ cwd: directory }),
 			onReport: (report) => reports.push(report),
 		},
@@ -152,6 +158,71 @@ async function agree(host: Awaited<ReturnType<typeof launch>>, criteria: string[
 		},
 		context,
 	);
+}
+
+type FixtureEffect = (
+	args: { path: string; content: string },
+	ctx: typeof context,
+	api: ToolExecutionApi,
+) => Promise<void>;
+
+function fixtureTools(
+	...tools: { name: "write" | "read"; replay?: "safe"; executionMode?: "sequential"; effect: FixtureEffect }[]
+) {
+	return defineExtension({
+		name: "fixture-mission-tools",
+		tools: tools.map(({ name, replay, executionMode, effect }) =>
+			defineTool({
+				name,
+				description: "A mission fixture action.",
+				parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+				...(replay === undefined ? {} : { replay }),
+				...(executionMode === undefined ? {} : { executionMode }),
+				execute: async (args, api, ctx) => {
+					await effect(args, ctx, api);
+					return { output: [] };
+				},
+			}),
+		),
+	});
+}
+
+const replaySafeWrite = (effect: FixtureEffect) => fixtureTools({ name: "write", replay: "safe", effect });
+
+/** One storage effect, committed through the tool's own commit as memory tools commit theirs. */
+const Effects = defineDoc<{ count: number }>({
+	kind: "fixture.mission.effects",
+	version: 1,
+	scope: "session",
+	initial: () => ({ count: 0 }),
+	checkpointWhen: () => true,
+});
+
+const commitEffect: FixtureEffect = async (_args, ctx, api) => {
+	await api.commit(async (tx) => {
+		(await tx.doc(Effects)).count++;
+	}, ctx);
+};
+
+const untilAborted = (ctx: typeof context) =>
+	new Promise<never>((_resolve, reject) =>
+		ctx.abortSignal!.addEventListener("abort", () => reject(new Error("Fixture interrupted")), { once: true }),
+	);
+
+function latch() {
+	let open!: () => void;
+	const opened = new Promise<void>((resolve) => {
+		open = resolve;
+	});
+	return { open, opened };
+}
+
+async function reopen(host: Awaited<ReturnType<typeof launch>>, ...args: Parameters<typeof launch>) {
+	await host.harness.close(context);
+	opened.splice(opened.indexOf(host.harness), 1);
+	const reopened = await launch(...args);
+	reopened.registry.uninstall(CodingTools);
+	return reopened;
 }
 
 async function finished(host: Awaited<ReturnType<typeof launch>>, task: TaskId<null>) {
@@ -485,6 +556,358 @@ describe("checkpointed mission controller", () => {
 		},
 	);
 
+	// #16: Durable reruns a replay-safe tool from its saved checkpoint without beforeTool; current authority must decide.
+	it.each([true, false])(
+		"reruns a recovered replay-safe mission action only under current authority: revoked=%s",
+		async (revoked) => {
+			let interrupted!: () => void;
+			const started = new Promise<void>((resolve) => {
+				interrupted = resolve;
+			});
+			const first = await launch([write("effect.txt", "proof")]);
+			first.registry.uninstall(CodingTools);
+			first.registry.install(
+				replaySafeWrite(async (_args, ctx) => {
+					interrupted();
+					await new Promise((_resolve, reject) =>
+						ctx.abortSignal!.addEventListener("abort", () => reject(new Error("Fixture interrupted")), {
+							once: true,
+						}),
+					);
+				}),
+			);
+			await agree(first, [criterion("effect.txt", "proof")]);
+			const task = await startMissionExecution(
+				first.harness,
+				first.engine,
+				first.admission,
+				first.registry,
+				model,
+				context,
+			);
+			first.harness.resume();
+			await started;
+			expect((await first.harness.snapshot(MissionExecutionDoc, context))!.current!.pendingTools).toHaveLength(1);
+			await first.harness.close(context);
+			opened.splice(opened.indexOf(first.harness), 1);
+			if (revoked) {
+				const authority = (await readMissionAuthority(first.location))!;
+				await writeMissionAuthority(first.location, { ...authority, revision: authority.revision + 1, approvals: [] });
+			}
+			const reruns: string[] = [];
+			const reopened = await launch();
+			reopened.registry.uninstall(CodingTools);
+			reopened.registry.install(
+				replaySafeWrite(async (args) => {
+					reruns.push(args.path);
+					await writeFile(join(directory, args.path), args.content);
+				}),
+			);
+			const result = await finished(reopened, task);
+			expect(reopened.faux.state.callCount).toBe(0);
+			if (revoked) {
+				expect(reruns).toEqual([]);
+				await expect(readFile(join(directory, "effect.txt"))).rejects.toThrow("ENOENT");
+				// The denied rerun proves nothing about the interrupted attempt, so its intent stays uncertain.
+				expect(result.pendingTools).toHaveLength(1);
+				expect(result.state).toEqual({ status: "blocked", reason: "authority" });
+			} else {
+				expect(reruns).toEqual(["effect.txt"]);
+				expect(result.pendingTools).toEqual([]);
+				expect(result.state).toEqual({ status: "completed", observedAt: 1_000 });
+			}
+		},
+	);
+
+	// #16: The admission decision and the effect are one transaction; a change landing after admission rolls it back.
+	it.each([
+		["fresh", "hold"],
+		["fresh", "pause"],
+		["fresh", "revoked"],
+		["recovered", "hold"],
+		["recovered", "pause"],
+		["recovered", "revoked"],
+	] as const)("commits no %s mission effect once a %s lands after its admission", async (origin, change) => {
+		const parked = latch();
+		const release = latch();
+		const park: FixtureEffect = async (args, ctx, api) => {
+			parked.open();
+			await release.opened;
+			await commitEffect(args, ctx, api);
+		};
+		const interrupted = latch();
+		let host = await launch([write("effect.txt", "proof")]);
+		host.registry.uninstall(CodingTools);
+		host.registry.install(
+			replaySafeWrite(
+				origin === "fresh"
+					? park
+					: async (_args, ctx) => {
+							interrupted.open();
+							await untilAborted(ctx);
+						},
+			),
+		);
+		await agree(host, [criterion("effect.txt", "proof")]);
+		const task = await startMissionExecution(host.harness, host.engine, host.admission, host.registry, model, context);
+		host.harness.resume();
+		if (origin === "recovered") {
+			await interrupted.opened;
+			host = await reopen(host);
+			host.registry.install(replaySafeWrite(park));
+			host.harness.resume();
+		}
+		// The call passed admission and is about to commit its effect when the policy changes.
+		await parked.opened;
+		if (change === "hold")
+			await host.harness.commit(async (tx) => {
+				(await tx.doc(MaintenanceDoc)).current = { protocol: 1, state: "held", operationId: "update" };
+			}, context);
+		else if (change === "pause")
+			await host.harness.commit(async (tx) => {
+				const current = (await tx.doc(MissionExecutionDoc)).current!;
+				current.state = { status: "paused" };
+				current.policyRevision++;
+				current.revision++;
+			}, context);
+		else {
+			const authority = (await readMissionAuthority(host.location))!;
+			await writeMissionAuthority(host.location, { ...authority, revision: authority.revision + 1, approvals: [] });
+		}
+		release.open();
+		const result = await finished(host, task);
+		expect((await host.harness.snapshot(Effects, context))?.count ?? 0).toBe(0);
+		// The rolled-back commit proves nothing about work before it, so the intent stays uncertain.
+		expect(result.pendingTools).toHaveLength(1);
+		expect(result.state).toEqual(
+			change === "hold"
+				? { status: "blocked", reason: "unknown_tool_outcome" }
+				: change === "pause"
+					? { status: "paused" }
+					: { status: "blocked", reason: "authority" },
+		);
+		expect(host.faux.state.callCount).toBe(origin === "fresh" ? 1 : 0);
+	});
+
+	// #16: A saved round's later action never runs while an earlier action's outcome is unknown, created fresh or rerun.
+	it.each(["sequential", "parallel"] as const)(
+		"runs no saved sibling action beside an interrupted action: %s round",
+		async (mode) => {
+			const interrupted = latch();
+			const sibling = latch();
+			const second = mode === "sequential" ? ("write" as const) : ("read" as const);
+			const first = await launch([
+				fauxAssistantMessage(
+					[
+						fauxToolCall("write", { path: "a.txt", content: "a" }),
+						fauxToolCall(second, { path: "b.txt", content: "b" }),
+					],
+					{ stopReason: "toolUse" },
+				),
+			]);
+			first.registry.uninstall(CodingTools);
+			first.registry.install(
+				fixtureTools(
+					{
+						name: "write",
+						...(mode === "sequential" ? { executionMode: "sequential" as const } : {}),
+						effect: async (_args, ctx) => {
+							interrupted.open();
+							await untilAborted(ctx);
+						},
+					},
+					{
+						name: "read",
+						replay: "safe",
+						effect: async (_args, ctx) => {
+							sibling.open();
+							await untilAborted(ctx);
+						},
+					},
+				),
+			);
+			await agree(first, [criterion("b.txt", "b")], { allowedTools: ["write", "read"] });
+			const task = await startMissionExecution(
+				first.harness,
+				first.engine,
+				first.admission,
+				first.registry,
+				model,
+				context,
+			);
+			first.harness.resume();
+			await interrupted.opened;
+			if (mode === "parallel") await sibling.opened;
+			const reopened = await reopen(first);
+			const runs: string[] = [];
+			const record: FixtureEffect = async (args) => {
+				runs.push(args.path);
+				await writeFile(join(directory, args.path), args.content);
+			};
+			reopened.registry.install(
+				fixtureTools(
+					{ name: "write", ...(mode === "sequential" ? { executionMode: "sequential" as const } : {}), effect: record },
+					{ name: "read", replay: "safe", effect: record },
+				),
+			);
+			const result = await finished(reopened, task);
+			expect(runs).toEqual([]);
+			await expect(readFile(join(directory, "b.txt"))).rejects.toThrow("ENOENT");
+			// Sequential: the sibling was refused before its intent; parallel: its saved intent stays uncertain too.
+			expect(result.pendingTools).toHaveLength(mode === "sequential" ? 1 : 2);
+			expect(result.state).toEqual({ status: "blocked", reason: "unknown_tool_outcome" });
+			expect(reopened.faux.state.callCount).toBe(0);
+		},
+	);
+
+	// #16: Durable polls a deferred handle without the provider session, so no mission attempt may leave one behind.
+	it.each(["requested", "returned"] as const)("leaves no deferred mission poll: deferred %s", async (how) => {
+		const asked: unknown[] = [];
+		const host = await launch(
+			[
+				how === "requested"
+					? (_input, options) => {
+							asked.push(options?.deferred);
+							return write("effect.txt", "proof");
+						}
+					: (_input, _options, _state, requested) =>
+							fauxAssistantMessage([], {
+								stopReason: "deferred",
+								deferred: {
+									provider: requested.provider,
+									modelId: requested.id,
+									api: requested.api,
+									id: "fixture-deferred",
+								},
+							}),
+			],
+			false,
+			{ enabled: false },
+			how === "requested" ? { deferred: true } : {},
+		);
+		await agree(host, [criterion("effect.txt", "proof")], { maxRetries: 0 });
+		const result = await finished(
+			host,
+			await startMissionExecution(host.harness, host.engine, host.admission, host.registry, model, context),
+		);
+		expect(host.faux.state.deferredFetchCount).toBe(0);
+		if (how === "requested") {
+			expect(asked).toEqual([undefined]);
+			expect(result.state).toEqual({ status: "completed", observedAt: 1_000 });
+		} else {
+			expect(host.faux.state.cancelledDeferred.map((handle) => handle.id)).toEqual(["fixture-deferred"]);
+			// The provider accepted the work, so the attempt is an unpriced receipt, never a free one.
+			expect(result).toMatchObject({ requests: 1, unknownRequests: 0, unpricedResponses: 1 });
+			expect(result.state).toEqual({ status: "blocked", reason: "retry_limit" });
+		}
+	});
+
+	it("reruns a recovered replay-safe action unchanged in ordinary chat beside a bound mission", async () => {
+		const interrupted = latch();
+		const first = await launch([write("chat.txt", "ordinary")]);
+		first.registry.uninstall(CodingTools);
+		first.registry.install(
+			replaySafeWrite(async (_args, ctx) => {
+				interrupted.open();
+				await untilAborted(ctx);
+			}),
+		);
+		await agree(first, [criterion("missing.txt", "proof")]);
+		await startMissionExecution(first.harness, first.engine, first.admission, first.registry, model, context);
+		// The mission's own decision now denies everything; ordinary chat must not consult it.
+		const authority = (await readMissionAuthority(first.location))!;
+		await writeMissionAuthority(first.location, { ...authority, revision: authority.revision + 1, approvals: [] });
+		const root = await first.harness.root(context, { agent: { model } });
+		await root.submit({ type: "input", content: "Write the chat file", requestId: "chat" }, context);
+		first.harness.resume();
+		await interrupted.opened;
+		const reopened = await reopen(first);
+		const reruns: string[] = [];
+		reopened.registry.install(
+			replaySafeWrite(async (args) => {
+				reruns.push(args.path);
+				await writeFile(join(directory, args.path), args.content);
+			}),
+		);
+		reopened.harness.resume();
+		await (await reopened.harness.root(context)).waitForIdle(context);
+		const mission = (await reopened.harness.snapshot(MissionExecutionDoc, context))!.current!;
+		await reopened.harness.waitForTask(mission.controller, context);
+		expect((await reopened.harness.snapshot(MissionExecutionDoc, context))?.current?.state).toEqual({
+			status: "blocked",
+			reason: "authority",
+		});
+		expect(reruns).toEqual(["chat.txt"]);
+		expect(await readFile(join(directory, "chat.txt"), "utf8")).toBe("ordinary");
+	});
+
+	// #16 (unit-mei.35): the "re-send after kill" was Durable's scheduled retry of a settled failure, a new admitted
+	// attempt; an attempt still in flight at shutdown stays unknown and blocks every later attempt, retries included.
+	it.each([false, true])(
+		"distinguishes a scheduled provider retry from an unknown attempt across restart: in flight=%s",
+		async (inFlight) => {
+			const retry = { enabled: true, maxRetries: 3, baseDelayMs: 2_000 } as const;
+			let requested!: () => void;
+			const started = new Promise<void>((resolve) => {
+				requested = resolve;
+			});
+			const host = await launch(
+				[
+					inFlight
+						? (_input, options) =>
+								new Promise((_resolve, reject) => {
+									requested();
+									options?.signal?.addEventListener("abort", () => reject(new Error("socket hang up")), {
+										once: true,
+									});
+								})
+						: () => {
+								requested();
+								return fauxAssistantMessage([], { stopReason: "error", errorMessage: "socket hang up" });
+							},
+				],
+				false,
+				retry,
+			);
+			await agree(host, [criterion("missing.txt", "proof")], { maxCycles: 1 });
+			const task = await startMissionExecution(
+				host.harness,
+				host.engine,
+				host.admission,
+				host.registry,
+				model,
+				context,
+			);
+			host.harness.resume();
+			await started;
+			const generation = async () =>
+				(await host.harness.inspect(context)).tasks.find((item) => item.record.kind === "pi.generation")?.record;
+			if (!inFlight)
+				for (let i = 0; i < 500 && (await generation())?.state.status !== "sleeping"; i++) await setImmediate();
+			expect((await host.harness.snapshot(MissionExecutionDoc, context))!.current).toMatchObject({
+				requests: 1,
+				unknownRequests: inFlight ? 1 : 0,
+				unpricedResponses: inFlight ? 0 : 1,
+			});
+			if (!inFlight) expect((await generation())?.state).toMatchObject({ status: "sleeping", until: 3_000 });
+			await host.harness.close(context);
+			opened.splice(opened.indexOf(host.harness), 1);
+			now = 3_000;
+			const reopened = await launch([fauxAssistantMessage("Still working")], false, retry);
+			const result = await finished(reopened, task);
+			if (inFlight) {
+				expect(reopened.faux.state.callCount).toBe(0);
+				expect(result).toMatchObject({ requests: 1, unknownRequests: 1 });
+				expect(result.state).toEqual({ status: "blocked", reason: "unknown_request_outcome" });
+			} else {
+				// A new attempt, admitted against the current gates and counted; both receipts are unpriced on the free faux model.
+				expect(reopened.faux.state.callCount).toBe(1);
+				expect(result).toMatchObject({ requests: 2, unknownRequests: 0, unpricedResponses: 2 });
+				expect(result.state).toEqual({ status: "blocked", reason: "cycle_limit" });
+			}
+		},
+	);
+
 	it("rejects an unpriced capped request before dispatch", async () => {
 		const host = await launch();
 		await agree(host, [criterion("missing.txt", "proof")], { maxEstimatedCost: 1 });
@@ -494,6 +917,23 @@ describe("checkpointed mission controller", () => {
 		);
 		expect(result.state).toEqual({ status: "blocked", reason: "estimated_spend_limit" });
 		expect(host.faux.state.callCount).toBe(0);
+	});
+
+	it("keeps a pending (partial) provider response unknown instead of counting it as a receipt", async () => {
+		const host = await launch([]);
+		const pending = () => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => stream.end(fauxAssistantMessage("partial", { stopReason: "pending" })));
+			return stream;
+		};
+		vi.spyOn(host.faux.provider, "stream").mockImplementation(pending);
+		vi.spyOn(host.faux.provider, "streamSimple").mockImplementation(pending);
+		await agree(host, [criterion("missing.txt", "proof")]);
+		const result = await finished(
+			host,
+			await startMissionExecution(host.harness, host.engine, host.admission, host.registry, model, context),
+		);
+		expect(result).toMatchObject({ requests: 1, unknownRequests: 1, unpricedResponses: 0 });
 	});
 
 	it("retains a paid-model reservation when a response omits usage pricing", async () => {

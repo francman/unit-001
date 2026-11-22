@@ -18,6 +18,19 @@ Pause closes admissions and drains the current execution's requests, tools and b
 
 Status shows observed evidence, current policy revision, waiting/blocking reason, next wake and consumed allowances. Costs are estimates; reserved, unpriced and interrupted requests remain explicit. The initial engine verifies approved file digests. Unsupported completion requirements stay blocked.
 
+## Continuous operation commands
+
+A purpose approved for continuous operation has its own commands ([contract](purpose.md#continuous-operation-slice-2)):
+
+```sh
+agent mission purpose --file purpose.json --revision N   # propose exact terms (operator)
+sudo agent mission approve-purpose --revision N --digest SHA256   # run as the creator
+sudo agent mission operate open|suspend|close [--operation-revision N] [--request-id ID]
+sudo agent mission operate acknowledge --run RUN_ID
+```
+
+`mission creator --file` accepts an optional `purposeCeiling`. Approving opens nothing. `operate` writes a protected intent (open, suspend, close) or acknowledgment, bound to the purpose revision, digest, authority revision and expected operation revision; a retry with the same request ID is idempotent. A request ID names one command: reusing an acknowledgment ID for an intent, or the reverse, is refused before the authority file is written. If a file holds both anyway, reconciling that ID fails; a restrictive intent under it still applies first. `acknowledge` takes a run ID from the status lines `Unsettled run ID (...)` (JSON: `purpose.unsettled`), which list unsettled runs of every purpose revision, including work an amendment removed. Developer-local instances use the same commands without sudo. Managed routing of `approve-purpose` and `operate` through the installed command is pending (see the purpose contract's rollback section).
+
 ## Protected intent and replay
 
 The administrator client writes the latest `executionIntent` into the existing root-owned mission authority file. It binds a sequence, request ID, action, agreement identity/revision/digest, authority revision and expected mission policy revision. The existing owner reconciles that intent; neither a socket frame nor a remembered instruction grants authority.

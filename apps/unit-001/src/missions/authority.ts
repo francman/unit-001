@@ -18,6 +18,7 @@ import {
 	parseMissionCreator,
 	parseMissionDraftTerms,
 } from "./contract.ts";
+import { parseOperationAcknowledgment, parseOperationIntent, parsePurposeCeiling } from "./purpose-authority.ts";
 
 export type MissionLocation =
 	| { kind: "managed"; installationId: string; session: string }
@@ -240,7 +241,25 @@ export function parseMissionAuthority(value: unknown): MissionAuthority {
 		...(input.executionIntent === undefined
 			? {}
 			: { executionIntent: parseMissionExecutionIntent(input.executionIntent) }),
+		// Purpose fields are optional and additive: an old writer drops them, which closes continuous operation.
+		...(input.purposeCeiling === undefined ? {} : { purposeCeiling: parsePurposeCeiling(input.purposeCeiling) }),
+		...(input.purposeApprovals === undefined
+			? {}
+			: { purposeApprovals: boundedList(input.purposeApprovals, 2).map(parseMissionApproval) }),
+		...(input.operationIntent === undefined ? {} : { operationIntent: parseOperationIntent(input.operationIntent) }),
+		...(input.operationAcknowledgments === undefined
+			? {}
+			: {
+					operationAcknowledgments: boundedList(input.operationAcknowledgments, 8).map(
+						parseOperationAcknowledgment,
+					),
+				}),
 	};
+}
+
+function boundedList(value: unknown, maximum: number): unknown[] {
+	if (!Array.isArray(value) || value.length > maximum) throw new Error("Unsupported mission authority metadata.");
+	return value;
 }
 
 /** Validates the latest protected lifecycle intent, never accepting it from an ordinary owner-wire frame. */
@@ -309,7 +328,7 @@ export function missionDigest(
 	terms: MissionTerms,
 	missionId: string,
 	revision: number,
-	authority: MissionAuthority,
+	authority: Pick<MissionAuthority, "installationId" | "session" | "revision" | "creator">,
 ): string {
 	return createHash("sha256")
 		.update(

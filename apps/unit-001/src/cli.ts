@@ -20,6 +20,7 @@ import { describeStatus, runLogin, runLogout, subscriptionFor } from "./login.ts
 import { describeMemory, type MemoryRequest } from "./memory-control.ts";
 import { parseMissionCeiling } from "./missions/authority.ts";
 import { describeMission } from "./missions/command.ts";
+import { parsePurposeCeiling, parsePurposeTerms } from "./missions/purpose-authority.ts";
 import {
 	type MissionRequest,
 	type MissionView,
@@ -364,13 +365,36 @@ async function control(
 				expectedPolicyRevision: input.policyRevision ?? view.policyRevision ?? view.runtime?.policyRevision ?? 0,
 				requestId: input.requestId,
 			};
-		} else if (input.action === "draft" || input.action === "creator") {
+		} else if (input.action === "operate") {
+			const view = await request({ operation: "status" });
+			operation = {
+				operation: "operate-local",
+				action: input.operate,
+				expectedOperationRevision: input.operationRevision ?? view.purpose?.operationRevision ?? 0,
+				requestId: input.requestId,
+				...(input.runId === undefined ? {} : { runId: input.runId }),
+			};
+		} else if (input.action === "approve-purpose")
+			operation = {
+				operation: "purpose-approve-local",
+				revision: input.revision,
+				digest: input.digest,
+				requestId: input.requestId,
+			};
+		else if (input.action === "draft" || input.action === "creator" || input.action === "purpose") {
 			const path = resolve(runtime.cwd, input.file);
 			const info = await lstat(path);
-			if (!info.isFile() || info.isSymbolicLink() || info.size > 32768)
-				throw new UsageError("Mission input must be a regular file of at most 32 KiB.");
+			if (!info.isFile() || info.isSymbolicLink() || info.size > 65536)
+				throw new UsageError("Mission input must be a regular file of at most 64 KiB.");
 			const data: unknown = JSON.parse(await readFile(path, "utf8"));
-			if (input.action === "draft")
+			if (input.action === "purpose")
+				operation = {
+					operation: "purpose-propose",
+					expectedRevision: input.revision,
+					requestId: input.requestId,
+					terms: parsePurposeTerms(data),
+				};
+			else if (input.action === "draft")
 				operation = {
 					operation: "draft",
 					expectedRevision: input.revision,
@@ -383,6 +407,9 @@ async function control(
 					operation: "configure-local",
 					creator: parseMissionCreator(authority.creator),
 					ceiling: parseMissionCeiling(authority.ceiling),
+					...(authority.purposeCeiling === undefined
+						? {}
+						: { purposeCeiling: parsePurposeCeiling(authority.purposeCeiling) }),
 				};
 			}
 		} else if (input.action === "propose")

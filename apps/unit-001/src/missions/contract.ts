@@ -1,6 +1,7 @@
 // Defines bounded mission formation data without granting execution authority.
 
 import type { MissionExecutionView } from "./execution-view.ts";
+import type { MissionPurposeView } from "./purpose-view.ts";
 import type { MissionPolicy } from "./state.ts";
 
 // The managed Linux host approves only this application's shipped actions, independently of owner-provided text.
@@ -94,6 +95,75 @@ export type MissionAuthority = {
 	ceiling: MissionCeiling;
 	approvals: MissionApproval[];
 	executionIntent?: MissionExecutionIntent;
+	purposeCeiling?: PurposeCeiling;
+	purposeApprovals?: MissionApproval[];
+	operationIntent?: OperationIntent;
+	operationAcknowledgments?: OperationAcknowledgment[];
+};
+
+/** The only work kind a purpose can list: write one declared workspace file whose SHA-256 the creator fixed. */
+export type WorkTerms = {
+	kind: "artifact-digest";
+	path: string;
+	sha256: string;
+	instructions: string;
+	maxCycles: number;
+	maxRequests: number;
+	maxRetries: number;
+	maxConsecutiveNoProgress: number;
+};
+
+/** Lifetime limits of one purpose: absolute totals per mission, never renewed by restart, completion or reopen. */
+export type PurposeLifetime = {
+	maxWorkItems: number;
+	maxCycles: number;
+	maxRequests: number;
+	maxEstimatedCost?: number;
+	deadlineAt: number;
+};
+
+/** What a creator approves for continuous operation: an ordered list of bounded work and one lifetime allowance. */
+export type PurposeTerms = {
+	purpose: string;
+	scope: string;
+	reviewEveryMs: number;
+	works: WorkTerms[];
+	lifetime: PurposeLifetime;
+};
+
+/** The protected, purpose-only grant: the `artifact-digest` capability under these path prefixes and caps. */
+export type PurposeCeiling = {
+	capabilities: ["artifact-digest"];
+	paths: string[];
+	maxWorkItems: number;
+	maxCycles: number;
+	maxRequests: number;
+	maxRetries: number;
+	maxConsecutiveNoProgress: number;
+	maxDurationMs: number;
+	maxEstimatedCost?: number;
+};
+
+/** The latest protected open, suspend or close of continuous operation for one exact purpose revision. */
+export type OperationIntent = {
+	requestId: string;
+	sequence: number;
+	missionId: string;
+	purposeRevision: number;
+	purposeDigest: string;
+	authorityRevision: number;
+	expectedOperationRevision: number;
+	action: "open" | "suspend" | "close";
+	issuedAt: number;
+};
+
+/** A protected decision that one unsettled run's uncertain effects are accepted; it refunds nothing. */
+export type OperationAcknowledgment = {
+	requestId: string;
+	missionId: string;
+	runId: string;
+	authorityRevision: number;
+	issuedAt: number;
 };
 
 export type MissionExecutionIntent = {
@@ -120,8 +190,19 @@ export type MissionRequest =
 			expectedPolicyRevision: number;
 			requestId: string;
 	  }
-	| { operation: "configure-local"; creator: MissionCreator; ceiling: MissionCeiling }
-	| { operation: "approve-local"; expectedRevision: number; digest: string; requestId: string };
+	| { operation: "configure-local"; creator: MissionCreator; ceiling: MissionCeiling; purposeCeiling?: PurposeCeiling }
+	| { operation: "approve-local"; expectedRevision: number; digest: string; requestId: string }
+	| { operation: "purpose-propose"; expectedRevision: number; requestId: string; terms: PurposeTerms }
+	| { operation: "purpose-approve-local"; revision: number; digest: string; requestId: string }
+	| { operation: "reconcile-purpose"; receiptId: string }
+	| {
+			operation: "operate-local";
+			action: OperationIntent["action"] | "acknowledge";
+			expectedOperationRevision: number;
+			requestId: string;
+			runId?: string;
+	  }
+	| { operation: "reconcile-operation"; requestId: string };
 
 export type MissionView = {
 	stage: "awaiting_creator" | "drafting" | "awaiting_approval" | "agreed";
@@ -135,6 +216,11 @@ export type MissionView = {
 	runtime?: MissionExecutionView | null;
 	policyRevision?: number;
 	tools: string[];
+	purpose?: MissionPurposeView | null;
+	/** Why the stored purpose records failed validation; continuous operation then runs and admits nothing. */
+	purposeError?: string | null;
+	/** From live task inspection, not the purpose records: whether a loop task is live; rollback needs "no-live-loop". */
+	loopRollback?: "no-live-loop" | "live-loop";
 };
 
 /** Creates an unapproved formation; it never allocates a controller or execution conversation. */

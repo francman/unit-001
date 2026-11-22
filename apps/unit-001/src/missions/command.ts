@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { sanitizeTerminalText } from "../render.ts";
 import type { MissionView } from "./contract.ts";
+import type { MissionPurposeView } from "./purpose-view.ts";
 
 export type MissionCommand =
 	| { action: "status"; json: boolean }
@@ -10,7 +11,19 @@ export type MissionCommand =
 	| { action: "propose"; revision: number; requestId: string; json: boolean }
 	| { action: "approve"; revision: number; digest: string; requestId: string; json: boolean }
 	| { action: "start" | "pause" | "resume" | "stop"; policyRevision?: number; requestId: string; json: boolean }
-	| { action: "creator"; file: string; json: boolean };
+	| { action: "creator"; file: string; json: boolean }
+	| { action: "purpose"; file: string; revision: number; requestId: string; json: boolean }
+	| { action: "approve-purpose"; revision: number; digest: string; requestId: string; json: boolean }
+	| {
+			action: "operate";
+			operate: "open" | "suspend" | "close" | "acknowledge";
+			operationRevision?: number;
+			requestId: string;
+			runId?: string;
+			json: boolean;
+	  };
+
+const OPERATE_ACTIONS = ["open", "suspend", "close", "acknowledge"] as const;
 
 /** Parses the concrete mission client interface; only the primary owner session is supported. */
 export function parseMissionCommand(args: readonly string[]): {
@@ -19,9 +32,11 @@ export function parseMissionCommand(args: readonly string[]): {
 	dataDir?: string;
 } {
 	const action = args[0] ?? "status";
+	const operate = action === "operate" ? OPERATE_ACTIONS.find((item) => item === args[1]) : undefined;
+	if (action === "operate" && !operate) throw new Error("Mission operate expects open, suspend, close or acknowledge.");
 	const values = new Map<string, string>();
 	let json = false;
-	for (let index = 1; index < args.length; index++) {
+	for (let index = operate ? 2 : 1; index < args.length; index++) {
 		const flag = args[index];
 		if (flag === "--json") {
 			if (json) throw new Error("Duplicate --json.");
@@ -29,9 +44,17 @@ export function parseMissionCommand(args: readonly string[]): {
 			continue;
 		}
 		if (
-			!["--file", "--revision", "--policy-revision", "--digest", "--request-id", "--session", "--data-dir"].includes(
-				flag,
-			)
+			![
+				"--file",
+				"--revision",
+				"--policy-revision",
+				"--operation-revision",
+				"--run",
+				"--digest",
+				"--request-id",
+				"--session",
+				"--data-dir",
+			].includes(flag)
 		)
 			throw new Error(`Unknown mission option: ${flag}`);
 		const value = args[++index];
@@ -63,6 +86,32 @@ export function parseMissionCommand(args: readonly string[]): {
 			...location,
 		};
 	}
+	if (operate) {
+		unexpected(["--operation-revision", "--request-id", "--run"]);
+		const operationRevision = values.has("--operation-revision")
+			? Number(values.get("--operation-revision"))
+			: undefined;
+		if (operationRevision !== undefined && (!Number.isSafeInteger(operationRevision) || operationRevision < 0))
+			throw new Error("Mission operation revision must be a nonnegative integer.");
+		if (values.has("--request-id") && operationRevision === undefined)
+			throw new Error("An explicit operation request ID requires --operation-revision N for safe retries.");
+		if ((operate === "acknowledge") !== values.has("--run"))
+			throw new Error("Acknowledge needs exactly one --run ID; other operation actions take none.");
+		const requestId = values.get("--request-id") ?? randomUUID();
+		if (!requestId.trim() || Buffer.byteLength(requestId) > 200)
+			throw new Error("Mission request ID must fit 200 bytes.");
+		return {
+			command: {
+				action: "operate",
+				operate,
+				...(operationRevision === undefined ? {} : { operationRevision }),
+				requestId,
+				...(values.has("--run") ? { runId: values.get("--run") } : {}),
+				json,
+			},
+			...location,
+		};
+	}
 	if (action === "status") {
 		unexpected([]);
 		return { command: { action, json }, ...location };
@@ -78,12 +127,20 @@ export function parseMissionCommand(args: readonly string[]): {
 		if (!file) throw new Error("Mission creator requires --file FILE.");
 		return { command: { action, file, json }, ...location };
 	}
-	if (action !== "draft" && action !== "propose" && action !== "approve")
-		throw new Error("Mission expects status, setup, draft, propose, creator, approve, start, pause, resume or stop.");
+	if (
+		action !== "draft" &&
+		action !== "propose" &&
+		action !== "approve" &&
+		action !== "purpose" &&
+		action !== "approve-purpose"
+	)
+		throw new Error(
+			"Mission expects status, setup, draft, propose, creator, approve, start, pause, resume, stop, purpose, approve-purpose or operate.",
+		);
 	unexpected(
-		action === "draft"
+		action === "draft" || action === "purpose"
 			? ["--file", "--revision", "--request-id"]
-			: action === "approve"
+			: action === "approve" || action === "approve-purpose"
 				? ["--revision", "--digest", "--request-id"]
 				: ["--revision", "--request-id"],
 	);
@@ -93,12 +150,12 @@ export function parseMissionCommand(args: readonly string[]): {
 	const requestId = values.get("--request-id") ?? randomUUID();
 	if (!requestId.trim() || requestId.length > 200)
 		throw new Error("Mission request ID must contain 1–200 characters.");
-	if (action === "draft") {
+	if (action === "draft" || action === "purpose") {
 		const file = values.get("--file");
-		if (!file) throw new Error("Mission draft requires --file FILE.");
+		if (!file) throw new Error(`Mission ${action} requires --file FILE.`);
 		return { command: { action, file, revision, requestId, json }, ...location };
 	}
-	if (action === "approve") {
+	if (action === "approve" || action === "approve-purpose") {
 		const digest = values.get("--digest");
 		if (!digest || !/^[0-9a-f]{64}$/.test(digest))
 			throw new Error("Mission approval requires the exact --digest SHA256.");
@@ -152,7 +209,41 @@ export function describeMission(view: MissionView): string {
 		lines.push(`Review: ${terms.reviewEveryMs === undefined ? "unset" : `${terms.reviewEveryMs} ms`}.`);
 	}
 	if (draft && view.missing.length) lines.push(`Still needed: ${view.missing.join(", ")}.`);
+	if (view.purpose && (view.purpose.revision !== null || view.purpose.proposed !== null))
+		lines.push(...describePurpose(view.purpose, field));
+	if (view.purposeError)
+		lines.push(
+			`Purpose records are invalid: ${field(view.purposeError)}`,
+			"Continuous operation runs and admits nothing until they are repaired.",
+		);
+	if (view.loopRollback === "live-loop" && view.purpose?.rollback !== "live-loop")
+		lines.push("Rollback: a loop task is still live.");
 	if (view.authority === "unconfigured")
 		lines.push("An administrator must provision the creator and finite authority ceiling before approval.");
 	return sanitizeTerminalText(lines.join("\n"));
+}
+
+// Purpose revision, operation, activity, next wake, per-work result and lifetime use, one fact per line.
+function describePurpose(purpose: MissionPurposeView, field: (value: string) => string): string[] {
+	const lines = [
+		`Purpose revision ${purpose.revision ?? "none agreed"}: ${field(purpose.purpose ?? "")}`.trimEnd(),
+		`Operation: ${purpose.operation} (revision ${purpose.operationRevision}).`,
+	];
+	if (purpose.proposed)
+		lines.push(`Proposed purpose revision ${purpose.proposed.revision}.`, `Purpose digest: ${purpose.proposed.digest}`);
+	if (purpose.activity)
+		lines.push(`Activity: ${purpose.activity}${purpose.reason ? ` (${field(purpose.reason)})` : ""}.`);
+	if (purpose.nextWakeAt !== null) lines.push(`Next observation: ${new Date(purpose.nextWakeAt).toISOString()}.`);
+	for (const work of purpose.works)
+		lines.push(`${work.workId} ${field(work.path)}: ${work.result}${work.runId ? `; run ${field(work.runId)}` : ""}.`);
+	for (const run of purpose.unsettled)
+		lines.push(`Unsettled run ${field(run.runId)} (${run.workId} ${field(run.path)}): acknowledge it to continue.`);
+	const used = purpose.used;
+	const limits = purpose.limits;
+	lines.push(
+		`Lifetime: ${used.workItems}/${limits?.maxWorkItems ?? "-"} work, ${used.cycles}/${limits?.maxCycles ?? "-"} cycles, ${used.requests}/${limits?.maxRequests ?? "-"} requests.`,
+		`Spend: estimated ${used.estimatedCost}; reserved ${used.reservedCost}; unknown requests ${used.unknownRequests}; unpriced ${used.unpricedResponses}.`,
+	);
+	if (purpose.rollback === "live-loop") lines.push("Rollback: close operation first (a loop is live).");
+	return lines;
 }
