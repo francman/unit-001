@@ -99,6 +99,38 @@ export type MissionAuthority = {
 	purposeApprovals?: MissionApproval[];
 	operationIntent?: OperationIntent;
 	operationAcknowledgments?: OperationAcknowledgment[];
+	browserAgreement?: BrowserAgreementGrant;
+};
+
+/**
+ * The administrator's opt-in for the creator to agree from the browser through the root helper. It holds only for the
+ * creator UID and authority revision it names, so any creator or ceiling change closes it.
+ */
+export type BrowserAgreementGrant = {
+	enabled: boolean;
+	creatorUid: number;
+	/** The installation's service UID, which runs Bob's tools: never the creator, never an agreeing actor. */
+	serviceUid: number;
+	authorityRevision: number;
+	/** Changes on every enable and reinstall and is never reused, so a gateway armed under an older grant stays closed. */
+	generation: number;
+	/**
+	 * Receipts the helper issued, oldest first. Never evicted: at capacity the helper refuses new request IDs, so a
+	 * request ID stays bound to its exact click for the life of the grant.
+	 */
+	issued: IssuedAgreement[];
+};
+
+/** One receipt the browser agreement helper published, with the exact identity its request ID is bound to. */
+export type IssuedAgreement = {
+	requestId: string;
+	receiptId: string;
+	missionId: string;
+	revision: number;
+	digest: string;
+	authorityRevision: number;
+	previousReceipt: string | null;
+	issuedAt: number;
 };
 
 /** The only work kind a purpose can list: write one declared workspace file whose SHA-256 the creator fixed. */
@@ -192,6 +224,8 @@ export type MissionRequest =
 	  }
 	| { operation: "configure-local"; creator: MissionCreator; ceiling: MissionCeiling; purposeCeiling?: PurposeCeiling }
 	| { operation: "approve-local"; expectedRevision: number; digest: string; requestId: string }
+	/** The creator's one explicit browser agreement to an exact proposed revision; the owner mints it only on developer-local. */
+	| { operation: "agree"; revision: number; digest: string; requestId: string }
 	| { operation: "purpose-propose"; expectedRevision: number; requestId: string; terms: PurposeTerms }
 	| { operation: "purpose-approve-local"; revision: number; digest: string; requestId: string }
 	| { operation: "reconcile-purpose"; receiptId: string }

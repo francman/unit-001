@@ -1,5 +1,6 @@
 // Holds the workspace state, the router and the actions views may call; views read state, never write it.
 import type { Connection, MemoryGraphView, MissionRunView, SendOutcome, WorkspaceDetails, WorkspaceView } from "./contract.ts";
+import type { ChatEntries, ChatHistory } from "./history.ts";
 import type { IconName } from "./ui/icons.ts";
 
 /** The pages of the workspace; Chat is home. */
@@ -24,9 +25,23 @@ export interface Ui {
 	section: Section;
 	connection: Connection;
 	view: WorkspaceView | null;
+	/** Closed rows retained across watch windows and earlier pages for this mount only. */
+	chatEntries: ChatEntries;
+	chatHistory: ChatHistory;
 	details: WorkspaceDetails | null;
 	/** True when details were requested and could not be read; the last good details stay in `details`. */
 	detailsFailed: boolean;
+	missionDraft: {
+		editRevision: number | null;
+		unsaved: { revision: number; conflicted: boolean } | null;
+		status: "ready" | "saving" | "refreshing" | "needs-refresh";
+		notice: string;
+		/** A completed developer-local approval from this browser, not a receipt still awaiting status. */
+		localAgreementRevision: number | null;
+	} | null;
+	/** An issued protected receipt is not the owner's recorded agreement. */
+	missionReceipt: { revision: number; receiptId: string; reconciled: boolean } | null;
+	logoutNotice: string;
 	draft: string;
 	sending: boolean;
 	cancelling: boolean;
@@ -46,9 +61,14 @@ export interface Ui {
 	statusOpen: Readonly<Record<string, boolean>>;
 	pendingForget: { id: string; requestId: string; content: string; opener: string } | null;
 	forgetNotice: string;
-	forgetting: boolean;
+	/** The request in flight, independently of which confirmation is shown. */
+	forgetting: string | null;
 	query: string;
-	recall: "idle" | "searching" | "done" | "failed";
+	/** The last submitted query and its result, independent of the input draft and workspace details. */
+	recall:
+		| { kind: "idle" }
+		| { kind: "searching" | "failed"; query: string }
+		| { kind: "done"; query: string; records: WorkspaceDetails["memory"]["records"] };
 	/** The memory graph snapshot; null until the first read, and the last good one stays when a refresh fails. */
 	graph: MemoryGraphView | null;
 	/** True when the last graph read failed. */
@@ -66,6 +86,7 @@ export interface Actions {
 	go(section: Section): void;
 	send(): void;
 	cancel(): void;
+	loadEarlier(): void;
 	/** Updates the draft without redrawing anything (the composer already shows it). */
 	setDraft(text: string): void;
 	/** Puts text in the composer, opens Chat and focuses it; never sends. */
@@ -113,8 +134,13 @@ export function createStore(initial: { section?: Section; preview?: boolean; the
 		section: initial.section ?? "chat",
 		connection: "connecting",
 		view: null,
+		chatEntries: [],
+		chatHistory: { kind: "unstarted" },
 		details: null,
 		detailsFailed: false,
+		missionDraft: null,
+		missionReceipt: null,
+		logoutNotice: "",
 		draft: "",
 		sending: false,
 		cancelling: false,
@@ -128,9 +154,9 @@ export function createStore(initial: { section?: Section; preview?: boolean; the
 		statusOpen: {},
 		pendingForget: null,
 		forgetNotice: "",
-		forgetting: false,
+		forgetting: null,
 		query: "",
-		recall: "idle",
+		recall: { kind: "idle" },
 		graph: null,
 		graphFailed: false,
 		signedOut: false,

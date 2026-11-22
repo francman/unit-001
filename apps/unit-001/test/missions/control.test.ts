@@ -9,10 +9,12 @@ import { fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { MaintenanceDoc } from "../../src/maintenance.ts";
 import { missionAuthorityPath, readMissionAuthority, writeMissionAuthority } from "../../src/missions/authority.ts";
 import type { MissionApproval, MissionCeiling, MissionTerms } from "../../src/missions/contract.ts";
 import { MissionControl } from "../../src/missions/control.ts";
 import { MissionPurposeDoc, readMissionPurpose } from "../../src/missions/purpose.ts";
+import type { MissionRefusalCode } from "../../src/missions/refusal.ts";
 import { MissionDoc, MissionFoundation } from "../../src/missions/state.ts";
 
 let directory: string;
@@ -86,6 +88,12 @@ async function propose(mission: MissionControl) {
 		{ operation: "propose", expectedRevision: saved.formation.draft!.revision, requestId: "propose-1" },
 		context,
 	);
+}
+async function setHold(harness: Harness, state: "held" | "open", commit = harness.commit.bind(harness)) {
+	await commit(async (tx) => {
+		(await tx.doc(MaintenanceDoc)).current =
+			state === "held" ? { protocol: 1, state, operationId: "maintenance-1" } : { protocol: 1, state, operationId: null };
+	}, context);
 }
 
 describe("mission formation", () => {
@@ -318,5 +326,164 @@ describe("mission formation", () => {
 			mission.handle({ operation: "draft", expectedRevision: 0, requestId: "other", terms: terms() }, context),
 		).rejects.toThrow("default");
 		await expect(readFile(missionAuthorityPath(location))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
+// The browser's one-click agreement: bound to an exact proposed revision and digest, refused with a fixed code otherwise.
+describe("browser agreement", () => {
+	const refused = (code: MissionRefusalCode) => expect.objectContaining({ name: "MissionRefusal", code });
+
+	it("records a developer-local agreement once and replays the same request ID", async () => {
+		const { mission } = await launch();
+		const draft = (await propose(mission)).formation.draft!;
+		const request = { operation: "agree", revision: draft.revision, digest: draft.digest!, requestId: "click-1" } as const;
+		const agreed = await mission.handle(request, context);
+		expect(agreed.stage).toBe("agreed");
+		expect(agreed.agreementValid).toBe(true);
+		expect(agreed.formation.agreement).toMatchObject({ revision: draft.revision, digest: draft.digest });
+		expect(agreed.formation.agreement?.approval).toMatchObject({ requestId: "click-1", provenance: "developer-local" });
+		expect(await mission.handle(request, context)).toEqual(agreed);
+		await expect(mission.handle({ ...request, digest: "b".repeat(64) }, context)).rejects.toEqual(
+			refused("conflicting-request"),
+		);
+	});
+
+	it("never mints a managed receipt from the owner", async () => {
+		const { harness } = await launch();
+		const location = { kind: "managed" as const, installationId: "11111111-1111-4111-8111-111111111111", session: "default" };
+		const managed = new MissionControl(harness, location, ["read"], () => now);
+		await expect(
+			managed.handle({ operation: "agree", revision: 1, digest: "a".repeat(64), requestId: "click" }, context),
+		).rejects.toEqual(refused("managed-requires-gateway"));
+		await expect(readFile(missionAuthorityPath(location))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("refuses an agreement to a revision the agent redrafted, committing nothing", async () => {
+		const { mission, location } = await launch();
+		const proposed = (await propose(mission)).formation.draft!;
+		await mission.handle(
+			{ operation: "draft", expectedRevision: proposed.revision, requestId: "bob-redraft", terms: { ...terms(), scope: "More" } },
+			context,
+		);
+		await expect(
+			mission.handle({ operation: "agree", revision: proposed.revision, digest: proposed.digest!, requestId: "late" }, context),
+		).rejects.toEqual(refused("stale-revision"));
+		const after = await mission.inspect(context);
+		expect(after.formation.agreement).toBeNull();
+		expect(after.formation.draft?.status).toBe("editing");
+		expect((await readMissionAuthority(location))?.approvals).toEqual([]);
+	});
+
+	it("refuses a digest the owner did not propose", async () => {
+		const { mission, location } = await launch();
+		const proposed = (await propose(mission)).formation.draft!;
+		await expect(
+			mission.handle({ operation: "agree", revision: proposed.revision, digest: "c".repeat(64), requestId: "forged" }, context),
+		).rejects.toEqual(refused("stale-digest"));
+		expect((await mission.inspect(context)).formation.agreement).toBeNull();
+		expect((await readMissionAuthority(location))?.approvals).toEqual([]);
+	});
+
+	// Review A3-1: a refusal claims nothing changed, so it may only come before the receipt is published.
+	it("refuses a hold before publishing anything", async () => {
+		const { harness, mission, location } = await launch();
+		const draft = (await propose(mission)).formation.draft!;
+		await setHold(harness, "held");
+		await expect(
+			mission.handle({ operation: "agree", revision: draft.revision, digest: draft.digest!, requestId: "click" }, context),
+		).rejects.toEqual(refused("held"));
+		expect((await readMissionAuthority(location))?.approvals).toEqual([]);
+	});
+
+	it("reports a receipt published just before a hold as pending, never refused, and records it on retry", async () => {
+		const { harness, mission, location } = await launch();
+		const draft = (await propose(mission)).formation.draft!;
+		const request = { operation: "agree", revision: draft.revision, digest: draft.digest!, requestId: "click" } as const;
+		// Maintenance begins between the protected write and the owner's reconciling commit.
+		const commit = harness.commit.bind(harness);
+		let first = true;
+		harness.commit = (async (work: Parameters<Harness["commit"]>[0], ctx: Parameters<Harness["commit"]>[1]) => {
+			if (first) {
+				first = false;
+				await setHold(harness, "held", commit);
+			}
+			return commit(work, ctx);
+		}) as Harness["commit"];
+		const error = await mission.handle(request, context).then(
+			() => null,
+			(failure: unknown) => failure,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect(error).not.toMatchObject({ name: "MissionRefusal" });
+		expect((error as Error).message).toContain("is issued but not yet recorded");
+		const receipt = (await readMissionAuthority(location))!.approvals;
+		expect(receipt).toEqual([expect.objectContaining({ requestId: "click", digest: draft.digest })]);
+		// Still held: the retry is pending again and mints nothing new.
+		await expect(mission.handle(request, context)).rejects.not.toMatchObject({ name: "MissionRefusal" });
+		await setHold(harness, "open");
+		const agreed = await mission.handle(request, context);
+		expect(agreed.stage).toBe("agreed");
+		expect(agreed.formation.agreement?.approval).toEqual(receipt[0]);
+		expect((await readMissionAuthority(location))!.approvals).toEqual(receipt);
+	});
+
+	it("records a receipt published before an owner crash on a retry after restart", async () => {
+		const first = await launch();
+		const draft = (await propose(first.mission)).formation.draft!;
+		const authority = (await readMissionAuthority(first.location))!;
+		// The crash boundary: the protected receipt for this request exists; formation never recorded it.
+		const receipt: MissionApproval = {
+			receiptId: randomUUID(),
+			requestId: "click",
+			installationId: null,
+			session: "default",
+			missionId: draft.missionId,
+			revision: draft.revision,
+			digest: draft.digest!,
+			creator: authority.creator,
+			authorityRevision: authority.revision,
+			approvedAt: now,
+			provenance: "developer-local",
+			approvedBy: { kind: "developer-local", uid: process.getuid?.() ?? null },
+		};
+		await writeMissionAuthority(first.location, { ...authority, approvals: [receipt] });
+		await first.harness.close(context);
+		opened.splice(opened.indexOf(first.harness), 1);
+		const second = await launch();
+		const request = { operation: "agree", revision: draft.revision, digest: draft.digest!, requestId: "click" } as const;
+		await expect(second.mission.handle({ ...request, digest: "b".repeat(64) }, context)).rejects.toEqual(
+			refused("conflicting-request"),
+		);
+		const agreed = await second.mission.handle(request, context);
+		expect(agreed.formation.agreement?.approval).toEqual(receipt);
+		expect((await readMissionAuthority(second.location))!.approvals).toEqual([receipt]);
+	});
+
+	it("names stale drafts, incomplete proposals and terms beyond creator authority", async () => {
+		const { mission } = await launch();
+		await configure(mission);
+		await expect(
+			mission.handle({ operation: "draft", expectedRevision: 4, requestId: "stale", terms: terms() }, context),
+		).rejects.toEqual(refused("stale-revision"));
+		const partial = await mission.handle(
+			{ operation: "draft", expectedRevision: 0, requestId: "partial", terms: { objective: "Only a goal" } },
+			context,
+		);
+		await expect(
+			mission.handle({ operation: "propose", expectedRevision: partial.formation.draft!.revision, requestId: "p1" }, context),
+		).rejects.toEqual(refused("incomplete"));
+		const greedy = await mission.handle(
+			{
+				operation: "draft",
+				expectedRevision: partial.formation.draft!.revision,
+				requestId: "greedy",
+				terms: { ...terms(), policy: { ...terms().policy, maxCycles: 99 } },
+			},
+			context,
+		);
+		await expect(
+			mission.handle({ operation: "propose", expectedRevision: greedy.formation.draft!.revision, requestId: "p2" }, context),
+		).rejects.toEqual(refused("outside-authority"));
+		expect((await mission.inspect(context)).formation.draft?.status).toBe("editing");
 	});
 });

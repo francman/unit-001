@@ -22,11 +22,19 @@ import {
 } from "./maintenance.ts";
 import { type MemoryRequest, type MemoryResult, parseMemoryRequest, parseMemoryResult } from "./memory-control.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
+import { MissionRefusal, type MissionRefusalCode, parseMissionRefusalCode } from "./missions/refusal.ts";
 import { parseMissionRequest, parseMissionView } from "./missions/wire.ts";
 import type { RuntimeFacts } from "./orientation.ts";
 import { validateSessionName } from "./paths.ts";
 import { isSendDigest, parseSendAdmission, type SendAdmission } from "./send-receipt.ts";
-import { parseServiceEvent, type ServiceView, serviceView } from "./service-view.ts";
+import {
+	type ChatHistoryPage,
+	parseChatHistoryPage,
+	parseServiceEvent,
+	type ServiceView,
+	serviceView,
+} from "./service-view.ts";
+import { positiveId } from "./side-control.ts";
 import { parseToolEvidence, type ToolEvidence } from "./tool-evidence.ts";
 
 export type { ServiceEvent, ServiceView } from "./service-view.ts";
@@ -38,6 +46,7 @@ export type ServiceRequest =
 	| { readonly type: "mission"; readonly request: MissionRequest }
 	| { readonly type: "memory"; readonly request: MemoryRequest }
 	| { readonly type: "send"; readonly prompt: string; readonly requestId?: string }
+	| { readonly type: "chat-history"; readonly before: number | null }
 	| { readonly type: "tool-evidence"; readonly callId: string }
 	| { readonly type: "admission"; readonly requestId: string; readonly digest?: string }
 	| { readonly type: "status" | "cancel" };
@@ -51,9 +60,11 @@ export type ServiceResponse =
 	| { readonly type: "channels"; readonly result: ChannelResult }
 	| { readonly type: "command-suggestions"; readonly result: CommandInterpretation }
 	| { readonly type: "mission"; readonly result: MissionView }
+	| { readonly type: "mission-refused"; readonly code: MissionRefusalCode }
 	| { readonly type: "memory"; readonly result: MemoryResult }
 	| MaintenanceResult
 	| { readonly type: "reply"; readonly reply: Reply }
+	| { readonly type: "chat-history"; readonly page: ChatHistoryPage }
 	| { readonly type: "tool-evidence"; readonly evidence: ToolEvidence }
 	| { readonly type: "admission"; readonly admission: SendAdmission }
 	| {
@@ -141,6 +152,10 @@ export async function runService(
 					});
 					return;
 				}
+				if (access === "operator" && !operatorMayCall(value)) {
+					writeResponse(socket, { type: "error", message: "This operation requires the administrator endpoint." });
+					return;
+				}
 				if (typeof value === "object" && value !== null && "type" in value && value.type === "watch") {
 					socket.resume();
 					void streamViews(agent, socket, version, installationId).catch(() => socket.destroy());
@@ -149,7 +164,7 @@ export async function runService(
 				// Suggestions are disposable; admitted mission work must survive client disconnection.
 				const disconnected = new AbortController();
 				socket.once("close", () => disconnected.abort());
-				void handleRequest(agent, version, installationId, value, access, disconnected.signal).then(
+				void handleRequest(agent, version, installationId, value, disconnected.signal).then(
 					(response) => writeResponse(socket, response),
 					(error: unknown) =>
 						writeResponse(socket, {
@@ -330,6 +345,7 @@ export function requestService(
 	signal: AbortSignal,
 ): Promise<ServiceResponse> {
 	const wire = `${JSON.stringify(request)}\n`;
+	const historyBefore = request.type === "chat-history" ? request.before : undefined;
 	if (Buffer.byteLength(wire) > MAX_REQUEST_BYTES) throw new UsageError("Service request exceeds 64 KiB.");
 	signal.throwIfAborted();
 	return new Promise((resolve, reject) => {
@@ -354,7 +370,9 @@ export function requestService(
 		socket.once("close", () =>
 			finish(
 				new Error(
-					"The service disconnected before replying; admitted work may still be running. Retry with the same --request-id.",
+					historyBefore !== undefined
+						? "The service disconnected before returning chat history."
+						: "The service disconnected before replying; admitted work may still be running. Retry with the same --request-id.",
 				),
 			),
 		);
@@ -365,7 +383,7 @@ export function requestService(
 			const newline = buffer.indexOf("\n");
 			if (newline === -1) return;
 			try {
-				finish(undefined, parseServiceResponse(buffer.slice(0, newline)));
+				finish(undefined, parseServiceResponse(buffer.slice(0, newline), historyBefore));
 			} catch (error) {
 				finish(error);
 			}
@@ -374,31 +392,78 @@ export function requestService(
 	});
 }
 
+// The operator socket's whole surface, each entry with its callers. Everything else, unknown operations included, is
+// refused before dispatch. This limits what operator clients send directly; it is not the authority boundary: operator
+// chat runs tools as the service account, which can reach the administrator socket, so approval and lifecycle stay
+// protected by root-owned receipts and the handlers' location checks. Keep those checks. A multiplexed request is
+// keyed `type:operation`. Add an entry only together with the operator client that sends it.
+const OPERATOR_OPERATIONS: ReadonlySet<string> = new Set([
+	// Views: attach (CLI and remote), the web gateway's live view.
+	"watch",
+	// Web Chat: read earlier retained rows from the root conversation.
+	"chat-history",
+	// CLI status, attach, `bob web` launcher, web gateway, remote clients.
+	"status",
+	// CLI send, attach, web gateway, remote send.
+	"send",
+	// CLI cancel, attach, web gateway, remote cancel.
+	"cancel",
+	// Attach and terminal controller: send receipts and tool evidence.
+	"admission",
+	"tool-evidence",
+	// CLI inspection, attach /inspect.
+	"inspection",
+	// CLI usage fallback and attach slash suggestions.
+	"resolve-command",
+	// CLI memory, attach /memory, web gateway (stats, graph, recall, forget).
+	"memory:stats",
+	"memory:graph",
+	"memory:recall",
+	"memory:remember",
+	"memory:forget",
+	"memory:sleep",
+	// CLI channels, web gateway: status only; setup and its authority stay with the administrator.
+	"channels:status",
+	// CLI and web mission status/draft/propose, CLI and attach mission setup. Creator configuration,
+	// managed approval, lifecycle, operation and reconciliation use the administrator command.
+	"mission:status",
+	"mission:draft",
+	"mission:propose",
+	// Browser agreement can issue directly on developer-local owners. Managed owners require a protected receipt.
+	"mission:agree",
+	// CLI mission purpose: proposing grants nothing; approval needs the root-owned receipt.
+	"mission:purpose-propose",
+]);
+
+/** Admits a raw operator request only when its operation is on the operator allowlist. */
+function operatorMayCall(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || !("type" in value) || typeof value.type !== "string") return false;
+	if (value.type !== "memory" && value.type !== "channels" && value.type !== "mission")
+		return OPERATOR_OPERATIONS.has(value.type);
+	const request = "request" in value ? value.request : undefined;
+	if (typeof request !== "object" || request === null || !("operation" in request)) return false;
+	return typeof request.operation === "string" && OPERATOR_OPERATIONS.has(`${value.type}:${request.operation}`);
+}
+
 async function handleRequest(
 	agent: Agent,
 	version: string,
 	installationId: string | null,
 	value: unknown,
-	access: "administrator" | "operator",
 	disconnected: AbortSignal,
 ): Promise<ServiceResponse> {
 	// Local wire input is untrusted even when the socket is restricted to its owner.
 	if (typeof value !== "object" || value === null || !("type" in value))
 		throw new UsageError("Invalid service request.");
-	if (
-		access === "operator" &&
-		value.type !== "status" &&
-		value.type !== "send" &&
-		value.type !== "cancel" &&
-		value.type !== "memory" &&
-		value.type !== "mission" &&
-		value.type !== "channels" &&
-		value.type !== "resolve-command" &&
-		value.type !== "tool-evidence" &&
-		value.type !== "admission" &&
-		value.type !== "inspection"
-	)
-		throw new UsageError("This operation requires the administrator endpoint.");
+	if (value.type === "chat-history") {
+		if (
+			Object.keys(value).some((key) => key !== "type" && key !== "before") ||
+			!("before" in value) ||
+			(value.before !== null && !positiveId(value.before))
+		)
+			throw new UsageError("Invalid chat history request.");
+		return { type: "chat-history", page: await agent.chatHistory(value.before, BACKGROUND_CONTEXT) };
+	}
 	if (value.type === "admission") {
 		if (Object.keys(value).some((key) => key !== "type" && key !== "requestId" && key !== "digest"))
 			throw new UsageError("Admission lookups accept only a request ID and a prompt digest.");
@@ -448,15 +513,16 @@ async function handleRequest(
 	if (value.type === "mission") {
 		if (!("request" in value)) throw new UsageError("Missing mission request.");
 		const request = parseMissionRequest(value.request);
-		if (
-			access === "operator" &&
-			(request.operation === "reconcile" ||
-				request.operation === "approve-local" ||
-				request.operation === "reconcile-execution" ||
-				request.operation === "control-local")
-		)
-			throw new UsageError("Mission approval requires its administrator authority.");
-		return { type: "mission", result: await agent.mission(request, BACKGROUND_CONTEXT) };
+		try {
+			return { type: "mission", result: await agent.mission(request, BACKGROUND_CONTEXT) };
+		} catch (error) {
+			if (
+				error instanceof MissionRefusal &&
+				(request.operation === "draft" || request.operation === "propose" || request.operation === "agree")
+			)
+				return { type: "mission-refused", code: error.code };
+			throw error;
+		}
 	}
 	if (value.type === "status")
 		return {
@@ -512,10 +578,14 @@ function writeResponse(socket: Socket, response: ServiceResponse): void {
 }
 
 /** Validates a bounded response from a local or authenticated remote owner. */
-export function parseServiceResponse(wire: string): ServiceResponse {
+export function parseServiceResponse(wire: string, historyBefore?: number | null): ServiceResponse {
 	const value: unknown = JSON.parse(wire);
 	// A failed or different local service must not be mistaken for a valid reply.
 	if (typeof value === "object" && value !== null && "type" in value) {
+		if (value.type === "chat-history" && "page" in value && Object.keys(value).length === 2)
+			return { type: "chat-history", page: parseChatHistoryPage(value.page, historyBefore) };
+		if (historyBefore !== undefined && value.type !== "error")
+			throw new Error("Invalid service chat history response.");
 		if (value.type === "inspection" && "report" in value)
 			return { type: "inspection", report: parseInspectionReport(value.report) };
 		if (value.type === "channels" && "result" in value)
@@ -524,6 +594,8 @@ export function parseServiceResponse(wire: string): ServiceResponse {
 			return { type: "command-suggestions", result: parseCommandInterpretation(value.result) };
 		if (value.type === "mission" && "result" in value)
 			return { type: "mission", result: parseMissionView(value.result) };
+		if (value.type === "mission-refused" && "code" in value && Object.keys(value).length === 2)
+			return { type: "mission-refused", code: parseMissionRefusalCode(value.code) };
 		if (value.type === "memory" && "result" in value)
 			return { type: "memory", result: parseMemoryResult(value.result) };
 		if (

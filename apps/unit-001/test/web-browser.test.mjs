@@ -12,12 +12,13 @@ import { fileURLToPath } from "node:url";
 import { assertFreshWebAssets } from "../scripts/build-web-freshness.mjs";
 
 const executable = process.env.UNIT_001_BROWSER_EXECUTABLE;
+const fixtureAssets = process.env.UNIT_001_TEST_WEB_ASSETS;
 
 test(
-	"#65 live browser pairing, outcomes, focus, stable forget, responsive layout and sign-out",
+	"#65 live browser pairing, retained history, outcomes, focus, stable forget, responsive layout and sign-out",
 	{ skip: !executable, timeout: 90000 },
 	async () => {
-		await assertFreshWebAssets();
+		await assertFreshWebAssets(fixtureAssets);
 		const directory = await mkdtemp(join(tmpdir(), "unit-web-browser-"));
 		const reservation = createServer();
 		reservation.listen(0, "127.0.0.1");
@@ -32,6 +33,7 @@ test(
 				fileURLToPath(new URL("fixtures/web-workspace.ts", import.meta.url)),
 				join(directory, "owner"),
 				String(port),
+				...(fixtureAssets ? [fixtureAssets] : []),
 			],
 			{ stdio: ["ignore", "pipe", "pipe"] },
 		);
@@ -140,8 +142,43 @@ test(
 			await call("Page.enable");
 			// Record CSP violations from before the first script runs; the page must raise none.
 			await call("Page.addScriptToEvaluateOnNewDocument", {
-				// Also keeps every event stream and its last real view, so a test can replay or inject owner events.
-				source: `window.cspViolations=[];document.addEventListener('securitypolicyviolation',event=>window.cspViolations.push(event.violatedDirective+' '+event.blockedURI));window.eventSources=[];(()=>{const Native=EventSource;window.EventSource=class extends Native{constructor(...args){super(...args);window.eventSources.push(this);this.addEventListener('view',event=>{if(event.isTrusted)window.lastView=JSON.parse(event.data)})}}})()`,
+				// Capture real gateway snapshots and replay variants through the same fetched byte stream.
+				source: String.raw`
+					window.cspViolations = [];
+					window.historyReads = [];
+					document.addEventListener("securitypolicyviolation", (event) =>
+						window.cspViolations.push(event.violatedDirective + " " + event.blockedURI));
+					const nativeFetch = window.fetch.bind(window);
+					window.fetch = async (path, init) => {
+						const response = await nativeFetch(path, init);
+						if (path === "/api/v1/requests" && typeof init?.body === "string") {
+							const { operation } = JSON.parse(init.body);
+							if (operation.type === "chat-history")
+								window.historyReads.push({ before: operation.before, status: response.status, result: await response.clone().json() });
+						}
+						if (path !== "/api/v1/events" || !response.ok || !response.body) return response;
+						const encoder = new TextEncoder();
+						const decoder = new TextDecoder();
+						const prefix = "event: view\ndata: ";
+						let pending = "";
+						const stream = response.body.pipeThrough(new TransformStream({
+							start(controller) {
+								window.emitSse = (event, value) =>
+									controller.enqueue(encoder.encode("event: " + event + "\ndata: " + JSON.stringify(value) + "\n\n"));
+							},
+							transform(chunk, controller) {
+								pending += decoder.decode(chunk, { stream: true });
+								for (let end; (end = pending.indexOf("\n\n")) !== -1; ) {
+									const frame = pending.slice(0, end);
+									if (frame.startsWith(prefix)) window.lastView = JSON.parse(frame.slice(prefix.length));
+									pending = pending.slice(end + 2);
+								}
+								controller.enqueue(chunk);
+							},
+						}));
+						return new Response(stream, { status: response.status, headers: response.headers });
+					};
+				`,
 			});
 			await call("Emulation.setDeviceMetricsOverride", {
 				width: 1440,
@@ -160,6 +197,53 @@ test(
 			await fill('#pairing-code', secret);
 			await click("Connect");
 			await until(() => evaluate(`document.querySelector('#composer')!==null`));
+			await evaluate(`window.beforeHistoryReload = true`);
+			await call("Page.reload");
+			await until(() => evaluate(`!window.beforeHistoryReload && window.lastView?.historyTruncated && document.querySelector('#composer') !== null`));
+			assert.equal(await has("Connect to your agent"), false, "reload restores the real paired session without a code");
+			const sentinel = "Retained browser message 1: oldest SQLite sentinel";
+			const transcript = () =>
+				evaluate(`[...document.querySelectorAll('#thread article')].flatMap(row => [...row.innerText.matchAll(/Retained browser message (\\d+)/g)].map(match => Number(match[1])))`);
+			const range = (first, count) => Array.from({ length: count }, (_, index) => first + index);
+			const recent = await transcript();
+			assert.ok(recent.length > 0 && recent.length <= 20, "the reload shows a bounded live window");
+			assert.deepEqual(recent, range(29 - recent.length, recent.length), "the live window ends with the newest row");
+			assert.equal(await has(sentinel), false);
+			assert.deepEqual(await evaluate(`window.historyReads`), [], "no retained page was requested before activation");
+			const earlier = `document.querySelector('[data-key="load-earlier"]')`;
+			let cursor = await evaluate(`window.lastView.entries[0].id`);
+			let total = recent.length;
+			let sawEmptyContinuation = false;
+			let sawFullPage = false;
+			for (let pageIndex = 0; cursor !== null && pageIndex < 8; pageIndex++) {
+				await until(() => evaluate(`${earlier}?.offsetParent != null && ${earlier}.getAttribute('aria-disabled') === 'false'`));
+				await evaluate(`{ const button = ${earlier}; button.focus(); button.click(); }`);
+				await until(() => evaluate(`window.historyReads.length === ${pageIndex + 1}`), () => `No POST result for history page ${pageIndex + 1}`);
+				const { before, status, result } = await evaluate(`window.historyReads[${pageIndex}]`);
+				assert.equal(before, cursor, "the next request uses the returned exclusive cursor");
+				assert.equal(status, 200);
+				assert.equal(result.state, "completed");
+				assert.equal(result.response.type, "chat-history");
+				const { entries, nextBefore } = result.response.page;
+				assert.ok(entries.length <= 5, "each read returns at most five display rows");
+				assert.ok(entries.every((row, index) => row.id < before && (index === 0 || entries[index - 1].id < row.id)), "page IDs are ascending below the request bound");
+				if (nextBefore !== null) {
+					assert.ok(Number.isSafeInteger(nextBefore) && nextBefore > 0 && nextBefore < before, "the cursor advances");
+					if (entries.length === 0) sawEmptyContinuation = true;
+				}
+				if (entries.length === 5) sawFullPage = true;
+				cursor = nextBefore;
+				total += entries.length;
+				await until(async () => (await transcript()).length === total);
+				assert.deepEqual(await transcript(), range(29 - total, total), "each page prepends in order, without duplicate rows");
+			}
+			assert.equal(cursor, null, "the final page declares exhaustion");
+			assert.equal(sawEmptyContinuation, true, "a hidden raw page advances without adding visible rows");
+			assert.equal(sawFullPage, true, "the earlier transcript takes multiple bounded pages");
+			assert.deepEqual(await transcript(), range(1, 28), "the complete retained transcript is ordered and deduplicated");
+			await until(() => evaluate(`${earlier}?.offsetParent === null`));
+			assert.equal(await evaluate(`document.activeElement.id`), "thread", "exhaustion returns focus to the thread");
+			assert.equal(await has(sentinel), true);
 			await fill("#composer", "Give a browser answer");
 			await click("Send message");
 			await until(() => has("Verified browser answer."));
@@ -186,6 +270,27 @@ test(
 			const mapLabel = () => evaluate(`document.querySelector('[data-graph] canvas')?.getAttribute('aria-label')??''`);
 			await until(async () => (await mapLabel()).startsWith("Map of 2 memories"));
 			assert.equal(await evaluate(`document.querySelector('[data-graph]').getAttribute('aria-label').startsWith('Memory graph: 2 memories')`), true);
+			// Swiping on the canvas scrolls the Memory page before opting into graph gestures.
+			await call("Emulation.setDeviceMetricsOverride", { width: 390, height: 600, deviceScaleFactor: 1, mobile: true });
+			await call("Emulation.setTouchEmulationEnabled", { enabled: true });
+			const memoryScroll = () => evaluate(`document.querySelector('[data-scroll="memory"]').scrollTop`);
+			const swipe = await evaluate(`(()=>{
+				const frame = document.querySelector('[data-graph]').getBoundingClientRect();
+				const x = Math.round(frame.left + frame.width / 2), y = Math.round(Math.min(frame.top + 120, innerHeight - 24));
+				return { x, y, onGraph: Boolean(document.elementFromPoint(x, y)?.closest('[data-graph]')) };
+			})()`);
+			assert.equal(swipe.onGraph, true, "the default swipe starts over the visible canvas");
+			assert.equal(await evaluate(`document.querySelector('[data-key=graph-gestures]').getAttribute('aria-pressed')`), "false");
+			const scrollBefore = await memoryScroll();
+			await call("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: swipe.x, y: swipe.y }] });
+			for (let step = 1; step <= 5; step++) {
+				await call("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: swipe.x, y: swipe.y - step * 20 }] });
+			}
+			await call("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+			await until(async () => (await memoryScroll()) > scrollBefore, () => "the default graph swipe did not scroll the Memory page");
+			await call("Emulation.setTouchEmulationEnabled", { enabled: false });
+			await call("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+			await evaluate(`document.querySelector('[data-scroll="memory"]').scrollTo(0, 0)`);
 			// The map forms first (two memories only appear: too few for a brain); everything below starts once that is over.
 			const formed = () => evaluate(`document.querySelector('[data-graph]')?.dataset.formed==='true'`);
 			const shaped = () => evaluate(`document.querySelector('[data-graph]')?.dataset.shaped`);
@@ -269,9 +374,15 @@ test(
 			};
 			const drag = async (from, steps) => {
 				await mouse("mouseMoved", from.x, from.y);
+				await until(async () => (await previewText()) !== "", () => "the pressed point does not reach a painted memory");
+				await evaluate(`{
+					window.dragCaptured = false;
+					document.querySelector('[data-graph]').addEventListener('gotpointercapture', () => { window.dragCaptured = true; }, { once: true });
+				}`);
 				await mouse("mousePressed", from.x, from.y);
 				for (let step = 1; step <= steps; step++)
 					await call("Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x + step * 12, y: from.y + step * 8, button: "left", buttons: 1 });
+				assert.equal(await evaluate(`window.dragCaptured`), true, "the graph owns the active pointer during the drag");
 			};
 			// Animation frames the map asks for in a quiet half second: none once everything has settled.
 			const framesWhileIdle = async () => {
@@ -305,6 +416,9 @@ test(
 			await call("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
 			await until(() => evaluate(`(()=>{const c=document.querySelector('[data-graph] canvas');return c.width===c.clientWidth&&c.height===c.clientHeight&&c.clientHeight>600})()`));
 			points = await settledPoints(2);
+			assert.equal(await evaluate(`document.querySelector('[data-key=graph-gestures]').getAttribute('aria-pressed')`), "false");
+			await click("Graph gestures");
+			assert.equal(await evaluate(`document.querySelector('[data-key=graph-gestures]').getAttribute('aria-pressed')`), "true");
 			// A redraw of the page during a drag (the shell redraws on state changes, here a theme change) moves the frame and drops the pointer capture.
 			// The drag must end there: frames stop, and the next gesture works (codex review, high).
 			await drag(points[0], 4);
@@ -322,6 +436,7 @@ test(
 			await press("Escape", "Escape", 27);
 			await until(detailsHidden);
 			// Leaving the page during a drag ends it too, and the map comes back usable.
+			points = await settledPoints(2);
 			await drag(points[1], 4);
 			await click("Chat");
 			await setTimeout(300);
@@ -336,13 +451,12 @@ test(
 			await evaluate(`document.querySelector('[data-graph]').focus()`);
 			await press("Escape", "Escape", 27);
 			await until(detailsHidden);
-			// Clicking the Amber memory opens its details; try each node until the details show it.
-			for (const point of points) {
-				await clickAt(point);
-
-				await until(() => evaluate(`document.querySelector('#graph-details')?.hidden===false`));
-				if (await evaluate(`document.querySelector('#graph-details')?.innerText.includes('Amber graph acceptance memory')`)) break;
-			}
+			// Reclosing Details recenters the view. Identify Amber on the new paint before clicking its node.
+			points = await settledPoints(2);
+			const hoveredNames = [await memoryAt(points[0]), await memoryAt(points[1])];
+			const amber = hoveredNames.findIndex((name) => name.includes("Amber graph acceptance memory"));
+			assert.notEqual(amber, -1, `Amber is reachable on the recentered graph: ${JSON.stringify(hoveredNames)}`);
+			await clickAt(points[amber]);
 			await until(() => evaluate(`document.querySelector('#graph-details')?.innerText.includes('Amber graph acceptance memory')`));
 			// One mind: the conversation is only a fact in the details, never a control.
 			assert.equal(await evaluate(`document.querySelector('#graph-details')?.innerText.includes('Conversation 1')`), true);
@@ -363,7 +477,7 @@ test(
 			await focusKey("graph-focus-off");
 			await enter();
 			await until(async () => (await mapLabel()).startsWith("Map of 2 memories"));
-			assert.equal(await activeName(), "frame", "Show all hands keyboard focus to the map");
+			assert.equal(await activeName(), "graph-details", "Clear focus moves keyboard focus to the still-open details");
 			await focusKey("graph-close");
 			await enter();
 			await until(detailsHidden);
@@ -394,10 +508,17 @@ test(
 			await until(() => evaluate(`document.querySelector('#graph-details')?.innerText.includes(${JSON.stringify(memories[1 - start])})`));
 			await until(async () => /Details are open/.test(await liveText()) && whose(await liveText()) === 1 - start);
 			assert.equal(await evaluate(`window.cspViolations.length`), 0, "no CSP violation after the keyboard flow");
-			// List view: Tab reaches the rows, Details moves focus to the opened details, Close returns it to the row, and there is no map-only Focus (codex review).
+			// List shares Focus with Graph, but not its canvas gesture controls. Tab reaches rows and the details return focus to their opener.
 			await click("List");
 			await until(() => evaluate(`document.querySelector('[data-key^="list-open-"]')!==null`));
-			assert.equal(await evaluate(`document.querySelector('[data-key=graph-focus]')===null`), true, "List has no Focus action that only works on the map");
+			assert.equal(await evaluate(`document.querySelector('[data-key=graph-gestures]').offsetParent`), null, "List hides canvas-only gestures");
+			await focusKey("graph-focus");
+			await enter();
+			const listCount = () => evaluate(`document.querySelectorAll('[data-key^="list-open-"]').length`);
+			await until(async () => (await listCount()) === 1);
+			await focusKey("graph-focus-off");
+			await enter();
+			await until(async () => (await listCount()) === 2);
 			await focusKey("graph-mode-list");
 			for (let tabs = 0; tabs < 60 && !(await activeName()).startsWith("list-open-"); tabs++) await press("Tab", "Tab", 9);
 			assert.equal((await activeName()).startsWith("list-open-"), true, `Tab reaches a List row, focus is on ${await activeName()}`);
@@ -579,7 +700,15 @@ test(
 				`document.querySelector('#memory-query').focus();document.querySelector('#memory-query').setSelectionRange(2,2)`,
 			);
 			await evaluate(
-				`(async()=>{const session=await (await window.originalFetch('/api/v1/session')).json();await window.originalFetch('/api/v1/requests',{method:'POST',headers:{'Content-Type':'application/json','X-Unit-CSRF':session.csrfToken},body:JSON.stringify({requestId:crypto.randomUUID(),operation:{type:'cancel'}})});})()`,
+				`(async()=>{
+					const Authorization='Bearer '+localStorage.getItem('unit-001.session');
+					const session=await (await window.originalFetch('/api/v1/session',{credentials:'omit',headers:{Authorization}})).json();
+					const reply=await window.originalFetch('/api/v1/requests',{
+						method:'POST',credentials:'omit',headers:{Authorization,'Content-Type':'application/json','X-Unit-CSRF':session.csrfToken},
+						body:JSON.stringify({requestId:crypto.randomUUID(),operation:{type:'cancel'}}),
+					});
+					if(!reply.ok)throw Error('Authorized fixture cancellation failed: '+reply.status);
+				})()`,
 			);
 			await until(() => has("The owner could not complete this request."));
 			assert.equal(
@@ -656,21 +785,18 @@ test(
 				draft: "cleared draft",
 			});
 			// Regression: a model change that arrives on the event stream updates the setup banner; the stream is replayed here.
-			assert.deepEqual(
-				await evaluate(`(()=>{
-					const input=document.querySelector('#composer');
-					window.composerNode=input;input.focus();input.setSelectionRange(4,7);
-					const source=window.eventSources.at(-1);
-					const send=(view)=>source.dispatchEvent(new MessageEvent('view',{data:JSON.stringify(view)}));
-					send({...window.lastView,model:null});
-					const without=document.body.innerText.includes('No model is configured. ');
-					const kept=document.querySelector('#composer')===input&&document.activeElement===input&&input.selectionStart===4&&input.selectionEnd===7;
-					send(window.lastView);
-					const restored=!document.body.innerText.includes('No model is configured. ');
-					return {without,kept,restored};
-				})()`),
-				{ without: true, kept: true, restored: true },
-			);
+			await evaluate(`(()=>{
+				const input=document.querySelector('#composer');
+				window.composerNode=input;input.focus();input.setSelectionRange(4,7);
+				window.emitSse('view',{...window.lastView,model:null});
+			})()`);
+			await until(() => has("No model is configured. "));
+			assert.equal(await evaluate(`(()=>{
+				const input=window.composerNode;
+				return document.querySelector('#composer')===input&&document.activeElement===input&&input.selectionStart===4&&input.selectionEnd===7;
+			})()`), true);
+			await evaluate(`window.emitSse('view',window.lastView)`);
+			await until(async () => !(await has("No model is configured. ")));
 			// Regression: a banner change that leaves the setup Copy button in place keeps keyboard focus on it.
 			// Reports no model, focuses the setup Copy button, then a details refresh toggles only the maintenance hold.
 			await refreshWhileTyping({ unconfigured: true }, "");
@@ -680,7 +806,7 @@ test(
 			await evaluate(`(()=>{document.querySelector('[data-owner-banners] button').focus();window.reported={unconfigured:true,held:true};})()`);
 			assert.deepEqual(await copyFocus(), { inBanner: true, label: "Copy" }, "the setup Copy button is focused before the refresh");
 			await evaluate(
-				`(()=>{const source=window.eventSources.at(-1);const send=(busy)=>source.dispatchEvent(new MessageEvent('view',{data:JSON.stringify({...window.lastView,busy})}));send(true);send(false);})()`,
+				`(()=>{for(const busy of [true,false])window.emitSse('view',{...window.lastView,busy});})()`,
 			);
 			await until(async () => (await frame()).hold);
 			assert.deepEqual(await copyFocus(), { inBanner: true, label: "Copy" });
@@ -701,7 +827,7 @@ test(
 			})()`);
 			assert.equal(scrolled.top > 0, true, "the draft is scrolled before the redraw");
 			await evaluate(
-				`(()=>{const source=window.eventSources.at(-1);source.dispatchEvent(new MessageEvent('connecting'));source.dispatchEvent(new MessageEvent('view',{data:JSON.stringify(window.lastView)}));})()`,
+				`(()=>{window.emitSse('connecting',{});window.emitSse('view',window.lastView);})()`,
 			);
 			// The composer is patched in place, never rebuilt: the same textarea keeps its offset, size, focus and selection.
 			await setTimeout(250);

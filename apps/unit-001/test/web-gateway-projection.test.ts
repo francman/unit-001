@@ -6,6 +6,7 @@ import type { ServiceView } from "../src/service.ts";
 import type { ServiceClient } from "../src/service-client.ts";
 import { parseWebRequest } from "../src/web/contract.ts";
 import { createWebGateway } from "../src/web/gateway.ts";
+import { projectWebResponse } from "../src/web/post-response.ts";
 
 const servers: ReturnType<typeof createWebGateway>[] = [];
 afterEach(async () => {
@@ -40,7 +41,12 @@ async function gateway(view: ServiceView) {
 		},
 	};
 	// Reserve an ephemeral port first so the gateway can enforce its exact configured origin.
-	const reservation = createWebGateway({ client, origin: "http://127.0.0.1:1", secret: "a".repeat(32), assets: new Map() });
+	const reservation = createWebGateway({
+		client,
+		origin: "http://127.0.0.1:1",
+		secret: "a".repeat(32),
+		assets: new Map(),
+	});
 	reservation.server.listen(0, "127.0.0.1");
 	await once(reservation.server, "listening");
 	const port = (reservation.server.address() as AddressInfo).port;
@@ -55,12 +61,18 @@ async function gateway(view: ServiceView) {
 		headers: { Origin: origin, "Content-Type": "application/json" },
 		body: JSON.stringify({ secret: "a".repeat(32) }),
 	});
-	return { origin, cookie: pair.headers.get("set-cookie")?.split(";")[0] ?? "" };
+	expect(pair.ok).toBe(true);
+	const { sessionToken } = (await pair.json()) as { sessionToken: unknown };
+	if (typeof sessionToken !== "string" || sessionToken.length === 0) throw new Error("Expected a session token.");
+	return { origin, sessionToken };
 }
 
-async function firstViewFrame(origin: string, cookie: string): Promise<string> {
+async function firstViewFrame(origin: string, sessionToken: string): Promise<string> {
 	const abort = new AbortController();
-	const response = await fetch(`${origin}/api/v1/events`, { headers: { Origin: origin, Cookie: cookie }, signal: abort.signal });
+	const response = await fetch(`${origin}/api/v1/events`, {
+		headers: { Origin: origin, Authorization: `Bearer ${sessionToken}` },
+		signal: abort.signal,
+	});
 	const reader = (response.body as ReadableStream<Uint8Array>).getReader();
 	const decoder = new TextDecoder();
 	let stream = "";
@@ -80,18 +92,132 @@ async function firstViewFrame(origin: string, cookie: string): Promise<string> {
 
 describe("browser frame projection", () => {
 	it("forwards only workspace fields: no failure, retry, tool reason or owner PID", async () => {
-		const { origin, cookie } = await gateway(ownerFrame);
-		const data = JSON.parse(await firstViewFrame(origin, cookie)) as Record<string, unknown>;
+		const { origin, sessionToken } = await gateway(ownerFrame);
+		const data = JSON.parse(await firstViewFrame(origin, sessionToken)) as Record<string, unknown>;
 		expect(Object.keys(data).sort()).toEqual(
-			["busy", "entries", "historyTruncated", "installationId", "model", "name", "text", "textTruncated", "tools", "usage", "version"].sort(),
+			[
+				"busy",
+				"entries",
+				"historyTruncated",
+				"installationId",
+				"model",
+				"name",
+				"text",
+				"textTruncated",
+				"tools",
+				"usage",
+				"version",
+			].sort(),
 		);
 		expect(data.tools).toEqual([{ callId: "toolu_1", name: "bash", status: "failed" }]);
 	});
 
 	it("never exposes the tool-evidence operation to the browser", () => {
-		expect(() => parseWebRequest({ requestId: "e", operation: { type: "tool-evidence", callId: "toolu_1" } })).toThrow();
+		expect(() =>
+			parseWebRequest({ requestId: "e", operation: { type: "tool-evidence", callId: "toolu_1" } }),
+		).toThrow();
 		expect(() => parseWebRequest({ requestId: "e", operation: { type: "tool-evidence" } })).toThrow(
 			"Operation is unavailable on the browser surface.",
 		);
+	});
+});
+
+describe("browser operation response projection", () => {
+	it("B5 projects only bounded chat history rows and a progressing continuation", () => {
+		const operation = { type: "chat-history", before: 12 } as const;
+		const entry = { id: 10, role: "assistant", text: "Earlier reply", truncated: false, source: "host" };
+		expect(
+			projectWebResponse(operation, {
+				type: "chat-history",
+				page: { entries: [entry], nextBefore: 9 },
+				unprojected: "Private owner diagnostic",
+			}),
+		).toEqual({ type: "chat-history", page: { entries: [entry], nextBefore: 9 } });
+		expect(projectWebResponse(operation, { type: "chat-history", page: { entries: [], nextBefore: 9 } })).toEqual({
+			type: "chat-history",
+			page: { entries: [], nextBefore: 9 },
+		});
+		expect(() =>
+			projectWebResponse(operation, {
+				type: "chat-history",
+				page: { entries: [{ ...entry, detail: "Private owner diagnostic" }], nextBefore: null },
+			}),
+		).toThrow();
+		expect(() =>
+			projectWebResponse(operation, { type: "chat-history", page: { entries: [], nextBefore: 12 } }),
+		).toThrow();
+	});
+
+	it.each([
+		{
+			authority: "invalid",
+			authorityError: "Unable to read /private/owner/mission.json",
+			expected: "invalid-authority",
+		},
+		{ authority: "developer-local", authorityError: null, expected: null },
+	])("projects a stable authority error for $authority", ({ authority, authorityError, expected }) => {
+		const response = projectWebResponse(
+			{ type: "mission", request: { operation: "status" } },
+			{
+				type: "mission",
+				result: {
+					stage: "awaiting_creator",
+					formation: { agreement: null, draft: null },
+					creator: null,
+					authority,
+					authorityError,
+					agreementValid: false,
+					missing: [],
+					execution: "not-implemented",
+					tools: [],
+				},
+			},
+		);
+		expect(response).toMatchObject({ type: "mission", result: { authority, authorityError: expected } });
+		expect(JSON.stringify(response)).not.toContain("/private/owner/mission.json");
+	});
+
+	it("shows a protected terminal review without arming agreement and ignores the owner's digest", () => {
+		const operation = { type: "mission", request: { operation: "status" } } as const;
+		const terms = { objective: "Ship", scope: "Unit", policy: { allowedTools: ["read"], maxCycles: 3 } };
+		const draft = { missionId: "mission-one", revision: 2, status: "proposed", digest: "a".repeat(64), terms };
+		const view = {
+			stage: "awaiting_approval",
+			formation: { agreement: null, draft },
+			creator: null,
+			authority: "managed-administrator",
+			agreementValid: true,
+			missing: [],
+			execution: "not-implemented",
+			tools: [],
+		};
+		const proposal = {
+			missionId: draft.missionId,
+			revision: draft.revision,
+			digest: "b".repeat(64),
+			authorityRevision: 1,
+			previousReceipt: null,
+		};
+		expect(
+			projectWebResponse(operation, { type: "mission", result: view }, { review: { armed: false, proposal } }),
+		).toMatchObject({
+			result: {
+				canAgree: false,
+				previousReceipt: null,
+				review: proposal,
+				agreementValid: false,
+				formation: { draft: { ...draft, digest: proposal.digest } },
+			},
+		});
+		expect(
+			projectWebResponse(operation, { type: "mission", result: { ...view, authority: "developer-local" } }, {}),
+		).toMatchObject({
+			result: {
+				canAgree: false,
+				authority: "invalid",
+				agreementValid: false,
+				formation: { draft: { digest: null } },
+			},
+		});
 	});
 });

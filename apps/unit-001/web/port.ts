@@ -1,9 +1,17 @@
 // Connects the workspace to the paired loopback gateway without replaying mutations.
+import { parseMissionRefusalCode } from "../src/missions/refusal.ts";
+import { type BrowserSession, browserApiFetch, checkBrowserSession, clearBrowserSession } from "./client-auth.ts";
+import { readEventStream } from "./client-stream.ts";
 import type {
+	ChatHistoryPage,
+	LogoutOutcome,
 	MemoryGraphEdgeView,
 	MemoryGraphView,
 	MemoryStatsView,
 	MissionAgreementView,
+	MissionDraftTerms,
+	MissionMutationOutcome,
+	MissionReviewView,
 	MissionRunView,
 	WorkspaceDetails,
 	WorkspacePort,
@@ -15,20 +23,42 @@ type JsonObject = Record<string, unknown>;
 
 class GatewayRejection extends Error {}
 
-/** Creates a port whose CSRF credential stays in memory and whose writes are never retried. */
-export function browserWorkspacePort(csrfToken: string): WorkspacePort {
-	let closed = false;
-	let events: EventSource | null = null;
+/** Creates a bearer-authenticated port whose writes are never retried. */
+export function browserWorkspacePort({ sessionToken, csrfToken, expiresAt }: BrowserSession): WorkspacePort {
+	let closed: { state: "expired" | "signed-out"; clearing: Promise<void> } | null = null;
+	let logoutResult: Promise<LogoutOutcome> | null = null;
+	let watcher: { controller: AbortController; listener: Parameters<WorkspacePort["watch"]>[0] } | null = null;
 	const pending = new AbortController();
-	const request = async (operation: JsonObject, requestId: string = crypto.randomUUID()): Promise<JsonObject> => {
-		if (closed) throw new Error("Signed out.");
-		const response = await fetch("/api/v1/requests", {
+	const authorization = { Authorization: `Bearer ${sessionToken}` };
+	const writeHeaders = { ...authorization, "Content-Type": "application/json", "X-Unit-CSRF": csrfToken };
+
+	function close(state: "expired" | "signed-out"): Promise<void> {
+		if (closed !== null) return closed.clearing;
+		const clearing = clearBrowserSession(sessionToken);
+		closed = { state, clearing };
+		pending.abort();
+		const previous = watcher;
+		watcher = null;
+		previous?.controller.abort();
+		if (state === "expired") previous?.listener({ type: "connection", state });
+		return clearing;
+	}
+
+	function active(): boolean {
+		if (Date.now() >= expiresAt) void close("expired");
+		return closed === null;
+	}
+
+	const requestEnvelope = async (operation: JsonObject, requestId: string): Promise<JsonObject> => {
+		if (!active()) throw new GatewayRejection("Session ended. Reload and pair again.");
+		const response = await browserApiFetch("/api/v1/requests", {
 			method: "POST",
-			headers: { "Content-Type": "application/json", "X-Unit-CSRF": csrfToken },
+			headers: writeHeaders,
 			body: JSON.stringify({ requestId, operation }),
 			signal: AbortSignal.any([pending.signal, AbortSignal.timeout(125_000)]),
 		});
 		if (!response.ok) {
+			if (response.status === 401) await close("expired");
 			// Only statuses the gateway uses before dispatch can establish that the owner was not called.
 			if (![400, 401, 403, 409, 429].includes(response.status)) throw new Error("Owner outcome is unknown.");
 			throw new GatewayRejection(
@@ -40,8 +70,12 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 			);
 		}
 		const result = object(await response.json());
-		if (closed || result.requestId !== requestId || result.state !== "completed")
-			throw new Error("Owner outcome is unknown.");
+		if (!active() || result.requestId !== requestId) throw new Error("Owner outcome is unknown.");
+		return result;
+	};
+	const request = async (operation: JsonObject, requestId: string = crypto.randomUUID()): Promise<JsonObject> => {
+		const result = await requestEnvelope(operation, requestId);
+		if (result.state !== "completed") throw new Error("Owner outcome is unknown.");
 		const reply = object(result.response);
 		if (reply.type === "error" && typeof reply.message === "string")
 			throw new Error("The owner could not complete this request.");
@@ -57,67 +91,126 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 		}
 		return reply;
 	};
+	async function loadMission(): Promise<WorkspaceDetails["mission"]> {
+		return parseMission((await request({ type: "mission", request: { operation: "status" } })).result);
+	}
 	return {
 		watch(listener) {
-			events?.close();
-			events = new EventSource("/api/v1/events");
-			const stream = events;
-			stream.addEventListener("view", (event: MessageEvent<string>) => {
-				if (closed) return;
-				try {
-					listener({ type: "view", view: parseWorkspaceView(JSON.parse(event.data)) });
-				} catch {
-					listener({ type: "connection", state: "offline" });
-				}
-			});
-			stream.addEventListener("connecting", () => listener({ type: "connection", state: "connecting" }));
-			stream.onerror = () => {
-				if (closed) return;
-				listener({ type: "connection", state: "offline" });
-				void fetch("/api/v1/session", { cache: "no-store", signal: pending.signal })
-					.then(async (response) => {
-						const session = object(await response.json());
-						if (!closed && session.authenticated === false) {
-							stream.close();
-							listener({ type: "connection", state: "expired" });
-						}
-					})
-					.catch(() => {});
+			watcher?.controller.abort();
+			if (closed !== null) {
+				if (closed.state === "expired") listener({ type: "connection", state: closed.state });
+				return () => {};
+			}
+			const controller = new AbortController();
+			const { signal } = controller;
+			const current = { controller, listener };
+			watcher = current;
+			let expiryTimer: ReturnType<typeof setTimeout>;
+			let retryTimer: ReturnType<typeof setTimeout> | undefined;
+			signal.addEventListener("abort", () => {
+				clearTimeout(expiryTimer);
+				clearTimeout(retryTimer);
+			}, { once: true });
+			const armExpiry = () => {
+				if (active()) expiryTimer = setTimeout(armExpiry, Math.min(expiresAt - Date.now(), 2_147_483_647));
 			};
-			return () => stream.close();
+			armExpiry();
+			void connect();
+			return () => {
+				if (watcher === current) watcher = null;
+				controller.abort();
+			};
+
+			async function connect(): Promise<void> {
+				if (signal.aborted || !active()) return;
+				try {
+					const response = await browserApiFetch("/api/v1/events", {
+						headers: { ...authorization, Accept: "text/event-stream" },
+						signal,
+					});
+					if (response.status === 401 || signal.aborted || !active()) {
+						void response.body?.cancel().catch(() => {});
+						if (!signal.aborted && response.status === 401) await close("expired");
+						return;
+					}
+					const type = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+					if (!response.ok || type !== "text/event-stream" || !response.body) {
+						void response.body?.cancel().catch(() => {});
+						throw new Error("Invalid event stream.");
+					}
+					await readEventStream(response.body, signal, (event, data) => {
+						if (!active()) return;
+						if (event === "connecting") {
+							listener({ type: "connection", state: "connecting" });
+						} else if (event === "view") {
+							let view: WorkspaceView;
+							try {
+								view = parseWorkspaceView(JSON.parse(data));
+							} catch {
+								listener({ type: "connection", state: "offline" });
+								return;
+							}
+							listener({ type: "view", view });
+						}
+					});
+				} catch {
+					// Network failures and invalid streams are both recoverable; never replay writes.
+				}
+				if (signal.aborted || !active()) return;
+				listener({ type: "connection", state: "offline" });
+				try {
+					const session = await checkBrowserSession(sessionToken, signal);
+					if (!signal.aborted && session === null) await close("expired");
+				} catch {
+					// While the gateway is unreachable, wait for the next reconnect attempt or expiry.
+				}
+				if (!signal.aborted && active()) retryTimer = setTimeout(() => void connect(), 3000);
+			}
+		},
+		async history(before) {
+			const reply = await request({ type: "chat-history", before });
+			return parseHistoryPage(reply.page, before);
+		},
+		mission: loadMission,
+		async mutateMission(change, requestId): Promise<MissionMutationOutcome> {
+			try {
+				const result = await requestEnvelope({ type: "mission", request: change }, requestId);
+				if (result.state === "refused") return { state: "refused", code: parseMissionRefusalCode(result.code) };
+				if (result.state === "issued" && change.operation === "agree" && change.previousReceipt !== undefined)
+					return { state: "issued", receiptId: missionIdentity(result.receiptId), reconciled: boolean(result.reconciled) };
+				if (result.state === "completed") {
+					const reply = object(result.response);
+					if (reply.type === "mission") {
+						const mission = parseMission(reply.result);
+						const draft = mission.draft;
+						if (
+							(change.operation === "draft" && draft?.status === "editing" && draft.revision > change.expectedRevision) ||
+							(change.operation === "propose" && draft?.status === "proposed" && draft.revision === change.expectedRevision) ||
+							// The gateway emits completed for Agree only after checking the owner's exact revision and digest.
+							(change.operation === "agree" && change.previousReceipt === undefined && mission.authority === "developer-local" &&
+								mission.agreementValid && mission.agreement?.revision === change.revision && draft === null)
+						) return { state: "completed", mission };
+					}
+				}
+			} catch (error) {
+				if (error instanceof GatewayRejection) return { state: "rejected" };
+			}
+			return { state: "unknown" };
 		},
 		async details() {
-			const [missionReply, memoryReply, channelsReply, owner] = await Promise.all([
-				request({ type: "mission", request: { operation: "status" } }),
+			const [mission, memoryReply, channelsReply, owner] = await Promise.all([
+				loadMission(),
 				request({ type: "memory", request: { operation: "stats" } }),
 				request({ type: "channels", request: { operation: "status" } }),
 				// A failed status read must not hide mission, memory or channel details.
 				request({ type: "status" }).then(parseOwner, () => null),
 			]);
-			const mission = object(missionReply.result);
-			const formation = object(mission.formation);
-			const current = formation.agreement ?? formation.draft;
-			const terms = current === null ? {} : object(object(current).terms);
 			const stats = object(memoryReply.result);
 			const channels = object(object(channelsReply.result).view).channels;
 			if (!Array.isArray(channels)) throw new Error("Invalid channel response.");
 			return {
 				owner,
-				mission: {
-					stage: text(mission.stage),
-					objective: typeof terms.objective === "string" ? terms.objective : null,
-					scope: typeof terms.scope === "string" ? terms.scope : null,
-					missing: Array.isArray(mission.missing) ? mission.missing.map(text) : [],
-					execution: text(mission.execution),
-					tools: list(mission.tools, 128, text),
-					agreement: formation.agreement === null ? null : parseAgreement(formation.agreement),
-					run: mission.runtime === undefined || mission.runtime === null ? null : parseRun(mission.runtime),
-					creator: mission.creator === null ? null : parseCreator(mission.creator),
-					authority: oneOf(mission.authority, AUTHORITIES),
-					agreementValid: boolean(mission.agreementValid),
-					authorityError: mission.authorityError === null ? null : text(mission.authorityError),
-					draft: formation.draft === null ? null : parseDraft(formation.draft),
-				},
+				mission,
 				memory: {
 					count:
 						typeof stats.working === "number" && typeof stats.episodic === "number"
@@ -195,16 +288,24 @@ export function browserWorkspacePort(csrfToken: string): WorkspacePort {
 				return { state: "unknown", message: "Forget outcome not confirmed. Inspect memory before acting again." };
 			}
 		},
-		async logout() {
-			const response = await fetch("/api/v1/logout", {
-				method: "POST",
-				headers: { "Content-Type": "application/json", "X-Unit-CSRF": csrfToken },
-				body: "{}",
-			});
-			if (!response.ok && response.status !== 401) throw new Error("Sign out failed.");
-			closed = true;
-			events?.close();
-			pending.abort();
+		logout() {
+			logoutResult ??= (async () => {
+				const clearing = close("signed-out");
+				try {
+					const response = await browserApiFetch("/api/v1/logout", {
+						method: "POST",
+						headers: writeHeaders,
+						body: "{}",
+						signal: AbortSignal.timeout(10_000),
+					});
+					return response.ok || response.status === 401 ? "revoked" : "unconfirmed";
+				} catch {
+					return "unconfirmed";
+				} finally {
+					await clearing;
+				}
+			})();
+			return logoutResult;
 		},
 	};
 }
@@ -224,6 +325,7 @@ export function parseWorkspaceView(value: unknown): WorkspaceView {
 	)
 		throw new Error("Invalid view.");
 	const model = view.model === null ? null : object(view.model);
+	let previous = 0;
 	return {
 		name: text(view.name),
 		version: text(view.version),
@@ -236,14 +338,12 @@ export function parseWorkspaceView(value: unknown): WorkspaceView {
 		historyTruncated: boolean(view.historyTruncated),
 		entries: view.entries.map((value: unknown) => {
 			const entry = object(value);
-			if (
-				typeof entry.id !== "number" ||
-				!Number.isSafeInteger(entry.id) ||
-				(entry.role !== "user" && entry.role !== "assistant")
-			)
+			const id = historyId(entry.id);
+			if (id <= previous || (entry.role !== "user" && entry.role !== "assistant"))
 				throw new Error("Invalid entry.");
+			previous = id;
 			return {
-				id: entry.id,
+				id,
 				role: entry.role,
 				text: text(entry.text),
 				truncated: boolean(entry.truncated),
@@ -309,6 +409,71 @@ function parseOwner(reply: JsonObject): NonNullable<WorkspaceDetails["owner"]> {
 	};
 }
 
+function parseHistoryPage(value: unknown, before: number | null): ChatHistoryPage {
+	const page = object(value);
+	let previous = 0;
+	const entries = list(page.entries, 5, (item): ChatHistoryPage["entries"][number] => {
+		const row = object(item);
+		const id = historyId(row.id);
+		if (id <= previous || (before !== null && id >= before)) throw new Error("Invalid chat history order.");
+		previous = id;
+		const role = oneOf(row.role, ["user", "assistant"] as const);
+		const content = text(row.text);
+		if (content.length > 4096) throw new Error("Invalid chat history text.");
+		const truncated = boolean(row.truncated);
+		if (row.source === undefined) return { id, role, text: content, truncated };
+		if (row.source !== "host") throw new Error("Invalid chat history source.");
+		return { id, role, text: content, truncated, source: "host" };
+	});
+	const nextBefore = page.nextBefore === null ? null : historyId(page.nextBefore);
+	const first = entries[0]?.id;
+	if (nextBefore !== null && ((before !== null && nextBefore >= before) || (first !== undefined && nextBefore > first)))
+		throw new Error("Invalid chat history continuation.");
+	return { entries, nextBefore };
+}
+
+function historyId(value: unknown): number {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new Error("Invalid chat history ID.");
+	return value;
+}
+
+function parseMission(value: unknown): WorkspaceDetails["mission"] {
+	const mission = object(value);
+	const formation = object(mission.formation);
+	const authority = oneOf(mission.authority, AUTHORITIES);
+	const current = formation.agreement ?? formation.draft;
+	const terms = current === null ? {} : object(object(current).terms);
+	const draft = formation.draft === null ? null : parseDraft(formation.draft);
+	if (draft?.status === "proposed" && draft.digest === null &&
+		!(authority === "managed-administrator" && mission.canAgree === false))
+		throw new Error("Invalid mission proposal.");
+	const previousReceipt = mission.previousReceipt == null ? mission.previousReceipt : missionIdentity(mission.previousReceipt);
+	const review = mission.review == null ? null : parseMissionReview(mission.review);
+	const matchingReview = review === null ||
+		(draft?.status === "proposed" && review.missionId === draft.missionId && review.revision === draft.revision &&
+			review.digest === draft.digest && review.previousReceipt === (previousReceipt ?? null));
+	return {
+		stage: text(mission.stage),
+		objective: typeof terms.objective === "string" ? terms.objective : null,
+		scope: typeof terms.scope === "string" ? terms.scope : null,
+		missing: list(mission.missing, 32, text),
+		execution: text(mission.execution),
+		tools: list(mission.tools, 128, text),
+		agreement: formation.agreement === null ? null : parseAgreement(formation.agreement),
+		run: mission.runtime == null ? null : parseRun(mission.runtime),
+		creator: mission.creator === null ? null : parseCreator(mission.creator),
+		// The authority kind identifies the wire variant; only canAgree grants browser capability.
+		authority,
+		agreementValid: boolean(mission.agreementValid),
+		authorityError: mission.authorityError === null ? null : oneOf(mission.authorityError, ["invalid-authority"]),
+		formationAvailable: typeof mission.canAgree === "boolean" && matchingReview && (draft === null || draft.terms !== undefined),
+		canAgree: mission.canAgree === true && matchingReview,
+		previousReceipt,
+		draft,
+		review: matchingReview ? review : null,
+	};
+}
+
 function parseAgreement(value: unknown): MissionAgreementView {
 	const agreement = object(value);
 	const terms = object(agreement.terms);
@@ -321,6 +486,7 @@ function parseAgreement(value: unknown): MissionAgreementView {
 		reviewEveryMs: number(terms.reviewEveryMs),
 		approvedAt: number(approval.approvedAt),
 		approvedBy: oneOf(object(approval.approvedBy).kind, APPROVERS),
+		...(policy.allowedTools === undefined ? {} : { allowedTools: list(policy.allowedTools, 128, text) }),
 		limits: {
 			maxCycles: number(policy.maxCycles),
 			maxRequests: number(policy.maxRequests),
@@ -445,11 +611,58 @@ function parseCreator(value: unknown): NonNullable<WorkspaceDetails["mission"]["
 
 function parseDraft(value: unknown): NonNullable<WorkspaceDetails["mission"]["draft"]> {
 	const draft = object(value);
+	const revision = historyId(draft.revision);
+	const status = oneOf(draft.status, DRAFT_STATUSES);
+	const digest = draft.digest === null ? null : missionDigest(draft.digest);
+	if (status === "editing" && digest !== null) throw new Error("Invalid mission proposal.");
+	// Legacy projection still supports the existing terminal command, but cannot drive web formation.
+	if (draft.missionId === undefined) return { revision, status, digest };
+	return { revision, status, digest, missionId: missionIdentity(draft.missionId), terms: parseDraftTerms(draft.terms) };
+}
+
+function parseMissionReview(value: unknown): MissionReviewView {
+	const review = object(value);
 	return {
-		revision: number(draft.revision),
-		status: oneOf(draft.status, DRAFT_STATUSES),
-		digest: draft.digest === null ? null : text(draft.digest),
+		missionId: missionIdentity(review.missionId),
+		revision: historyId(review.revision),
+		digest: missionDigest(review.digest),
+		authorityRevision: historyId(review.authorityRevision),
+		previousReceipt: review.previousReceipt === null ? null : missionIdentity(review.previousReceipt),
 	};
+}
+
+function missionIdentity(value: unknown): string {
+	const id = text(value);
+	if (id.length === 0 || id.length > 200) throw new Error("Invalid mission identity.");
+	return id;
+}
+
+function missionDigest(value: unknown): string {
+	const digest = text(value);
+	if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error("Invalid mission digest.");
+	return digest;
+}
+
+function parseDraftTerms(value: unknown): MissionDraftTerms {
+	const input = object(value);
+	const terms: MissionDraftTerms = {};
+	for (const key of ["objective", "scope"] as const) if (input[key] !== undefined) terms[key] = text(input[key]);
+	for (const key of ["successCriteria", "approvalBoundary"] as const) if (input[key] !== undefined) terms[key] = list(input[key], 32, text);
+	if (input.reviewEveryMs !== undefined) terms.reviewEveryMs = draftNumber(input.reviewEveryMs);
+	if (input.policy !== undefined) {
+		const inputPolicy = object(input.policy);
+		const policy: NonNullable<MissionDraftTerms["policy"]> = {};
+		if (inputPolicy.allowedTools !== undefined) policy.allowedTools = list(inputPolicy.allowedTools, 128, text);
+		for (const key of ["maxCycles", "maxRequests", "maxRetries", "maxConsecutiveNoProgress", "deadlineAt", "maxEstimatedCost"] as const)
+			if (inputPolicy[key] !== undefined) policy[key] = draftNumber(inputPolicy[key]);
+		terms.policy = policy;
+	}
+	return terms;
+}
+
+function draftNumber(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("Invalid mission term.");
+	return value;
 }
 
 function list<T>(value: unknown, max: number, item: (value: unknown) => T): T[] {

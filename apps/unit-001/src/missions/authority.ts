@@ -4,6 +4,8 @@ import type { Stats } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
+	type BrowserAgreementGrant,
+	type IssuedAgreement,
 	type MissionApproval,
 	type MissionAuthority,
 	type MissionCeiling,
@@ -254,7 +256,61 @@ export function parseMissionAuthority(value: unknown): MissionAuthority {
 						parseOperationAcknowledgment,
 					),
 				}),
+		// Additive too: a writer that drops the grant disables browser agreement, which is the safe direction.
+		...(input.browserAgreement === undefined
+			? {}
+			: { browserAgreement: parseBrowserAgreementGrant(input.browserAgreement) }),
 	};
+}
+
+/**
+ * Most browser-issued receipts one grant records. Entries are never evicted (an evicted request ID could later name
+ * different terms); at this count the helper refuses new request IDs until the administrator issues a new grant.
+ */
+export const MAX_ISSUED_AGREEMENTS = 32;
+
+function parseBrowserAgreementGrant(value: unknown): BrowserAgreementGrant {
+	const input = missionObject(value);
+	const fields = ["enabled", "creatorUid", "serviceUid", "authorityRevision", "generation", "issued"];
+	if (Object.keys(input).some((key) => !fields.includes(key))) throw new Error("Unknown browser agreement field.");
+	if (typeof input.enabled !== "boolean") throw new Error("Invalid browser agreement grant.");
+	const grant: BrowserAgreementGrant = {
+		enabled: input.enabled,
+		creatorUid: counter(input.creatorUid, 1),
+		serviceUid: counter(input.serviceUid, 1),
+		authorityRevision: counter(input.authorityRevision, 1),
+		generation: counter(input.generation, 1),
+		issued: boundedList(input.issued, MAX_ISSUED_AGREEMENTS).map(parseIssuedAgreement),
+	};
+	// Bob's tools run as the service UID; a grant naming it as the creator would let the agent approve its own mission.
+	if (grant.creatorUid === grant.serviceUid) throw new Error("Browser agreement creator must not be the service account.");
+	if (new Set(grant.issued.map((item) => item.requestId)).size !== grant.issued.length)
+		throw new Error("Duplicate browser agreement request ID.");
+	return grant;
+}
+
+function parseIssuedAgreement(value: unknown): IssuedAgreement {
+	const input = missionObject(value);
+	const fields = ["requestId", "receiptId", "missionId", "revision", "digest", "authorityRevision", "previousReceipt", "issuedAt"];
+	if (Object.keys(input).some((key) => !fields.includes(key))) throw new Error("Unknown issued agreement field.");
+	const digest = missionText(input.digest, 64);
+	if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("Invalid issued agreement digest.");
+	return {
+		requestId: missionText(input.requestId, 64),
+		receiptId: missionText(input.receiptId),
+		missionId: missionText(input.missionId),
+		revision: counter(input.revision, 1),
+		digest,
+		authorityRevision: counter(input.authorityRevision, 1),
+		previousReceipt: input.previousReceipt === null ? null : missionText(input.previousReceipt),
+		issuedAt: counter(input.issuedAt, 0),
+	};
+}
+
+function counter(value: unknown, minimum: number): number {
+	const number = missionNumber(value);
+	if (!Number.isSafeInteger(number) || number < minimum) throw new Error("Invalid browser agreement number.");
+	return number;
 }
 
 function boundedList(value: unknown, maximum: number): unknown[] {

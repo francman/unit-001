@@ -1,5 +1,7 @@
 // Mounts the workspace: owns state and actions, builds the shell once (sidebar, top bar, bands, page, status bar) and patches it.
-import type { WorkspacePort } from "./contract.ts";
+import { describeMissionRefusal } from "../src/missions/refusal.ts";
+import type { ChatHistoryPage, MissionDraftTerms, MissionMutation, MissionMutationOutcome, WorkspaceDetails, WorkspacePort } from "./contract.ts";
+import { mergeChatEntries } from "./history.ts";
 import {
 	type Actions,
 	agentState,
@@ -18,7 +20,7 @@ import {
 	unknownResults,
 	unnamed,
 } from "./state.ts";
-import { command, dot, tag } from "./ui/blocks.ts";
+import { callout, command, dot, tag } from "./ui/blocks.ts";
 import { button, iconButton } from "./ui/controls.ts";
 import { dialogTitleId } from "./ui/dialog.ts";
 import { attrs, coarsePointer, el, srOnly } from "./ui/dom.ts";
@@ -29,16 +31,18 @@ import { renderAbout } from "./views/about.ts";
 import { type ChatView, createChat } from "./views/chat.ts";
 import { renderConnections } from "./views/connections.ts";
 import { renderForgetDialog, renderMemory } from "./views/memory.ts";
-import { renderMission } from "./views/mission.ts";
+import { missionApprovalCommand, missionProposalDigest, renderMission } from "./views/mission.ts";
+import { createMissionDraftEditor, type MissionDraftEditor, renderMissionDraftCard } from "./views/mission-draft.ts";
 import { renderActivity, renderStatus } from "./views/status.ts";
 
-const pages: Record<Exclude<Section, "chat">, (ctx: Ctx) => HTMLElement> = {
-	mission: renderMission,
+const pages: Record<Exclude<Section, "chat" | "mission">, (ctx: Ctx) => HTMLElement> = {
 	status: renderStatus,
 	memory: renderMemory,
 	connections: renderConnections,
 	about: renderAbout,
 };
+
+type MissionSnapshot = WorkspaceDetails["mission"];
 
 /** Mounts the workspace against a live or sample port; unmounting never cancels the agent's work. */
 export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: { preview?: boolean; section?: Section } = {}): () => void {
@@ -54,10 +58,10 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 
 	// One polite live region for short state words; streamed tokens are never announced.
 	const live = attrs(el("div", "sr-only"), { role: "status" });
-	const announce = (text: string) => {
+	const announce = (text: string, current?: () => boolean) => {
 		live.textContent = "";
 		setTimeout(() => {
-			live.textContent = text;
+			if (!current || current()) live.textContent = text;
 		}, 50);
 	};
 	const toaster = createToaster();
@@ -72,39 +76,180 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		announce(text);
 	};
 
+	let graphRead = 0;
+	let detailsRead = 0;
+	let recallRead = 0;
+
 	// The memory graph is read only while the Memory page is open; a failed read keeps the last good snapshot.
 	const loadGraph = async () => {
+		const read = ++graphRead;
 		try {
 			const next = await port.memoryGraph();
-			if (destroyed || ui.signedOut) return;
+			if (destroyed || ui.signedOut || read !== graphRead) return;
 			set("state", (ui) => {
 				ui.graph = next;
 				ui.graphFailed = false;
 			});
 		} catch {
+			if (destroyed || ui.signedOut || read !== graphRead) return;
 			set("state", (ui) => {
 				ui.graphFailed = true;
 			});
 		}
 	};
 
+	let missionVersion = 0;
+	let missionEditor: { base: MissionSnapshot; view: MissionDraftEditor } | null = null;
+
+	function noteDraftConflict(mission: MissionSnapshot): void {
+		const unsaved = ui.missionDraft?.unsaved;
+		if (unsaved && missionEditor && mission.formationAvailable && !sameMissionDraft(missionEditor.base, mission))
+			unsaved.conflicted = true;
+	}
+
 	const refresh = async () => {
+		const read = ++detailsRead;
 		if (ui.section === "memory") void loadGraph();
+		const version = missionVersion;
 		try {
 			const next = await port.details();
-			if (destroyed || ui.signedOut) return;
-			// Search results are the page's own; a details refresh keeps them.
+			if (destroyed || ui.signedOut || read !== detailsRead) return;
 			set("state", (ui) => {
-				ui.details = { ...next, memory: { ...next.memory, records: ui.details ? ui.details.memory.records : next.memory.records } };
+				ui.details = {
+					...next,
+					mission: version === missionVersion ? next.mission : (ui.details?.mission ?? next.mission),
+				};
+				noteDraftConflict(ui.details.mission);
 				ui.detailsFailed = false;
 			});
 		} catch {
+			if (destroyed || ui.signedOut || read !== detailsRead) return;
 			// Details are secondary: chat keeps working, the last good details stay, and the next navigation retries.
 			set("state", (ui) => {
 				ui.detailsFailed = true;
 			});
 		}
 	};
+
+	async function searchMemory(query: string): Promise<void> {
+		const read = ++recallRead;
+		const current = () => !destroyed && !ui.signedOut && read === recallRead;
+		set("state", (ui) => {
+			ui.recall = { kind: "searching", query };
+		});
+		try {
+			const { records } = await port.recall(query);
+			if (!current()) return;
+			set("state", (ui) => {
+				ui.recall = { kind: "done", query, records };
+			});
+			announce(records.length ? `${records.length} ${records.length === 1 ? "memory" : "memories"} found` : "No matches", current);
+		} catch {
+			if (!current()) return;
+			set("state", (ui) => {
+				ui.recall = { kind: "failed", query };
+			});
+		}
+	}
+
+	function openMissionDraft(): void {
+		if (!missionEntryAvailable(ui)) return;
+		const alreadyOpen = ui.missionDraft !== null;
+		set("state", (ui) => {
+			ui.missionDraft ??= { editRevision: null, unsaved: null, status: "ready", notice: "", localAgreementRevision: null };
+			ui.section = "chat";
+			ui.navOpen = false;
+			if (!alreadyOpen && ui.draft === "") ui.draft = "Let's define your mission.";
+		});
+		focusKey("mission-draft-heading");
+		if (!alreadyOpen) void refreshMissionDraft();
+	}
+
+	async function refreshMissionDraft(notice = ui.missionDraft?.notice ?? "", intent: "keep-edits" | "discard-edits" = "keep-edits"): Promise<void> {
+		const current = ui.missionDraft;
+		if (!current || current.status === "saving" || ui.connection !== "connected") return;
+		const panel = intent === "discard-edits" ? { ...current, unsaved: null } : current;
+		const version = ++missionVersion;
+		set("state", (ui) => {
+			ui.missionDraft = { ...panel, editRevision: null, status: "refreshing", notice };
+		});
+		try {
+			const mission = await port.mission();
+			if (destroyed || ui.signedOut || version !== missionVersion) return;
+			++missionVersion;
+			set("state", (ui) => {
+				if (ui.details) ui.details = { ...ui.details, mission };
+				ui.detailsFailed = false;
+				ui.missionDraft = { ...panel, editRevision: null, status: "ready", notice };
+				noteDraftConflict(mission);
+			});
+		} catch {
+			if (destroyed || ui.signedOut || version !== missionVersion) return;
+			set("state", (ui) => {
+				ui.missionDraft = { ...panel, editRevision: null, status: "needs-refresh", notice };
+			});
+		}
+	}
+
+	async function mutateMission(change: MissionMutation, shown: MissionSnapshot): Promise<void> {
+		const panel = ui.missionDraft;
+		const mission = ui.details?.mission;
+		if (!panel || panel.status !== "ready" || !mission || ui.connection !== "connected" || ui.detailsFailed || ui.details?.owner?.held) return;
+		const expected = missionRevision(mission);
+		const matches = change.operation === "agree"
+			? mission.canAgree && mission.formationAvailable && mission.draft?.status === "proposed" &&
+				mission.draft.missionId === shown.draft?.missionId && expected === change.revision &&
+				missionProposalDigest(mission) === change.digest && mission.review?.authorityRevision === shown.review?.authorityRevision &&
+				(mission.authority === "developer-local"
+					? change.previousReceipt === undefined
+					: mission.authority === "managed-administrator" && mission.review !== null &&
+						change.previousReceipt !== undefined && mission.previousReceipt === change.previousReceipt) &&
+				(mission === shown || JSON.stringify(mission.draft.terms) === JSON.stringify(shown.draft?.terms)) &&
+				ui.missionReceipt?.revision !== change.revision
+			: mission.formationAvailable && !panel.unsaved?.conflicted && expected === change.expectedRevision && sameMissionDraft(shown, mission);
+		if (!matches) {
+			await refreshMissionDraft("The draft or approval changed. Review the fresh terms before acting.");
+			return;
+		}
+		++missionVersion;
+		set("state", (ui) => {
+			ui.missionDraft = { ...panel, status: "saving", notice: "" };
+		});
+		let result: MissionMutationOutcome;
+		try {
+			result = await port.mutateMission(change, crypto.randomUUID());
+		} catch {
+			result = { state: "unknown" };
+		}
+		if (destroyed || ui.signedOut) return;
+		++missionVersion;
+		if (result.state === "completed") {
+			missionEditor = null;
+			const updated = result.mission;
+			set("state", (ui) => {
+				if (ui.details) ui.details = { ...ui.details, mission: updated };
+				ui.missionDraft = { editRevision: null, unsaved: null, status: "ready", notice: "", localAgreementRevision: change.operation === "agree" ? change.revision : null };
+			});
+			return;
+		}
+		if (result.state === "issued" && change.operation === "agree") {
+			const { receiptId, reconciled } = result;
+			set("state", (ui) => {
+				ui.missionReceipt = { revision: change.revision, receiptId, reconciled };
+				ui.missionDraft = { ...panel, editRevision: null, status: "ready", notice: "" };
+			});
+			if (reconciled) await refreshMissionDraft();
+			return;
+		}
+		const notice = result.state === "refused" ? describeMissionRefusal(result.code)
+			: result.state === "rejected" ? "The gateway rejected this mission change before dispatch."
+				: "The outcome is unknown. Check the current mission before acting again. Nothing was retried.";
+		set("state", (ui) => {
+			if (panel.unsaved && result.state === "refused" && result.code === "stale-revision") panel.unsaved.conflicted = true;
+			ui.missionDraft = { ...panel, status: "needs-refresh", notice };
+		});
+		await refreshMissionDraft(notice);
+	}
 
 	const act: Actions = {
 		go(section) {
@@ -152,6 +297,42 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 				fail("Stopping could not be confirmed. Check whether the agent is still working.");
 			});
 		},
+		async loadEarlier() {
+			const history = ui.chatHistory;
+			if (destroyed || ui.signedOut || ui.connection !== "connected" || history.kind === "loading" || history.kind === "exhausted") return;
+			if (history.kind === "unstarted" && !ui.view?.historyTruncated) return;
+			const before = history.kind === "unstarted" ? (ui.chatEntries[0]?.id ?? null) : history.before;
+			set("state", (ui) => {
+				ui.chatHistory = { kind: "loading", before };
+			});
+			announce("Loading earlier messages.");
+			let page: ChatHistoryPage;
+			try {
+				page = await port.history(before);
+			} catch {
+				if (destroyed || ui.signedOut) return;
+				set("state", (ui) => {
+					ui.chatHistory = { kind: "failed", before };
+				});
+				announce("Could not load earlier messages. Try again.");
+				return;
+			}
+			if (destroyed || ui.signedOut) return;
+			const reachedStart = page.nextBefore === null;
+			const entries = mergeChatEntries(ui.chatEntries, page.entries, "page");
+			const added = entries.length - ui.chatEntries.length;
+			set("state", (ui) => {
+				ui.chatEntries = entries;
+				ui.chatHistory = page.nextBefore === null ? { kind: "exhausted" } : { kind: "ready", before: page.nextBefore };
+			});
+			announce(
+				added
+					? `${added} earlier ${added === 1 ? "message" : "messages"} loaded.${reachedStart ? " Start of conversation." : ""}`
+					: reachedStart
+						? "No more earlier messages."
+						: "No messages in this page. You can keep loading earlier messages.",
+			);
+		},
 		setDraft(text) {
 			ui.draft = text;
 		},
@@ -189,26 +370,13 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			ui.query = query;
 		},
 		search() {
-			set("state", (ui) => {
-				ui.recall = "searching";
-			});
-			void (async () => {
-				try {
-					const memory = await port.recall(ui.query);
-					if (destroyed || ui.signedOut) return;
-					set("state", (ui) => {
-						if (ui.details) ui.details = { ...ui.details, memory: { ...ui.details.memory, records: memory.records } };
-						ui.recall = "done";
-					});
-					announce(memory.records.length ? `${memory.records.length} memories found` : "No matches");
-				} catch {
-					set("state", (ui) => {
-						ui.recall = "failed";
-					});
-				}
-			})();
+			if (destroyed || ui.signedOut) return;
+			const query = ui.query.trim();
+			if (ui.recall.kind === "searching" && ui.recall.query === query) return;
+			void searchMemory(query);
 		},
 		askForget(id, content, opener) {
+			if (destroyed || ui.signedOut || ui.pendingForget || ui.forgetting) return;
 			set("state", (ui) => {
 				// The request ID is fixed here, so trying again after an unknown outcome reuses it.
 				ui.pendingForget = { id, content, opener, requestId: crypto.randomUUID() };
@@ -217,63 +385,78 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		},
 		confirmForget() {
 			const pending = ui.pendingForget;
-			if (!pending || ui.forgetting) return;
+			if (destroyed || ui.signedOut || !pending || ui.forgetting) return;
 			set("state", (ui) => {
-				ui.forgetting = true;
+				ui.forgetting = pending.requestId;
+				ui.forgetNotice = "";
 			});
+			focusKey(dialogTitleId);
 			void (async () => {
-				let notice: string;
+				let result: Awaited<ReturnType<WorkspacePort["forget"]>>;
 				try {
-					const result = await port.forget(pending.id, pending.requestId);
-					if (result.state === "completed") {
-						set("state", (ui) => {
-							const memory = ui.details?.memory;
-							if (ui.details && memory)
-								ui.details = {
-									...ui.details,
-									memory: {
-										...memory,
-										count: memory.count === null ? null : memory.count - 1,
-										records: memory.records.filter((record) => record.id !== pending.id),
-									},
-								};
-							// The graph drops the forgotten node and its links at once; the refresh below re-reads the real snapshot.
-							const graph = ui.graph;
-							if (graph)
-								ui.graph = {
-									...graph,
-									nodes: graph.nodes.filter((node) => node.id !== pending.id),
-									edges: graph.edges.filter((edge) => edge.from !== pending.id && edge.to !== pending.id),
-									total: Math.max(0, graph.total - 1),
-								};
-							ui.pendingForget = null;
-							ui.forgetting = false;
-							ui.recall = "idle";
-						});
-						focusKey("memory-query");
-						notify("Memory forgotten. Conversation history was retained.");
-						void refresh();
-						return;
-					}
-					notice =
-						result.state === "unknown"
-							? `Forget outcome not confirmed. Close this dialog and search again to check. Request ID ${pending.requestId}. Trying again reuses this ID and may stay unknown.`
-							: result.message;
+					result = await port.forget(pending.id, pending.requestId);
 				} catch {
-					notice = `Forget outcome not confirmed. Close this dialog and search again to check. Request ID ${pending.requestId}.`;
+					result = { state: "unknown", message: "" };
 				}
+				if (destroyed || ui.signedOut || ui.forgetting !== pending.requestId) return;
+				const sameDialog = ui.pendingForget?.requestId === pending.requestId;
+				if (result.state !== "completed") {
+					const notice = result.state === "unknown"
+						? `Forget outcome not confirmed. Close this dialog and search again to check. Request ID ${pending.requestId}. Trying again reuses this ID and may stay unknown.`
+						: result.message;
+					set("state", (ui) => {
+						ui.forgetting = null;
+						if (sameDialog) ui.forgetNotice = notice;
+					});
+					if (sameDialog) announce(notice);
+					return;
+				}
+
+				// A read started before the confirmed removal cannot reintroduce the forgotten memory.
+				++detailsRead;
+				++graphRead;
+				++recallRead;
+				const recall = ui.recall;
 				set("state", (ui) => {
-					ui.forgetting = false;
-					ui.forgetNotice = notice;
+					if (ui.details) {
+						const memory = ui.details.memory;
+						ui.details = {
+							...ui.details,
+							memory: {
+								...memory,
+								count: memory.count === null ? null : Math.max(0, memory.count - 1),
+								records: memory.records.filter((record) => record.id !== pending.id),
+							},
+						};
+					}
+					const graph = ui.graph;
+					if (graph) {
+						const nodes = graph.nodes.filter((node) => node.id !== pending.id);
+						const total = Math.max(0, graph.total - 1);
+						ui.graph = {
+							nodes,
+							edges: graph.edges.filter((edge) => edge.from !== pending.id && edge.to !== pending.id),
+							total,
+							limited: nodes.length < total,
+						};
+					}
+					if (recall.kind === "done") {
+						ui.recall = { ...recall, records: recall.records.filter((record) => record.id !== pending.id) };
+					}
+					ui.forgetting = null;
+					if (sameDialog) ui.pendingForget = null;
 				});
-				announce(notice);
+				if (sameDialog) focusKey("memory-query");
+				notify("Memory forgotten. Conversation history was retained.");
+				void refresh();
+				if (recall.kind === "searching") void searchMemory(recall.query);
 			})();
 		},
 		closeForget() {
-			const opener = ui.pendingForget?.opener ?? "memory-query";
+			if (ui.forgetting || !ui.pendingForget) return;
+			const { opener } = ui.pendingForget;
 			set("state", (ui) => {
 				ui.pendingForget = null;
-				ui.forgetting = false;
 				ui.forgetNotice = "";
 			});
 			focusKey(opener);
@@ -296,35 +479,82 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			});
 		},
 		setNav(open) {
+			if (open && !mobile.matches) return;
 			set("state", (ui) => {
 				ui.navOpen = open;
 			});
-			focusKey(open ? `nav-${ui.section}` : "menu");
+			if (open) navButtons.get(ui.section)?.focus();
+			else menuButton.focus({ preventScroll: true });
 		},
 		signOut() {
-			void (async () => {
-				try {
-					await port.logout();
-				} catch {
-					fail("Sign out could not be confirmed. Close this tab, then stop the web command in its terminal.");
-					return;
-				}
-				set("state", (ui) => {
-					ui.signedOut = true;
-					ui.view = null;
-					ui.details = null;
-					ui.draft = "";
-					ui.unknown = null;
-					ui.pendingForget = null;
-					ui.connection = "offline";
-				});
-				announce("Signed out. Your agent keeps running.");
-			})();
+			if (ui.signedOut) return;
+			const revocation = port.logout().catch(() => "unconfirmed" as const);
+			set("state", (ui) => {
+				ui.signedOut = true;
+				ui.logoutNotice = "Signed out locally. Confirming remote session revocation…";
+				ui.missionDraft = null;
+				ui.missionReceipt = null;
+				ui.view = null;
+				ui.chatEntries = [];
+				ui.chatHistory = { kind: "unstarted" };
+				ui.details = null;
+				ui.draft = "";
+				ui.unknown = null;
+				ui.pendingForget = null;
+				ui.forgetting = null;
+				ui.query = "";
+				ui.recall = { kind: "idle" };
+				ui.graph = null;
+				ui.runTools = [];
+				ui.finishedTools = [];
+				ui.connection = "offline";
+			});
+			chat.destroy();
+			chat.root.replaceChildren();
+			missionEditor = null;
+			missionDraftBody.replaceChildren();
+			missionPanel.replaceChildren();
+			void revocation.then((outcome) => {
+				const notice = outcome === "revoked" ? "" : "Remote revocation could not be confirmed. Stop the web command in its terminal.";
+				set("state", (ui) => { ui.logoutNotice = notice; });
+				announce(notice || "Signed out. Your agent keeps running.");
+			});
 		},
 	};
 
 	// ── The shell, built once. ──
 	const chat: ChatView = createChat(context);
+	const missionPanel = attrs(
+		el("div", "order-first max-h-[48dvh] min-h-0 overflow-y-auto border-b border-stroke-3 px-3 py-3 lg:order-last lg:max-h-none lg:w-[25rem] lg:shrink-0 lg:border-b-0 lg:border-l"),
+		{ "data-scroll": "mission-draft" },
+	);
+	missionPanel.hidden = true;
+	const missionDraftBody = el("div", "min-w-0");
+	const missionDraftNotices = el("div", "flex flex-col gap-2 empty:hidden");
+	const dismissMissionDraft = button({
+		label: "Close mission draft", key: "mission-draft-close", variant: "ghost",
+		onClick: () => {
+			set("state", (ui) => { ui.missionDraft = null; });
+			if (!coarsePointer()) chat.focus();
+			else main.focus({ preventScroll: true });
+		},
+	});
+	const checkMissionDraft = button({
+		label: "Refresh draft", key: "mission-draft-refresh", onClick: () => void refreshMissionDraft(),
+	});
+	const discardMissionEdits = button({
+		label: "Discard edits and review latest", key: "mission-draft-discard", variant: "ghost",
+		onClick: () => {
+			void refreshMissionDraft("", "discard-edits");
+			focusKey("mission-draft-heading");
+		},
+	});
+	missionPanel.append(el("div", "flex min-w-0 flex-col gap-2",
+		missionDraftNotices, missionDraftBody,
+		el("div", "flex flex-wrap gap-2", checkMissionDraft, discardMissionEdits, dismissMissionDraft),
+	));
+	const chatPage = el("div", "flex min-h-0 min-w-0 flex-1 flex-col lg:flex-row", chat.root, missionPanel);
+	const mobile = matchMedia("(width < 48rem)");
 	const main = attrs(el("main", "flex min-h-0 min-w-0 flex-1 flex-col outline-none"), { id: "main", tabindex: "-1" });
 	const navButtons = new Map<Section, HTMLButtonElement>();
 	const agentTab = el("span", "truncate");
@@ -359,6 +589,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		el("footer", "flex h-5 shrink-0 items-stretch overflow-hidden bg-sidebar px-1.5 text-xs text-fg-3 pb-[env(safe-area-inset-bottom)] box-content"),
 		{ "aria-label": "Status bar" },
 	);
+	const statusText = document.createTextNode("");
 	const scrim = el("div", "fixed inset-0 z-30 bg-scrim animate-fade md:hidden");
 	scrim.hidden = true;
 	scrim.addEventListener("click", () => act.setNav(false));
@@ -393,6 +624,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 	);
 	root.replaceChildren(app, dialog, toaster.root, live);
 
+	let missionPanelKey = "";
 	// ── Patching: every region compares what it shows with the state and changes only what differs. ──
 	let pageShown: Section | null = null;
 	let bandsSignature = "";
@@ -411,10 +643,20 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 	function patchSidebar(): void {
 		const open = ui.navOpen;
 		sidebar.className = open
-			? "fixed inset-y-0 left-0 z-40 flex w-[16.25rem] max-w-[85vw] flex-col bg-sidebar shadow-float animate-fade md:static md:z-auto md:max-w-none md:shadow-none"
+			? "fixed inset-y-0 left-0 z-40 flex w-[16.25rem] max-w-[85vw] flex-col bg-sidebar shadow-float animate-fade"
 			: "flex w-[16.25rem] shrink-0 flex-col bg-sidebar max-md:hidden";
 		scrim.hidden = !open;
 		menuButton.setAttribute("aria-expanded", String(open));
+		workspace.inert = open;
+		statusbar.inert = open;
+		skip.inert = open;
+		if (open) {
+			sidebar.setAttribute("role", "dialog");
+			sidebar.setAttribute("aria-modal", "true");
+		} else {
+			sidebar.removeAttribute("role");
+			sidebar.removeAttribute("aria-modal");
+		}
 		agentTab.textContent = name();
 		for (const [section, item] of navButtons) {
 			item.setAttribute("aria-current", ui.section === section ? "page" : "false");
@@ -450,14 +692,134 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 
 	function patchPage(change: Change): void {
 		if (ui.section === "chat") {
-			if (pageShown !== "chat") main.replaceChildren(chat.root);
+			if (pageShown !== "chat") main.replaceChildren(chatPage);
 			pageShown = "chat";
 			chat.update(change);
+			if (change === "state") patchMissionDraft();
 			return;
 		}
 		if (change === "stream" && pageShown === ui.section) return;
 		pageShown = ui.section;
-		preserve(main, () => pages[ui.section as Exclude<Section, "chat">](context()));
+		preserve(main, () => ui.section === "mission"
+			? renderMission(context(), missionEntryAvailable(ui) ? openMissionDraft : undefined)
+			: pages[ui.section as Exclude<Section, "chat" | "mission">](context()));
+	}
+
+	function patchMissionDraft(): void {
+		const panel = ui.missionDraft;
+		const mission = ui.details?.mission;
+		missionPanel.hidden = panel === null || !mission;
+		if (!panel || !mission) {
+			if (missionPanelKey === "") return;
+			missionPanelKey = "";
+			missionEditor = null;
+			missionDraftBody.replaceChildren();
+			missionDraftNotices.replaceChildren();
+			return;
+		}
+		const { draft, review, agreement, missing } = mission;
+		const { unsaved } = panel;
+		const receipt = ui.missionReceipt;
+		const recorded = agreement && mission.agreementValid && draft === null;
+		const expectedRevision = missionRevision(mission);
+		const issued = receipt && expectedRevision <= receipt.revision && !(recorded && agreement.revision === receipt.revision)
+			? receipt : null;
+		const blocked = ui.details?.owner?.held === true || !["not-implemented", "not-started", "stopped", "completed"].includes(mission.execution);
+		const offline = ui.connection !== "connected";
+		const key = JSON.stringify([panel, ui.connection, ui.detailsFailed, blocked, mission.formationAvailable, mission.canAgree,
+			mission.authority, draft, review, agreement, recorded, issued, missing]);
+		if (key === missionPanelKey) return;
+		missionPanelKey = key;
+
+		const busy = panel.status === "saving" || panel.status === "refreshing";
+		const unavailable = panel.status === "needs-refresh" || !mission.formationAvailable;
+		const disabled = offline || blocked || ui.detailsFailed;
+		checkMissionDraft.disabled = offline || busy;
+		dismissMissionDraft.disabled = busy;
+		dismissMissionDraft.textContent = unsaved ? "Discard edits and close" : "Close mission draft";
+		discardMissionEdits.hidden = unsaved === null;
+		discardMissionEdits.disabled = offline || busy;
+
+		const progress = issued
+			? `Approval receipt ${issued.receiptId} was issued for revision ${issued.revision}. ${panel.status === "refreshing"
+				? "Checking the recorded agreement."
+				: issued.reconciled
+					? "The agreement is not recorded in the current status. Refresh to check again."
+					: "Reconciliation is pending."} Do not submit approval again.`
+			: panel.status === "saving" ? "Applying the mission change…"
+				: panel.status === "refreshing" ? "Reading the latest mission draft…"
+					: unavailable ? "A fresh mission draft is not available. Refresh to check current status." : "";
+		const conflict = unsaved?.conflicted
+			? `${expectedRevision > unsaved.revision ? `Revision ${expectedRevision} is now current.` : "The saved mission draft changed."} Your edits based on revision ${unsaved.revision} are kept here but cannot be saved. Copy any text you want to keep, then discard your edits to review the latest terms.`
+			: "";
+		missionDraftNotices.replaceChildren(...[
+			panel.notice ? callout({ tone: "warn", role: "alert", body: panel.notice }) : null,
+			conflict ? callout({ tone: "warn", role: "alert", body: conflict }) : null,
+			progress ? callout({ tone: "info", role: "status", body: progress }) : null,
+			blocked && !busy ? callout({ tone: "warn", body: ui.details?.owner?.held
+				? "The service is held for maintenance." : "Stop the current work before changing the mission." }) : null,
+		].filter((notice) => notice !== null));
+
+		if (unsaved && missionEditor) {
+			// Recreating a native number or date input loses invalid partial text, even if `.value` is saved.
+			missionEditor.view.update(panel.status === "saving" ? "locked"
+				: disabled || busy || unavailable || issued || unsaved.conflicted ? "local-only" : "ready");
+			return;
+		}
+
+		const restoreFocus = missionDraftBody.contains(document.activeElement);
+		const previous = agreement ? { revision: agreement.revision, terms: agreedTerms(mission, agreement) } : undefined;
+		let body: HTMLElement;
+		missionEditor = null;
+		if (busy || unavailable || issued) {
+			body = attrs(el("h2", "font-semibold", "Mission draft"), { id: "mission-draft-heading" });
+		} else if (recorded && (agreement.revision === panel.localAgreementRevision || agreement.revision === receipt?.revision)) {
+			const byYou = agreement.approvedBy === "developer-local" && agreement.revision === panel.localAgreementRevision ||
+				agreement.approvedBy === "local-creator" && agreement.revision === receipt?.revision;
+			body = renderMissionDraftCard({ kind: "agreed", agreement, byYou, disabled });
+		} else if (draft?.status === "proposed" && draft.terms && panel.editRevision !== draft.revision) {
+			const digest = missionProposalDigest(mission);
+			const web = mission.canAgree && (mission.authority === "developer-local" ||
+				(mission.authority === "managed-administrator" && review !== null && mission.previousReceipt !== undefined));
+			const previousReceipt = mission.authority === "managed-administrator" ? review?.previousReceipt : undefined;
+			body = renderMissionDraftCard({
+				kind: "review",
+				missionId: draft.missionId,
+				revision: draft.revision,
+				digest,
+				terms: draft.terms,
+				previous,
+				disabled,
+				binding: mission.authority === "developer-local" ? { kind: "developer-local" } : review ? { kind: "managed", review } : null,
+				approval: digest === null ? { kind: "unavailable" }
+					: web ? { kind: "web", onAgree: (snapshot) => void mutateMission({
+						operation: "agree", ...snapshot, ...(previousReceipt === undefined ? {} : { previousReceipt }),
+					}, mission) }
+						: { kind: "terminal", line: missionApprovalCommand(context(), draft.revision, digest), copy: act.copy },
+				onEdit: () => set("state", (ui) => { ui.missionDraft = { ...panel, editRevision: draft.revision }; }),
+			});
+		} else {
+			const view = createMissionDraftEditor({
+				expectedRevision,
+				terms: draft?.terms ?? previous?.terms ?? {},
+				saved: draft?.status === "editing",
+				missing: draft === null || draft.status === "proposed" ? [] : missing,
+				onDirty: () => set("state", (ui) => {
+					if (ui.missionDraft) ui.missionDraft.unsaved = { revision: expectedRevision, conflicted: false };
+				}),
+				onSave: (expectedRevision, terms) => void mutateMission({ operation: "draft", expectedRevision, terms }, mission),
+				onReview: (expectedRevision) => void mutateMission({ operation: "propose", expectedRevision }, mission),
+			});
+			view.update(disabled ? "locked" : "ready");
+			missionEditor = { base: mission, view };
+			body = view.root;
+		}
+		const top = missionPanel.scrollTop;
+		missionDraftBody.replaceChildren(body);
+		missionPanel.scrollTop = top;
+		const heading = missionDraftBody.querySelector<HTMLElement>("#mission-draft-heading");
+		if (heading) heading.tabIndex = -1;
+		if (restoreFocus) heading?.focus({ preventScroll: true });
 	}
 
 	function patchRail(change: Change): void {
@@ -473,7 +835,8 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		const parts: Node[] = [
 			el("span", `${item} shrink-0`, dot(connection.tone), el("span", connection.tone === "idle" ? "" : connection.color, connection.word)),
 		];
-		if (ui.connection === "connected") parts.push(el("span", `${item} min-w-0 truncate`, dot(state.tone), el("span", "truncate", state.text)));
+		statusText.data = state.text;
+		if (ui.connection === "connected") parts.push(el("span", `${item} min-w-0 truncate`, dot(state.tone), el("span", "truncate", statusText)));
 		const right = el("div", "ml-auto flex min-w-0 items-stretch max-md:hidden");
 		const view = ui.view;
 		if (view?.model) right.append(el("span", `${item} min-w-0`, icon("cpu", "size-3 shrink-0"), el("span", "truncate", view.model.modelId)));
@@ -492,6 +855,8 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			dialog.replaceChildren();
 			return;
 		}
+		// A native close request can be non-cancelable without user activation.
+		dialog.setAttribute("closedby", ui.forgetting ? "none" : "closerequest");
 		preserve(dialog, () => renderForgetDialog(context()));
 		if (!dialog.open) {
 			dialog.showModal();
@@ -513,6 +878,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 					"div",
 					"flex w-full max-w-[28rem] flex-col gap-3 rounded-md border border-line bg-bubble p-5 shadow-float max-sm:p-4",
 					el("h1", "text-md font-semibold text-fg", "Signed out. Your agent keeps running."),
+					ui.logoutNotice ? attrs(el("p", "text-base text-fg-2", ui.logoutNotice), { role: "status" }) : null,
 					el("p", "text-base text-fg-2", "To come back, run its web command in the terminal where it runs, reload this page and enter the new code:"),
 					command(cmd, "copy-web", act.copy),
 				),
@@ -529,11 +895,11 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 	}
 
 	function buildSidebar(): HTMLElement {
-		const nav = attrs(el("nav", "flex flex-col gap-px px-2.5 pt-1.5"), { "aria-label": "Workspace" });
+		const nav = attrs(el("nav", "flex min-h-0 flex-1 flex-col gap-px overflow-y-auto overscroll-y-contain px-2.5 py-1.5"), { "aria-label": "Workspace" });
 		for (const section of sections) {
 			const item = el(
 				"button",
-				"group flex h-7 w-full min-w-0 items-center gap-2 rounded-xs px-2 text-left text-base font-medium text-fg-2 transition-colors duration-100 hover:bg-hover hover:text-fg aria-[current=page]:bg-fill aria-[current=page]:text-fg pointer-coarse:h-11",
+				"group flex h-7 w-full min-w-0 shrink-0 items-center gap-2 rounded-xs px-2 text-left text-base font-medium text-fg-2 transition-colors duration-100 hover:bg-hover hover:text-fg aria-[current=page]:bg-fill aria-[current=page]:text-fg pointer-coarse:h-11",
 				icon(section.icon, "size-4 shrink-0 text-fg-3 group-hover:text-fg-2 group-aria-[current=page]:text-fg"),
 				el("span", "truncate", section.label),
 			);
@@ -565,12 +931,34 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			signOut,
 			el("span", "ml-auto truncate pr-1 font-mono text-2xs text-fg-3", version),
 		);
-		return attrs(el("aside", "", head, tabs, nav, el("div", "min-h-4 flex-1"), foot), { id: "sidebar", "aria-label": "Sidebar" });
+		return attrs(el("aside", "", head, tabs, nav, foot), { id: "sidebar", "aria-label": "Workspace menu" });
 	}
 
 	// ── Events. ──
+	const onWidth = () => {
+		if (!mobile.matches && ui.navOpen) {
+			set("state", (ui) => {
+				ui.navOpen = false;
+			});
+			if (!sidebar.contains(document.activeElement)) navButtons.get(ui.section)?.focus();
+		} else if (mobile.matches && sidebar.contains(document.activeElement)) {
+			menuButton.focus({ preventScroll: true });
+		}
+	};
+	mobile.addEventListener("change", onWidth);
 	const onKey = (event: KeyboardEvent) => {
-		if (destroyed || ui.signedOut || event.metaKey || event.ctrlKey || event.altKey || event.isComposing || ui.pendingForget) return;
+		if (destroyed || ui.signedOut || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || event.isComposing || ui.pendingForget) return;
+		if (ui.navOpen && event.key === "Tab") {
+			const controls = sidebar.querySelectorAll("button");
+			const first = controls[0];
+			const last = controls[controls.length - 1];
+			const active = document.activeElement;
+			if (!sidebar.contains(active) || active === (event.shiftKey ? first : last)) {
+				event.preventDefault();
+				(event.shiftKey ? last : first)?.focus();
+			}
+			return;
+		}
 		const target = event.target;
 		const typing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement;
 		if (typing && event.key !== "Escape") return;
@@ -582,18 +970,22 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		if (!document.hidden) document.title = baseTitle;
 	};
 	document.addEventListener("visibilitychange", onVisible);
-	// Elapsed time while replying ages every second; relative times on pages ("next wake in 5 min") every 30 s.
+	// Age the elapsed reply label without replacing its node or repainting any other region.
 	const secondTimer = setInterval(() => {
-		if (ui.view?.busy && !ui.signedOut) patchStatusbar();
+		if (!ui.view?.busy || ui.signedOut || ui.connection !== "connected") return;
+		const next = agentState(ui, Date.now()).text;
+		if (statusText.data !== next) statusText.data = next;
 	}, 1000);
-	const minuteTimer = setInterval(() => set("state", () => {}), 30_000);
 
 	const unsubscribe = store.subscribe(render);
 	const unwatch = port.watch((event) => {
 		if (destroyed || ui.signedOut) return;
 		if (event.type === "connection") {
+			if (ui.missionDraft?.status === "refreshing") ++missionVersion;
 			set("state", (ui) => {
 				ui.connection = event.state;
+				if (ui.missionDraft?.status === "ready" || ui.missionDraft?.status === "refreshing")
+					ui.missionDraft = { ...ui.missionDraft, status: "needs-refresh" };
 			});
 			announce(event.state === "connecting" ? "Reconnecting" : event.state === "expired" ? "Session ended" : "Offline");
 			return;
@@ -601,6 +993,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		const next = event.view;
 		const previous = ui.view;
 		const wasBusy = previous?.busy === true;
+		const reconnect = ui.connection !== "connected" && previous !== null;
 		const change: Change = ui.connection === "connected" && previous !== null && sameFrame(previous, next) ? "stream" : "state";
 		set(change, (ui) => {
 			if (!wasBusy && next.busy) {
@@ -622,6 +1015,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			}
 			if (!next.busy) ui.cancelling = false;
 			ui.view = next;
+			ui.chatEntries = mergeChatEntries(ui.chatEntries, next.entries, "live");
 			ui.connection = "connected";
 		});
 		if (wasBusy !== next.busy) announce(next.busy ? "Working" : ui.stopped ? "Stopped" : "Reply finished");
@@ -629,6 +1023,10 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			if (document.hidden) document.title = `● ${name()} replied`;
 			void refresh();
 		}
+		if (ui.missionDraft && ui.missionDraft.status !== "saving" && (reconnect || next.tools.some((tool) =>
+			tool.name === "unit_mission_draft" && tool.status === "succeeded" &&
+			!previous?.tools.some((seen) => seen.callId === tool.callId && seen.status === "succeeded")
+		))) void refreshMissionDraft();
 	});
 	render("state");
 	void refresh();
@@ -636,20 +1034,52 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		destroyed = true;
 		unwatch();
 		unsubscribe();
-		chat.destroy();
+		if (!ui.signedOut) chat.destroy();
 		document.removeEventListener("keydown", onKey);
+		mobile.removeEventListener("change", onWidth);
 		document.removeEventListener("visibilitychange", onVisible);
 		clearInterval(secondTimer);
-		clearInterval(minuteTimer);
 		root.replaceChildren();
+	};
+}
+
+function missionRevision(mission: MissionSnapshot): number {
+	return mission.draft?.revision ?? mission.agreement?.revision ?? 0;
+}
+
+function sameMissionDraft(a: MissionSnapshot, b: MissionSnapshot): boolean {
+	return missionRevision(a) === missionRevision(b) && a.draft?.missionId === b.draft?.missionId &&
+		a.draft?.status === b.draft?.status && a.draft?.digest === b.draft?.digest;
+}
+
+function missionEntryAvailable(ui: Readonly<Ui>): boolean {
+	return ui.connection === "connected" && !ui.detailsFailed && ui.details?.mission.formationAvailable === true;
+}
+
+function agreedTerms(mission: MissionSnapshot, agreement: NonNullable<MissionSnapshot["agreement"]>): MissionDraftTerms {
+	const { limits } = agreement;
+	return {
+		objective: mission.objective ?? undefined,
+		scope: mission.scope ?? undefined,
+		successCriteria: agreement.successCriteria,
+		approvalBoundary: agreement.approvalBoundary,
+		reviewEveryMs: agreement.reviewEveryMs,
+		policy: {
+			allowedTools: agreement.allowedTools,
+			maxCycles: limits.maxCycles,
+			maxRequests: limits.maxRequests,
+			maxRetries: limits.maxRetries,
+			maxConsecutiveNoProgress: limits.maxNoProgress,
+			deadlineAt: limits.deadlineAt,
+			maxEstimatedCost: limits.maxEstimatedCost ?? undefined,
+		},
 	};
 }
 
 /** Keys the workspace reacts to outside text fields (Escape also inside them); one table, no key checks in handlers. */
 const shortcuts: readonly { key: string; run: (act: Actions, ui: Readonly<Ui>) => boolean }[] = [
 	{ key: "Escape", run: (act, ui) => ui.navOpen && (act.setNav(false), true) },
-	{ key: "Escape", run: (act, ui) => ui.view?.busy === true && (act.cancel(), true) },
-	{ key: "/", run: (act, ui) => ui.section !== "chat" && (act.go("chat"), true) },
+	{ key: "/", run: (act, ui) => !ui.navOpen && ui.section !== "chat" && (act.go("chat"), true) },
 ];
 
 /** True when only the live text or tool rows changed, so the frame (bands, pages, rail) stays as it is. */

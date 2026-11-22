@@ -55,9 +55,16 @@ export function parseMissionRequest(value: unknown): MissionRequest {
 						? ["operation", "expectedRevision", "requestId", "terms"]
 						: input.operation === "approve-local"
 							? ["operation", "expectedRevision", "requestId", "digest"]
-							: ["operation", "expectedRevision", "requestId"];
+							: input.operation === "agree"
+								? ["operation", "revision", "requestId", "digest"]
+								: ["operation", "expectedRevision", "requestId"];
 	if (Object.keys(input).some((key) => !fields.includes(key))) throw new Error("Unknown mission command field.");
 	if (input.operation === "status") return { operation: "status" };
+	if (input.operation === "agree") {
+		const requestId = missionText(input.requestId);
+		if (!requestId.trim()) throw new Error("Mission changes need a request ID.");
+		return { operation: "agree", revision: revision(input.revision, 1), digest: digest(input.digest), requestId };
+	}
 	if (input.operation === "reconcile") return { operation: "reconcile", receiptId: missionText(input.receiptId) };
 	if (input.operation === "configure-local")
 		return {

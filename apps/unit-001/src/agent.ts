@@ -13,6 +13,7 @@ import {
 	defineEntry,
 	defineExtension,
 	defineTool,
+	type EntryId,
 	type EntryRecord,
 	type Extension,
 	Harness,
@@ -63,6 +64,7 @@ import type { MissionLocation } from "./missions/authority.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import { MissionControl } from "./missions/control.ts";
 import { missionController } from "./missions/controller.ts";
+import { missionDraftTool } from "./missions/draft-tool.ts";
 import { MissionOwner } from "./missions/owner.ts";
 import { isLoopTask, loopParkedForMaintenance } from "./missions/loop-drain.ts";
 import { MissionPurposeDoc } from "./missions/purpose.ts";
@@ -78,6 +80,7 @@ import {
 	sendAdmission,
 	sendDigest,
 } from "./send-receipt.ts";
+import { type ChatHistoryPage, projectChatHistoryPage } from "./service-view.ts";
 import type { SideRequest, SideResult } from "./side-control.ts";
 import { controlSides, initializeSideRegistry, type SideOwner } from "./side.ts";
 import { type EvidenceScope, EVIDENCE_SCAN_ENTRIES, projectToolEvidence, type ToolEvidence } from "./tool-evidence.ts";
@@ -85,6 +88,8 @@ import { type EvidenceScope, EVIDENCE_SCAN_ENTRIES, projectToolEvidence, type To
 export interface AgentOptions {
 	readonly storage: Storage;
 	readonly name?: string;
+	/** The installed unit-001 version, stated in the agent's identity; omitted when the host does not know it. */
+	readonly version?: string;
 	readonly models: Models;
 	readonly model: ModelChoice | null;
 	readonly mission?: MissionLocation;
@@ -193,7 +198,7 @@ export class Agent {
 		if ((options.platform ?? process.platform) === "win32") {
 			registry.install(defineExtension({ name: "powershell", tools: [createPowerShellTool()] }));
 		}
-		registry.install(orientationExtension(runtime));
+		registry.install(orientationExtension(runtime, options.version));
 		registry.install(introspectionExtension());
 		let inspect!: InspectionReader;
 		registry.install(ownerInspectionExtension((query, ctx) => inspect(query, ctx)));
@@ -216,6 +221,7 @@ export class Agent {
 							output: [{ type: "text", text: JSON.stringify(await mission.inspect(ctx)) }],
 						}),
 					}),
+					missionDraftTool((request, ctx) => mission.handle(request, ctx)),
 				],
 			}),
 		);
@@ -485,6 +491,22 @@ export class Agent {
 	/** Watches bounded transcript and live state through this session's sole storage owner. */
 	watchConversation(context: Context): Promise<ConversationWatch> {
 		return this.#root.watch(context, { min: 20, max: 20 });
+	}
+
+	/** Reads one bounded page from the retained root transcript, even while execution is held or inhibited. */
+	async chatHistory(before: number | null, context: Context): Promise<ChatHistoryPage> {
+		if (before === 1) return { entries: [], nextBefore: null };
+		const page = await this.#root.entries(
+			{
+				order: "descending",
+				// The wire validates positive safe integers, and Durable takes an inclusive entry ID bound.
+				...(before === null ? {} : { maxEntryId: (before - 1) as EntryId }),
+			},
+			20,
+			undefined,
+			context,
+		);
+		return projectChatHistoryPage(page);
 	}
 
 	/**

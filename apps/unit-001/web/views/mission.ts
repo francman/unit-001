@@ -1,31 +1,35 @@
-// Mission page: the agreed purpose, the current work run, recorded checks and history; read-only.
+// Mission page: the agreed purpose, the current work run, recorded checks, history and the entry to authoring.
 import type { MissionAgreementView, MissionRunView, WorkspaceDetails } from "../contract.ts";
 import { type Ctx, commandName, runBlocked } from "../state.ts";
 import { callout, command, emptyState, tag } from "../ui/blocks.ts";
 import { surfaces, text } from "../ui/classes.ts";
+import { button } from "../ui/controls.ts";
 import { type Child, el } from "../ui/dom.ts";
 import { ago, count, dateTime, duration, humanize, money, until } from "../ui/format.ts";
 import { facts, listRow, pageFrame, panel, rowList, section } from "../ui/page.ts";
 import { bullets, chips, limitRow, runStates, unknownSentence } from "../ui/run.ts";
 
 const approvers: Record<MissionAgreementView["approvedBy"], string> = {
-	"local-creator": "you, in a terminal",
+	"local-creator": "the local creator",
 	"host-administrator": "the host administrator",
 	"developer-local": "a developer in a local source checkout",
 };
 
 const creators = { human: "you", elder: "an elder", organization: "an organization" } as const;
 
-/** Renders the Mission page; anything that changes the agent is a copyable terminal command, never a button. */
-export function renderMission(ctx: Ctx): HTMLElement {
+/** Opens Mission authoring only when the shell supplies a working entry point. */
+export function renderMission(ctx: Ctx, openDraft?: () => void): HTMLElement {
 	const details = ctx.ui.details;
 	const run = details?.mission.run ?? null;
 	const state = run ? runStates[run.status] : null;
+	const entry = details && openDraft
+		? button({ label: details.mission.agreement ? "Amend mission" : "Define mission", key: "open-mission-draft", onClick: openDraft })
+		: null;
 	const { root, body } = pageFrame({
 		title: "Mission",
 		key: "mission",
 		lead: details?.mission.objective ?? "No purpose agreed yet.",
-		actions: state ? [tag(state.word, state.tone)] : [],
+		actions: [state ? tag(state.word, state.tone) : null, entry],
 	});
 	if (!details) {
 		body.append(missingDetails(ctx));
@@ -33,7 +37,7 @@ export function renderMission(ctx: Ctx): HTMLElement {
 	}
 	const sections = [
 		...needsYou(ctx, details),
-		purposeSection(ctx, details),
+		purposeSection(ctx, details, openDraft !== undefined),
 		currentWork(details, run),
 		evidenceSection(run),
 		historySection(),
@@ -43,10 +47,23 @@ export function renderMission(ctx: Ctx): HTMLElement {
 	return root;
 }
 
-/** The terminal command for this installation: `sudo` first when the owner acts through the host administrator. */
-function terminal(ctx: Ctx, rest: string, privileged = false): string {
-	const managed = ctx.ui.view?.installationId !== null && ctx.ui.view?.installationId !== undefined;
-	return `${privileged && managed ? "sudo " : ""}${commandName(ctx.name)} ${rest}`;
+/** Formats the existing terminal approval command for this exact proposal. */
+export function missionApprovalCommand(ctx: Ctx, revision: number, digest: string): string {
+	const sudo = ctx.ui.details?.mission.authority === "managed-administrator" ? "sudo " : "";
+	return `${sudo}${terminal(ctx, `mission approve --revision ${revision} --digest ${digest}`)}`;
+}
+
+/** Uses only the digest the gateway bound to the managed proposal; a pre-upgrade owner digest is not enough. */
+export function missionProposalDigest({ draft, review, authority, previousReceipt }: WorkspaceDetails["mission"]): string | null {
+	if (draft?.status !== "proposed") return null;
+	if (authority !== "managed-administrator") return draft.digest;
+	return review && review.missionId === draft.missionId && review.revision === draft.revision &&
+		review.digest === draft.digest && review.previousReceipt === previousReceipt ? review.digest : null;
+}
+
+/** The terminal command uses the installation's reported name. */
+function terminal(ctx: Ctx, rest: string): string {
+	return `${commandName(ctx.name)} ${rest}`;
 }
 
 /** What the owner has to do, one callout per case, each with one sentence and one command. */
@@ -71,12 +88,13 @@ function needsYou(ctx: Ctx, details: WorkspaceDetails): HTMLElement[] {
 	return items;
 }
 
-function purposeSection(ctx: Ctx, details: WorkspaceDetails): HTMLElement {
+function purposeSection(ctx: Ctx, details: WorkspaceDetails, canOpenDraft: boolean): HTMLElement {
 	const { mission } = details;
 	const agreement = mission.agreement;
-	const proposed = mission.draft?.status === "proposed" && mission.draft.digest !== null ? mission.draft : null;
+	const proposed = mission.draft?.status === "proposed" ? mission.draft : null;
+	const digest = missionProposalDigest(mission);
 	const children: Child[] = [];
-	if (mission.objective === null) children.push(emptyState("target", "No purpose has been agreed yet. Agreeing one happens in a terminal."));
+	if (mission.objective === null) children.push(emptyState("target", canOpenDraft ? "No purpose has been agreed yet." : "No purpose has been agreed yet. Agreeing one happens in a terminal."));
 	else {
 		const rows: (readonly [string, Child])[] = [["Purpose", el("span", text.strong, mission.objective)]];
 		if (mission.scope) rows.push(["Scope", mission.scope]);
@@ -92,25 +110,37 @@ function purposeSection(ctx: Ctx, details: WorkspaceDetails): HTMLElement {
 				["Approval receipt", receipt(mission)],
 			);
 		children.push(panel(el("div", surfaces.panelBody, facts(rows))));
-		if (!agreement && !proposed) children.push(el("p", text.description, "Not approved yet. Approval happens in a terminal."));
+		if (!agreement && !proposed) children.push(el("p", text.description, canOpenDraft ? "Not approved yet." : "Not approved yet. Approval happens in a terminal."));
 	}
-	if (proposed && proposed.digest !== null)
+	if (proposed && ctx.ui.missionReceipt?.revision === proposed.revision)
+		children.push(el("p", text.description, "Approval receipt issued. Check the recorded agreement before acting again."));
+	else if (proposed && digest !== null)
 		children.push(
 			callout({
 				tone: "info",
 				title: "Waiting for your approval.",
-				body: `Draft revision ${proposed.revision} is proposed. Approving it is a step you take in a terminal.`,
-				children: [command(terminal(ctx, `mission approve --revision ${proposed.revision} --digest ${proposed.digest}`, true), "copy-mission-approve", ctx.act.copy)],
+				body: canOpenDraft
+					? `Draft revision ${proposed.revision} is proposed. Open the draft to review it, or approve it in a terminal.`
+					: `Draft revision ${proposed.revision} is proposed. Approving it is a step you take in a terminal.`,
+				children: [command(missionApprovalCommand(ctx, proposed.revision, digest), "copy-mission-approve", ctx.act.copy)],
 			}),
 		);
+	else if (proposed) children.push(el("p", text.description, `Draft revision ${proposed.revision} is proposed, but this session has no reviewed digest.`));
 	else if (mission.draft?.status === "editing") children.push(el("p", text.description, `A draft (revision ${mission.draft.revision}) is still being written and has not been proposed.`));
+	if (!canOpenDraft && mission.formationAvailable === false)
+		children.push(el("p", text.description, "Web drafting is not available in this session."));
 	return section({ title: "Purpose", icon: "target", children });
 }
 
-/** Whether the stored approval still holds, as a tag and the owner's reason when it does not. */
+/** Whether the stored approval still holds, without displaying owner diagnostics. */
 function receipt(mission: WorkspaceDetails["mission"]): HTMLElement {
 	if (mission.agreementValid) return tag("Valid", "ok", "check");
-	return el("span", "inline-flex flex-wrap items-center gap-2", tag("Not valid", "warn", "warning"), mission.authorityError ?? null);
+	return el(
+		"span",
+		"inline-flex flex-wrap items-center gap-2",
+		tag("Not valid", "warn", "warning"),
+		mission.authorityError === "invalid-authority" ? "Mission authority could not be verified." : null,
+	);
 }
 
 function currentWork(details: WorkspaceDetails, run: MissionRunView | null): HTMLElement | null {

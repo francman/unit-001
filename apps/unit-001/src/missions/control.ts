@@ -13,15 +13,19 @@ import {
 } from "./authority.ts";
 import {
 	initialFormation,
+	type MissionApproval,
 	type MissionAuthority,
 	type MissionDraft,
+	type MissionDraftTerms,
 	type MissionRequest,
+	type MissionTerms,
 	type MissionView,
 	missingMissionTerms,
 	parseMissionDraftTerms,
 } from "./contract.ts";
 import { MissionExecutionDoc } from "./execution-state.ts";
 import { importLegacyAgreements, readMissionPurpose, recordLegacyAgreement } from "./purpose.ts";
+import { MissionRefusal } from "./refusal.ts";
 import { MissionDoc } from "./state.ts";
 
 /** Owns one session's mission formation; it contains no controller, model request or execution admission. */
@@ -142,6 +146,16 @@ export class MissionControl {
 		if (this.#location.session !== "default")
 			throw new Error("Mission formation belongs to the default owner session.");
 		if (request.operation === "status") return this.inspect(context);
+		if (request.operation === "agree") {
+			// The owner shares the service UID with the agent's tools, so on a managed host it never mints a receipt itself.
+			if (this.#location.kind !== "developer-local")
+				throw new MissionRefusal(
+					"managed-requires-gateway",
+					"Managed agreement is issued by the creator's own gateway or administrator command.",
+				);
+			const { revision, digest, requestId } = request;
+			return this.handle({ operation: "approve-local", expectedRevision: revision, digest, requestId }, context);
+		}
 		if (request.operation === "configure-local") {
 			if (this.#location.kind !== "developer-local")
 				throw new Error("Managed creator and authority changes require the administrator command.");
@@ -167,65 +181,10 @@ export class MissionControl {
 			return this.inspect(context);
 		}
 		const authority = await readMissionAuthority(this.#location);
-		if (request.operation === "approve-local" || request.operation === "reconcile") {
-			const current = (await this.#harness.snapshot(MissionExecutionDoc, context))?.current;
+		if (request.operation === "approve-local") return this.#approveLocal(request, authority, context);
+		if (request.operation === "reconcile") {
 			const agreement = (await this.#harness.snapshot(MissionDoc, context))?.formation.agreement;
-			const retry =
-				request.operation === "reconcile"
-					? agreement?.approval.receiptId === request.receiptId
-					: agreement?.approval.requestId === request.requestId;
-			if (!retry && current && current.state.status !== "stopped" && current.state.status !== "completed")
-				throw new Error("Stop the existing mission execution before approving an amendment.");
-		}
-		if (request.operation === "approve-local") {
-			if (this.#location.kind !== "developer-local" || authority === null)
-				throw new Error("Managed approval requires an exact administrator receipt.");
-			const formation = (await this.#harness.snapshot(MissionDoc, context))?.formation;
-			if (formation?.agreement?.approval.requestId === request.requestId) {
-				if (
-					formation.agreement.revision !== request.expectedRevision ||
-					formation.agreement.digest !== request.digest
-				)
-					throw new Error("Conflicting approval request ID.");
-				return this.inspect(context);
-			}
-			const draft = formation?.draft;
-			if (
-				!draft ||
-				draft.status !== "proposed" ||
-				draft.revision !== request.expectedRevision ||
-				draft.digest !== request.digest
-			)
-				throw new Error("Stale mission approval; inspect the exact proposal again.");
-			const terms = validateMissionTerms(draft.terms, authority, this.#tools, this.#now());
-			const digest = missionDigest(terms, draft.missionId, draft.revision, authority);
-			if (digest !== request.digest) throw new Error("Mission authority changed; propose the draft again.");
-			const previous = authority.approvals.find((item) => item.requestId === request.requestId);
-			if (previous && previous.digest !== digest) throw new Error("Conflicting approval request ID.");
-			if (!previous) await this.#requirePurpose(context);
-			const receipt = previous ?? {
-				receiptId: randomUUID(),
-				requestId: request.requestId,
-				installationId: null,
-				session: "default",
-				missionId: draft.missionId,
-				revision: draft.revision,
-				digest,
-				creator: authority.creator,
-				authorityRevision: authority.revision,
-				approvedAt: this.#now(),
-				provenance: "developer-local" as const,
-				approvedBy: { kind: "developer-local" as const, uid: process.getuid?.() ?? null },
-			};
-			const currentReceipt = authority.approvals.find(
-				(item) => item.receiptId === formation.agreement?.approval.receiptId,
-			);
-			await writeMissionAuthority(this.#location, {
-				...authority,
-				approvals:
-					currentReceipt && currentReceipt.receiptId !== receipt.receiptId ? [currentReceipt, receipt] : [receipt],
-			});
-			return this.handle({ operation: "reconcile", receiptId: receipt.receiptId }, context);
+			if (agreement?.approval.receiptId !== request.receiptId) await this.#requireStopped(context);
 		}
 		// A proposal is what the managed administrator command approves, so the purpose check also precedes its receipt.
 		if (request.operation === "propose") await this.#requirePurpose(context);
@@ -240,7 +199,7 @@ export class MissionControl {
 		const fingerprint = createHash("sha256").update(JSON.stringify(request)).digest("hex");
 		await this.#harness.commit(async (tx) => {
 			if ((await tx.doc(MaintenanceDoc)).current.state === "held")
-				throw new Error("Service is held for maintenance.");
+				throw new MissionRefusal("held", "Service is held for maintenance.");
 			const state = await tx.doc(MissionDoc);
 			const formation = state.formation;
 			if (request.operation === "reconcile") {
@@ -277,12 +236,13 @@ export class MissionControl {
 				return;
 			}
 			if (formation.lastOperation?.requestId === request.requestId) {
-				if (formation.lastOperation.digest !== fingerprint) throw new Error("Conflicting mission request ID.");
+				if (formation.lastOperation.digest !== fingerprint)
+					throw new MissionRefusal("conflicting-request", "Conflicting mission request ID.");
 				return;
 			}
 			const expected = formation.draft?.revision ?? formation.agreement?.revision ?? 0;
 			if (request.expectedRevision !== expected)
-				throw new Error("Stale mission revision; inspect the saved draft again.");
+				throw new MissionRefusal("stale-revision", "Stale mission revision; inspect the saved draft again.");
 			if (request.operation === "draft") {
 				const draft: MissionDraft = {
 					missionId:
@@ -297,9 +257,11 @@ export class MissionControl {
 				};
 				formation.draft = draft;
 			} else {
-				if (!formation.draft || authority === null)
-					throw new Error("Save a draft and configure its creator authority first.");
-				const terms = validateMissionTerms(formation.draft.terms, authority, this.#tools, this.#now());
+				if (!formation.draft)
+					throw new MissionRefusal("incomplete", "Save a draft and configure its creator authority first.");
+				if (authority === null)
+					throw new MissionRefusal("outside-authority", "Save a draft and configure its creator authority first.");
+				const terms = agreeableTerms(formation.draft.terms, authority, this.#tools, this.#now());
 				formation.draft.digest = missionDigest(
 					terms,
 					formation.draft.missionId,
@@ -317,6 +279,79 @@ export class MissionControl {
 		return this.inspect(context);
 	}
 
+	// Every refusal comes before the receipt is published; once it is, a failure is reported as pending, never a refusal.
+	async #approveLocal(
+		request: Extract<MissionRequest, { operation: "approve-local" }>,
+		authority: MissionAuthority | null,
+		context: Context,
+	): Promise<MissionView> {
+		if (this.#location.kind !== "developer-local" || authority === null)
+			throw new Error("Managed approval requires an exact administrator receipt.");
+		const formation = (await this.#harness.snapshot(MissionDoc, context))?.formation;
+		if (formation?.agreement?.approval.requestId === request.requestId) {
+			if (formation.agreement.revision !== request.expectedRevision || formation.agreement.digest !== request.digest)
+				throw new MissionRefusal("conflicting-request", "Conflicting approval request ID.");
+			return this.inspect(context);
+		}
+		const issued = authority.approvals.find((item) => item.requestId === request.requestId);
+		if (issued) {
+			if (issued.revision !== request.expectedRevision || issued.digest !== request.digest)
+				throw new MissionRefusal("conflicting-request", "Conflicting approval request ID.");
+			return this.#reconcileIssued(issued.receiptId, context);
+		}
+		await this.#requireStopped(context);
+		if ((await this.#harness.snapshot(MaintenanceDoc, context))?.current.state === "held")
+			throw new MissionRefusal("held", "Service is held for maintenance.");
+		const draft = formation?.draft;
+		if (!draft || draft.status !== "proposed" || draft.revision !== request.expectedRevision)
+			throw new MissionRefusal("stale-revision", "Stale mission approval; inspect the exact proposal again.");
+		if (draft.digest !== request.digest)
+			throw new MissionRefusal("stale-digest", "Stale mission approval; inspect the exact proposal again.");
+		const terms = agreeableTerms(draft.terms, authority, this.#tools, this.#now());
+		const digest = missionDigest(terms, draft.missionId, draft.revision, authority);
+		if (digest !== request.digest)
+			throw new MissionRefusal("stale-digest", "Mission authority changed; propose the draft again.");
+		await this.#requirePurpose(context);
+		const receipt: MissionApproval = {
+			receiptId: randomUUID(),
+			requestId: request.requestId,
+			installationId: null,
+			session: "default",
+			missionId: draft.missionId,
+			revision: draft.revision,
+			digest,
+			creator: authority.creator,
+			authorityRevision: authority.revision,
+			approvedAt: this.#now(),
+			provenance: "developer-local",
+			approvedBy: { kind: "developer-local", uid: process.getuid?.() ?? null },
+		};
+		const currentReceipt = authority.approvals.find((item) => item.receiptId === formation?.agreement?.approval.receiptId);
+		await writeMissionAuthority(this.#location, {
+			...authority,
+			approvals: currentReceipt ? [currentReceipt, receipt] : [receipt],
+		});
+		return this.#reconcileIssued(receipt.receiptId, context);
+	}
+
+	// A hold or failure here leaves a published receipt unrecorded: a plain error (pending), which a retry of the same
+	// request ID or the next owner start reconciles. It must never surface as a refusal, which would claim nothing changed.
+	async #reconcileIssued(receiptId: string, context: Context): Promise<MissionView> {
+		try {
+			return await this.handle({ operation: "reconcile", receiptId }, context);
+		} catch (error) {
+			throw new Error(
+				`Mission agreement ${receiptId} is issued but not yet recorded; a retry of the same request or the next owner start records it while it is current. ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	async #requireStopped(context: Context): Promise<void> {
+		const current = (await this.#harness.snapshot(MissionExecutionDoc, context))?.current;
+		if (current && current.state.status !== "stopped" && current.state.status !== "completed")
+			throw new MissionRefusal("execution-active", "Stop the existing mission execution before approving an amendment.");
+	}
+
 	// A new receipt closes the agreed revision at once, so it is issued only when this release can also record its purpose.
 	async #requirePurpose(context: Context): Promise<void> {
 		try {
@@ -326,5 +361,20 @@ export class MissionControl {
 				`Mission purpose records are unreadable by this release; the agreed revision stays in force. ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
+	}
+}
+
+// Terms the creator cannot agree yet are a refusal: missing fields are incomplete, anything else exceeds creator authority.
+function agreeableTerms(
+	draft: MissionDraftTerms,
+	authority: MissionAuthority,
+	tools: readonly string[],
+	now: number,
+): MissionTerms {
+	try {
+		return validateMissionTerms(draft, authority, tools, now);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new MissionRefusal(missingMissionTerms(draft).length > 0 ? "incomplete" : "outside-authority", message);
 	}
 }

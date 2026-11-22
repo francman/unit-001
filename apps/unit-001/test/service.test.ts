@@ -7,13 +7,31 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import {
+	AssistantEntry,
+	createRegistry,
+	defineEntry,
+	Harness,
+	ResetEntry,
+	ROOT_CONVERSATION_ID,
+	ToolResultEntry,
+	UserEntry,
+} from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "../src/agent.ts";
 import { parseArguments } from "../src/args.ts";
+import { HostFactEntry } from "../src/commands/facts.ts";
 import { acquireSessionLock } from "../src/lock.ts";
 import { sendDigest } from "../src/send-receipt.ts";
-import { requestService, runService, type ServiceView, serviceEndpoint, watchService } from "../src/service.ts";
+import {
+	parseServiceResponse,
+	requestService,
+	runService,
+	type ServiceView,
+	serviceEndpoint,
+	watchService,
+} from "../src/service.ts";
 
 let directory: string;
 const cleanup: (() => Promise<void>)[] = [];
@@ -333,6 +351,97 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 		});
 		expect(service.faux.state.callCount).toBe(0);
 	});
+	it("unit-hn1 refuses operator operations outside the allowlist before dispatch", async () => {
+		const service = await launch([], undefined, join(directory, "operator"));
+		const operatorPath = service.operatorPath!;
+		const view = await service.agent.mission({ operation: "status" }, BACKGROUND_CONTEXT);
+		const mission = vi.spyOn(service.agent, "mission").mockResolvedValue(view);
+		const channels = vi.spyOn(service.agent, "channels");
+		const refused = { type: "error", message: "This operation requires the administrator endpoint." };
+		// Allowed: an operator drafts the one-shot mission, as attach /mission setup does.
+		const draft = {
+			type: "mission",
+			request: { operation: "draft", expectedRevision: 0, requestId: "operator-draft", terms: { objective: "x" } },
+		} as const;
+		expect(await requestService(operatorPath, draft, signal())).toMatchObject({ type: "mission" });
+		expect(mission).toHaveBeenCalledTimes(1);
+		// Each other multiplexed allowlist key has one positive case; watch is gated like every other operation.
+		expect(
+			await requestService(operatorPath, { type: "mission", request: { operation: "propose", expectedRevision: 1, requestId: "operator-propose" } }, signal()),
+		).toMatchObject({ type: "mission" });
+		expect(mission).toHaveBeenCalledTimes(2);
+		expect(await requestService(operatorPath, { type: "channels", request: { operation: "status" } }, signal())).not.toEqual(refused);
+		channels.mockClear();
+		const watched = new AbortController();
+		let firstView = false;
+		await watchService(
+			operatorPath,
+			() => {
+				firstView = true;
+				watched.abort();
+			},
+			watched.signal,
+		);
+		expect(firstView).toBe(true);
+		// Proposing purpose terms grants nothing (approval needs the root-owned receipt), so operators may send it.
+		const purpose = {
+			type: "mission",
+			request: {
+				operation: "purpose-propose",
+				expectedRevision: 0,
+				requestId: "operator-purpose",
+				terms: {
+					purpose: "Keep the report current",
+					scope: "reports",
+					reviewEveryMs: 60_000,
+					works: [
+						{
+							kind: "artifact-digest",
+							path: "reports/summary.md",
+							sha256: "a".repeat(64),
+							instructions: "Refresh the summary",
+							maxCycles: 1,
+							maxRequests: 1,
+							maxRetries: 0,
+							maxConsecutiveNoProgress: 1,
+						},
+					],
+					lifetime: { maxWorkItems: 1, maxCycles: 1, maxRequests: 1, deadlineAt: Date.now() + 86_400_000 },
+				},
+			},
+		};
+		expect(await requestService(operatorPath, purpose as never, signal())).toMatchObject({ type: "mission" });
+		expect(mission).toHaveBeenCalledTimes(3);
+		for (const request of [
+			{ operation: "configure-local", creator: {}, ceiling: {} },
+			{ operation: "purpose-approve-local", revision: 1, digest: "b".repeat(64), requestId: "operator" },
+			{ operation: "reconcile-purpose", receiptId: "operator" },
+			{ operation: "operate-local", action: "open", expectedOperationRevision: 0, requestId: "operator" },
+			{ operation: "reconcile-operation", requestId: "operator" },
+		])
+			expect(await requestService(operatorPath, { type: "mission", request } as never, signal())).toEqual(refused);
+		expect(mission).toHaveBeenCalledTimes(3);
+		expect(
+			await requestService(
+				operatorPath,
+				{ type: "channels", request: { operation: "setup", channelId: "telegram" } } as never,
+				signal(),
+			),
+		).toEqual(refused);
+		expect(channels).not.toHaveBeenCalled();
+		// Unknown operations, top-level or multiplexed, get the same refusal instead of a parser error.
+		for (const request of [
+			{ type: "shutdown" },
+			{ type: "mission", request: { operation: "self-destruct" } },
+			{ type: "memory", request: {} },
+			{ type: "mission" },
+		])
+			expect(await requestService(operatorPath, request as never, signal())).toEqual(refused);
+		// The administrator endpoint is unchanged: the same purpose request still reaches its handler.
+		expect(await requestService(service.path, purpose as never, signal())).toMatchObject({ type: "mission" });
+		expect(mission).toHaveBeenCalledTimes(4);
+		expect(mission.mock.calls[3]?.[0]).toMatchObject({ operation: "purpose-propose" });
+	});
 	it("#33 retains coding tools for trusted operator chat", async () => {
 		const service = await launch(
 			[
@@ -414,6 +523,206 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 		});
 		expect(service.faux.state.callCount).toBe(1);
 	});
+
+	it("pages retained chat history on the root across hidden entries, maintenance, and reopen", async () => {
+		const context = BACKGROUND_CONTEXT;
+		const harness = await Harness.open(
+			await openNodeSqliteStorage(join(directory, "session.sqlite")),
+			{ models: createModels(), registry: createRegistry() },
+			context,
+		);
+		const hiddenEntry = defineEntry<{ text: string }>("test.chat.hidden");
+		const escapedText = "\u0001".repeat(4097);
+		const seeded = await (async () => {
+			try {
+				const root = await harness.root(context);
+				const other = await harness.createConversation({ ownership: { kind: "ownerless" } }, context);
+				return await harness.commit(async (tx) => {
+					const appendHidden = () => tx.appendEntry(hiddenEntry, root.id, { data: { text: "hidden detail" } });
+					const oldest = await tx.appendEntry(UserEntry, root.id, {
+						model: [{ role: "user", content: "Oldest input", timestamp: 1 }],
+					});
+					for (let i = 0; i < 9; i++) await appendHidden();
+					const sixth = await tx.appendEntry(AssistantEntry, root.id, { model: [reply("Sixth visible row")] });
+					const emitted = [];
+					const between = [];
+					for (let i = 0; i < 5; i++) {
+						between.push(await appendHidden());
+						emitted.push(
+							i === 0
+								? await tx.appendEntry(HostFactEntry, root.id, {
+										data: { role: "user", text: escapedText, input: "private host input", facts: null },
+									})
+								: await tx.appendEntry(AssistantEntry, root.id, { model: [reply(escapedText)] }),
+						);
+					}
+					const foreign = await tx.appendEntry(AssistantEntry, other.id, { model: [reply("Foreign chat")] });
+					const hiddenBoundary = await tx.appendEntry(ResetEntry, root.id, { head: "self" });
+					for (let i = 0; i < 18; i++) await appendHidden();
+					await tx.appendEntry(ToolResultEntry, root.id, {
+						data: { diagnostics: [] },
+						model: [
+							{
+								role: "toolResult",
+								toolCallId: "hidden-call",
+								toolName: "read",
+								content: [fauxText("private tool output")],
+								isError: false,
+								timestamp: 1,
+							},
+						],
+					});
+					return { oldest, sixth, emitted, between, foreign, hiddenBoundary };
+				}, context);
+			} finally {
+				await harness.close(context);
+			}
+		})();
+		const service = await launch([], undefined, join(directory, "operator"));
+		const operator = service.operatorPath!;
+		const read = (before: number | null, path = operator) =>
+			requestService(path, { type: "chat-history", before }, signal());
+		const watcher = new AbortController();
+		let initialView: ServiceView | undefined;
+		await watchService(
+			operator,
+			(view) => {
+				initialView = view;
+				watcher.abort();
+			},
+			watcher.signal,
+		);
+		expect(initialView).toMatchObject({ entries: [], historyTruncated: true });
+		const hiddenPage = { type: "chat-history", page: { entries: [], nextBefore: seeded.hiddenBoundary.id } };
+		expect(await read(null)).toEqual(hiddenPage);
+		expect(await read(Number.MAX_SAFE_INTEGER, service.path)).toEqual(hiddenPage);
+		const lastPage = {
+			type: "chat-history",
+			page: {
+				entries: [
+					{ id: seeded.oldest.id, role: "user", text: "Oldest input", truncated: false },
+					{ id: seeded.sixth.id, role: "assistant", text: "Sixth visible row", truncated: false },
+				],
+				nextBefore: null,
+			},
+		};
+		const firstVisible = await read(seeded.hiddenBoundary.id);
+		expect(firstVisible).toEqual({
+			type: "chat-history",
+			page: {
+				entries: seeded.emitted.map(({ id }, index) => ({
+					id,
+					role: index === 0 ? "user" : "assistant",
+					text: escapedText.slice(0, 4096),
+					truncated: true,
+					...(index === 0 ? { source: "host" } : {}),
+				})),
+				nextBefore: seeded.between[0]!.id,
+			},
+		});
+		expect(await read(seeded.foreign.id)).toEqual(firstVisible);
+		const empty = { type: "chat-history", page: { entries: [], nextBefore: null } };
+		expect(await read(1)).toEqual(empty);
+		expect(await read(seeded.oldest.id)).toEqual(empty);
+		expect(await read(seeded.between[0]!.id)).toEqual(lastPage);
+
+		expect(
+			await requestService(
+				service.path,
+				{ type: "maintenance-enter", operationId: "history-hold", timeoutMs: 0 },
+				signal(),
+			),
+		).toMatchObject({ state: "held" });
+		const scanRoot = () =>
+			service.storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 100, undefined, context);
+		const before = await scanRoot();
+		const commit = vi.spyOn(service.storage, "commit");
+		const scan = vi.spyOn(service.storage, "scanEntries");
+		expect(await read(seeded.hiddenBoundary.id)).toEqual(firstVisible);
+		expect(scan).toHaveBeenCalledExactlyOnceWith(
+			{ conversationId: ROOT_CONVERSATION_ID, order: "descending", maxEntryId: seeded.hiddenBoundary.id - 1 },
+			20,
+			undefined,
+			context,
+		);
+		expect(commit).not.toHaveBeenCalled();
+		expect(await scanRoot()).toEqual(before);
+		expect(service.faux.state.callCount).toBe(0);
+		await service.close();
+
+		const reopened = await launch([], undefined, join(directory, "reopened"));
+		const reopenedOperator = reopened.operatorPath!;
+		expect(await requestService(reopenedOperator, { type: "status" }, signal())).toMatchObject({
+			inhibited: true,
+			maintenance: { state: "held" },
+		});
+		const reopenedCommit = vi.spyOn(reopened.storage, "commit");
+		expect(await read(null, reopenedOperator)).toEqual(hiddenPage);
+		expect(await read(seeded.between[0]!.id, reopenedOperator)).toEqual(lastPage);
+		expect(reopenedCommit).not.toHaveBeenCalled();
+		expect(
+			await reopened.storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 100, undefined, context),
+		).toEqual(before);
+		expect(
+			await requestService(reopenedOperator, { type: "send", prompt: "Held input", requestId: "held" }, signal()),
+		).toMatchObject({ type: "error" });
+		expect(await requestService(reopenedOperator, { type: "admission", requestId: "held" }, signal())).toEqual({
+			type: "admission",
+			admission: { status: "not-found" },
+		});
+		expect(reopened.faux.state.callCount).toBe(0);
+	});
+
+	it("rejects invalid chat history requests before dispatch on either socket", async () => {
+		const service = await launch([], undefined, join(directory, "operator"));
+		const read = vi.spyOn(service.agent, "chatHistory");
+		for (const fields of [
+			{},
+			{ before: 0 },
+			{ before: -1 },
+			{ before: 1.5 },
+			{ before: Number.MAX_SAFE_INTEGER + 1 },
+			{ before: "1" },
+			{ before: null, conversationId: 1 },
+			{ before: 20, limit: 5 },
+		]) {
+			for (const path of [service.path, service.operatorPath!]) {
+				expect(await requestService(path, { type: "chat-history", ...fields } as never, signal())).toEqual({
+					type: "error",
+					message: "Invalid chat history request.",
+				});
+			}
+		}
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	it("decodes only closed chat history replies that respect the exclusive request bound", () => {
+		const row = { id: 10, role: "assistant", text: "Retained reply", truncated: false, source: "host" };
+		const response = { type: "chat-history", page: { entries: [row], nextBefore: 10 } };
+		expect(parseServiceResponse(JSON.stringify(response), 11)).toEqual(response);
+		for (const value of [
+			{ ...response, diagnostics: {} },
+			{ ...response, page: { ...response.page, tools: [] } },
+			...[
+				{ ...response.page, nextBefore: undefined },
+				{ ...response.page, nextBefore: 11 },
+				{ ...response.page, nextBefore: 0 },
+				{ entries: [], nextBefore: 11 },
+				{ entries: [], nextBefore: Number.MAX_SAFE_INTEGER + 1 },
+				{ entries: [{ ...row, id: 9 }], nextBefore: 10 },
+				{ entries: [{ ...row, id: 11 }], nextBefore: null },
+				{ entries: [row, row], nextBefore: null },
+				{ entries: [row, { ...row, id: 9 }], nextBefore: null },
+				{ entries: Array.from({ length: 6 }, (_, id) => ({ ...row, id: id + 1 })), nextBefore: null },
+				{ entries: [{ ...row, text: "x".repeat(4097) }], nextBefore: null },
+				{ entries: [{ ...row, source: "tool" }], nextBefore: null },
+				{ entries: [{ ...row, model: [] }], nextBefore: null },
+			].map((page) => ({ type: "chat-history", page })),
+		])
+			expect(() => parseServiceResponse(JSON.stringify(value), 11)).toThrow();
+		expect(() => parseServiceResponse(JSON.stringify(response), 10)).toThrow();
+	});
+
 	it("keeps the second watcher alive through queued prompts and a tool round after the first detaches", async () => {
 		// #21: structural snapshots retain committed answers even when intermediate updates fold.
 		let resume!: () => void;

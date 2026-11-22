@@ -8,9 +8,6 @@ import { attrs, type Child, el } from "../ui/dom.ts";
 import { duration, plural } from "../ui/format.ts";
 import { facts, listRow, pageFrame, panel, rowList, section } from "../ui/page.ts";
 
-/** Where "purpose" is explained today; switch to the Mission page when it exists. */
-const purposePage: Section = "status";
-
 /** The published releases page named in the README; the only external link, since the docs host is not decided. */
 const releasesUrl = "https://github.com/francman/unit-001-releases/releases";
 
@@ -81,7 +78,7 @@ function purposeSection(ctx: Ctx, details: Details | null): HTMLElement {
 					"div",
 					`flex flex-wrap items-center justify-between gap-x-4 gap-y-2 ${surfaces.panelBody}`,
 					el("p", `min-w-0 flex-1 ${objective ? text.strong : text.body}`, sentence),
-					openLink(ctx, purposePage, "Open Status", "about-purpose"),
+					openLink(ctx, "mission", "Open Mission", "about-purpose"),
 				),
 			),
 		],

@@ -2,19 +2,32 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { browserWorkspacePort, parseMemoryGraph, parseWorkspaceView } from "./port.ts";
 
-class Events {
-	static current: Events;
-	closed = false;
-	onerror: (() => void) | null = null;
-	constructor() {
-		Events.current = this;
-	}
-	addEventListener() {}
-	close() {
-		this.closed = true;
-	}
+const session = { sessionToken: "a".repeat(64), csrfToken: "b".repeat(64), expiresAt: Date.now() + 1_800_000 };
+const newerToken = "c".repeat(64);
+
+afterEach(() => {
+	vi.unstubAllGlobals();
+	vi.useRealTimers();
+});
+
+const createPort = () => browserWorkspacePort(session);
+
+function storedToken() {
+	let token: string | null = session.sessionToken;
+	vi.stubGlobal("navigator", { locks: { request: async (_name: string, update: () => void) => update() } });
+	vi.stubGlobal("localStorage", {
+		getItem: () => token,
+		removeItem: () => { token = null; },
+	});
+	return {
+		read: () => token,
+		replace: () => { token = newerToken; },
+	};
 }
-afterEach(() => vi.unstubAllGlobals());
+
+function eventResponse(body: ReadableStream<Uint8Array> | string) {
+	return new Response(body, { headers: { "Content-Type": "text/event-stream; charset=utf-8" } });
+}
 
 function completed(init: RequestInit | undefined, response: unknown) {
 	const { requestId } = JSON.parse(String(init?.body));
@@ -22,19 +35,41 @@ function completed(init: RequestInit | undefined, response: unknown) {
 }
 
 describe("browser operator transport", () => {
+	it("reads closed history pages with an exclusive cursor, including empty continuation pages", async () => {
+		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+			completed(init, {
+				type: "chat-history",
+				page: { entries: [{ id: 12, role: "assistant", text: "Older answer", truncated: false, source: "host" }], nextBefore: 12 },
+			}),
+		);
+		vi.stubGlobal("fetch", fetch);
+		const port = createPort();
+		await expect(port.history(20)).resolves.toEqual({
+			entries: [{ id: 12, role: "assistant", text: "Older answer", truncated: false, source: "host" }],
+			nextBefore: 12,
+		});
+		expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)).operation).toEqual({ type: "chat-history", before: 20 });
+		fetch.mockImplementation(async (_input, init) =>
+			completed(init, { type: "chat-history", page: { entries: [], nextBefore: 9 } }),
+		);
+		await expect(port.history(12)).resolves.toEqual({ entries: [], nextBefore: 9 });
+		await expect(port.history(9)).rejects.toThrow("Invalid chat history continuation.");
+		expect(fetch).toHaveBeenCalledTimes(3);
+	});
+
 	it.each([400, 401, 403, 409, 429])("#65 distinguishes pre-dispatch HTTP %s from unknown delivery", async (status) => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => new Response("{}", { status })),
 		);
-		const port = browserWorkspacePort("csrf");
+		const port = createPort();
 		expect(await port.send("work", "stable")).toMatchObject({ state: "failed" });
 		expect(await port.forget("memory-id", "forget-stable")).toMatchObject({ state: "failed" });
 	});
 	it("#65 retains unknown delivery after post-dispatch session loss without replay", async () => {
 		const fetch = vi.fn(async () => Response.json({ requestId: "stable", state: "unknown", message: "session ended" }));
 		vi.stubGlobal("fetch", fetch);
-		const port = browserWorkspacePort("csrf");
+		const port = createPort();
 		expect(await port.send("work", "stable")).toMatchObject({ state: "unknown" });
 		expect(fetch).toHaveBeenCalledTimes(1);
 		expect(await port.forget("memory-id", "forget-stable")).toMatchObject({ state: "unknown" });
@@ -45,7 +80,7 @@ describe("browser operator transport", () => {
 			completed(init, { type: "send-failed" }),
 		);
 		vi.stubGlobal("fetch", fetch);
-		const port = browserWorkspacePort("csrf");
+		const port = createPort();
 		expect(await port.send("work", "id")).toEqual({
 			state: "failed-after-admission",
 			message: "The owner could not complete this request. Your message was sent.",
@@ -64,7 +99,7 @@ describe("browser operator transport", () => {
 	it("only accepts a matching operation acknowledgement for a mutation", async () => {
 		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => completed(init, { type: "sent" }));
 		vi.stubGlobal("fetch", fetch);
-		const port = browserWorkspacePort("csrf");
+		const port = createPort();
 		expect(await port.send("work", "send")).toEqual({ state: "completed" });
 		expect(await port.forget("memory-id", "forget")).toMatchObject({ state: "unknown" });
 		await expect(port.cancel("cancel")).rejects.toThrow("Unexpected operation response.");
@@ -87,7 +122,7 @@ describe("browser operator transport", () => {
 			Response.json({ requestId: "other", state: "completed", response: { type: "error", message: "sample" } }),
 		);
 		vi.stubGlobal("fetch", fetch);
-		const port = browserWorkspacePort("csrf");
+		const port = createPort();
 		expect(await port.send("work", "send")).toMatchObject({ state: "unknown" });
 		fetch.mockImplementation(async () => new Response("{}", { status: 502 }));
 		expect(await port.send("work", "send")).toMatchObject({ state: "unknown" });
@@ -98,31 +133,210 @@ describe("browser operator transport", () => {
 			completed(init, { type: "memory", result: { operation: "forget", removed: true } }),
 		);
 		vi.stubGlobal("fetch", fetch);
-		const port = browserWorkspacePort("csrf");
+		const port = createPort();
 		expect(await port.forget("memory-id", "same-explicit-id")).toEqual({ state: "completed" });
 		expect(await port.forget("memory-id", "same-explicit-id")).toEqual({ state: "completed" });
 		expect(fetch).toHaveBeenCalledTimes(2);
-		for (const call of fetch.mock.calls)
-			expect(JSON.parse(String(call[1]?.body))).toMatchObject({
+		for (const [path, init] of fetch.mock.calls) {
+			expect(path).toBe("/api/v1/requests");
+			expect(init).toMatchObject({
+				method: "POST",
+				credentials: "omit",
+				redirect: "error",
+				headers: { Authorization: `Bearer ${session.sessionToken}`, "X-Unit-CSRF": session.csrfToken },
+			});
+			expect(JSON.parse(String(init?.body))).toMatchObject({
 				requestId: "same-explicit-id",
 				operation: { request: { confirmed: true, id: "memory-id" } },
 			});
+		}
 	});
-	it("#65 observes expired sessions, closes the stream and treats already-revoked logout as success", async () => {
-		vi.stubGlobal("EventSource", Events);
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async (path: string) =>
-				path.endsWith("session") ? Response.json({ authenticated: false }) : new Response("{}", { status: 401 }),
-			),
+	it.each([false, true])("expires an active watch on POST 401 (newer token: %s)", async (replace) => {
+		const storage = storedToken();
+		const cancel = vi.fn();
+		const fetch = vi.fn(async (path: string, _init?: RequestInit) =>
+			path.endsWith("events")
+				? eventResponse(new ReadableStream({ cancel }))
+				: new Response("{}", { status: 401 }),
 		);
-		const port = browserWorkspacePort("csrf");
-		const events: unknown[] = [];
-		port.watch((event) => events.push(event));
-		Events.current.onerror?.();
-		await expect.poll(() => events).toContainEqual({ type: "connection", state: "expired" });
-		expect(Events.current.closed).toBe(true);
-		await expect(port.logout()).resolves.toBeUndefined();
+		vi.stubGlobal("fetch", fetch);
+		const port = createPort();
+		const receive = vi.fn();
+		port.watch(receive);
+		if (replace) storage.replace();
+		expect(await port.send("work", "expired")).toMatchObject({ state: "failed" });
+		expect(receive).toHaveBeenCalledExactlyOnceWith({ type: "connection", state: "expired" });
+		expect(cancel).toHaveBeenCalledTimes(1);
+		expect(storage.read()).toBe(replace ? newerToken : null);
+		expect(await port.forget("mem", "never-dispatched")).toMatchObject({ state: "failed" });
+		expect(fetch.mock.calls.map(([path]) => path)).toEqual(["/api/v1/events", "/api/v1/requests"]);
+	});
+
+	it("reconnects after EOF and reads authenticated SSE without replaying an uncertain write", async () => {
+		vi.useFakeTimers();
+		const view = { name: "unit", version: "1", installationId: null, model: null, usage: null, busy: false,
+			text: "café", textTruncated: false, historyTruncated: false, entries: [], tools: [] };
+		let attempts = 0;
+		const cancel = vi.fn();
+		const fetch = vi.fn(async (path: string, _init?: RequestInit) => {
+			if (path.endsWith("requests")) return Response.json({ requestId: "stable", state: "unknown" });
+			if (path.endsWith("session")) return Response.json({ authenticated: true, csrfToken: session.csrfToken, expiresAt: session.expiresAt });
+			if (++attempts === 1) return eventResponse(": heartbeat\n\nevent: connecting\ndata: {}\n\n");
+			return eventResponse(new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(`event: view\ndata: ${JSON.stringify(view)}\n\n`));
+				},
+				cancel,
+			}));
+		});
+		vi.stubGlobal("fetch", fetch);
+		const port = createPort();
+		const receive = vi.fn();
+		const unwatch = port.watch(receive);
+		expect(await port.send("work", "stable")).toMatchObject({ state: "unknown" });
+		await vi.advanceTimersByTimeAsync(2999);
+		expect(attempts).toBe(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(receive.mock.calls.map(([event]) => event)).toEqual([
+			{ type: "connection", state: "connecting" },
+			{ type: "connection", state: "offline" },
+			{ type: "view", view },
+		]);
+		expect(fetch.mock.calls.map(([path]) => path)).toEqual([
+			"/api/v1/events", "/api/v1/requests", "/api/v1/session", "/api/v1/events",
+		]);
+		for (const [path, init] of fetch.mock.calls) {
+			expect(init?.credentials).toBe("omit");
+			expect(new Headers(init?.headers).get("Authorization")).toBe(`Bearer ${session.sessionToken}`);
+			if (path.endsWith("events")) expect(new Headers(init?.headers).get("Accept")).toBe("text/event-stream");
+		}
+		unwatch();
+		expect(cancel).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(6000);
+		expect(fetch).toHaveBeenCalledTimes(4);
+	});
+
+	it.each([401, 200])("ends the watch when the stream is unauthorized or its session probe returns false (%s)", async (status) => {
+		vi.useFakeTimers();
+		const storage = storedToken();
+		const fetch = vi.fn(async (path: string) => {
+			if (path.endsWith("session")) return Response.json({ authenticated: false });
+			return status === 401 ? new Response("{}", { status }) : eventResponse("");
+		});
+		vi.stubGlobal("fetch", fetch);
+		const receive = vi.fn();
+		createPort().watch(receive);
+		await vi.advanceTimersByTimeAsync(6000);
+		expect(receive).toHaveBeenLastCalledWith({ type: "connection", state: "expired" });
+		expect(storage.read()).toBeNull();
+		expect(fetch).toHaveBeenCalledTimes(status === 401 ? 1 : 2);
+	});
+
+	it.each([false, true])("expires a quiet watch and aborts pending writes at the local deadline (newer token: %s)", async (replace) => {
+		vi.useFakeTimers();
+		const storage = storedToken();
+		const cancel = vi.fn();
+		const fetch = vi.fn(async (path: string, init?: RequestInit) => {
+			if (path.endsWith("events")) return eventResponse(new ReadableStream({ cancel }));
+			return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason)));
+		});
+		vi.stubGlobal("fetch", fetch);
+		const port = browserWorkspacePort({ ...session, expiresAt: Date.now() + 10 });
+		const receive = vi.fn();
+		port.watch(receive);
+		const pending = port.send("work", "in-flight");
+		if (replace) storage.replace();
+		await vi.advanceTimersByTimeAsync(10);
+		expect(receive).toHaveBeenCalledExactlyOnceWith({ type: "connection", state: "expired" });
+		expect(await pending).toMatchObject({ state: "unknown" });
+		expect(cancel).toHaveBeenCalledTimes(1);
+		expect(storage.read()).toBe(replace ? newerToken : null);
+		expect(fetch).toHaveBeenCalledTimes(2);
+	});
+
+	it.each([false, true])("stops the stream and clears only its own bearer on logout (newer token: %s)", async (replace) => {
+		const storage = storedToken();
+		const cancel = vi.fn();
+		const fetch = vi.fn(async (path: string, _init?: RequestInit) =>
+			path.endsWith("events") ? eventResponse(new ReadableStream({ cancel })) : new Response("{}", { status: 401 }),
+		);
+		vi.stubGlobal("fetch", fetch);
+		const port = createPort();
+		port.watch(vi.fn());
+		if (replace) storage.replace();
+		await expect(port.logout()).resolves.toBe("revoked");
+		expect(cancel).toHaveBeenCalledTimes(1);
+		expect(storage.read()).toBe(replace ? newerToken : null);
+		expect(fetch).toHaveBeenLastCalledWith("/api/v1/logout", expect.objectContaining({
+			credentials: "omit",
+			method: "POST",
+			headers: expect.objectContaining({ Authorization: `Bearer ${session.sessionToken}`, "X-Unit-CSRF": session.csrfToken }),
+		}));
+		await port.logout();
+		expect(fetch).toHaveBeenCalledTimes(2);
+	});
+
+	it.each([false, true])("ends the local session without replay when revocation is unconfirmed (network failure: %s)", async (network) => {
+		const storage = storedToken();
+		const cancel = vi.fn();
+		const fetch = vi.fn(async (path: string, init?: RequestInit) => {
+			if (path.endsWith("events")) return eventResponse(new ReadableStream({ cancel }));
+			if (path.endsWith("requests"))
+				return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason)));
+			if (network) throw new Error("response lost");
+			return new Response("{}", { status: 503 });
+		});
+		vi.stubGlobal("fetch", fetch);
+		const port = createPort();
+		port.watch(vi.fn());
+		const pending = port.send("work", "in-flight");
+		await expect(port.logout()).resolves.toBe("unconfirmed");
+		await expect(pending).resolves.toMatchObject({ state: "unknown" });
+		expect(storage.read()).toBeNull();
+		expect(cancel).toHaveBeenCalledTimes(1);
+		await expect(port.send("later", "not-dispatched")).resolves.toMatchObject({ state: "failed" });
+		await expect(port.logout()).resolves.toBe("unconfirmed");
+		expect(fetch.mock.calls.map(([path]) => path)).toEqual(["/api/v1/events", "/api/v1/requests", "/api/v1/logout"]);
+	});
+
+	it("distinguishes managed issuance, an exact refusal, and an unconfirmed request without replay", async () => {
+		const change = { operation: "agree", revision: 4, digest: "a".repeat(64), confirmed: true, previousReceipt: "previous" } as const;
+		const fetch = vi.fn(async (_path: string, _init?: RequestInit) =>
+			Response.json({ requestId: "click", state: "issued", receiptId: "receipt-4", reconciled: false }),
+		);
+		vi.stubGlobal("fetch", fetch);
+		const port = createPort();
+		await expect(port.mutateMission(change, "click")).resolves.toEqual({ state: "issued", receiptId: "receipt-4", reconciled: false });
+		expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toEqual({ requestId: "click", operation: { type: "mission", request: change } });
+		fetch.mockImplementationOnce(async () => Response.json({ requestId: "refused", state: "refused", code: "stale-authority" }));
+		await expect(port.mutateMission(change, "refused")).resolves.toEqual({ state: "refused", code: "stale-authority" });
+		fetch.mockImplementationOnce(async () => Response.json({ requestId: "limit", state: "refused", code: "agreement-limit" }));
+		await expect(port.mutateMission(change, "limit")).resolves.toEqual({ state: "refused", code: "agreement-limit" });
+		fetch.mockImplementationOnce(async () => Response.json({ requestId: "retired", state: "refused", code: "superseded" }));
+		await expect(port.mutateMission(change, "retired")).resolves.toEqual({ state: "unknown" });
+		fetch.mockImplementationOnce(async () => Response.json({ requestId: "other", state: "refused", code: "stale-revision" }));
+		await expect(port.mutateMission(change, "lost")).resolves.toEqual({ state: "unknown" });
+		await expect(port.mutateMission({ operation: "agree", revision: 4, digest: change.digest, confirmed: true }, "click")).resolves.toEqual({ state: "unknown" });
+		expect(fetch).toHaveBeenCalledTimes(6);
+	});
+
+	it("discards a late session probe after stopping the watch", async () => {
+		vi.useFakeTimers();
+		const storage = storedToken();
+		let finishProbe!: (response: Response) => void;
+		const probe = new Promise<Response>((resolve) => { finishProbe = resolve; });
+		const fetch = vi.fn(async (path: string) => path.endsWith("events") ? eventResponse("") : probe);
+		vi.stubGlobal("fetch", fetch);
+		const receive = vi.fn();
+		const unwatch = createPort().watch(receive);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(fetch).toHaveBeenCalledTimes(2);
+		unwatch();
+		finishProbe(Response.json({ authenticated: false }));
+		await vi.advanceTimersByTimeAsync(6000);
+		expect(receive).toHaveBeenCalledExactlyOnceWith({ type: "connection", state: "offline" });
+		expect(storage.read()).toBe(session.sessionToken);
+		expect(fetch).toHaveBeenCalledTimes(2);
 	});
 });
 
@@ -241,12 +455,19 @@ describe("browser operator details", () => {
 		installationId: null,
 		busy: false,
 		model: null,
+		usage: null,
 		text: "",
 		textTruncated: false,
 		historyTruncated: false,
 		entries: [],
 		tools: [],
 	};
+	it("requires positive strictly ascending live row IDs while allowing gaps", () => {
+		const entries = (ids: number[]) => ids.map((id) => ({ id, role: "user", text: "message", truncated: false }));
+		for (const ids of [[0], [-1], [3, 3], [7, 4], [1.2]])
+			expect(() => parseWorkspaceView({ ...base, entries: entries(ids) })).toThrow();
+		expect(parseWorkspaceView({ ...base, entries: entries([1, 9]) }).entries.map((row) => row.id)).toEqual([1, 9]);
+	});
 	it("parses usage, null usage and rejects negative or non-finite numbers", () => {
 		const usage = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 10, cost: { kind: "estimate", usd: 0.25 } };
 		expect(parseWorkspaceView({ ...base, usage }).usage).toEqual(usage);
@@ -273,24 +494,24 @@ describe("browser operator details", () => {
 	});
 	it("maps status to owner including held and unconfigured", async () => {
 		stubOwner({});
-		expect((await browserWorkspacePort("csrf").details()).owner).toEqual({
+		expect((await createPort().details()).owner).toEqual({
 			uptimeMs: 1234,
 			held: false,
 			inhibited: true,
 			configured: true,
 		});
 		stubOwner({ status: status("held", "unconfigured") });
-		expect((await browserWorkspacePort("csrf").details()).owner).toMatchObject({ held: true, configured: false });
+		expect((await createPort().details()).owner).toMatchObject({ held: true, configured: false });
 	});
 	it("leaves owner null when status fails without failing details", async () => {
 		stubOwner({ status: { type: "error", message: "x" } });
-		const details = await browserWorkspacePort("csrf").details();
+		const details = await createPort().details();
 		expect(details.owner).toBeNull();
 		expect(details.mission.stage).toBe("agreed");
 	});
 	it("parses agreement, run, tools and memory stats", async () => {
 		stubOwner({ agreement, run });
-		const details = await browserWorkspacePort("csrf").details();
+		const details = await createPort().details();
 		expect(details.mission.tools).toEqual(["read"]);
 		expect(details.mission.agreement).toEqual({
 			revision: 3,
@@ -299,6 +520,7 @@ describe("browser operator details", () => {
 			reviewEveryMs: 60000,
 			approvedAt: 1000,
 			approvedBy: "local-creator",
+			allowedTools: ["read"],
 			limits: { maxCycles: 5, maxRequests: 50, maxRetries: 2, maxNoProgress: 3, deadlineAt: 2000, maxEstimatedCost: null },
 		});
 		expect(details.mission.run).toEqual(run);
@@ -315,13 +537,13 @@ describe("browser operator details", () => {
 	it("keeps all mission tools in a full owner list and rejects an over-limit reply", async () => {
 		const tools = Array.from({ length: 128 }, (_, index) => `tool-${index}`);
 		stubOwner({ mission: { tools } });
-		expect((await browserWorkspacePort("csrf").details()).mission.tools).toEqual(tools);
+		expect((await createPort().details()).mission.tools).toEqual(tools);
 		stubOwner({ mission: { tools: [...tools, "extra"] } });
-		await expect(browserWorkspacePort("csrf").details()).rejects.toThrow("Invalid owner list.");
+		await expect(createPort().details()).rejects.toThrow("Invalid owner list.");
 	});
 	it("returns null agreement and run when absent", async () => {
 		stubOwner({});
-		const details = await browserWorkspacePort("csrf").details();
+		const details = await createPort().details();
 		expect(details.mission.agreement).toBeNull();
 		expect(details.mission.run).toBeNull();
 	});
@@ -333,12 +555,12 @@ describe("browser operator details", () => {
 			{ ...run, evidence: [{ criterion: "c", accepted: "yes", detail: "d", observedAt: 1 }] },
 		]) {
 			stubOwner({ run: bad });
-			await expect(browserWorkspacePort("csrf").details()).rejects.toThrow();
+			await expect(createPort().details()).rejects.toThrow();
 		}
 	});
 	it("maps channel health, failure and awaiting step and never exposes the confirmation url", async () => {
 		stubOwner({});
-		const details = await browserWorkspacePort("csrf").details();
+		const details = await createPort().details();
 		expect(details.channels[0]).toMatchObject({
 			awaiting: "telegram-confirmation",
 			failure: null,
@@ -349,31 +571,57 @@ describe("browser operator details", () => {
 	});
 	it("keeps the creator, authority, agreement validity, and draft the page needs", async () => {
 		stubOwner({ draft: { revision: 4, status: "proposed", digest: "d".repeat(64), terms: {} } });
-		const { mission } = await browserWorkspacePort("csrf").details();
+		const { mission } = await createPort().details();
 		expect(mission.creator).toEqual({ kind: "human", id: "owner" });
 		expect(mission.authority).toBe("developer-local");
 		expect(mission.agreementValid).toBe(true);
 		expect(mission.authorityError).toBeNull();
 		expect(mission.draft).toEqual({ revision: 4, status: "proposed", digest: "d".repeat(64) });
-		stubOwner({ mission: { creator: null, authority: "unconfigured", authorityError: "bad file" } });
-		expect((await browserWorkspacePort("csrf").details()).mission).toMatchObject({
+		stubOwner({ mission: { creator: null, authority: "invalid", authorityError: "invalid-authority" } });
+		expect((await createPort().details()).mission).toMatchObject({
 			creator: null,
-			authority: "unconfigured",
-			authorityError: "bad file",
+			authority: "invalid",
+			authorityError: "invalid-authority",
 			draft: null,
 		});
+	});
+	it("retains exact proposal terms and fails closed on an inconsistent review or missing capability", async () => {
+		const terms = { ...agreement.terms, objective: "exact\r\n\u202E" };
+		const digest = "a".repeat(64);
+		const draft = { missionId: "m1", revision: 4, status: "proposed", digest, terms };
+		const review = { missionId: "m1", revision: 4, digest, authorityRevision: 9, previousReceipt: "receipt-3" };
+		stubOwner({ draft, mission: { authority: "managed-administrator", canAgree: true, previousReceipt: "receipt-3", review } });
+		await expect(createPort().mission()).resolves.toMatchObject({ draft, review, canAgree: true, formationAvailable: true });
+		stubOwner({ draft, mission: { authority: "managed-administrator", canAgree: false, previousReceipt: "receipt-3", review } });
+		await expect(createPort().mission()).resolves.toMatchObject({ draft, review, canAgree: false, formationAvailable: true });
+		stubOwner({ draft, mission: { authority: "managed-administrator", canAgree: true, previousReceipt: "receipt-4", review } });
+		await expect(createPort().mission()).resolves.toMatchObject({ review: null, canAgree: false, formationAvailable: false });
+		stubOwner({ draft });
+		await expect(createPort().mission()).resolves.toMatchObject({ draft, canAgree: false, formationAvailable: false });
+		stubOwner({ draft: { ...draft, digest: null }, mission: { authority: "managed-administrator", canAgree: false } });
+		await expect(createPort().mission()).resolves.toMatchObject({ draft: { digest: null, terms }, canAgree: false, formationAvailable: true });
+	});
+	it("accepts completed developer-local agreement only for the requested revision and valid receipt", async () => {
+		const change = { operation: "agree", revision: 3, digest: "d".repeat(64), confirmed: true } as const;
+		stubOwner({ agreement });
+		const port = createPort();
+		await expect(port.mutateMission(change, "agree")).resolves.toMatchObject({ state: "completed", mission: { agreement: { revision: 3 } } });
+		await expect(port.mutateMission({ ...change, revision: 4 }, "different")).resolves.toEqual({ state: "unknown" });
+		stubOwner({ agreement, mission: { agreementValid: false } });
+		await expect(port.mutateMission(change, "invalid")).resolves.toEqual({ state: "unknown" });
 	});
 	it("rejects malformed mission authority fields", async () => {
 		for (const bad of [
 			{ authority: "root" },
 			{ agreementValid: "yes" },
+			{ authority: "invalid", authorityError: "unexpected internal path" },
 			{ creator: { kind: "robot", id: "x" } },
 		]) {
 			stubOwner({ mission: bad });
-			await expect(browserWorkspacePort("csrf").details()).rejects.toThrow();
+			await expect(createPort().details()).rejects.toThrow();
 		}
 		stubOwner({ draft: { revision: 1, status: "agreed", digest: null } });
-		await expect(browserWorkspacePort("csrf").details()).rejects.toThrow();
+		await expect(createPort().details()).rejects.toThrow();
 	});
 	it("recall returns null stats", async () => {
 		vi.stubGlobal(
@@ -382,7 +630,7 @@ describe("browser operator details", () => {
 				completed(init, { type: "memory", result: { operation: "recall", records: [] } }),
 			),
 		);
-		expect(await browserWorkspacePort("csrf").recall("q")).toEqual({ count: null, stats: null, records: [] });
+		expect(await createPort().recall("q")).toEqual({ count: null, stats: null, records: [] });
 	});
 });
 
@@ -415,7 +663,7 @@ describe("browser memory graph", () => {
 			completed(init, { type: "memory", result: graph }),
 		);
 		vi.stubGlobal("fetch", fetch);
-		const view = await browserWorkspacePort("csrf").memoryGraph();
+		const view = await createPort().memoryGraph();
 		expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)).operation).toEqual({
 			type: "memory",
 			request: { operation: "graph" },
@@ -434,19 +682,19 @@ describe("browser memory graph", () => {
 				completed(init, { type: "error", message: "x" }),
 			),
 		);
-		await expect(browserWorkspacePort("csrf").memoryGraph()).rejects.toThrow();
+		await expect(createPort().memoryGraph()).rejects.toThrow();
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => Response.json({ state: "unknown", message: "x" })),
 		);
-		await expect(browserWorkspacePort("csrf").memoryGraph()).rejects.toThrow();
+		await expect(createPort().memoryGraph()).rejects.toThrow();
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
 				completed(init, { type: "memory", result: { operation: "recall", records: [] } }),
 			),
 		);
-		await expect(browserWorkspacePort("csrf").memoryGraph()).rejects.toThrow();
+		await expect(createPort().memoryGraph()).rejects.toThrow();
 	});
 	it("accepts the limits and a limited graph", () => {
 		const nodes = Array.from({ length: 300 }, (_, index) => node(`m${index}`, { content: "語".repeat(280), truncated: true }));

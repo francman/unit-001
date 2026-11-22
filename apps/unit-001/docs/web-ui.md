@@ -20,7 +20,7 @@ Pairing grants the operator's existing conversation and coding authority. Keep t
 
 The gateway runs in a separate process as the operator. Managed installations reject owner/root web launches; the launcher resolves only the installation's existing operator socket. It never opens SQLite or private credentials. Creator approval, connection grants, security changes, updates and lifecycle administration have no browser endpoints. Source-checkout launches use the developer's existing owner socket and authority.
 
-Only exact `http://127.0.0.1:PORT` origins and loopback peers are accepted. Every request checks Host and Origin; forwarded headers are rejected. Writes additionally require same-origin JSON and an in-memory CSRF token. The host-only session cookie is HttpOnly and SameSite=Strict. The computer and browser must be trusted: loopback HTTP is not an isolation boundary against a compromised browser, OS administrator, or malicious local program able to acquire the pairing/session credentials. The Linux operator account cannot read private owner state; trusted coding tools still run with the owner's existing authority.
+Only exact `http://127.0.0.1:PORT` origins and loopback peers are accepted. Every request checks Host and any supplied Origin. Forwarded headers are rejected. The browser stores the session token under this exact origin, including the port, and sends it in the Authorization header for status, events and operator requests. Protected POST requests also require same-origin JSON and a CSRF token. Use a trusted computer and browser to protect the pairing code and session token. The Linux operator account cannot read private owner state. Trusted coding tools run with the owner's existing authority.
 
 The stylesheet is Tailwind v4 (exact-pinned dev dependencies `tailwindcss` and `@tailwindcss/cli`) compiled by `scripts/build-tailwind.mjs` into a single static `style.css`; no inline styles or runtime CSS generation, so the CSP stays `style-src 'self'`. For design review without an owner, `node scripts/build-web-preview.mjs` builds a sample-data preview into the gitignored `web-preview/` (never part of a release).
 
@@ -30,7 +30,15 @@ Layout: a 260 px sidebar (wordmark, the agent's name as a tab, the pages Chat, M
 
 For design review the preview accepts `?section=status|memory|connections` (`channels` still works as an alias), `?theme=light|dark`, `?empty=1`, `?busy=1`, `?blocked=1`, `?held=1`, `?unconfigured=1`, `?norun=1`, `?long=1`, `?details=none`, `?draft=long`, `?unknown=1`, `?connection=connecting|offline|expired`, `?memory=1`, `?forget=1` and `?pairing=1`; `preview.ts` lists them with what each shows.
 
+Assistant messages render a limited Markdown subset without interpreting HTML, loading images, or making model URLs actionable. Owner messages and copied replies keep their original text. Use the explicit Stop control to cancel chat work; Escape never sends a cancel request.
+
+When Chat shows a bounded window, **Load earlier messages** reads the retained transcript a page at a time. A failed read can be retried without removing rows already shown. Older rows stay in the open tab but are not saved in browser storage; after reload, load them again from the owner.
+
+Use **Define mission** or **Amend mission** to open the draft card in Chat. Opening it does not send a message. Discuss or edit the terms, then select **Review for agreement** to see the exact proposed revision. **Agree** appears only if the gateway confirms that this paired session can use it; otherwise use the terminal command when available. If the receipt has been issued but reconciliation is pending, wait for the status to update. Agreeing does not start work.
+
 The Memory page draws the memories as a map on a canvas (a `d3-force` layout, node size by degree) with the List view as its text equivalent. The first time the map is shown after the page loads, it forms: memories appear one by one, most related first, their relations draw in, the layout settles, and then the memories glide into a side-view brain while a hairline outline of it is traced. That takes about two seconds, and the first click, wheel turn or key press during it jumps to the end. Later changes of the memories (a filter, a new or forgotten memory, leaving the Focus view) re-form the brain quickly instead of replaying the intro. With fewer than 12 memories, and in the Focus view, there is no brain, only the appearing animation. A dragged memory pulls its neighbours along and springs back to its place when let go. With reduced motion the finished brain is shown at once and nothing animates. Positions in the brain carry no meaning; the shape is only a layout target. The preview switches `?graph=small|mid|large` show 8, 30 and 300 memories.
+
+Graph and List apply the same filters and focus scope. On touch, the map allows page scrolling and tap-to-inspect by default; enable Graph gestures to drag or pan.
 
 Static assets use an exact path map, never a filesystem traversal. The production builder bundles `bootstrap.ts` and copies only `index.html`, `bootstrap.js` and `style.css`. `preview.ts` and its fixture controls are excluded from production assets and releases. Text renders through DOM text nodes, including model output; no executable model-generated markup is accepted.
 
@@ -40,19 +48,21 @@ All API paths start with `/api/v1`. Responses and assets have `Cache-Control: no
 
 | Method/path | Purpose |
 | --- | --- |
-| GET `/session` | Inspect the current session and obtain its CSRF token. |
-| POST `/session` | Exchange the one-time pairing code for a session cookie. |
+| GET `/session` | Inspect the presented session and obtain its CSRF token. |
+| POST `/session` | Exchange the one-time pairing code for a session token and CSRF token. |
 | POST `/logout` | Revoke that session, pending observations and streams. |
 | GET `/events` | Watch bounded owner snapshots over server-sent events. |
 | POST `/requests` | Submit one stable-ID operator operation. |
 
-The closed operation set is status, send, cancel, mission status, channel status, memory stats, memory graph, recall and explicitly confirmed forget. The memory graph is a read-only snapshot of at most 300 live memories (newest by update), content truncated to 280 code points, summary links only between returned memories (at most 1,000), and an opaque per-owner key instead of each conversation ID; forgotten memories never appear. Browser requests cannot select another installation, claim creator authority or change the configured endpoint.
+The closed operation set is status, send, cancel, earlier root conversation messages, mission status, draft, propose and explicitly confirmed agreement, channel status, memory stats, memory graph, recall and explicitly confirmed forget. Earlier messages use a bounded, exclusive cursor and do not resume work. The memory graph is a read-only snapshot of at most 300 live memories (newest by update), content truncated to 280 code points, summary links only between returned memories (at most 1,000), and an opaque per-owner key instead of each conversation ID; forgotten memories never appear. Browser requests cannot select another installation, claim creator authority or change the configured endpoint.
+
+Agreement names the exact proposed revision and digest shown for review. Developer-local owners can issue the agreement directly. Managed browser agreement requires an administrator-installed, explicitly enabled helper for the current creator. Until that helper is enabled, use the terminal to approve a managed mission. A structured refusal means issuance did not occur. An issued receipt may still be pending owner reconciliation.
 
 A POST response returns only the fields defined for that operation. Send returns an acknowledgement or a notice that an admitted message ended without an answer; conversation text comes from the event stream. An unexpected mutation reply after dispatch is unknown. Only rejection before dispatch restores the send draft.
 
 Each explicit action gets one request ID. A repeated ID with the same input receives the same gateway result; different input conflicts. Mutations are never automatically retried. If the connection fails after admission, delivery remains unknown; inspect the conversation and keep the displayed ID before deciding to act again. Owner send/forget receipts remain the durable deduplication boundary. SSE reconnects replace the current snapshot without replaying commands. Drafts stay in page memory during reconnect and are cleared on sign-out; reloading the page discards them.
 
-Limits are one session, two streams, four active requests, thirty-two mutation outcomes, 1 MiB owner frames, 128 KiB browser responses (1 MiB for the memory graph), 64 KiB HTTP input and two-minute request observation. The browser limit applies to the send/cancel acknowledgement, not to owner text that is omitted from it. A consumed mutation outcome budget requires restarting and pairing again. Slow streams disconnect rather than accumulate backlog. Authentication expiry, sign-out and shutdown detach observation; admitted owner work survives.
+Limits are one session, two streams, four active requests, thirty-two mutation outcomes, 1 MiB owner frames, 128 KiB projected browser response envelopes (1 MiB for the memory graph), 64 KiB HTTP input and two-minute request observation. The browser counts the reply it actually returns, including the send or cancel acknowledgment envelope. Repeated failed pairing attempts temporarily suspend code verification. A consumed mutation outcome budget requires restarting and pairing again. Slow streams disconnect rather than accumulate backlog. Authentication expiry, sign-out and shutdown detach observation. Admitted owner work survives.
 
 ## Local verification and release gate
 

@@ -1,4 +1,6 @@
 // Defines the browser workspace projection independently of private owner storage.
+import type { MissionRefusalCode } from "../src/missions/refusal.ts";
+
 export type Connection = "connected" | "connecting" | "offline" | "expired";
 
 /** Conversation-scope token usage; the cost is an estimate or unknown, never billing. */
@@ -25,7 +27,13 @@ export interface WorkspaceView {
 	tools: readonly { callId: string; name: string; status: string }[];
 }
 
-/** The agreed purpose terms and who approved them; display only, approval stays in the terminal. */
+/** At most five closed rows, oldest first; null means the retained start was reached. */
+export interface ChatHistoryPage {
+	entries: WorkspaceView["entries"];
+	nextBefore: number | null;
+}
+
+/** The agreed purpose terms and its recorded approval. */
 export interface MissionAgreementView {
 	revision: number;
 	successCriteria: readonly string[];
@@ -33,6 +41,7 @@ export interface MissionAgreementView {
 	reviewEveryMs: number;
 	approvedAt: number;
 	approvedBy: "local-creator" | "host-administrator" | "developer-local";
+	allowedTools?: readonly string[];
 	limits: {
 		maxCycles: number;
 		maxRequests: number;
@@ -42,6 +51,51 @@ export interface MissionAgreementView {
 		maxEstimatedCost: number | null;
 	};
 }
+
+/** Partial terms can be saved without granting permission or filling defaults. */
+export interface MissionDraftTerms {
+	objective?: string;
+	scope?: string;
+	successCriteria?: readonly string[];
+	approvalBoundary?: readonly string[];
+	reviewEveryMs?: number;
+	policy?: {
+		allowedTools?: readonly string[];
+		maxCycles?: number;
+		maxRequests?: number;
+		maxRetries?: number;
+		maxConsecutiveNoProgress?: number;
+		deadlineAt?: number;
+		maxEstimatedCost?: number;
+	};
+}
+
+export type MissionDraftView = { revision: number; status: "editing" | "proposed"; digest: string | null } &
+	({ missionId: string; terms: MissionDraftTerms } | { missionId?: never; terms?: never });
+
+/** The gateway's exact review binding, not an authority claim from the draft. */
+export type MissionReviewView = {
+	missionId: string;
+	revision: number;
+	digest: string;
+	authorityRevision: number;
+	previousReceipt: string | null;
+};
+
+export type MissionMutation =
+	| { operation: "draft"; expectedRevision: number; terms: MissionDraftTerms }
+	| { operation: "propose"; expectedRevision: number }
+	| { operation: "agree"; revision: number; digest: string; confirmed: true; previousReceipt?: string | null };
+
+export type MissionMutationOutcome =
+	| { state: "completed"; mission: WorkspaceDetails["mission"] }
+	| { state: "issued"; receiptId: string; reconciled: boolean }
+	| { state: "refused"; code: MissionRefusalCode }
+	| { state: "rejected" }
+	| { state: "unknown" };
+
+/** The port always ends the local session, even when the gateway cannot confirm revocation. */
+export type LogoutOutcome = "revoked" | "unconfirmed";
 
 /** The one bounded work run the owner reports; it is not the purpose and not a planner. */
 export interface MissionRunView {
@@ -124,8 +178,14 @@ export interface WorkspaceDetails {
 		authority: "managed-administrator" | "developer-local" | "unconfigured" | "invalid";
 		agreementValid: boolean;
 		authorityError: string | null;
-		/** The saved draft's revision, status and digest; the digest is set once the draft is proposed. */
-		draft: { revision: number; status: "editing" | "proposed"; digest: string | null } | null;
+		/** True only when the authenticated gateway projects the formation protocol. */
+		formationAvailable: boolean;
+		/** Affirmative authenticated server capability; an absent flag is false. */
+		canAgree: boolean;
+		/** The gateway's current protected receipt binding, if projected. */
+		previousReceipt?: string | null;
+		draft: MissionDraftView | null;
+		review: MissionReviewView | null;
 	};
 	memory: {
 		count: number | null;
@@ -153,7 +213,12 @@ export interface WorkspacePort {
 	watch(
 		listener: (event: { type: "view"; view: WorkspaceView } | { type: "connection"; state: Connection }) => void,
 	): () => void;
+	/** Reads before an exclusive ID, or from newest with null; rejects on owner or wire failure. */
+	history(before: number | null): Promise<ChatHistoryPage>;
 	details(): Promise<WorkspaceDetails>;
+	/** Reads only the current mission snapshot; never resends a mutation. */
+	mission(): Promise<WorkspaceDetails["mission"]>;
+	mutateMission(request: MissionMutation, requestId: string): Promise<MissionMutationOutcome>;
 	send(prompt: string, requestId: string): Promise<SendOutcome>;
 	cancel(requestId: string): Promise<void>;
 	recall(query: string): Promise<WorkspaceDetails["memory"]>;
@@ -163,5 +228,5 @@ export interface WorkspacePort {
 		id: string,
 		requestId: string,
 	): Promise<{ state: "completed" } | { state: "unknown" | "failed"; message: string }>;
-	logout(): Promise<void>;
+	logout(): Promise<LogoutOutcome>;
 }

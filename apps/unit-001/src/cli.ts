@@ -29,6 +29,7 @@ import {
 	parseMissionCreator,
 	parseMissionDraftTerms,
 } from "./missions/contract.ts";
+import { describeMissionRefusal } from "./missions/refusal.ts";
 import { runMissionSetup } from "./missions/setup.ts";
 import { credentialsFile, dataDirectory, sessionFile } from "./paths.ts";
 import { createConfiguredModels, createModelsFor, createOwnerModels } from "./provider.ts";
@@ -235,6 +236,7 @@ async function run(
 			`No model provider is configured. Mission drafting and memory remain available. Run ${runtime.managed === undefined ? "" : "sudo "}${runtime.managed?.name ?? "agent"} setup to connect a provider, then restart the owner. Mission formation uses the default session.\n`,
 		);
 
+	const appVersion = await version();
 	const release = await acquireSessionLock(`${file}.lock`);
 	let agent: Agent | undefined;
 	try {
@@ -242,6 +244,7 @@ async function run(
 			{
 				storage: await openNodeSqliteStorage(file),
 				name: runtime.managed?.name ?? "agent",
+				version: appVersion,
 				models,
 				model: choice,
 				channelCredentialsDirectory: join(directory, "channels"),
@@ -261,7 +264,7 @@ async function run(
 			await runService(
 				opened,
 				endpoint,
-				await version(),
+				appVersion,
 				terminal.err,
 				signal,
 				runtime.managed?.id ?? null,
@@ -274,7 +277,7 @@ async function run(
 		const rich = richTerminalFor(runtime);
 		return rich === undefined
 			? await runRepl(agent, terminal, signal)
-			: await runRichForeground(agent, options.session, await version(), rich, signal, {
+			: await runRichForeground(agent, options.session, appVersion, rich, signal, {
 					colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
 					drafts: draftsFor(runtime, runtime.managed?.id ?? `local:${directory}`, options.session),
 					missionSetup: (flowSignal) =>
@@ -355,6 +358,7 @@ async function control(
 		const request = async (request: MissionRequest): Promise<MissionView> => {
 			const response = await requestService(endpoint, { type: "mission", request }, signal);
 			if (response.type === "error") throw new ConfigurationError(response.message);
+			if (response.type === "mission-refused") throw new ConfigurationError(describeMissionRefusal(response.code));
 			if (response.type !== "mission") throw new Error("Unexpected mission response.");
 			return response.result;
 		};
@@ -459,6 +463,8 @@ async function control(
 					async (request) => {
 						const response = await requestService(endpoint, { type: "mission", request }, flowSignal);
 						if (response.type === "error") throw new ConfigurationError(response.message);
+						if (response.type === "mission-refused")
+							throw new ConfigurationError(describeMissionRefusal(response.code));
 						if (response.type !== "mission") throw new Error("Unexpected mission response.");
 						return response.result;
 					},
@@ -607,9 +613,12 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				throw new ConfigurationError("This operation requires the administrator command.");
 			if (
 				command.kind === "mission" &&
-				["creator", "approve", "start", "pause", "resume", "stop"].includes(command.command.action)
+				// Mirrors the operator socket allowlist in service.ts: operators may only inspect, draft and propose.
+				!["status", "setup", "draft", "propose", "purpose"].includes(command.command.action)
 			)
-				throw new ConfigurationError("Mission creator and approval changes require the administrator command.");
+				throw new ConfigurationError(
+					"Mission purpose, creator, approval and operation changes require the administrator command.",
+				);
 			if (command.kind !== "run" && command.options.dataDir !== undefined)
 				throw new UsageError("Operator clients cannot change their data directory.");
 		}
@@ -627,7 +636,8 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 							runtime.platform,
 						)
 					: operatorEndpoint(runtime.managed.id, command.options.session);
-			code = await runWebWorkspace(endpoint, command.port, (text) => void runtime.stdout.write(text), signal);
+			const write = (text: string) => void runtime.stdout.write(text);
+			code = await runWebWorkspace(endpoint, command.port, write, signal, runtime.managed?.id);
 		} else if (command.kind === "setup") code = await setup(command, runtime, signal);
 		else if (command.kind === "run" && argv.length === 0 && runtime.managed !== undefined && runtime.interactive) {
 			// The normal installed entry is a client; explicit foreground flags retain their existing owner semantics.

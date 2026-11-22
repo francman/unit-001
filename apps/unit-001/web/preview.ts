@@ -1,5 +1,5 @@
 // Sample data for design review and screenshots; built into web-preview only, never into a release.
-import type { Connection, MemoryGraphView, MissionRunView, WorkspaceDetails, WorkspacePort, WorkspaceView } from "./contract.ts";
+import type { Connection, MemoryGraphView, MissionDraftTerms, MissionRunView, WorkspaceDetails, WorkspacePort, WorkspaceView } from "./contract.ts";
 import { sampleMemoryGraph } from "./preview-memory-graph.ts";
 import { mountWorkspace } from "./shell.ts";
 import { sections } from "./state.ts";
@@ -10,13 +10,14 @@ import { renderPairing } from "./views/pairing.ts";
  *   ?section=mission|status|memory|connections|about   open that page first (About uses the sample view and details; ?details=none, ?unconfigured=1 change it)
  *   ?busy=1        a reply is streaming, with one finished and one running tool
  *   ?blocked=1     scheduled work is blocked on unknown results
- *   ?long=1        many messages, a long model id and long connection text
+ *   ?long=1        paged chat history, a long model id and long connection text
  *   ?draft=long    a 30-line draft in the composer
  *   ?details=none  details never load
  *   ?empty=1       no messages yet
  *   ?held=1        a maintenance hold is active
  *   ?unconfigured=1  no model is configured
  *   ?norun=1       no work run exists
+ *   ?mission=new|unarmed   start without a mission, or with managed web approval unavailable
  *   ?connection=connecting|offline|expired   the connection state after load
  *   ?unknown=1     sending returns an unknown outcome
  *   ?send=1        sends a sample message after load (with ?unknown=1: the uncertain-delivery notice)
@@ -68,6 +69,18 @@ let view: WorkspaceView = {
 	tools: [],
 };
 
+const retainedEntries = [...view.entries];
+const watchRows = 20;
+
+function chatWindow(): Pick<WorkspaceView, "entries" | "historyTruncated"> {
+	return { entries: retainedEntries.slice(-watchRows), historyTruncated: retainedEntries.length > watchRows };
+}
+
+function appendChat(role: WorkspaceView["entries"][number]["role"], text: string): Pick<WorkspaceView, "entries" | "historyTruncated"> {
+	retainedEntries.push({ id: (retainedEntries.at(-1)?.id ?? 0) + 1, role, text, truncated: false });
+	return chatWindow();
+}
+
 const sampleRun: MissionRunView = {
 	status: "waiting",
 	blocker: null,
@@ -109,6 +122,9 @@ const details: WorkspaceDetails = {
 		authority: "developer-local",
 		agreementValid: true,
 		authorityError: null,
+		formationAvailable: true,
+		canAgree: true,
+		review: null,
 		draft: null,
 		tools: ["read_file", "run_tests"],
 		agreement: {
@@ -118,6 +134,7 @@ const details: WorkspaceDetails = {
 			reviewEveryMs: 7 * day,
 			approvedAt: now - 2 * day,
 			approvedBy: "local-creator",
+			allowedTools: ["read_file", "run_tests"],
 			limits: { maxCycles: 20, maxRequests: 200, maxRetries: 5, maxNoProgress: 3, deadlineAt: now + 30 * day, maxEstimatedCost: 5 },
 		},
 		run: sampleRun,
@@ -161,6 +178,7 @@ let listener: Parameters<WorkspacePort["watch"]>[0] | null = null;
 let unknown = flag("unknown");
 let detailsAvailable = params.get("details") !== "none";
 let timer: ReturnType<typeof setInterval> | undefined;
+let remount: (() => void) | undefined;
 const emit = () => listener?.({ type: "view", view });
 // The workspace re-reads details when a run ends, so a short busy cycle shows a changed fixture.
 const refresh = () => {
@@ -182,15 +200,70 @@ const port: WorkspacePort = {
 			listener = null;
 		};
 	},
+	async history(before) {
+		const boundary = before === null ? -1 : retainedEntries.findIndex((entry) => entry.id >= before);
+		const end = boundary < 0 ? retainedEntries.length : boundary;
+		const start = Math.max(0, end - 5);
+		return { entries: retainedEntries.slice(start, end), nextBefore: start === 0 ? null : retainedEntries[start].id };
+	},
 	async details() {
 		if (!detailsAvailable) throw new Error("Details are not available in this fixture.");
-		return details;
+		return { ...details };
+	},
+	async mission() {
+		if (!detailsAvailable) throw new Error("Details are not available in this fixture.");
+		return details.mission;
+	},
+	async mutateMission(change) {
+		const current = details.mission;
+		const { draft, agreement } = current;
+		if (details.owner?.held) return { state: "refused", code: "held" };
+		const expected = draft?.revision ?? agreement?.revision ?? 0;
+		if ((change.operation === "agree" ? change.revision : change.expectedRevision) !== expected)
+			return { state: "refused", code: "stale-revision" };
+		if (change.operation === "draft") {
+			const terms = change.terms;
+			details.mission = {
+				...current,
+				stage: "drafting",
+				missing: previewMissingTerms(terms),
+				draft: { missionId: "preview-mission", revision: expected + 1, status: "editing", digest: null, terms },
+			};
+		} else if (change.operation === "propose") {
+			if (!draft?.terms || current.missing.length) return { state: "refused", code: "incomplete" };
+			const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(draft)));
+			const digest = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
+			details.mission = { ...current, stage: "awaiting_approval", draft: { ...draft, status: "proposed", digest: current.canAgree ? digest : null } };
+		} else {
+			if (!current.canAgree) return { state: "refused", code: "managed-requires-gateway" };
+			if (draft?.status !== "proposed" || draft.digest !== change.digest) return { state: "refused", code: "stale-digest" };
+			const terms = draft.terms;
+			const policy = terms?.policy;
+			if (!terms || !policy || terms.objective === undefined || terms.scope === undefined || !terms.successCriteria ||
+				!terms.approvalBoundary || terms.reviewEveryMs === undefined || !policy.allowedTools ||
+				policy.maxCycles === undefined || policy.maxRequests === undefined || policy.maxRetries === undefined ||
+				policy.maxConsecutiveNoProgress === undefined || policy.deadlineAt === undefined)
+				return { state: "refused", code: "incomplete" };
+			details.mission = {
+				...current, stage: "agreed", draft: null, objective: terms.objective, scope: terms.scope, agreementValid: true,
+				agreement: {
+					revision: change.revision, approvedAt: Date.now(), approvedBy: "developer-local",
+					successCriteria: terms.successCriteria, approvalBoundary: terms.approvalBoundary, reviewEveryMs: terms.reviewEveryMs,
+					allowedTools: policy.allowedTools,
+					limits: {
+						maxCycles: policy.maxCycles, maxRequests: policy.maxRequests, maxRetries: policy.maxRetries,
+						maxNoProgress: policy.maxConsecutiveNoProgress, deadlineAt: policy.deadlineAt, maxEstimatedCost: policy.maxEstimatedCost ?? null,
+					},
+				},
+			};
+		}
+		return { state: "completed", mission: details.mission };
 	},
 	async send(prompt, requestId) {
 		if (unknown) return { state: "unknown", message: requestId };
 		view = {
 			...view,
-			entries: [...view.entries, { id: view.entries.length + 1, role: "user", text: prompt, truncated: false }],
+			...appendChat("user", prompt),
 			busy: true,
 			text: "",
 			tools: [{ callId: "t1", name: "read_file package-lock.json", status: "running" }],
@@ -208,7 +281,7 @@ const port: WorkspacePort = {
 					busy: false,
 					text: "",
 					tools: [],
-					entries: [...view.entries, { id: view.entries.length + 1, role: "assistant", text: reply, truncated: false }],
+					...appendChat("assistant", reply),
 				};
 			}
 			emit();
@@ -244,8 +317,28 @@ const port: WorkspacePort = {
 		if (params.get("graph") === "failed") throw new Error("The memory map is not available in this fixture.");
 		return graph;
 	},
-	async logout() {},
+	async logout() {
+		listener = null;
+		return "revoked";
+	},
 };
+
+function previewMissingTerms(terms: MissionDraftTerms): string[] {
+	const { policy } = terms;
+	return [
+		[terms.objective?.trim(), "objective"],
+		[terms.scope?.trim(), "scope"],
+		[terms.successCriteria?.length, "success criteria"],
+		[terms.approvalBoundary !== undefined, "approval boundary"],
+		[terms.reviewEveryMs, "review cadence"],
+		[policy?.allowedTools !== undefined, "allowed tool actions"],
+		[policy?.maxCycles, "max cycles"],
+		[policy?.maxRequests, "max requests"],
+		[policy?.maxRetries !== undefined, "max retries"],
+		[policy?.maxConsecutiveNoProgress, "max consecutive cycles without progress"],
+		[policy?.deadlineAt, "deadline"],
+	].flatMap(([present, label]) => present ? [] : [String(label)]);
+}
 
 declare global {
 	interface Window {
@@ -264,17 +357,20 @@ declare global {
 }
 
 if (params.get("theme") === "light" || params.get("theme") === "dark") document.documentElement.dataset.theme = params.get("theme") ?? "";
-if (flag("empty")) view = { ...view, entries: [] };
+if (flag("empty")) {
+	retainedEntries.length = 0;
+	view = { ...view, ...chatWindow() };
+}
 if (flag("long")) {
-	const turns = Array.from({ length: 8 }, (_, index) => [
+	const turns = Array.from({ length: 12 }, (_, index) => [
 		{ id: 10 + index * 2, role: "user" as const, text: `Question ${index + 1}: what changed in the lockfile since yesterday?`, truncated: false },
 		{ id: 11 + index * 2, role: "assistant" as const, text: reply, truncated: false },
 	]).flat();
+	retainedEntries.push(...turns);
 	view = {
 		...view,
 		model: { provider: "sample-provider-with-a-long-name", modelId: "sample-model-2026-11-21-with-a-very-long-identifier-for-layout-checks" },
-		entries: [...view.entries, ...turns],
-		historyTruncated: true,
+		...chatWindow(),
 	};
 	const second = details.channels[1];
 	if (second) second.detail = `${second.detail} ${second.detail}`;
@@ -291,6 +387,10 @@ if (flag("busy"))
 	};
 if (flag("blocked")) details.mission.run = blockedRun;
 if (flag("norun")) details.mission.run = null;
+if (params.get("mission") === "new")
+	details.mission = { ...details.mission, stage: "drafting", objective: null, scope: null, agreement: null, agreementValid: false, run: null };
+else if (params.get("mission") === "unarmed")
+	details.mission = { ...details.mission, authority: "managed-administrator", canAgree: false };
 if (flag("held") && details.owner) details.owner.held = true;
 if (flag("unconfigured")) {
 	if (details.owner) details.owner.configured = false;
@@ -306,8 +406,10 @@ window.unitPreview = {
 		unknown = value;
 	},
 	empty() {
-		view = { ...view, entries: [] };
-		emit();
+		retainedEntries.length = 0;
+		view = { ...view, ...chatWindow() };
+		// The workspace keeps seen rows across frames, so a new sample conversation needs a new mount.
+		remount?.();
 	},
 	held(value) {
 		if (details.owner) details.owner.held = value;
@@ -347,7 +449,11 @@ else {
 	// "channels" is the old name of the Connections page; keep old preview links working.
 	const requested = params.get("section") === "channels" ? "connections" : params.get("section");
 	const section = sections.find((entry) => entry.id === requested)?.id;
-	mountWorkspace(root, port, { preview: true, section });
+	let unmount = mountWorkspace(root, port, { preview: true, section });
+	remount = () => {
+		unmount();
+		unmount = mountWorkspace(root, port, { preview: true, section });
+	};
 	if (params.get("draft") === "long")
 		window.unitPreview.draft(
 			Array.from({ length: 30 }, (_, index) => `Line ${index + 1} of a long draft that keeps going to check how tall the composer may grow.`).join("\n"),

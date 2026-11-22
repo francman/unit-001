@@ -1,11 +1,16 @@
 // Projects only fields used by the workspace from a dispatched operation's owner reply.
+import type { AgreementReview } from "../missions/browser-agreement.ts";
+import { type MissionApproval, type MissionDraft, parseMissionDraftTerms } from "../missions/contract.ts";
+import type { MissionRefusalCode } from "../missions/refusal.ts";
 import type { ServiceRequest } from "../service.ts";
+import { type ChatHistoryPage, parseChatHistoryPage } from "../service-view.ts";
 
 type PostResponse =
 	| { type: "error"; message: "Owner rejected the operation." }
 	| { type: "sent" }
 	| { type: "send-failed" }
 	| { type: "cancelled" }
+	| { type: "chat-history"; page: ChatHistoryPage }
 	| StatusResponse
 	| { type: "mission"; result: MissionStatus }
 	| { type: "channels"; result: ChannelStatus }
@@ -13,6 +18,8 @@ type PostResponse =
 
 export type WebResult =
 	| { requestId: string; state: "completed"; response: PostResponse }
+	| { requestId: string; state: "refused"; code: MissionRefusalCode }
+	| { requestId: string; state: "issued"; receiptId: string; reconciled: boolean }
 	| { requestId: string; state: "unknown"; message: string };
 
 type StatusResponse = {
@@ -22,12 +29,21 @@ type StatusResponse = {
 	runtime: { configuration: "configured" | "unconfigured"; uptimeMs: number };
 };
 
+export type ManagedMissionReview = {
+	armed: boolean;
+	proposal: AgreementReview | null;
+	verifiedApproval?: MissionApproval;
+};
+
 type MissionStatus = {
 	stage: "awaiting_creator" | "drafting" | "awaiting_approval" | "agreed";
-	formation: { agreement: Agreement | null; draft: Draft | null };
+	formation: { agreement: Agreement | null; draft: MissionDraft | null };
 	creator: { kind: "human" | "elder" | "organization"; id: string } | null;
 	authority: "managed-administrator" | "developer-local" | "unconfigured" | "invalid";
-	authorityError: string | null;
+	authorityError: "invalid-authority" | null;
+	canAgree: boolean;
+	previousReceipt?: string | null;
+	review?: AgreementReview;
 	agreementValid: boolean;
 	missing: string[];
 	execution: "not-implemented" | "not-started" | RunState;
@@ -44,6 +60,7 @@ type Agreement = {
 		approvalBoundary: string[];
 		reviewEveryMs: number;
 		policy: {
+			allowedTools: string[];
 			maxCycles: number;
 			maxRequests: number;
 			maxRetries: number;
@@ -56,13 +73,6 @@ type Agreement = {
 		approvedAt: number;
 		approvedBy: { kind: "local-creator" | "host-administrator" | "developer-local" };
 	};
-};
-
-type Draft = {
-	revision: number;
-	status: "editing" | "proposed";
-	digest: string | null;
-	terms: { objective?: string; scope?: string };
 };
 
 type RunState = "ready" | "running" | "waiting" | "paused" | "blocked" | "completed" | "stopped";
@@ -137,8 +147,17 @@ type MemoryGraph = {
 	limited: boolean;
 };
 
+/** Identifies the mission changes available on the browser surface. */
+export function isWebMissionMutation(operation: ServiceRequest): boolean {
+	return operation.type === "mission" && ["draft", "propose", "agree"].includes(operation.request.operation);
+}
+
 /** Rejects unexpected owner replies; the gateway still knows the operation was dispatched. */
-export function projectWebResponse(operation: ServiceRequest, value: unknown): PostResponse {
+export function projectWebResponse(
+	operation: ServiceRequest,
+	value: unknown,
+	managed?: { review?: ManagedMissionReview },
+): PostResponse {
 	const response = object(value);
 	if (response.type === "error" && typeof response.message === "string")
 		return { type: "error", message: "Owner rejected the operation." };
@@ -161,9 +180,16 @@ export function projectWebResponse(operation: ServiceRequest, value: unknown): P
 		case "status":
 			if (response.type === "status") return status(response);
 			break;
+		case "chat-history":
+			if (response.type === "chat-history")
+				return { type: "chat-history", page: parseChatHistoryPage(response.page, operation.before) };
+			break;
 		case "mission":
-			if (operation.request.operation === "status" && response.type === "mission")
-				return { type: "mission", result: mission(object(response.result)) };
+			if (
+				(operation.request.operation === "status" || isWebMissionMutation(operation)) &&
+				response.type === "mission"
+			)
+				return { type: "mission", result: mission(object(response.result), managed) };
 			break;
 		case "channels":
 			if (operation.request.operation === "status" && response.type === "channels")
@@ -195,22 +221,42 @@ function status(response: Record<string, unknown>): StatusResponse {
 
 const RUN_STATES = ["ready", "running", "waiting", "paused", "blocked", "completed", "stopped"] as const;
 
-function mission(result: Record<string, unknown>): MissionStatus {
+function mission(result: Record<string, unknown>, managed?: { review?: ManagedMissionReview }): MissionStatus {
 	const formation = object(result.formation);
 	const creator = result.creator === null ? null : object(result.creator);
+	const reported = oneOf(result.authority, ["managed-administrator", "developer-local", "unconfigured", "invalid"]);
+	const authority = managed !== undefined && reported === "developer-local" ? "invalid" : reported;
+	const currentDraft = formation.draft === null ? null : draft(object(formation.draft));
+	const proposal = managed?.review?.proposal;
+	const approval = managed?.review?.verifiedApproval;
+	if ((managed !== undefined || authority === "managed-administrator") && currentDraft !== null) {
+		if (
+			proposal != null &&
+			(proposal.revision !== currentDraft.revision || proposal.missionId !== currentDraft.missionId)
+		)
+			return invalid();
+		currentDraft.digest = proposal?.digest ?? null;
+	}
 	return {
 		stage: oneOf(result.stage, ["awaiting_creator", "drafting", "awaiting_approval", "agreed"]),
 		formation: {
-			agreement: formation.agreement === null ? null : agreement(object(formation.agreement)),
-			draft: formation.draft === null ? null : draft(object(formation.draft)),
+			agreement:
+				formation.agreement === null || (managed !== undefined && approval === undefined)
+					? null
+					: agreement(object(formation.agreement), approval),
+			draft: currentDraft,
 		},
 		creator:
 			creator === null
 				? null
 				: { kind: oneOf(creator.kind, ["human", "elder", "organization"]), id: text(creator.id, 200) },
-		authority: oneOf(result.authority, ["managed-administrator", "developer-local", "unconfigured", "invalid"]),
-		authorityError: result.authorityError === null ? null : text(result.authorityError, 1000),
-		agreementValid: flag(result.agreementValid),
+		authority,
+		authorityError: authority === "invalid" ? "invalid-authority" : null,
+		canAgree: managed === undefined ? authority === "developer-local" : managed.review?.armed === true,
+		...(authority === "managed-administrator" && proposal != null
+			? { previousReceipt: proposal.previousReceipt, review: proposal }
+			: {}),
+		agreementValid: managed === undefined ? flag(result.agreementValid) : approval !== undefined,
 		missing: rows(result.missing, 32, (item) => text(item, 200)),
 		execution: oneOf(result.execution, ["not-implemented", "not-started", ...RUN_STATES]),
 		runtime: result.runtime == null ? null : run(object(result.runtime)),
@@ -218,10 +264,10 @@ function mission(result: Record<string, unknown>): MissionStatus {
 	};
 }
 
-function agreement(value: Record<string, unknown>): Agreement {
+function agreement(value: Record<string, unknown>, verifiedApproval?: MissionApproval): Agreement {
 	const terms = object(value.terms);
 	const policy = object(terms.policy);
-	const approval = object(value.approval);
+	const approval = verifiedApproval ?? object(value.approval);
 	return {
 		revision: count(value.revision),
 		terms: {
@@ -231,6 +277,7 @@ function agreement(value: Record<string, unknown>): Agreement {
 			approvalBoundary: rows(terms.approvalBoundary, 32, (item) => text(item, 2000)),
 			reviewEveryMs: count(terms.reviewEveryMs),
 			policy: {
+				allowedTools: rows(policy.allowedTools, 128, (item) => text(item, 100)),
 				maxCycles: count(policy.maxCycles),
 				maxRequests: count(policy.maxRequests),
 				maxRetries: count(policy.maxRetries),
@@ -248,16 +295,16 @@ function agreement(value: Record<string, unknown>): Agreement {
 	};
 }
 
-function draft(value: Record<string, unknown>): Draft {
-	const terms = object(value.terms);
+function draft(value: Record<string, unknown>): MissionDraft {
+	const digest = value.digest === null ? null : text(value.digest, 64);
+	const status = oneOf(value.status, ["editing", "proposed"]);
+	if (status === "proposed" ? digest === null || !/^[a-f0-9]{64}$/.test(digest) : digest !== null) return invalid();
 	return {
+		missionId: text(value.missionId, 200),
 		revision: count(value.revision),
-		status: oneOf(value.status, ["editing", "proposed"]),
-		digest: value.digest === null ? null : text(value.digest, 64),
-		terms: {
-			objective: terms.objective === undefined ? undefined : text(terms.objective, 4096),
-			scope: terms.scope === undefined ? undefined : text(terms.scope, 4096),
-		},
+		status,
+		digest,
+		terms: parseMissionDraftTerms(value.terms),
 	};
 }
 
