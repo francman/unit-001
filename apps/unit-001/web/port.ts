@@ -10,6 +10,9 @@ import type {
 	MissionAgreementView,
 	MissionDraftTerms,
 	MissionMutationOutcome,
+	MissionPlanMutation,
+	MissionPlanMutationOutcome,
+	MissionPlanStatusRequest,
 	MissionReviewView,
 	MissionRunView,
 	WorkspaceDetails,
@@ -17,8 +20,10 @@ import type {
 	WorkspaceUsage,
 	WorkspaceView,
 } from "./contract.ts";
+import { parseMissionPlanBinding, parsePlanTerms, parsePlanView } from "./mission-plan.ts";
 
 type JsonObject = Record<string, unknown>;
+type VerifiedConnection = { csrfToken: string; invalidate: () => void };
 
 class GatewayRejection extends Error {}
 
@@ -26,9 +31,11 @@ class GatewayRejection extends Error {}
 export function browserWorkspacePort(initialSession: GatewaySession): WorkspacePort {
 	const { workspaceId } = initialSession;
 	let candidate: GatewaySession | null = initialSession;
-	let active: { csrfToken: string; invalidate: () => void } | null = null;
+	let active: VerifiedConnection | null = null;
 	let workspaceChanged = false;
 	let watcher: AbortController | null = null;
+	let planProposal: { connection: VerifiedConnection; revision: number; digest: string } | null = null;
+	let missionVersion = 0;
 
 	const requestEnvelope = async (operation: JsonObject, requestId: string): Promise<JsonObject> => {
 		const connection = active;
@@ -77,7 +84,22 @@ export function browserWorkspacePort(initialSession: GatewaySession): WorkspaceP
 		return reply;
 	};
 	async function loadMission(): Promise<WorkspaceDetails["mission"]> {
-		return parseMission((await request({ type: "mission", request: { operation: "status" } })).result);
+		const version = ++missionVersion;
+		const connection = active;
+		planProposal = null;
+		const status: MissionPlanStatusRequest = { operation: "status" };
+		const mission = parseMission((await request({ type: "mission", request: status })).result);
+		rememberPlanProposal(mission, version, connection);
+		return mission;
+	}
+	function rememberPlanProposal(mission: WorkspaceDetails["mission"], version: number, connection: VerifiedConnection | null): void {
+		const plan = mission.plan;
+		const draft = plan?.draft;
+		if (
+			version === missionVersion && connection !== null && connection === active && mission.canAgreePlan === true &&
+			draft?.status === "proposed" && draft.digest !== null && draft.missing.length === 0 &&
+			draft.baseRevision === (plan?.head?.revision ?? 0)
+		) planProposal = { connection, revision: draft.revision, digest: draft.digest };
 	}
 	return {
 		watch(listener) {
@@ -189,6 +211,44 @@ export function browserWorkspacePort(initialSession: GatewaySession): WorkspaceP
 			}
 			return { state: "unknown" };
 		},
+		async mutateMissionPlan(change, requestId): Promise<MissionPlanMutationOutcome> {
+			const connection = active;
+			if (!connection) return { state: "rejected" };
+			if (
+				change.operation === "plan-agree" &&
+				(change.confirmed !== true || planProposal === null || planProposal.connection !== connection ||
+					planProposal.revision !== change.revision || planProposal.digest !== change.digest)
+			) return { state: "rejected" };
+
+			let mutation: MissionPlanMutation;
+			try {
+				mutation = planMutationRequest(change);
+			} catch {
+				return { state: "rejected" };
+			}
+			// A write consumes the exact proposal snapshot even when the result is uncertain.
+			const version = ++missionVersion;
+			planProposal = null;
+			try {
+				const result = await requestEnvelope({ type: "mission", request: mutation }, requestId);
+				if (result.state === "refused") return { state: "refused", code: parseMissionRefusalCode(result.code) };
+				if (result.state === "issued" && mutation.operation === "plan-agree")
+					return { state: "issued", receiptId: missionIdentity(result.receiptId), reconciled: boolean(result.reconciled) };
+				if (result.state === "completed") {
+					const reply = object(result.response);
+					if (reply.type === "mission") {
+						const mission = parseMission(reply.result);
+						if (confirmsPlanMutation(mutation, mission)) {
+							rememberPlanProposal(mission, version, connection);
+							return { state: "completed", mission };
+						}
+					}
+				}
+			} catch (error) {
+				if (error instanceof GatewayRejection) return { state: "rejected" };
+			}
+			return { state: "unknown" };
+		},
 		async details() {
 			const [mission, memoryReply, channelsReply, owner] = await Promise.all([
 				loadMission(),
@@ -281,6 +341,42 @@ export function browserWorkspacePort(initialSession: GatewaySession): WorkspaceP
 			}
 		},
 	};
+}
+
+function planMutationRequest(change: MissionPlanMutation): MissionPlanMutation {
+	switch (change.operation) {
+		case "plan-draft":
+			return { operation: change.operation, expectedRevision: change.expectedRevision, terms: parsePlanTerms(change.terms) };
+		case "plan-propose":
+			return { operation: change.operation, expectedRevision: change.expectedRevision };
+		case "plan-agree":
+			return { operation: change.operation, revision: change.revision, digest: change.digest, confirmed: change.confirmed };
+		case "review-now":
+			return { operation: change.operation };
+		case "review-dismiss":
+			return { operation: change.operation, reviewId: change.reviewId };
+	}
+	throw new Error("Invalid mission plan operation.");
+}
+
+function confirmsPlanMutation(change: MissionPlanMutation, mission: WorkspaceDetails["mission"]): boolean {
+	const plan = mission.plan;
+	if (!plan) return false;
+	switch (change.operation) {
+		case "plan-draft":
+			return plan.draft?.status === "editing" && plan.draft.savedBy === "owner" &&
+				plan.draft.revision > change.expectedRevision && JSON.stringify(plan.draft.terms) === JSON.stringify(change.terms);
+		case "plan-propose":
+			return plan.draft?.status === "proposed" && plan.draft.revision === change.expectedRevision;
+		case "plan-agree":
+			return mission.authority === "developer-local" && plan.headValid &&
+				plan.head?.revision === change.revision && plan.head.digest === change.digest;
+		case "review-now":
+			// The request ID binds the gateway acknowledgement, including replay of an earlier stored note.
+			return plan.reviews.length !== 0;
+		case "review-dismiss":
+			return plan.reviews.some((note) => note.reviewId === change.reviewId && note.disposition !== null);
+	}
 }
 
 // Failure reasons and retry state are owner-terminal fields; the gateway's projection never forwards them.
@@ -425,6 +521,10 @@ function parseMission(value: unknown): WorkspaceDetails["mission"] {
 	const matchingReview = review === null ||
 		(draft?.status === "proposed" && review.missionId === draft.missionId && review.revision === draft.revision &&
 			review.digest === draft.digest && review.previousReceipt === (previousReceipt ?? null));
+	const plan = mission.plan == null ? mission.plan : parsePlanView(mission.plan);
+	const planError = mission.planError == null ? mission.planError : oneOf(mission.planError, ["invalid-plan"]);
+	if (planError === "invalid-plan" && plan != null) throw new Error("Invalid mission plan projection.");
+	const binding = mission.runnablePurposeBinding;
 	return {
 		stage: text(mission.stage),
 		objective: typeof terms.objective === "string" ? terms.objective : null,
@@ -444,6 +544,13 @@ function parseMission(value: unknown): WorkspaceDetails["mission"] {
 		previousReceipt,
 		draft,
 		review: matchingReview ? review : null,
+		...(plan === undefined ? {} : { plan }),
+		...(planError === undefined ? {} : { planError }),
+		...(mission.canAgreePlan === undefined ? {} : {
+			canAgreePlan: mission.canAgreePlan === true && authority === "developer-local" && plan !== undefined &&
+				planError !== "invalid-plan",
+		}),
+		...(binding === undefined ? {} : { runnablePurposeBinding: binding === null ? null : parseMissionPlanBinding(binding) }),
 	};
 }
 

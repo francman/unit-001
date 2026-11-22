@@ -12,6 +12,7 @@ import {
 	type MissionDraftTerms,
 	type MissionExecutionIntent,
 	type MissionTerms,
+	type PlanRequestBinding,
 	missingMissionTerms,
 	missionNumber,
 	missionObject,
@@ -232,14 +233,65 @@ export function parseMissionAuthority(value: unknown): MissionAuthority {
 	const creator = parseMissionCreator(input.creator);
 	if (input.installationId !== null && creator.uid === null)
 		throw new Error("Managed creator needs an authenticated host UID.");
+	const installationId = input.installationId === null ? null : missionText(input.installationId);
+	const planApprovals =
+		input.planApprovals === undefined ? undefined : boundedList(input.planApprovals, 2).map(parseMissionApproval);
+	for (const receipt of planApprovals ?? []) {
+		const managed = installationId !== null;
+		if (
+			receipt.installationId !== installationId ||
+			receipt.session !== input.session ||
+			receipt.authorityRevision > revision ||
+			(receipt.authorityRevision === revision && JSON.stringify(receipt.creator) !== JSON.stringify(creator)) ||
+			receipt.approvedBy.uid !== receipt.creator.uid ||
+			receipt.provenance !== (managed ? "managed-administrator" : "developer-local") ||
+			receipt.approvedBy.kind !== (managed ? "local-creator" : "developer-local") ||
+			(managed && receipt.creator.uid === 0) ||
+			!Number.isSafeInteger(receipt.approvedAt) ||
+			receipt.approvedAt < 0 ||
+			!receipt.requestId.trim() ||
+			!receipt.receiptId.trim() ||
+			!receipt.missionId.trim()
+		)
+			throw new Error("Plan approval does not bind this authority and creator.");
+	}
+	const planRequests =
+		input.planRequests === undefined ? undefined : boundedList(input.planRequests, 32).map(parsePlanRequest);
+	if (planRequests) {
+		if (
+			new Set(planRequests.map((item) => item.requestId)).size !== planRequests.length ||
+			new Set(planRequests.map((item) => item.receiptId)).size !== planRequests.length ||
+			planRequests.some(
+				(item, index) =>
+					item.authorityRevision > revision ||
+					(index > 0 &&
+						(item.missionId !== planRequests[index - 1].missionId ||
+							item.revision <= planRequests[index - 1].revision ||
+							item.authorityRevision < planRequests[index - 1].authorityRevision)),
+			)
+		)
+			throw new Error("Invalid protected plan request history.");
+	}
+	if (planApprovals?.length === 2) {
+		const [prior, head] = planApprovals;
+		if (
+			head.missionId !== prior.missionId ||
+			head.revision <= prior.revision ||
+			head.receiptId === prior.receiptId ||
+			head.requestId === prior.requestId
+		)
+			throw new Error("Invalid protected plan receipt history.");
+	}
 	return {
 		schemaVersion: 1,
-		installationId: input.installationId === null ? null : missionText(input.installationId),
+		installationId,
 		session: "default",
 		revision,
 		creator,
 		ceiling: parseMissionCeiling(input.ceiling),
 		approvals: input.approvals.map(parseMissionApproval),
+		...(planApprovals === undefined ? {} : { planApprovals }),
+		...(planRequests === undefined ? {} : { planRequests }),
 		...(input.executionIntent === undefined
 			? {}
 			: { executionIntent: parseMissionExecutionIntent(input.executionIntent) }),
@@ -260,6 +312,27 @@ export function parseMissionAuthority(value: unknown): MissionAuthority {
 		...(input.browserAgreement === undefined
 			? {}
 			: { browserAgreement: parseBrowserAgreementGrant(input.browserAgreement) }),
+	};
+}
+
+function parsePlanRequest(value: unknown): PlanRequestBinding {
+	const input = missionObject(value);
+	const fields = ["requestId", "receiptId", "missionId", "revision", "digest", "authorityRevision", "issuedAt"];
+	if (Object.keys(input).some((key) => !fields.includes(key))) throw new Error("Unknown plan request field.");
+	const requestId = missionText(input.requestId);
+	const receiptId = missionText(input.receiptId);
+	const missionId = missionText(input.missionId);
+	const digest = missionText(input.digest, 64);
+	if (!requestId.trim() || !receiptId.trim() || !missionId.trim() || !/^[0-9a-f]{64}$/.test(digest))
+		throw new Error("Invalid plan request binding.");
+	return {
+		requestId,
+		receiptId,
+		missionId,
+		digest,
+		revision: counter(input.revision, 1),
+		authorityRevision: counter(input.authorityRevision, 1),
+		issuedAt: counter(input.issuedAt, 0),
 	};
 }
 
@@ -309,7 +382,7 @@ function parseIssuedAgreement(value: unknown): IssuedAgreement {
 
 function counter(value: unknown, minimum: number): number {
 	const number = missionNumber(value);
-	if (!Number.isSafeInteger(number) || number < minimum) throw new Error("Invalid browser agreement number.");
+	if (!Number.isSafeInteger(number) || number < minimum) throw new Error("Invalid protected authority counter.");
 	return number;
 }
 

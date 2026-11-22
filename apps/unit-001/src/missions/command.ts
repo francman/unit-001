@@ -14,6 +14,7 @@ export type MissionCommand =
 	| { action: "creator"; file: string; json: boolean }
 	| { action: "purpose"; file: string; revision: number; requestId: string; json: boolean }
 	| { action: "approve-purpose"; revision: number; digest: string; requestId: string; json: boolean }
+	| { action: "plan-approve"; revision: number; digest: string; requestId: string; json: boolean }
 	| {
 			action: "operate";
 			operate: "open" | "suspend" | "close" | "acknowledge";
@@ -31,12 +32,14 @@ export function parseMissionCommand(args: readonly string[]): {
 	session: string;
 	dataDir?: string;
 } {
-	const action = args[0] ?? "status";
+	const planApprove = args[0] === "plan" && args[1] === "approve";
+	const action = planApprove ? "plan-approve" : (args[0] ?? "status");
+	if (action === "plan-approve" && !planApprove) throw new Error("Use mission plan approve.");
 	const operate = action === "operate" ? OPERATE_ACTIONS.find((item) => item === args[1]) : undefined;
 	if (action === "operate" && !operate) throw new Error("Mission operate expects open, suspend, close or acknowledge.");
 	const values = new Map<string, string>();
 	let json = false;
-	for (let index = operate ? 2 : 1; index < args.length; index++) {
+	for (let index = operate || planApprove ? 2 : 1; index < args.length; index++) {
 		const flag = args[index];
 		if (flag === "--json") {
 			if (json) throw new Error("Duplicate --json.");
@@ -132,15 +135,16 @@ export function parseMissionCommand(args: readonly string[]): {
 		action !== "propose" &&
 		action !== "approve" &&
 		action !== "purpose" &&
-		action !== "approve-purpose"
+		action !== "approve-purpose" &&
+		action !== "plan-approve"
 	)
 		throw new Error(
-			"Mission expects status, setup, draft, propose, creator, approve, start, pause, resume, stop, purpose, approve-purpose or operate.",
+			"Mission expects status, setup, draft, propose, creator, approve, start, pause, resume, stop, purpose, approve-purpose, plan approve or operate.",
 		);
 	unexpected(
 		action === "draft" || action === "purpose"
 			? ["--file", "--revision", "--request-id"]
-			: action === "approve" || action === "approve-purpose"
+			: action === "approve" || action === "approve-purpose" || action === "plan-approve"
 				? ["--revision", "--digest", "--request-id"]
 				: ["--revision", "--request-id"],
 	);
@@ -148,15 +152,16 @@ export function parseMissionCommand(args: readonly string[]): {
 	if (!values.has("--revision") || !Number.isSafeInteger(revision) || revision < 0)
 		throw new Error("Mission change requires --revision N (0 for the first draft).");
 	const requestId = values.get("--request-id") ?? randomUUID();
-	if (!requestId.trim() || requestId.length > 200)
+	if (!requestId.trim() || Buffer.byteLength(requestId) > 200)
 		throw new Error("Mission request ID must contain 1–200 characters.");
 	if (action === "draft" || action === "purpose") {
 		const file = values.get("--file");
 		if (!file) throw new Error(`Mission ${action} requires --file FILE.`);
 		return { command: { action, file, revision, requestId, json }, ...location };
 	}
-	if (action === "approve" || action === "approve-purpose") {
+	if (action === "approve" || action === "approve-purpose" || action === "plan-approve") {
 		const digest = values.get("--digest");
+		if (action === "plan-approve" && revision === 0) throw new Error("Plan approval requires a positive revision.");
 		if (!digest || !/^[0-9a-f]{64}$/.test(digest))
 			throw new Error("Mission approval requires the exact --digest SHA256.");
 		return { command: { action, revision, digest, requestId, json }, ...location };
@@ -218,6 +223,14 @@ export function describeMission(view: MissionView): string {
 		);
 	if (view.loopRollback === "live-loop" && view.purpose?.rollback !== "live-loop")
 		lines.push("Rollback: a loop task is still live.");
+	const plan = view.plan;
+	if (plan?.head)
+		lines.push(`Plan revision ${plan.head.revision}: ${plan.headValid ? "verified receipt" : "receipt unavailable or stale"}.`);
+	if (plan?.draft) {
+		lines.push(`Plan draft revision ${plan.draft.revision}: ${plan.draft.status}.`);
+		if (plan.draft.digest !== null) lines.push(`Plan digest: ${plan.draft.digest}`);
+	}
+	if (view.planError) lines.push("Plan records are invalid. Plan admission is closed.");
 	if (view.authority === "unconfigured")
 		lines.push("An administrator must provision the creator and finite authority ceiling before approval.");
 	return sanitizeTerminalText(lines.join("\n"));

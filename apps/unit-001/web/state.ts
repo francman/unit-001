@@ -39,6 +39,16 @@ export interface Ui {
 		/** A completed developer-local approval from this browser, not a receipt still awaiting status. */
 		localAgreementRevision: number | null;
 	} | null;
+	/** A status read from this connection, not a retained projection from before a refresh or disconnect. */
+	planFresh: boolean;
+	planDraft: {
+		editRevision: number | null;
+		unsaved: { revision: number; conflicted: boolean } | null;
+	} | null;
+	planChange:
+		| { kind: "idle"; notice: string }
+		| { kind: "writing" }
+		| { kind: "unresolved"; revision: number; digest: string; requestId: string; receiptId: string | null };
 	draft: string;
 	sending: boolean;
 	cancelling: boolean;
@@ -134,6 +144,9 @@ export function createStore(initial: { section?: Section; preview?: boolean; the
 		details: null,
 		detailsFailed: false,
 		missionDraft: null,
+		planFresh: false,
+		planDraft: null,
+		planChange: { kind: "idle", notice: "" },
 		draft: "",
 		sending: false,
 		cancelling: false,

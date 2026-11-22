@@ -26,6 +26,7 @@ import { type MissionLocation, matchingApproval, readMissionAuthority } from "./
 import type { MissionAuthority } from "./contract.ts";
 import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts";
 import { operationDenial } from "./loop.ts";
+import { storedPlan } from "./plan-state.ts";
 import { MissionPurposeDoc, storedLoop } from "./purpose.ts";
 import { type LoopState, listedWork, loopAgreement } from "./purpose-loop.ts";
 import { WORK_TOOL } from "./work-tool.ts";
@@ -250,7 +251,7 @@ export class MissionAdmission {
 		if (options.pending && !run.pendingTools.includes(call.taskId)) return "Mission admission is closed.";
 		if (run.pendingTools.some((id) => id !== call.taskId && !this.#admitted.has(id)))
 			return "An interrupted mission tool needs reconciliation.";
-		const denial = operationDenial(await this.readAuthority(), loop, run.sequence, this.#now());
+		const denial = operationDenial(await this.readAuthority(), loop, await storedPlan(tx), run.sequence, this.#now());
 		return denial === undefined ? undefined : `Mission authority is closed: ${denial}.`;
 	}
 
@@ -408,7 +409,7 @@ export class MissionAdmission {
 		const run = loop.runs.find((item) => item.providerSession === sessionId);
 		if (!run || run.state.status !== "running" || run.state.phase !== "execution")
 			throw new Error("Mission admission is closed.");
-		const denial = operationDenial(await this.readAuthority(), loop, run.sequence, this.#now());
+		const denial = operationDenial(await this.readAuthority(), loop, await storedPlan(tx), run.sequence, this.#now());
 		if (denial !== undefined) throw new Error(`Mission authority is closed: ${denial}.`);
 		if ((await tx.doc(MaintenanceDoc)).current.state === "held") throw new Error("Maintenance holds mission requests.");
 		const agreement = loopAgreement(loop, run.purposeRevision)!;

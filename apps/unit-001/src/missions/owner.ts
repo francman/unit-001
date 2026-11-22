@@ -11,6 +11,9 @@ import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts
 import { missionExecutionView } from "./execution-view.ts";
 import { loopRollbackBlocker } from "./loop-drain.ts";
 import { PurposeOperation } from "./operation.ts";
+import { PlanFormation } from "./plan-formation.ts";
+import { type PlanState, readMissionPlan } from "./plan-state.ts";
+import { missionPlanView, proposalDraftView } from "./plan-view.ts";
 import { readMissionPurpose } from "./purpose.ts";
 import { PurposeFormation } from "./purpose-formation.ts";
 import type { LoopState } from "./purpose-loop.ts";
@@ -30,6 +33,8 @@ export class MissionOwner {
 	readonly #cwd: string;
 	readonly #purpose: PurposeFormation;
 	readonly #operation: PurposeOperation;
+	readonly #plan: PlanFormation;
+	readonly #now: () => number;
 	#tail: Promise<unknown> = Promise.resolve();
 	#scheduling: "inhibited" | "permitted" = "inhibited";
 
@@ -54,6 +59,8 @@ export class MissionOwner {
 		this.#cwd = cwd;
 		this.#purpose = new PurposeFormation(harness, location, now);
 		this.#operation = new PurposeOperation(harness, location, engine.loop, model, now);
+		this.#plan = new PlanFormation(harness, location, now);
+		this.#now = now;
 	}
 
 	/** Replays only the latest protected intent after restart; agreement alone never starts execution. */
@@ -62,6 +69,7 @@ export class MissionOwner {
 		await this.#formation.initialize(context);
 		if (this.#location.session !== "default") return;
 		await this.#purpose.initialize(context);
+		await this.#plan.initialize(context);
 		// Restrictive operation intents apply before scheduling; open and acknowledgment wait for permission.
 		await this.#operation.initialize(context, scheduling);
 		const authority = await readMissionAuthority(this.#location).catch(() => null);
@@ -86,7 +94,23 @@ export class MissionOwner {
 			policyRevision:
 				current?.policyRevision ?? (intent?.expectedPolicyRevision ?? 0) + (intent?.action === "stop" ? 1 : 0),
 			...(await this.#purposeView(context)),
+			...(await this.#planView(context)),
 		};
+	}
+
+	// The plan view reads the same validated records the gate reads; a failure is reported, never shown as no plan.
+	async #planView(context: Context): Promise<Pick<MissionView, "plan" | "planError">> {
+		let plan: PlanState | undefined;
+		try {
+			plan = await readMissionPlan(this.#harness, context);
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			return { plan: null, planError: reason.slice(0, 500) };
+		}
+		if (!plan) return { plan: null, planError: null };
+		const loop = (await readMissionPurpose(this.#harness, context).catch(() => undefined))?.loop;
+		const authority = await readMissionAuthority(this.#location).catch(() => null);
+		return { plan: missionPlanView(plan, loop, authority, this.#now()), planError: null };
 	}
 
 	// Status validates exactly what execution validates (`readMissionPurpose`, `validPurposeLoop`), and reports a
@@ -105,19 +129,34 @@ export class MissionOwner {
 		let live = loopRollback === "live-loop";
 		for (const id of [loop.operation.loop, loop.operation.drain?.loop])
 			if (id && (await this.#harness.getTask(id, context))?.state.status !== "terminal") live = true;
-		return { purpose: missionPurposeView(loop, live), purposeError: null, loopRollback };
+		// A persisted drain is cleanup the owner has not finished (abandoning runs, clearing the target), even after its
+		// task is terminal; rollback needs that completed, so it reports live until the drain record is gone.
+		const pending = loop.operation.drain !== null ? "live-loop" : loopRollback;
+		return { purpose: missionPurposeView(loop, live), purposeError: null, loopRollback: pending };
 	}
 
 	/** Routes formation normally and serializes exact protected lifecycle requests through the same owner. */
 	async handle(request: MissionRequest, context: Context): Promise<MissionView> {
 		if (request.operation === "status") return this.inspect(context);
 		const work = this.#tail.then(async () => {
+			if (request.operation === "prepare-plan") {
+				// The answer shows exactly the prepared snapshot as the draft, whatever the owner has edited since.
+				const proposal = await this.#plan.prepare(request, context);
+				const view = await this.inspect(context);
+				return { ...view, plan: view.plan && { ...view.plan, draft: proposalDraftView(proposal) } };
+			}
 			if (request.operation === "control-local" || request.operation === "reconcile-execution") {
 				if (request.operation === "control-local") await this.issueLocal(request, context);
 				await this.reconcile(request.requestId, context, this.#scheduling);
 			} else if (request.operation === "purpose-propose") await this.#purpose.propose(request, context);
 			else if (request.operation === "purpose-approve-local") await this.#purpose.approveLocal(request, context);
 			else if (request.operation === "reconcile-purpose") await this.#purpose.reconcile(request.receiptId, context);
+			else if (request.operation === "plan-draft") await this.#plan.draft(request, context);
+			else if (request.operation === "plan-propose") await this.#plan.propose(request, context);
+			else if (request.operation === "plan-agree") await this.#plan.agreeLocal(request, context);
+			else if (request.operation === "reconcile-plan") await this.#plan.reconcile(request.receiptId, context);
+			else if (request.operation === "review-now") await this.#plan.review(request.requestId, context);
+			else if (request.operation === "review-dismiss") await this.#plan.dismiss(request.reviewId, context);
 			else if (request.operation === "operate-local" || request.operation === "reconcile-operation") {
 				if (request.operation === "operate-local") await this.#operation.issueLocal(request, context);
 				await this.#operation.reconcile(request.requestId, context, this.#scheduling);

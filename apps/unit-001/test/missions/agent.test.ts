@@ -59,6 +59,7 @@ it("keeps mission drafting, status and memory available without registering a fa
 				"unit_channel_request_setup",
 				"unit_channel_setup",
 				"unit_mission_draft",
+				"unit_plan_draft",
 				"unit_work_write",
 			].sort(),
 		);

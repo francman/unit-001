@@ -1,6 +1,7 @@
 // Projects only fields used by the workspace from a dispatched operation's owner reply.
 import type { AgreementReview } from "../missions/browser-agreement.ts";
 import { type MissionApproval, type MissionDraft, parseMissionDraftTerms } from "../missions/contract.ts";
+import { parsePlanView, type PlanView } from "../missions/plan-wire.ts";
 import type { MissionRefusalCode } from "../missions/refusal.ts";
 import type { ServiceRequest } from "../service.ts";
 import { type ChatHistoryPage, parseChatHistoryPage } from "../service-view.ts";
@@ -35,6 +36,18 @@ export type ManagedMissionReview = {
 	verifiedApproval?: MissionApproval;
 };
 
+export type WebPlanReview = {
+	canAgree: boolean;
+	headValid: boolean;
+	openUnderHead: boolean;
+	draftDigest: string | null;
+	runnablePurposeBinding: {
+		missionId: string;
+		purposeRevision: number;
+		purposeDigest: string;
+	} | null;
+};
+
 type MissionStatus = {
 	stage: "awaiting_creator" | "drafting" | "awaiting_approval" | "agreed";
 	formation: { agreement: Agreement | null; draft: MissionDraft | null };
@@ -49,6 +62,10 @@ type MissionStatus = {
 	execution: "not-implemented" | "not-started" | RunState;
 	runtime: Run | null;
 	tools: string[];
+	plan: PlanView | null;
+	planError: "invalid-plan" | null;
+	canAgreePlan: boolean;
+	runnablePurposeBinding: WebPlanReview["runnablePurposeBinding"];
 };
 
 type Agreement = {
@@ -149,7 +166,9 @@ type MemoryGraph = {
 
 /** Identifies the mission changes available on the browser surface. */
 export function isWebMissionMutation(operation: ServiceRequest): boolean {
-	return operation.type === "mission" && ["draft", "propose", "agree"].includes(operation.request.operation);
+	return operation.type === "mission" &&
+		["draft", "propose", "agree", "plan-draft", "plan-propose", "plan-agree", "review-now", "review-dismiss"]
+			.includes(operation.request.operation);
 }
 
 /** Rejects unexpected owner replies; the gateway still knows the operation was dispatched. */
@@ -157,6 +176,7 @@ export function projectWebResponse(
 	operation: ServiceRequest,
 	value: unknown,
 	managed?: { review?: ManagedMissionReview },
+	planReview?: WebPlanReview,
 ): PostResponse {
 	const response = object(value);
 	if (response.type === "error" && typeof response.message === "string")
@@ -189,7 +209,7 @@ export function projectWebResponse(
 				(operation.request.operation === "status" || isWebMissionMutation(operation)) &&
 				response.type === "mission"
 			)
-				return { type: "mission", result: mission(object(response.result), managed) };
+				return { type: "mission", result: mission(object(response.result), managed, planReview) };
 			break;
 		case "channels":
 			if (operation.request.operation === "status" && response.type === "channels")
@@ -221,7 +241,11 @@ function status(response: Record<string, unknown>): StatusResponse {
 
 const RUN_STATES = ["ready", "running", "waiting", "paused", "blocked", "completed", "stopped"] as const;
 
-function mission(result: Record<string, unknown>, managed?: { review?: ManagedMissionReview }): MissionStatus {
+function mission(
+	result: Record<string, unknown>,
+	managed?: { review?: ManagedMissionReview },
+	planReview?: WebPlanReview,
+): MissionStatus {
 	const formation = object(result.formation);
 	const creator = result.creator === null ? null : object(result.creator);
 	const reported = oneOf(result.authority, ["managed-administrator", "developer-local", "unconfigured", "invalid"]);
@@ -236,6 +260,15 @@ function mission(result: Record<string, unknown>, managed?: { review?: ManagedMi
 		)
 			return invalid();
 		currentDraft.digest = proposal?.digest ?? null;
+	}
+	const plan = result.plan == null ? null : parsePlanView(result.plan);
+	if (plan !== null) {
+		plan.headValid &&= planReview?.headValid === true;
+		if (!plan.headValid && (plan.adopted || plan.head !== null || plan.gate.state === "open"))
+			plan.gate = { state: "closed", reason: "receipt" };
+		else if (plan.gate.state === "open" && planReview?.openUnderHead !== true)
+			plan.gate = { state: "closed", reason: "reopen-needed" };
+		if (plan.draft !== null) plan.draft.digest = planReview?.draftDigest ?? null;
 	}
 	return {
 		stage: oneOf(result.stage, ["awaiting_creator", "drafting", "awaiting_approval", "agreed"]),
@@ -261,6 +294,10 @@ function mission(result: Record<string, unknown>, managed?: { review?: ManagedMi
 		execution: oneOf(result.execution, ["not-implemented", "not-started", ...RUN_STATES]),
 		runtime: result.runtime == null ? null : run(object(result.runtime)),
 		tools: rows(result.tools, 128, (item) => text(item, 100)),
+		plan,
+		planError: result.planError == null ? null : "invalid-plan",
+		canAgreePlan: managed === undefined && authority === "developer-local" && planReview?.canAgree === true,
+		runnablePurposeBinding: planReview?.runnablePurposeBinding ?? null,
 	};
 }
 

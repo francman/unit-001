@@ -1314,6 +1314,7 @@ describe("restart validation and request IDs", () => {
 		const close = nextOperationAuthority(
 			{ ...authority, operationAcknowledgments: [] },
 			open,
+			undefined,
 			{ operation: "operate-local", action: "close", expectedOperationRevision: open.operation.revision, requestId: "same-1" },
 			now,
 		);
@@ -1326,5 +1327,29 @@ describe("restart validation and request IDs", () => {
 		await expect(host.request({ operation: "reconcile-operation", requestId: "same-1" })).rejects.toThrow(
 			"names both",
 		);
+	});
+});
+
+describe("rollback answer while a drain is persisted", () => {
+	it("reports live-loop until the owner finishes the drain, even after the loop task is terminal", async () => {
+		const host = await launch([writes("alpha")]);
+		await configure(host);
+		await approve(host, purpose([work("reports/a.txt", "alpha")]));
+		await operate(host, "open", "open-1");
+		await until(host, idle);
+		expect(await host.request({ operation: "status" })).toMatchObject({ loopRollback: "no-live-loop" });
+		// A suspend applied, its task already terminal, but the owner's cleanup commit has not run yet.
+		const finished = (await host.harness.inspect(context)).tasks.find((t) => t.record.kind === "unit.mission.loop");
+		await host.harness.commit(async (tx) => {
+			(await tx.doc(MissionPurposeDoc)).loop.operation.drain = {
+				loop: (finished?.record.id ?? "task-gone") as never,
+				conversations: [],
+			};
+		}, context);
+		expect(await host.request({ operation: "status" })).toMatchObject({ loopRollback: "live-loop" });
+		await host.harness.commit(async (tx) => {
+			(await tx.doc(MissionPurposeDoc)).loop.operation.drain = null;
+		}, context);
+		expect(await host.request({ operation: "status" })).toMatchObject({ loopRollback: "no-live-loop" });
 	});
 });

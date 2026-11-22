@@ -1,5 +1,6 @@
 // Restricts browser requests to an explicit subset of the existing operator protocol.
 import type { MissionDraftTerms, MissionRequest } from "../missions/contract.ts";
+import type { PlanTerms } from "../missions/plan-terms.ts";
 import { parseMissionRequest } from "../missions/wire.ts";
 import type { ServiceRequest } from "../service.ts";
 
@@ -13,6 +14,11 @@ export type WebOperation =
 				| { operation: "status" }
 				| { operation: "draft"; expectedRevision: number; terms: MissionDraftTerms }
 				| { operation: "propose"; expectedRevision: number }
+				| { operation: "plan-draft"; expectedRevision: number; terms: PlanTerms }
+				| { operation: "plan-propose"; expectedRevision: number }
+				| { operation: "plan-agree"; revision: number; digest: string; confirmed: true }
+				| { operation: "review-now" }
+				| { operation: "review-dismiss"; reviewId: string }
 				| {
 						operation: "agree";
 						revision: number;
@@ -121,23 +127,34 @@ function missionRequest(value: unknown, requestId: string): MissionRequest {
 		"digest",
 		"confirmed",
 		"previousReceipt",
+		"reviewId",
 	]);
 	if (request.operation === "status") {
 		object(request, ["operation"]);
 		return { operation: "status" };
 	}
-	if (request.operation === "draft") {
+	if (request.operation === "draft" || request.operation === "plan-draft") {
 		object(request, ["operation", "expectedRevision", "terms"]);
 		return parseMissionRequest({ ...request, requestId });
 	}
-	if (request.operation === "propose") {
+	if (request.operation === "propose" || request.operation === "plan-propose") {
 		object(request, ["operation", "expectedRevision"]);
 		return parseMissionRequest({ ...request, requestId });
 	}
-	if (request.operation !== "agree") throw new Error("Operation is unavailable on the browser surface.");
+	if (request.operation === "review-now") {
+		object(request, ["operation"]);
+		return parseMissionRequest({ ...request, requestId });
+	}
+	if (request.operation === "review-dismiss") {
+		object(request, ["operation", "reviewId"]);
+		return parseMissionRequest({ ...request, requestId });
+	}
+	if (request.operation !== "agree" && request.operation !== "plan-agree")
+		throw new Error("Operation is unavailable on the browser surface.");
+	if (request.operation === "plan-agree") object(request, ["operation", "revision", "digest", "confirmed"]);
 	object(request, ["operation", "revision", "digest", "confirmed", "previousReceipt"]);
 	if (request.confirmed !== true) throw new Error("Agreeing to a mission requires explicit confirmation.");
-	return parseMissionRequest({ operation: "agree", revision: request.revision, digest: request.digest, requestId });
+	return parseMissionRequest({ operation: request.operation, revision: request.revision, digest: request.digest, requestId });
 }
 
 function object(value: unknown, fields: readonly string[]): Record<string, unknown> {

@@ -7,6 +7,8 @@ import { button } from "../ui/controls.ts";
 import { type Child, el } from "../ui/dom.ts";
 import { ago, count, dateTime, duration, humanize, money, until } from "../ui/format.ts";
 import { facts, listRow, pageFrame, panel, rowList, section } from "../ui/page.ts";
+import { type MissionPlanOptions, renderMissionPlan } from "./mission-plan.ts";
+import { encodePlanText, type PlanTerminalCommand } from "./mission-plan-display.ts";
 import { bullets, chips, limitRow, runStates, unknownSentence } from "../ui/run.ts";
 
 const approvers: Record<MissionAgreementView["approvedBy"], string> = {
@@ -17,19 +19,31 @@ const approvers: Record<MissionAgreementView["approvedBy"], string> = {
 
 const creators = { human: "a human creator", elder: "an elder", organization: "an organization" } as const;
 
-/** Opens Mission authoring only when the shell supplies a working entry point. */
-export function renderMission(ctx: Ctx, openDraft?: () => void): HTMLElement {
+type PlanActions = Omit<MissionPlanOptions, "plan" | "planError" | "legacy"> & {
+	openDraft?: () => void;
+	notice?: HTMLElement | null;
+};
+
+/** Shows the existing purpose and run, plus the plan only when the gateway projects it. */
+export function renderMission(ctx: Ctx, openDraft?: () => void, planActions?: PlanActions): HTMLElement {
 	const details = ctx.ui.details;
+	const mission = details?.mission;
+	const hasPlanStatus = mission?.plan !== undefined || mission?.planError != null;
 	const run = details?.mission.run ?? null;
 	const state = run ? runStates[run.status] : null;
 	const entry = details && openDraft
 		? button({ label: details.mission.agreement ? "Amend mission" : "Define mission", key: "open-mission-draft", onClick: openDraft })
 		: null;
+	const planEntry = planActions?.openDraft
+		? button({
+			label: mission?.plan?.draft ? "Open plan draft" : mission?.plan?.head ? "Amend plan" : "Define plan",
+			key: "open-mission-plan-draft", onClick: planActions.openDraft,
+		}) : null;
 	const { root, body } = pageFrame({
 		title: "Mission",
 		key: "mission",
-		lead: details?.mission.objective ?? "No purpose agreed yet.",
-		actions: [state ? tag(state.word, state.tone) : null, entry],
+		lead: mission?.plan?.head ? encodePlanText(mission.plan.head.terms.overall.purpose) : mission?.objective ?? "No purpose agreed yet.",
+		actions: [state ? tag(state.word, state.tone) : null, planEntry, entry],
 	});
 	if (!details) {
 		body.append(missingDetails(ctx));
@@ -37,10 +51,17 @@ export function renderMission(ctx: Ctx, openDraft?: () => void): HTMLElement {
 	}
 	const sections = [
 		...needsYou(ctx, details),
+		planActions?.notice,
+		hasPlanStatus ? renderMissionPlan({
+			...planActions,
+			plan: details.mission.plan ?? null,
+			planError: details.mission.planError != null,
+			legacy: mission?.agreement && mission.objective !== null ? { purpose: mission.objective, scope: mission.scope } : undefined,
+		}) : null,
 		purposeSection(ctx, details, openDraft !== undefined),
 		currentWork(details, run),
 		evidenceSection(run),
-		historySection(),
+		!mission?.plan ? historySection() : null,
 		terminalSection(ctx),
 	];
 	for (const item of sections) if (item) body.append(item);
@@ -51,6 +72,13 @@ export function renderMission(ctx: Ctx, openDraft?: () => void): HTMLElement {
 export function missionApprovalCommand(ctx: Ctx, revision: number, digest: string): string {
 	const sudo = ctx.ui.details?.mission.authority === "managed-administrator" ? "sudo " : "";
 	return `${sudo}${terminal(ctx, `mission approve --revision ${revision} --digest ${digest}`)}`;
+}
+
+/** Formats a copy-only plan instruction using the same installation command as legacy Mission. */
+export function missionPlanTerminalCommand(ctx: Ctx, action: "open" | { revision: number; digest: string }): PlanTerminalCommand {
+	const sudo = ctx.ui.details?.mission.authority === "managed-administrator" ? "sudo " : "";
+	const rest = action === "open" ? "mission operate open" : `mission plan approve --revision ${action.revision} --digest ${action.digest}`;
+	return { line: `${sudo}${terminal(ctx, rest)}`, copy: ctx.act.copy };
 }
 
 /** Uses only an exact proposal digest for a known authority, never an unverified managed owner digest. */

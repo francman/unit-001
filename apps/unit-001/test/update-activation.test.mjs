@@ -1,8 +1,10 @@
 // #18: Update fault recovery keeps a two-way door until commit and never restores state after release.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
+	copyFileSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -53,7 +55,6 @@ function release(root, version, stateCompatibility = compatibility, serviceTempl
 		"install.sh": "install",
 		"updater/runtime/bin/node": "independent node",
 		"updater/lib/update.mjs": "independent core",
-		"updater/lib/update-activation.mjs": "activation core",
 		"deploy/unit-001.service": serviceTemplate,
 	};
 	if (version === "0.0.6")
@@ -63,6 +64,8 @@ function release(root, version, stateCompatibility = compatibility, serviceTempl
 		);
 	for (const name of ["installation.mjs", "lifecycle.mjs", "agent-command.mjs", "update-activation.mjs"])
 		files[`deploy/${name}`] = readFileSync(fileURLToPath(new URL(`../deploy/${name}`, import.meta.url)), "utf8");
+	for (const name of ["installation.mjs", "update-activation.mjs"])
+		files[`updater/lib/${name}`] = files[`deploy/${name}`];
 	for (const [path, text] of Object.entries(files)) {
 		mkdirSync(dirname(join(directory, path)), { recursive: true });
 		writeFileSync(join(directory, path), text);
@@ -601,11 +604,141 @@ test("#72 a closed owner cannot drop the mission loop, and refuses before any ho
 	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.3");
 });
 
-test("#72 the shipped release declares the mission loop", () => {
+test("#72 the shipped release declares both continuous operation and protected plan admission", () => {
 	const declared = JSON.parse(
 		readFileSync(fileURLToPath(new URL("../deploy/release-compatibility.json", import.meta.url)), "utf8"),
 	);
-	assert.deepEqual(declared.features, ["mission-loop"]);
+	assert.deepEqual(declared.features, ["mission-loop", "mission-plan-gate"]);
+});
+
+const planCompatibility = { ...compatibility, features: ["mission-loop", "mission-plan-gate"] };
+
+async function planFixture() {
+	const fixture = setup("healthy", { baseline: "0.0.16", candidate: "0.0.17" });
+	release(fixture.root, "0.0.16", loopCompatibility);
+	release(fixture.root, "0.0.17", planCompatibility);
+	const candidate = { ...fixture.candidate, compatibility: planCompatibility };
+	assert.equal((await activateUpdate(fixture.record, candidate, fixture.context)).status, "updated");
+	fixture.calls.length = 0;
+	const intent = {
+		requestId: "restrict", sequence: 5, missionId: "mission", purposeRevision: 2, purposeDigest: "a".repeat(64),
+		authorityRevision: 1, expectedOperationRevision: 4, action: "close", issuedAt: 1234,
+	};
+	const authority = {
+		schemaVersion: 1, session: "default", revision: 1, installationId: id,
+		creator: { id: "owner", kind: "human", uid: 2001 },
+		ceiling: { allowedTools: [], maxCycles: 1, maxRequests: 1, maxRetries: 0, maxConsecutiveNoProgress: 1, maxDurationMs: 1 },
+		approvals: [], operationIntent: intent,
+	};
+	const authorityPath = join(fixture.paths.config, "mission-authority.json");
+	writeFileSync(authorityPath, JSON.stringify(authority));
+	const view = {
+		authority: "managed-administrator", authorityError: null, purposeError: null, loopRollback: "no-live-loop",
+		purpose: { missionId: "mission", revision: 2, digest: intent.purposeDigest, operation: "closed",
+			operationRevision: 5, appliedSequence: 5, rollback: "no-live-loop" },
+	};
+	fixture.context.missionStatus = () => {
+		fixture.calls.push(["mission-status"]);
+		return view;
+	};
+	return { ...fixture, record: readInstallation(id, fixture.root), authority, authorityPath, view };
+}
+
+test("plan downgrade requires a protected applied restriction and affirmative task inspection before journaling", async () => {
+	const fixture = await planFixture();
+	const { authority, authorityPath, context, record, root, view } = fixture;
+	const journal = updatePaths(id, root).journal;
+	const committed = readFileSync(journal);
+	for (const invalid of [
+		null, { ...authority, installationId: "another" }, { ...authority, operationIntent: null },
+		...[
+			{ action: "open", planDigest: "b".repeat(64) }, { action: "suspend" }, { sequence: 6 },
+			{ authorityRevision: 2 }, { missionId: "another" }, { expectedOperationRevision: 5 },
+		].map((change) => ({ ...authority, operationIntent: { ...authority.operationIntent, ...change } })),
+	]) {
+		if (invalid === null) rmSync(authorityPath);
+		else writeFileSync(authorityPath, JSON.stringify(invalid));
+		assert.equal((await rollbackUpdate(record, context)).status, "deferred");
+	}
+	writeFileSync(authorityPath, JSON.stringify(authority));
+	chmodSync(authorityPath, 0o666);
+	assert.equal((await rollbackUpdate(record, context)).status, "deferred");
+	chmodSync(authorityPath, 0o644);
+	for (const answer of [
+		{ ...view, authority: "invalid" }, { ...view, purpose: null }, { ...view, loopRollback: undefined },
+		{ ...view, loopRollback: "live-loop" }, { ...view, purpose: { ...view.purpose, rollback: "live-loop" } },
+		{ ...view, purpose: { ...view.purpose, operation: "open" } },
+	]) {
+		context.missionStatus = () => answer;
+		assert.equal((await rollbackUpdate(record, context)).status, "deferred");
+	}
+	assert.deepEqual(readFileSync(journal), committed);
+	assert.equal(readInstallation(id, root).releaseVersion, "0.0.17");
+	assert.ok(!fixture.calls.some((call) => call[1] === "maintenance-enter" || call[1] === "stop"));
+});
+
+for (const pointer of ["currentCore", "recoveryCore"])
+	test(`plan downgrade rechecks owner tasks and protected intent while held using the patched ${pointer}`, async () => {
+		const { authority, authorityPath, calls, context, record, root, view } = await planFixture();
+		const paths = updatePaths(id, root);
+		// Model a retained patched core separately from the selected app. An actual historical core lacks this check.
+		if (pointer === "recoveryCore") {
+			const retained = { ...record, releaseVersion: "0.0.17-rc.1" };
+			installUpdateCore(retained, release(root, retained.releaseVersion, planCompatibility), context);
+			rmSync(paths.recoveryCore);
+			symlinkSync(`cores/${retained.releaseVersion}`, paths.recoveryCore);
+		}
+		const selected = readlinkSync(paths[pointer]);
+		// Load the selected ESM from disk in a fresh process, with only fixture controls available.
+		context.executingModule = join(paths[pointer], "lib/update-activation.mjs");
+		const probe = join(root, "test/fixtures/updater-plan-core.mjs");
+		mkdirSync(dirname(probe), { recursive: true });
+		copyFileSync(new URL("./fixtures/updater-plan-core.mjs", import.meta.url), probe);
+		symlinkSync(dirname(context.executingModule), join(root, "deploy"));
+		const committed = readFileSync(paths.journal);
+		const change = pointer === "currentCore" ? "task" : "intent";
+		const output = execFileSync(process.execPath, [probe, JSON.stringify([root, record, view, authorityPath, change])], { encoding: "utf8" });
+		const { result, events } = JSON.parse(output);
+		assert.equal(result.status, "deferred");
+		assert.deepEqual(events, [
+			"service-status", "mission-status", "maintenance-enter", "mission-status", "maintenance-release",
+		]);
+		assert.deepEqual(readFileSync(paths.journal), committed);
+		assert.equal(existsSync(paths.priorJournal), false);
+		assert.equal(readInstallation(id, root).releaseVersion, record.releaseVersion);
+		if (pointer === "recoveryCore") {
+			authority.operationIntent.action = "suspend";
+			view.purpose.operation = "suspended";
+		}
+		writeFileSync(authorityPath, JSON.stringify(authority));
+		assert.equal((await rollbackUpdate(record, context)).status, "updated");
+		assert.equal(calls.filter(([call]) => call === "mission-status").length, 2);
+		assert.equal(readInstallation(id, root).releaseVersion, "0.0.16");
+		assert.equal(readUpdateJournal(id, root).previousCore, selected);
+	});
+
+test("closed-owner repair cannot substitute a protected close for live inspection when dropping the plan gate", async () => {
+	const fixture = await planFixture();
+	const journal = updatePaths(id, fixture.root).journal;
+	const committed = readFileSync(journal);
+	await fixture.context.run("systemctl", ["stop", fixture.paths.unit]);
+	fixture.calls.length = 0;
+	assert.equal((await rollbackUpdate(fixture.record, fixture.context)).status, "incompatible");
+	assert.deepEqual(readFileSync(journal), committed);
+	assert.ok(!fixture.calls.some((call) => call[0] === "mission-status" || call[1] === "maintenance-enter"));
+});
+
+test("a plan release dropping both features requires the plan fence on direct activation", async () => {
+	const { record, context, root, calls, authority, authorityPath } = await planFixture();
+	const candidate = { releasePath: release(root, "0.0.9"), version: "0.0.9", compatibility };
+	const journal = updatePaths(id, root).journal;
+	const committed = readFileSync(journal);
+	writeFileSync(authorityPath, JSON.stringify({ ...authority, operationIntent: { ...authority.operationIntent, action: "open" } }));
+	assert.equal((await activateUpdate(record, candidate, context)).status, "deferred");
+	assert.deepEqual(readFileSync(journal), committed);
+	assert.ok(!calls.some((call) => call[1] === "maintenance-enter"));
+	writeFileSync(authorityPath, JSON.stringify(authority));
+	assert.equal((await activateUpdate(record, candidate, context)).status, "updated");
 });
 
 test("#18 failed recovery preparation preserves stopped operator intent", async () => {

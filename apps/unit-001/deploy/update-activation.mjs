@@ -1128,19 +1128,24 @@ export async function activateUpdate(record, candidate, context) {
 				reason: "The release's features differ from its signed descriptor.",
 				version: candidate.version,
 			};
-		// A release without the loop task cannot run or drain a live loop, and its drain would then defer every later
-		// update. Only a live owner can say no loop task exists, so a closed one cannot drop the feature.
-		const dropsLoop =
-			releaseFeatures(record.releaseVersion, context.root).includes("mission-loop") &&
-			!features.includes("mission-loop");
-		if (dropsLoop && closedRepair)
+		// A loop-capable predecessor can replay Open while ignoring its plan binding.
+		const currentFeatures = releaseFeatures(record.releaseVersion, context.root);
+		const dropsPlan = currentFeatures.includes("mission-plan-gate") && !features.includes("mission-plan-gate");
+		const dropsLoop = currentFeatures.includes("mission-loop") && !features.includes("mission-loop");
+		const guard = dropsPlan ? "mission-plan-gate" : dropsLoop ? "mission-loop" : null;
+		if (guard && closedRepair)
 			return {
 				status: "incompatible",
-				reason: `The target release cannot run a mission loop. Start ${record.name}, run sudo ${record.name} mission operate close until mission status shows no live loop, then retry.`,
+				reason:
+					guard === "mission-plan-gate"
+						? "The running owner must confirm a protected close or completed suspend before dropping the mission plan gate."
+						: `The target release cannot run a mission loop. Start ${record.name}, run sudo ${record.name} mission operate close until mission status shows no live loop, then retry.`,
 			};
+		if (dropsPlan && (status.installationId !== record.id || status.version !== record.releaseVersion))
+			return { status: "deferred", reason: "Cannot verify the current installation owner for mission plan downgrade." };
 		// Asked before the journal, so the common refusal never holds admissions or touches the journal.
-		if (dropsLoop && (await liveLoop(record, context)))
-			return { status: "deferred", reason: liveLoopReason(record) };
+		const refusal = await missionDowngradeRefusal(guard, record, context);
+		if (refusal) return { status: "deferred", reason: refusal };
 		const unitPlan = legacyRollback
 			? { action: "keep" }
 			: serviceUnitPlan(record, candidate, destination, previousJournal, context);
@@ -1181,13 +1186,15 @@ export async function activateUpdate(record, candidate, context) {
 					]);
 			// Asked again under the hold, where no operation can open a loop before the stop: this closes the race with
 			// an open issued after the first answer.
-			const loopLive = hold.result === "drained" && dropsLoop && (await liveLoop(record, context));
-			if (hold.result !== "drained" || loopLive) {
+			const held = !dropsPlan || (hold.protocol === 1 && hold.state === "held" && hold.operationId === operationId);
+			const reason =
+				hold.result === "drained" && held ? await missionDowngradeRefusal(guard, record, context) : "Active work did not drain.";
+			if (reason) {
 				journal.liveDeferred = true;
 				saveJournal(record, context, journal, "restored");
 				await context.control(record, ["maintenance-release", "--operation-id", operationId]);
 				completeDeferral(record, journal, context);
-				return { status: "deferred", reason: loopLive ? liveLoopReason(record) : "Active work did not drain." };
+				return { status: "deferred", reason };
 			}
 			await context.run("systemctl", ["stop", installationPaths(record.id, context.root).unit]);
 			const locks = sessionLocks(record, context);
@@ -1258,18 +1265,56 @@ function sameFeatures(declared, signed) {
 	);
 }
 
-// Fails closed: only the owner's affirmative answer from its live tasks permits the drop. The purpose document is no
-// answer: an unreadable one reads as no purpose while a parked loop task stays live.
-async function liveLoop(record, context) {
+// The owner inspects tasks and reconciled state. Only the administrator-owned file can attest which intent a
+// predecessor would read at startup. The management lock serializes its writer with both downgrade checks.
+async function missionDowngradeRefusal(guard, record, context) {
+	if (guard === null) return null;
 	try {
-		return (await context.missionStatus(record))?.loopRollback !== "no-live-loop";
+		const view = await context.missionStatus(record);
+		if (view?.loopRollback === "no-live-loop") {
+			if (guard === "mission-loop") return null;
+			const path = join(installationPaths(record.id, context.root).config, "mission-authority.json");
+			const authority = readProtectedJson(path, context.root, 65536);
+			if (
+				view.authority === "managed-administrator" &&
+				view.authorityError === null &&
+				view.purposeError === null &&
+				authority?.schemaVersion === 1 &&
+				authority.installationId === record.id &&
+				authority.session === "default" &&
+				appliedRestriction(authority, view.purpose)
+			)
+				return null;
+		}
 	} catch {
-		return true;
+		// Unavailable status or untrusted protected metadata cannot establish rollback safety.
 	}
+	if (guard === "mission-plan-gate")
+		return `The target lacks the mission plan gate. Confirm a protected close or completed suspend and no live loop with ${record.name} mission status before retrying.`;
+	return `A mission loop is live and the target release cannot run it. Run sudo ${record.name} mission operate close until mission status shows no live loop, then retry.`;
 }
 
-function liveLoopReason(record) {
-	return `A mission loop is live and the target release cannot run it. Run sudo ${record.name} mission operate close until mission status shows no live loop, then retry.`;
+function appliedRestriction(authority, purpose) {
+	const intent = authority.operationIntent;
+	if (!intent || purpose?.rollback !== "no-live-loop") return false;
+	// Status parsed the protected authority. Bind its applied state to the same restrictive command, even if a
+	// subsequent purpose amendment changed the newest agreement while the operation remained closed.
+	return (
+		Number.isSafeInteger(authority.revision) &&
+		authority.revision > 0 &&
+		intent.authorityRevision === authority.revision &&
+		typeof intent.missionId === "string" &&
+		intent.missionId.length > 0 &&
+		purpose.missionId === intent.missionId &&
+		Number.isSafeInteger(intent.sequence) &&
+		intent.sequence > 0 &&
+		purpose.appliedSequence === intent.sequence &&
+		Number.isSafeInteger(intent.expectedOperationRevision) &&
+		intent.expectedOperationRevision >= 0 &&
+		purpose.operationRevision === intent.expectedOperationRevision + 1 &&
+		((intent.action === "close" && purpose.operation === "closed") ||
+			(intent.action === "suspend" && purpose.operation === "suspended"))
+	);
 }
 
 /**

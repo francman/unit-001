@@ -22,6 +22,7 @@ import {
 } from "./maintenance.ts";
 import { type MemoryRequest, type MemoryResult, parseMemoryRequest, parseMemoryResult } from "./memory-control.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
+import { MissionPlanIssued } from "./missions/plan-formation.ts";
 import { MissionRefusal, type MissionRefusalCode, parseMissionRefusalCode } from "./missions/refusal.ts";
 import { parseMissionRequest, parseMissionView } from "./missions/wire.ts";
 import type { RuntimeFacts } from "./orientation.ts";
@@ -61,6 +62,7 @@ export type ServiceResponse =
 	| { readonly type: "command-suggestions"; readonly result: CommandInterpretation }
 	| { readonly type: "mission"; readonly result: MissionView }
 	| { readonly type: "mission-refused"; readonly code: MissionRefusalCode }
+	| { readonly type: "mission-plan-issued"; readonly receiptId: string }
 	| { readonly type: "memory"; readonly result: MemoryResult }
 	| MaintenanceResult
 	| { readonly type: "reply"; readonly reply: Reply }
@@ -433,6 +435,11 @@ const OPERATOR_OPERATIONS: ReadonlySet<string> = new Set([
 	"mission:agree",
 	// CLI mission purpose: proposing grants nothing; approval needs the root-owned receipt.
 	"mission:purpose-propose",
+	"mission:plan-draft",
+	"mission:plan-propose",
+	"mission:plan-agree",
+	"mission:review-now",
+	"mission:review-dismiss",
 ]);
 
 /** Admits a raw operator request only when its operation is on the operator allowlist. */
@@ -516,9 +523,12 @@ async function handleRequest(
 		try {
 			return { type: "mission", result: await agent.mission(request, BACKGROUND_CONTEXT) };
 		} catch (error) {
+			if (request.operation === "plan-agree" && error instanceof MissionPlanIssued)
+				return { type: "mission-plan-issued", receiptId: error.receiptId };
 			if (
 				error instanceof MissionRefusal &&
-				(request.operation === "draft" || request.operation === "propose" || request.operation === "agree")
+				["draft", "propose", "agree", "plan-draft", "plan-propose", "plan-agree", "review-now", "review-dismiss"]
+					.includes(request.operation)
 			)
 				return { type: "mission-refused", code: error.code };
 			throw error;
@@ -596,6 +606,14 @@ export function parseServiceResponse(wire: string, historyBefore?: number | null
 			return { type: "mission", result: parseMissionView(value.result) };
 		if (value.type === "mission-refused" && "code" in value && Object.keys(value).length === 2)
 			return { type: "mission-refused", code: parseMissionRefusalCode(value.code) };
+		if (
+			value.type === "mission-plan-issued" &&
+			"receiptId" in value &&
+			typeof value.receiptId === "string" &&
+			/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value.receiptId) &&
+			Object.keys(value).length === 2
+		)
+			return { type: "mission-plan-issued", receiptId: value.receiptId };
 		if (value.type === "memory" && "result" in value)
 			return { type: "memory", result: parseMemoryResult(value.result) };
 		if (

@@ -1,6 +1,8 @@
 // Defines bounded mission formation data without granting execution authority.
 
 import type { MissionExecutionView } from "./execution-view.ts";
+import type { PlanTerms } from "./plan-terms.ts";
+import type { PlanView } from "./plan-wire.ts";
 import type { MissionPurposeView } from "./purpose-view.ts";
 import type { MissionPolicy } from "./state.ts";
 
@@ -97,6 +99,13 @@ export type MissionAuthority = {
 	executionIntent?: MissionExecutionIntent;
 	purposeCeiling?: PurposeCeiling;
 	purposeApprovals?: MissionApproval[];
+	/** Plan receipts, newest last; only the newest counts. Additive: an old writer drops them, which closes the plan gate. */
+	planApprovals?: MissionApproval[];
+	/**
+	 * Every issued plan receipt's request binding, oldest first, never evicted: at 32 new request IDs are refused, so a
+	 * replayed ID always resolves to its exact receipt and never to a new one.
+	 */
+	planRequests?: PlanRequestBinding[];
 	operationIntent?: OperationIntent;
 	operationAcknowledgments?: OperationAcknowledgment[];
 	browserAgreement?: BrowserAgreementGrant;
@@ -176,6 +185,17 @@ export type PurposeCeiling = {
 	maxEstimatedCost?: number;
 };
 
+/** One issued plan receipt's protected request binding. */
+export type PlanRequestBinding = {
+	requestId: string;
+	receiptId: string;
+	missionId: string;
+	revision: number;
+	digest: string;
+	authorityRevision: number;
+	issuedAt: number;
+};
+
 /** The latest protected open, suspend or close of continuous operation for one exact purpose revision. */
 export type OperationIntent = {
 	requestId: string;
@@ -187,6 +207,8 @@ export type OperationIntent = {
 	expectedOperationRevision: number;
 	action: "open" | "suspend" | "close";
 	issuedAt: number;
+	/** The exact agreed plan head an open was issued under; recorded at issue, never inferred on replay. */
+	planDigest?: string;
 };
 
 /** A protected decision that one unsettled run's uncertain effects are accepted; it refunds nothing. */
@@ -236,7 +258,24 @@ export type MissionRequest =
 			requestId: string;
 			runId?: string;
 	  }
-	| { operation: "reconcile-operation"; requestId: string };
+	| { operation: "reconcile-operation"; requestId: string }
+	/** `savedBy` is "bob" only from the agent's own draft tool; the owner wire always records "owner". */
+	| {
+			operation: "plan-draft";
+			expectedRevision: number;
+			requestId: string;
+			terms: PlanTerms;
+			savedBy: "bob" | "owner";
+			fromReview: string | null;
+	  }
+	| { operation: "plan-propose"; expectedRevision: number; requestId: string }
+	/** The creator's explicit agreement to an exact proposed plan revision; the owner mints it only on developer-local. */
+	| { operation: "plan-agree"; revision: number; digest: string; requestId: string }
+	| { operation: "reconcile-plan"; receiptId: string }
+	/** Private: a protected publisher prepares one exact proposed snapshot before publishing; never a browser operation. */
+	| { operation: "prepare-plan"; revision: number; digest: string; requestId: string }
+	| { operation: "review-now"; requestId: string }
+	| { operation: "review-dismiss"; reviewId: string; requestId: string };
 
 export type MissionView = {
 	stage: "awaiting_creator" | "drafting" | "awaiting_approval" | "agreed";
@@ -255,6 +294,9 @@ export type MissionView = {
 	purposeError?: string | null;
 	/** From live task inspection, not the purpose records: whether a loop task is live; rollback needs "no-live-loop". */
 	loopRollback?: "no-live-loop" | "live-loop";
+	plan?: PlanView | null;
+	/** Why the stored plan records failed validation; the plan gate then stays closed. */
+	planError?: string | null;
 };
 
 /** Creates an unapproved formation; it never allocates a controller or execution conversation. */

@@ -87,6 +87,7 @@ export const USAGE = `Usage: agent [options]
        agent web [--port 4317] [options]  open the browser workspace on a trusted workstation
        agent memory [stats|recall <query>|remember <text>|forget <id>|sleep] [options]
        agent mission [status|setup|draft|propose|creator|approve|start|pause|resume|stop] [options]
+       agent mission plan approve --revision N --digest SHA256 [--request-id ID]
        agent channels [status] [options] show available adapters and observed channel state
        agent inspect [runtime|configuration|tools|channels|mission|tasks|host] [--json]
        agent inspect os [options]        read observed operating-system facts

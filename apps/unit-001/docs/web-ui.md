@@ -61,11 +61,15 @@ The closed operation set is status, send, cancel, earlier root conversation mess
 
 Agreement names the exact proposed revision and digest shown for review. Developer-local owners can issue the agreement on a trusted workstation. Managed installations use terminal approval. A structured refusal means issuance did not occur. An issued receipt may still be pending owner reconciliation.
 
+The mission plan shows the overall purpose, strategy, tactical work and saved review notes. **Review now** records a note from existing evidence. It makes no model request. A plan can bind at most one runnable tactical to an exact approved purpose. Agreement applies to the complete reviewed revision. Execution stays closed until a separate Open for that revision.
+
+On a managed installation, copy the approval command for the exact revision and digest into the authorized terminal. A later edit leaves an earlier reviewed proposal eligible until the agreed head changes. After a new head is recorded, save any remaining draft again before proposing it against the new head.
+
 A POST response returns only the fields defined for that operation. Send returns an acknowledgement or a notice that an admitted message ended without an answer; conversation text comes from the event stream. An unexpected mutation reply after dispatch is unknown. Only rejection before dispatch restores the send draft.
 
 Each explicit action gets one request ID. A repeated ID with the same input receives the same gateway result; different input conflicts. Mutations are never automatically retried. If the connection fails after admission, delivery remains unknown; inspect the conversation and keep the displayed ID before deciding to act again. Owner send/forget receipts remain the durable deduplication boundary. SSE reconnects replace the current snapshot without replaying commands. Drafts stay in page memory when the browser verifies that it has reconnected to the same workspace. Reloading the page discards them.
 
-Limits are two streams, four active requests, thirty-two mutation outcomes per launch, 1 MiB owner frames, 128 KiB projected browser response envelopes (1 MiB for the memory graph), 64 KiB HTTP input and two-minute request observation. The browser limit includes the full response envelope. Restart the gateway if its mutation outcome budget is full. Slow streams disconnect before they accumulate backlog. Shutdown detaches observation. Admitted owner work survives.
+Limits are two streams, four active requests, thirty-two mutation outcomes per launch, 1 MiB owner frames, 128 KiB projected browser response envelopes (1 MiB for the memory graph and mission plan responses), 64 KiB HTTP input and two-minute request observation. The browser limit includes the full response envelope. Restart the gateway if its mutation outcome budget is full. Slow streams disconnect before they accumulate backlog. Shutdown detaches observation. Admitted owner work survives.
 
 ## Local verification and release gate
 

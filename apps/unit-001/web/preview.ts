@@ -1,5 +1,6 @@
 // Sample data for design review and screenshots; built into web-preview only, never into a release.
 import type { Connection, MemoryGraphView, MissionDraftTerms, MissionRunView, WorkspaceDetails, WorkspacePort, WorkspaceView } from "./contract.ts";
+import type { PlanRevisionView, PlanTerms, PlanView, ReviewNote } from "./mission-plan-contract.ts";
 import { sampleMemoryGraph } from "./preview-memory-graph.ts";
 import { mountWorkspace } from "./shell.ts";
 import { sections } from "./state.ts";
@@ -17,6 +18,7 @@ import { sections } from "./state.ts";
  *   ?unconfigured=1  no model is configured
  *   ?norun=1       no work run exists
  *   ?mission=new|unarmed   start without a mission, or with managed web approval unavailable
+ *   ?plan=history|new|managed|invalid   sample charter and due review, no charter, managed proposal, or blocked plan validation
  *   ?connection=connecting|offline   the connection state after load
  *   ?unknown=1     sending returns an unknown outcome
  *   ?send=1        sends a sample message after load (with ?unknown=1: the uncertain-delivery notice)
@@ -163,6 +165,52 @@ const details: WorkspaceDetails = {
 	],
 };
 
+const previewBinding = { missionId: "sample-purpose", purposeRevision: 2, purposeDigest: "a".repeat(64) };
+const planTerms: PlanTerms = {
+	overall: { purpose: "Keep Harbor secure without disrupting production.", scope: "Harbor only", askFirst: ["Merging"], reviewEveryMs: 7 * day },
+	strategics: [{ id: "supply-chain", title: "Reduce dependency risk", intent: "Keep known issues triaged.", signals: ["Advisories have owners"], priority: "high" }],
+	tacticals: [
+		{ id: "triage", strategic: "supply-chain", objective: "Triage Harbor advisories", successCriteria: ["Record affected versions"],
+			priority: "high", deadlineAt: now + day, mode: "runnable", binding: previewBinding },
+		{ id: "proxy-tests", strategic: "supply-chain", objective: "Revisit proxy test coverage", successCriteria: ["Document test gaps"],
+			priority: "normal", deadlineAt: null, mode: "parked", binding: null },
+	],
+};
+const previousPlan: PlanRevisionView = {
+	revision: 1, digest: "1".repeat(64), previousDigest: null, agreedAt: now - 21 * day, receiptId: "sample-plan-receipt-1",
+	terms: { ...planTerms, overall: { ...planTerms.overall, scope: "Harbor and shared proxy infrastructure" } },
+};
+const planHead: PlanRevisionView = {
+	revision: 2, digest: "2".repeat(64), previousDigest: previousPlan.digest, terms: planTerms, agreedAt: now - 8 * day, receiptId: "sample-plan-receipt-2",
+};
+const cadence = { kind: "cadence", key: "2:cadence:1", subject: null } as const;
+
+function previewReview(head: PlanRevisionView, trigger: ReviewNote["trigger"], reviewId: string): ReviewNote {
+	return {
+		reviewId, key: trigger.key, trigger, planRevision: head.revision, planDigest: head.digest,
+		window: { from: head.agreedAt, to: now }, createdAt: now, outcome: "attention", disposition: null,
+		items: [
+			{ id: "triage", level: "tactical", status: "at-risk", verifiedWorks: 1, listedWorks: 3,
+				runIds: ["sample-run-4"], blockReasons: [], unsettled: 0, deadlineAt: now + day },
+		],
+		facts: { runsUsed: 4, runsLimit: 32, cycles: 6, maxCycles: 20, requests: 41, maxRequests: 200, estimatedCost: 0.42, maxEstimatedCost: 5 },
+		uncertainty: ["The proxy tests are still failing."],
+	};
+}
+
+function previewPlan(variant: string): PlanView {
+	return {
+		missionId: "sample-charter", adopted: true, head: planHead, headValid: true, previous: previousPlan,
+		history: [planHead, previousPlan].map(({ revision, digest, agreedAt }) => ({ revision, digest, agreedAt })),
+		draft: variant === "managed" ? {
+			revision: 3, baseRevision: 2, status: "proposed", digest: "3".repeat(64), terms: planTerms,
+			savedBy: "owner", fromReview: null, missing: [],
+		} : null,
+		gate: { state: "closed", reason: "reopen-needed" }, runs: { used: 4, limit: 32 },
+		due: [cadence], preview: previewReview(planHead, cadence, "sample-due-review"), reviews: [],
+	};
+}
+
 const memories = [
 	{ id: "m1", content: "The creator prefers a short weekly digest with links to sources.", source: "creator/semantic" },
 	{ id: "m2", content: "Harbor's API runs behind a corporate proxy; proxy changes need explicit review.", source: "creator/semantic" },
@@ -253,6 +301,66 @@ const port: WorkspacePort = {
 				},
 			};
 		}
+		return { state: "completed", mission: details.mission };
+	},
+	async mutateMissionPlan(change, requestId) {
+		const mission = details.mission;
+		if (mission.plan === undefined || mission.planError !== null) return { state: "rejected" };
+		if (details.owner?.held) return { state: "refused", code: "held" };
+		const plan: PlanView = mission.plan ?? {
+			missionId: "sample-charter", adopted: false, head: null, headValid: false, previous: null, history: [], draft: null,
+			gate: { state: "not-adopted", reason: null }, runs: { used: 0, limit: 32 }, due: [], preview: null, reviews: [],
+		};
+		const { draft, head } = plan;
+		const revision = draft?.revision ?? head?.revision ?? 0;
+		if ("expectedRevision" in change && change.expectedRevision !== revision) return { state: "refused", code: "stale-revision" };
+		let next: PlanView;
+		switch (change.operation) {
+			case "plan-draft": {
+				const { terms } = change;
+				const missing = [
+					!terms.overall.purpose.trim() ? "purpose" : "",
+					!terms.overall.scope.trim() ? "scope" : "",
+					terms.overall.reviewEveryMs < 1 ? "review cadence" : "",
+					...terms.strategics.filter((item) => !item.id || !item.title.trim() || !item.intent.trim()).map((item) => `strategy ${item.id}`),
+					...terms.tacticals.filter((item) => !item.id || !item.objective.trim() || !item.successCriteria.length).map((item) => `tactic ${item.id}`),
+				].filter(Boolean);
+				next = { ...plan, draft: { revision: revision + 1, baseRevision: head?.revision ?? 0, status: "editing",
+					terms, digest: null, savedBy: "owner", fromReview: null, missing } };
+				break;
+			}
+			case "plan-propose": {
+				if (draft?.status !== "editing" || draft.missing.length) return { state: "refused", code: "incomplete" };
+				const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([draft.revision, draft.terms])));
+				const digest = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
+				next = { ...plan, draft: { ...draft, status: "proposed", digest } };
+				break;
+			}
+			case "plan-agree": {
+				if (!mission.canAgreePlan || mission.authority !== "developer-local") return { state: "refused", code: "managed-requires-gateway" };
+				if (draft?.status !== "proposed" || revision !== change.revision || draft.digest !== change.digest)
+					return { state: "refused", code: "stale-digest" };
+				const { digest } = change;
+				next = { ...plan, adopted: true, headValid: true, previous: head, draft: null, due: [], preview: null,
+					head: { revision, digest, previousDigest: head?.digest ?? null, terms: draft.terms, agreedAt: now, receiptId: `sample-plan-receipt-${revision}` },
+					history: [{ revision, digest, agreedAt: now }, ...plan.history], gate: { state: "closed", reason: "reopen-needed" } };
+				break;
+			}
+			case "review-now": {
+				if (!head) return { state: "refused", code: "incomplete" };
+				const trigger = plan.due[0] ?? { kind: "owner", key: `${head.revision}:owner:${requestId}`, subject: null };
+				if (plan.reviews.some((review) => review.key === trigger.key)) return { state: "completed", mission };
+				next = { ...plan, due: [], preview: null, reviews: [previewReview(head, trigger, `sample-${requestId}`), ...plan.reviews].slice(0, 12) };
+				break;
+			}
+			case "review-dismiss":
+				if (!plan.reviews.some((review) => review.reviewId === change.reviewId))
+					return { state: "refused", code: "stale-revision" };
+				next = { ...plan, reviews: plan.reviews.map((review) => review.reviewId !== change.reviewId || review.disposition ? review :
+					{ ...review, disposition: { kind: "dismissed", at: now, draftRevision: null } }) };
+				break;
+		}
+		details.mission = { ...mission, plan: next };
 		return { state: "completed", mission: details.mission };
 	},
 	async send(prompt, requestId) {
@@ -383,6 +491,17 @@ if (params.get("mission") === "new")
 	details.mission = { ...details.mission, stage: "drafting", objective: null, scope: null, agreement: null, agreementValid: false, run: null };
 else if (params.get("mission") === "unarmed")
 	details.mission = { ...details.mission, authority: "managed-administrator", canAgree: false };
+const planVariant = params.get("plan");
+if (planVariant === "history" || planVariant === "managed" || planVariant === "new" || planVariant === "invalid") {
+	const authority = planVariant === "managed" ? "managed-administrator" : details.mission.authority;
+	details.mission = {
+		...details.mission, authority, canAgree: authority === "developer-local",
+		plan: planVariant === "new" || planVariant === "invalid" ? null : previewPlan(planVariant),
+		planError: planVariant === "invalid" ? "invalid-plan" : null,
+		canAgreePlan: authority === "developer-local" && planVariant !== "invalid",
+		runnablePurposeBinding: details.mission.agreement && planVariant !== "invalid" ? previewBinding : null,
+	};
+}
 if (flag("held") && details.owner) details.owner.held = true;
 if (flag("unconfigured")) {
 	if (details.owner) details.owner.configured = false;

@@ -359,6 +359,10 @@ async function control(
 			const response = await requestService(endpoint, { type: "mission", request }, signal);
 			if (response.type === "error") throw new ConfigurationError(response.message);
 			if (response.type === "mission-refused") throw new ConfigurationError(describeMissionRefusal(response.code));
+			if (request.operation === "plan-agree" && response.type === "mission-plan-issued")
+				throw new ConfigurationError(
+					`Plan agreement ${response.receiptId} was issued and is awaiting reconciliation. Retry with the same --request-id. Request ID: ${sanitizeTerminalText(request.requestId)}`,
+				);
 			if (response.type !== "mission") throw new Error("Unexpected mission response.");
 			return response.result;
 		};
@@ -441,7 +445,11 @@ async function control(
 				requestId: input.requestId,
 				digest: input.digest,
 			};
-		else operation = { operation: "status" };
+		else if (input.action === "plan-approve") {
+			if (runtime.managed !== undefined)
+				throw new ConfigurationError(`Run sudo ${runtime.managed.name} mission plan approve as the configured creator.`);
+			operation = { operation: "plan-agree", revision: input.revision, digest: input.digest, requestId: input.requestId };
+		} else operation = { operation: "status" };
 		const view = await request(operation);
 		runtime.stdout.write(`${input.json ? JSON.stringify(view) : describeMission(view)}\n`);
 		return 0;
@@ -637,7 +645,14 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 						)
 					: operatorEndpoint(runtime.managed.id, command.options.session);
 			const write = (text: string) => void runtime.stdout.write(text);
-			code = await runWebWorkspace(endpoint, command.port, write, signal, runtime.managed?.id);
+			code = await runWebWorkspace(
+				endpoint,
+				command.port,
+				write,
+				signal,
+				runtime.managed?.id,
+				runtime.managed === undefined ? resolveDirectory(command.options.dataDir, runtime) : undefined,
+			);
 		} else if (command.kind === "setup") code = await setup(command, runtime, signal);
 		else if (command.kind === "run" && argv.length === 0 && runtime.managed !== undefined && runtime.interactive) {
 			// The normal installed entry is a client; explicit foreground flags retain their existing owner semantics.

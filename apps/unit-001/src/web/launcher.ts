@@ -6,12 +6,13 @@ import { chmod, link, lstat, mkdir, mkdtemp, readFile, rmdir, unlink } from "nod
 import { userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { ConfigurationError } from "../errors.ts";
-import { matchingApproval, readMissionAuthority } from "../missions/authority.ts";
+import { matchingApproval, type MissionLocation, readMissionAuthority } from "../missions/authority.ts";
 import { agreementReview } from "../missions/browser-agreement.ts";
 import type { MissionView } from "../missions/contract.ts";
+import { matchingPlanApproval, planDigest } from "../missions/plan-authority.ts";
 import { localServiceClient } from "../service-client.ts";
 import { createWebGateway } from "./gateway.ts";
-import type { ManagedMissionReview } from "./post-response.ts";
+import type { ManagedMissionReview, WebPlanReview } from "./post-response.ts";
 
 /** Serves packaged browser assets until interrupted. */
 export async function runWebWorkspace(
@@ -20,6 +21,7 @@ export async function runWebWorkspace(
 	write: (text: string) => void,
 	signal: AbortSignal,
 	installationId?: string,
+	developerDirectory?: string,
 ): Promise<number> {
 	if (signal.aborted) return 130;
 	const managed = installationId === undefined ? undefined : managedListener(installationId);
@@ -45,6 +47,14 @@ export async function runWebWorkspace(
 		assets.set(path, { contentType, body });
 	}
 	const origin = `http://127.0.0.1:${port}`;
+	const location: MissionLocation | undefined =
+		client.session !== "default"
+			? undefined
+			: installationId !== undefined
+				? { kind: "managed", installationId, session: client.session }
+				: developerDirectory !== undefined
+					? { kind: "developer-local", directory: developerDirectory, session: client.session }
+					: undefined;
 	const gateway = createWebGateway({
 		client,
 		workspaceId: createHash("sha256").update(JSON.stringify([installationId ?? null, endpoint])).digest("hex"),
@@ -55,6 +65,7 @@ export async function runWebWorkspace(
 			installationId !== undefined && client.session === "default"
 				? (view) => reviewManagedMission(installationId, view)
 				: undefined,
+		planReview: location === undefined ? undefined : (view) => reviewPlan(location, view),
 	});
 	let staging: string | undefined;
 	let published: BigIntStats | undefined;
@@ -167,4 +178,50 @@ async function reviewManagedMission(installationId: string, view: MissionView): 
 			? matchingApproval(authority, active.approval.receiptId, active.missionId, active.revision, active.terms)
 			: undefined;
 	return { armed: false, proposal: agreementReview(view.formation.draft, authority), verifiedApproval };
+}
+
+async function reviewPlan(location: MissionLocation, view: MissionView): Promise<WebPlanReview | undefined> {
+	const authority = await readMissionAuthority(location).catch(() => null);
+	if (authority === null) return undefined;
+	const plan = view.plan;
+	const head = plan?.head;
+	const approval = plan?.missionId && head
+		? matchingPlanApproval(authority, head.receiptId, plan.missionId, head.revision, head.previousDigest, head.terms)
+		: undefined;
+	const draft = plan?.draft;
+	const draftDigest = plan?.missionId && draft?.status === "proposed"
+		? planDigest(draft.terms, plan.missionId, draft.revision, head?.digest ?? null, authority)
+		: null;
+	const purpose = view.purpose;
+	// The owner status identifies its current purpose. A protected receipt must attest to the same tuple.
+	const receipt = authority.purposeApprovals?.at(-1);
+	const managed = location.kind === "managed";
+	const runnablePurposeBinding =
+		purpose && receipt &&
+		purpose.missionId === receipt.missionId &&
+		purpose.revision === receipt.revision &&
+		purpose.digest === receipt.digest &&
+		receipt.installationId === authority.installationId &&
+		receipt.session === authority.session &&
+		receipt.authorityRevision === authority.revision &&
+		receipt.provenance === (managed ? "managed-administrator" : "developer-local") &&
+		receipt.approvedBy.kind === (managed ? "local-creator" : "developer-local") &&
+		receipt.approvedBy.uid === authority.creator.uid &&
+		(!managed || (authority.creator.uid !== null && authority.creator.uid !== 0)) &&
+		receipt.creator.id === authority.creator.id &&
+		receipt.creator.kind === authority.creator.kind &&
+		receipt.creator.uid === authority.creator.uid
+			? { missionId: receipt.missionId, purposeRevision: receipt.revision, purposeDigest: receipt.digest }
+			: null;
+	return {
+		canAgree: !managed && view.planError == null,
+		headValid: approval !== undefined && approval.digest === head?.digest,
+		openUnderHead:
+			approval !== undefined &&
+			authority.operationIntent?.action === "open" &&
+			authority.operationIntent.authorityRevision === authority.revision &&
+			authority.operationIntent.planDigest === approval.digest,
+		draftDigest: draftDigest === draft?.digest ? draftDigest : null,
+		runnablePurposeBinding,
+	};
 }

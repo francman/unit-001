@@ -1,6 +1,7 @@
 // Browser mission definition: the contract admits draft, propose and one confirmed agreement, and nothing else.
 import { describe, expect, it } from "vitest";
 import { parseWebRequest } from "../src/web/contract.ts";
+import { planTerms } from "./missions/fixtures/plan.ts";
 
 const digest = "a".repeat(64);
 const mission = (request: unknown) => parseWebRequest({ requestId: "r-1", operation: { type: "mission", request } });
@@ -43,7 +44,31 @@ describe("browser mission operations", () => {
 	});
 
 	it("keeps approval, reconciliation and purpose operations off the browser surface", () => {
-		for (const operation of ["approve-local", "reconcile", "configure-local", "purpose-propose", "purpose-approve-local", "operate-local", "control-local"])
+		for (const operation of ["approve-local", "reconcile", "reconcile-plan", "configure-local", "purpose-propose", "purpose-approve-local", "operate-local", "control-local"])
 			expect(() => mission({ operation, expectedRevision: 1 }), operation).toThrow();
+	});
+
+	it("uses closed plan and review requests with the existing request ID", () => {
+		const terms = planTerms();
+		expect(mission({ operation: "plan-draft", expectedRevision: 0, terms }).operation).toEqual({
+			type: "mission",
+			request: { operation: "plan-draft", expectedRevision: 0, requestId: "r-1", terms, savedBy: "owner", fromReview: null },
+		});
+		expect(mission({ operation: "plan-propose", expectedRevision: 2 }).operation).toEqual({
+			type: "mission", request: { operation: "plan-propose", expectedRevision: 2, requestId: "r-1" },
+		});
+		expect(mission({ operation: "plan-agree", revision: 3, digest, confirmed: true }).operation).toEqual({
+			type: "mission", request: { operation: "plan-agree", revision: 3, digest, requestId: "r-1" },
+		});
+		expect(mission({ operation: "review-now" }).operation).toEqual({
+			type: "mission", request: { operation: "review-now", requestId: "r-1" },
+		});
+		expect(mission({ operation: "review-dismiss", reviewId: "review-1" }).operation).toEqual({
+			type: "mission", request: { operation: "review-dismiss", reviewId: "review-1", requestId: "r-1" },
+		});
+		expect(() => mission({ operation: "plan-draft", expectedRevision: 0, terms, savedBy: "bob" })).toThrow();
+		expect(() => mission({ operation: "plan-agree", revision: 3, digest })).toThrow("explicit confirmation");
+		expect(() => mission({ operation: "plan-agree", revision: 3, digest, confirmed: true, previousReceipt: null })).toThrow();
+		expect(() => mission({ operation: "review-now", reviewId: "review-1" })).toThrow();
 	});
 });

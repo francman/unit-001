@@ -176,6 +176,9 @@ export function parseOperationIntent(value: unknown): OperationIntent {
 		throw new Error("Unknown mission operation intent.");
 	const requestId = missionText(input.requestId);
 	const purposeDigest = missionText(input.purposeDigest, 64);
+	const planDigest = input.planDigest === undefined ? undefined : missionText(input.planDigest, 64);
+	if (planDigest !== undefined && (input.action !== "open" || !/^[0-9a-f]{64}$/.test(planDigest)))
+		throw new Error("Invalid plan-bound open intent.");
 	if (!requestId.trim() || !/^[0-9a-f]{64}$/.test(purposeDigest)) throw new Error("Invalid operation intent binding.");
 	return {
 		requestId,
@@ -183,6 +186,7 @@ export function parseOperationIntent(value: unknown): OperationIntent {
 		missionId: missionText(input.missionId),
 		purposeRevision: count(input.purposeRevision, 1),
 		purposeDigest,
+		...(planDigest === undefined ? {} : { planDigest }),
 		authorityRevision: count(input.authorityRevision, 1),
 		expectedOperationRevision: count(input.expectedOperationRevision, 0),
 		action: input.action,

@@ -43,7 +43,8 @@ export async function dispatchAgent(id, expectedName, args, context) {
 	if (
 		!service &&
 		action === "mission" &&
-		["creator", "approve", "approve-purpose", "operate", "start", "pause", "resume", "stop"].includes(args[1])
+		(["creator", "approve", "approve-purpose", "operate", "start", "pause", "resume", "stop"].includes(args[1]) ||
+			(args[1] === "plan" && args[2] === "approve"))
 	) {
 		if (context.uid !== 0)
 			throw new Error(

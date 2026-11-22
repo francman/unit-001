@@ -10,6 +10,7 @@ import {
 	isWebMissionMutation,
 	type ManagedMissionReview,
 	projectWebResponse,
+	type WebPlanReview,
 	type WebResult,
 } from "./post-response.ts";
 
@@ -20,6 +21,7 @@ export type WebGatewayOptions = {
 	assets: ReadonlyMap<string, { contentType: string; body: Uint8Array }>;
 	managed?: boolean;
 	managedReview?: (view: MissionView) => Promise<ManagedMissionReview | undefined>;
+	planReview?: (view: MissionView) => Promise<WebPlanReview | undefined>;
 };
 
 export type WebGateway = { server: Server; close(): Promise<void> };
@@ -155,6 +157,8 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 					inFlight++;
 					const signal = AbortSignal.any([shutdown.signal, AbortSignal.timeout(120_000)]);
 					const result = (async (): Promise<WebResult> => {
+						if (managed && parsed.operation.type === "mission" && parsed.operation.request.operation === "plan-agree")
+							return { requestId: parsed.requestId, state: "refused", code: "managed-requires-gateway" };
 						if (
 							parsed.operation.type === "mission" &&
 							parsed.operation.request.operation === "agree" &&
@@ -162,6 +166,12 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 						)
 							return { requestId: parsed.requestId, state: "refused", code: "not-enabled" };
 						const response = await options.client.request(parsed.operation, signal);
+						if (
+							parsed.operation.type === "mission" &&
+							parsed.operation.request.operation === "plan-agree" &&
+							response.type === "mission-plan-issued"
+						)
+							return { requestId: parsed.requestId, state: "issued", receiptId: response.receiptId, reconciled: false };
 						if (missionMutation && response.type === "mission-refused")
 							return {
 								requestId: parsed.requestId,
@@ -183,6 +193,17 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 						// The service transport bounds the owner frame. This limit covers the entire browser reply.
 						const review =
 							managed && response.type === "mission" ? await options.managedReview?.(response.result) : undefined;
+						const planReview = response.type === "mission" ? await options.planReview?.(response.result) : undefined;
+						if (parsed.operation.type === "mission" && parsed.operation.request.operation === "plan-agree") {
+							if (
+								response.type !== "mission" ||
+								response.result.authority !== "developer-local" ||
+								planReview?.headValid !== true ||
+								response.result.plan?.head?.revision !== parsed.operation.request.revision ||
+								response.result.plan.head.digest !== parsed.operation.request.digest
+							)
+								throw new Error("Owner plan agreement outcome is unknown.");
+						}
 						const completed: WebResult = {
 							requestId: parsed.requestId,
 							state: "completed",
@@ -190,9 +211,12 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 								parsed.operation,
 								response,
 								managed ? { review: review && { ...review, armed: false } } : undefined,
+								planReview,
 							),
 						};
-						if (Buffer.byteLength(JSON.stringify(completed)) > limit)
+						const browserLimit =
+							completed.response.type === "mission" && completed.response.result.plan !== null ? 1_048_576 : limit;
+						if (Buffer.byteLength(JSON.stringify(completed)) > browserLimit)
 							return {
 								requestId: parsed.requestId,
 								state: "unknown",

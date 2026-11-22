@@ -10,6 +10,9 @@ export const MISSION_REFUSAL_CODES = [
 	"held",
 	"managed-requires-gateway",
 	"conflicting-request",
+	// Mission plan formation.
+	"plan-limit",
+	"owner-draft",
 	// The managed browser agreement helper's own pre-write refusals.
 	"not-enabled",
 	"creator-mismatch",
@@ -41,6 +44,8 @@ const REFUSAL_TEXT: Record<MissionRefusalCode, string> = {
 	held: "The service is held for maintenance.",
 	"managed-requires-gateway": "On a managed host, agreement needs the creator's armed browser or the administrator command.",
 	"conflicting-request": "That request ID already belongs to a different mission change.",
+	"plan-limit": "The mission plan has reached its limit of agreed revisions.",
+	"owner-draft": "The owner has a pending plan draft; Bob cannot replace it.",
 	"not-enabled": "Browser agreement is not enabled for this creator.",
 	"creator-mismatch": "Only the creator's own account can agree to the mission.",
 	"stale-authority": "Mission authority changed since the review; inspect the proposal again.",

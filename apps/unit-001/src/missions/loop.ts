@@ -9,6 +9,8 @@ import { admitWork, chargeCycle, workAllowanceDenial } from "./allowance.ts";
 import type { MissionAuthority } from "./contract.ts";
 import { type MissionEvidence, MissionExecutionDoc } from "./execution-state.ts";
 import { MissionPurposeDoc, storedLoop, validPurposeLoop } from "./purpose.ts";
+import { planGate } from "./plan-gate.ts";
+import { type PlanState, storedPlan } from "./plan-state.ts";
 import { matchingPurposeApproval, workDigest } from "./purpose-authority.ts";
 import {
 	appendProposal,
@@ -48,7 +50,7 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					if (!loop) return terminal();
 					const now = runtime.now();
 					const agreement = loopAgreement(loop, task.input.purposeRevision)!;
-					const denial = operationDenial(await authority(), loop, task.input.sequence, now);
+					const denial = operationDenial(await authority(), loop, await storedPlan(tx), task.input.sequence, now);
 					if (denial) return blocked(loop, denial);
 					if (await held(tx)) return sleep(loop, agreement, now, "maintenance", "observe");
 					if (loop.runs.some((run) => run.settlement === "unsettled"))
@@ -96,7 +98,7 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					if (!loop || !proposal || proposal.status !== "recorded") return terminal();
 					const now = runtime.now();
 					const agreement = loopAgreement(loop, task.input.purposeRevision)!;
-					const denial = operationDenial(await authority(), loop, task.input.sequence, now);
+					const denial = operationDenial(await authority(), loop, await storedPlan(tx), task.input.sequence, now);
 					if (denial || proposal.purposeRevision !== task.input.purposeRevision) {
 						proposal.status = "stale";
 						return blocked(loop, denial ?? "stale_proposal");
@@ -162,7 +164,7 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					const work = listedWork(agreement, run.workId)!;
 					run.evidence = evidence;
 					if (evidence.every((item) => item.accepted)) return verified(loop, run, agreement, now);
-					const denial = operationDenial(await authority(), loop, task.input.sequence, now);
+					const denial = operationDenial(await authority(), loop, await storedPlan(tx), task.input.sequence, now);
 					if (denial) return blockRun(loop, run, agreement, now, denial);
 					if (await held(tx)) return sleep(loop, agreement, now, "maintenance", { runId: run.runId });
 					if (run.attempts.some((attempt) => attempt.status === "reserved"))
@@ -213,7 +215,7 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					run.noProgress = progress ? 0 : run.noProgress + 1;
 					run.evidence = evidence;
 					if (evidence.every((item) => item.accepted)) return verified(loop, run, agreement, now);
-					const denial = operationDenial(await authority(), loop, task.input.sequence, now);
+					const denial = operationDenial(await authority(), loop, await storedPlan(tx), task.input.sequence, now);
 					if (denial) return blockRun(loop, run, agreement, now, denial);
 					if (run.attempts.some((attempt) => attempt.status === "reserved"))
 						return blockRun(loop, run, agreement, now, "unknown_request_outcome");
@@ -255,11 +257,12 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 /**
  * The protected decision for one admission: the latest purpose receipt still agrees the open revision, the protected
  * open intent is exactly the applied one (request ID and sequence), the authority revision is unchanged, and the
- * lifetime deadline has not passed.
+ * lifetime deadline has not passed. Once a mission plan is adopted, the plan gate must also be open (`planGate`).
  */
 export function operationDenial(
 	authority: MissionAuthority | null,
 	loop: LoopState,
+	plan: PlanState | undefined,
 	sequence: number,
 	now: number,
 ): string | undefined {
@@ -287,6 +290,8 @@ export function operationDenial(
 		)
 	)
 		return "authority";
+	const gate = planGate(authority, plan, loop);
+	if (gate !== "not-adopted" && gate !== "open") return "plan";
 	if (agreement.terms.lifetime.deadlineAt <= now) return "deadline";
 	return undefined;
 }

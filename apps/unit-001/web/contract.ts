@@ -1,5 +1,6 @@
 // Defines the browser workspace projection independently of private owner storage.
 import type { MissionRefusalCode } from "../src/missions/refusal.ts";
+import type { PlanTerms, PlanView } from "./mission-plan-contract.ts";
 
 export type Connection = "connected" | "connecting" | "offline" | "workspace-changed";
 
@@ -93,6 +94,23 @@ export type MissionMutationOutcome =
 	| { state: "rejected" }
 	| { state: "unknown" };
 
+/** An exact purpose revision the gateway offers as a runnable plan binding. */
+export type MissionPlanBinding = Extract<PlanTerms["tacticals"][number], { mode: "runnable" }>["binding"];
+
+/** Plan status is projected on the existing read-only mission status operation. */
+export type MissionPlanStatusRequest = { operation: "status" };
+
+/** Browser-only plan requests; the request ID is in the envelope, not the operation. */
+export type MissionPlanMutation =
+	| { operation: "plan-draft"; expectedRevision: number; terms: PlanTerms }
+	| { operation: "plan-propose"; expectedRevision: number }
+	| { operation: "plan-agree"; revision: number; digest: string; confirmed: true }
+	| { operation: "review-now" }
+	| { operation: "review-dismiss"; reviewId: string };
+
+/** Plan writes may issue a receipt before the full mission snapshot confirms agreement. */
+export type MissionPlanMutationOutcome = MissionMutationOutcome | { state: "issued"; receiptId: string; reconciled: boolean };
+
 /** The one bounded work run the owner reports; it is not the purpose and not a planner. */
 export interface MissionRunView {
 	status: "ready" | "running" | "waiting" | "paused" | "blocked" | "completed" | "stopped";
@@ -182,6 +200,12 @@ export interface WorkspaceDetails {
 		previousReceipt?: string | null;
 		draft: MissionDraftView | null;
 		review: MissionReviewView | null;
+		/** Presence means the gateway projects the Missions v2 protocol; null can mean there is no saved plan. */
+		plan?: PlanView | null;
+		planError?: "invalid-plan" | null;
+		/** Affirmative developer-local browser capability; absent or false never authorizes Agree. */
+		canAgreePlan?: boolean;
+		runnablePurposeBinding?: MissionPlanBinding | null;
 	};
 	memory: {
 		count: number | null;
@@ -215,6 +239,7 @@ export interface WorkspacePort {
 	/** Reads only the current mission snapshot; never resends a mutation. */
 	mission(): Promise<WorkspaceDetails["mission"]>;
 	mutateMission(request: MissionMutation, requestId: string): Promise<MissionMutationOutcome>;
+	mutateMissionPlan(request: MissionPlanMutation, requestId: string): Promise<MissionPlanMutationOutcome>;
 	send(prompt: string, requestId: string): Promise<SendOutcome>;
 	cancel(requestId: string): Promise<void>;
 	recall(query: string): Promise<WorkspaceDetails["memory"]>;

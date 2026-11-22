@@ -24,6 +24,7 @@ import {
 	parseMissionDraftTerms,
 } from "./contract.ts";
 import { MissionExecutionDoc } from "./execution-state.ts";
+import { readMissionPlan } from "./plan-state.ts";
 import { importLegacyAgreements, readMissionPurpose, recordLegacyAgreement } from "./purpose.ts";
 import { MissionRefusal } from "./refusal.ts";
 import { MissionDoc } from "./state.ts";
@@ -131,6 +132,16 @@ export class MissionControl {
 		};
 	}
 
+	// A rotation clears plan receipts; one still unrecorded would then look like an older head's successor or, on first
+	// adoption, like no plan at all. Rotation waits until the owner records it (or the plan cannot be read: unknown).
+	async #refuseRotationWhilePlanPending(prior: MissionAuthority | null, context: Context): Promise<void> {
+		const latest = prior?.planApprovals?.at(-1);
+		if (!latest) return;
+		const plan = await readMissionPlan(this.#harness, context).catch(() => undefined);
+		if (!plan?.agreed.some((agreement) => agreement.approval.receiptId === latest.receiptId))
+			throw new Error("A plan agreement awaits recording; reconcile the plan before changing the creator authority.");
+	}
+
 	/** Commits one revision-checked draft operation or an approval already issued by its authenticated authority. */
 	async handle(request: MissionRequest, context: Context): Promise<MissionView> {
 		if (
@@ -140,9 +151,16 @@ export class MissionControl {
 			request.operation === "purpose-approve-local" ||
 			request.operation === "reconcile-purpose" ||
 			request.operation === "operate-local" ||
-			request.operation === "reconcile-operation"
+			request.operation === "reconcile-operation" ||
+			request.operation === "plan-draft" ||
+			request.operation === "plan-propose" ||
+			request.operation === "plan-agree" ||
+			request.operation === "reconcile-plan" ||
+			request.operation === "prepare-plan" ||
+			request.operation === "review-now" ||
+			request.operation === "review-dismiss"
 		)
-			throw new Error("Mission execution and purpose changes belong to its runtime owner.");
+			throw new Error("Mission execution, purpose and plan changes belong to its runtime owner.");
 		if (this.#location.session !== "default")
 			throw new Error("Mission formation belongs to the default owner session.");
 		if (request.operation === "status") return this.inspect(context);
@@ -164,6 +182,7 @@ export class MissionControl {
 			if (request.ceiling.allowedTools.some((tool) => !this.#tools.includes(tool)))
 				throw new Error("Unknown registered tool action.");
 			const prior = await readMissionAuthority(this.#location);
+			await this.#refuseRotationWhilePlanPending(prior, context);
 			await writeMissionAuthority(this.#location, {
 				schemaVersion: 1,
 				installationId: null,
@@ -177,6 +196,9 @@ export class MissionControl {
 				...(request.purposeCeiling ? { purposeCeiling: request.purposeCeiling } : {}),
 				...(prior?.operationIntent ? { operationIntent: prior.operationIntent } : {}),
 				...(prior?.operationAcknowledgments ? { operationAcknowledgments: prior.operationAcknowledgments } : {}),
+				// The plan request ledger outlives every rotation, so an issued request ID never looks new; plan receipts
+				// belong to one epoch and are cleared, as the revision bump would revoke them anyway.
+				...(prior?.planRequests ? { planRequests: prior.planRequests } : {}),
 			});
 			return this.inspect(context);
 		}

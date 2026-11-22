@@ -6,10 +6,12 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { PlanView } from "../src/missions/plan-wire.ts";
 import type { ServiceRequest, ServiceResponse } from "../src/service.ts";
 import type { ServiceClient } from "../src/service-client.ts";
 import { parseWebRequest } from "../src/web/contract.ts";
 import { createWebGateway, type WebGatewayOptions } from "../src/web/gateway.ts";
+import { planTerms } from "./missions/fixtures/plan.ts";
 
 const directories: string[] = [];
 const servers: ReturnType<typeof createWebGateway>[] = [];
@@ -22,7 +24,7 @@ afterEach(async () => {
 });
 
 async function startGateway(
-	options: Pick<WebGatewayOptions, "managed" | "managedReview"> = {},
+	options: Pick<WebGatewayOptions, "managed" | "managedReview" | "planReview"> = {},
 	transport: "tcp" | "unix" = "tcp",
 ) {
 	const requests: ServiceRequest[] = [];
@@ -81,8 +83,8 @@ async function startGateway(
 	return { origin, requests, client, call };
 }
 
-async function fixture() {
-	const f = await startGateway();
+async function fixture(options?: Parameters<typeof startGateway>[0]) {
+	const f = await startGateway(options);
 	const response = await fetch(`${f.origin}/api/v1/session`);
 	expect(response.status).toBe(200);
 	const session = (await response.json()) as { csrfToken: string };
@@ -450,6 +452,65 @@ describe("web gateway", () => {
 		expect(f.requests).toEqual([{ type: "mission", request: { ...agree, requestId: "approve" } }]);
 	});
 
+	it("requires a reviewed protected head before reporting developer-local plan agreement complete", async () => {
+		const digest = "a".repeat(64);
+		const binding = { missionId: "mission-1", purposeRevision: 1, purposeDigest: "b".repeat(64) };
+		let headValid = false;
+		const f = await fixture({
+			planReview: async () => ({
+				canAgree: true, headValid, openUnderHead: false, draftDigest: null, runnablePurposeBinding: binding,
+			}),
+		});
+		const plan: PlanView = {
+			missionId: "mission-1",
+			adopted: true,
+			head: { revision: 2, digest, previousDigest: null, terms: planTerms(), agreedAt: 17, receiptId: "receipt-2" },
+			headValid: true,
+			previous: null,
+			history: [],
+			draft: null,
+			gate: { state: "open", reason: null },
+			runs: { used: 0, limit: 32 },
+			due: [],
+			preview: null,
+			reviews: [],
+		};
+		f.client.request = async () => ({
+			type: "mission",
+			result: {
+				stage: "awaiting_approval",
+				formation: { nextRevision: 3, lastOperation: null, agreement: null, draft: null },
+				creator: null,
+				authority: "developer-local",
+				authorityError: null,
+				agreementValid: false,
+				missing: [],
+				execution: "not-implemented",
+				tools: [],
+				plan,
+			},
+		});
+		const agree = { type: "mission", request: { operation: "plan-agree", revision: 2, digest, confirmed: true } };
+		expect(await postOwnerReply(f, "unverified", agree)).toMatchObject({ state: "unknown" });
+		headValid = true;
+		expect(await postOwnerReply(f, "verified", agree)).toMatchObject({
+			state: "completed",
+			response: {
+				type: "mission",
+				result: {
+					canAgreePlan: true, runnablePurposeBinding: binding,
+					plan: { headValid: true, gate: { state: "closed", reason: "reopen-needed" } },
+				},
+			},
+		});
+		expect(await postOwnerReply(f, "unverified", agree)).toMatchObject({ state: "unknown" });
+		const receiptId = "11111111-1111-4111-8111-111111111111";
+		f.client.request = async () => ({ type: "mission-plan-issued", receiptId });
+		expect(await postOwnerReply(f, "pending", agree)).toEqual({
+			requestId: "pending", state: "issued", receiptId, reconciled: false,
+		});
+	});
+
 	it("accepts a managed filesystem socket for review and locally denies every browser agreement", async () => {
 		const proposal = {
 			missionId: "mission-one",
@@ -492,6 +553,17 @@ describe("web gateway", () => {
 			expect(denied.status).toBe(200);
 			expect(JSON.parse(denied.body)).toEqual({ requestId: id, state: "refused", code: "not-enabled" });
 		}
+		const planDenied = await post(
+			"managed-plan",
+			{ operation: "plan-agree", revision: 2, digest: proposal.digest, confirmed: true },
+			csrf,
+		);
+		expect(planDenied.status).toBe(200);
+		expect(JSON.parse(planDenied.body)).toEqual({
+			requestId: "managed-plan",
+			state: "refused",
+			code: "managed-requires-gateway",
+		});
 		expect(f.requests).toEqual([]);
 		expect(review).not.toHaveBeenCalled();
 		f.client.request = async () => ({
@@ -519,6 +591,7 @@ describe("web gateway", () => {
 			response: {
 				result: {
 					canAgree: false,
+					canAgreePlan: false,
 					agreementValid: false,
 					review: proposal,
 					formation: { draft: { digest: proposal.digest } },
@@ -574,6 +647,10 @@ describe("web gateway", () => {
 					authority: "developer-local",
 					authorityError: null,
 					canAgree: true,
+					canAgreePlan: false,
+					plan: null,
+					planError: null,
+					runnablePurposeBinding: null,
 					agreementValid: true,
 					missing: [],
 					execution: "waiting",

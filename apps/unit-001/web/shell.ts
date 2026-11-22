@@ -1,7 +1,11 @@
 // Mounts the workspace: owns state and actions, builds the shell once (sidebar, top bar, bands, page, status bar) and patches it.
 import { describeMissionRefusal } from "../src/missions/refusal.ts";
-import type { ChatHistoryPage, MissionDraftTerms, MissionMutation, MissionMutationOutcome, WorkspaceDetails, WorkspacePort } from "./contract.ts";
+import type {
+	ChatHistoryPage, MissionDraftTerms, MissionMutation, MissionMutationOutcome, MissionPlanMutation,
+	MissionPlanMutationOutcome, WorkspaceDetails, WorkspacePort,
+} from "./contract.ts";
 import { mergeChatEntries } from "./history.ts";
+import type { PlanTerms, PlanView } from "./mission-plan-contract.ts";
 import {
 	type Actions,
 	agentState,
@@ -32,8 +36,9 @@ import { renderAbout } from "./views/about.ts";
 import { type ChatView, createChat } from "./views/chat.ts";
 import { renderConnections } from "./views/connections.ts";
 import { renderForgetDialog, renderMemory } from "./views/memory.ts";
-import { missionApprovalCommand, missionProposalDigest, renderMission } from "./views/mission.ts";
+import { missionApprovalCommand, missionPlanTerminalCommand, missionProposalDigest, renderMission } from "./views/mission.ts";
 import { createMissionDraftEditor, type MissionDraftEditor, renderMissionDraftCard } from "./views/mission-draft.ts";
+import { createMissionPlanDraftEditor, type MissionPlanEditor, renderMissionPlanDraftCard } from "./views/mission-plan-draft.ts";
 import { renderActivity, renderStatus } from "./views/status.ts";
 
 const pages: Record<Exclude<Section, "chat" | "mission">, (ctx: Ctx) => HTMLElement> = {
@@ -44,6 +49,14 @@ const pages: Record<Exclude<Section, "chat" | "mission">, (ctx: Ctx) => HTMLElem
 };
 
 type MissionSnapshot = WorkspaceDetails["mission"];
+type PlanBinding = NonNullable<PlanTerms["tacticals"][number]["binding"]>;
+type ExactPlanProposal = { revision: number; digest: string };
+
+const newPlanTerms: PlanTerms = {
+	overall: { purpose: "", scope: "", askFirst: [], reviewEveryMs: 7 * 24 * 60 * 60 * 1000 },
+	strategics: [],
+	tacticals: [],
+};
 
 /** Mounts the workspace against a live or sample port; unmounting never cancels the agent's work. */
 export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: { preview?: boolean; section?: Section } = {}): () => void {
@@ -101,6 +114,8 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 
 	let missionVersion = 0;
 	let missionEditor: { base: MissionSnapshot; view: MissionDraftEditor } | null = null;
+	let planConnection = 0;
+	let planEditor: { base: MissionSnapshot; view: MissionPlanEditor } | null = null;
 
 	function noteDraftConflict(mission: MissionSnapshot): void {
 		const unsaved = ui.missionDraft?.unsaved;
@@ -108,11 +123,24 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			unsaved.conflicted = true;
 	}
 
+	function recordPlanStatus(ui: Ui, mission: MissionSnapshot): void {
+		ui.planFresh = ui.connection === "connected" && hasPlanProtocol(mission);
+		if (!ui.planFresh) return;
+		const unsaved = ui.planDraft?.unsaved;
+		if (unsaved && planEditor && !samePlanDraft(planEditor.base, mission)) unsaved.conflicted = true;
+		const pending = ui.planChange;
+		if (pending.kind === "unresolved" && mission.plan?.headValid && [mission.plan.head, mission.plan.previous].some((revision) =>
+			revision?.revision === pending.revision && revision.digest === pending.digest &&
+			(pending.receiptId === null || pending.receiptId === revision.receiptId)
+		)) ui.planChange = { kind: "idle", notice: "" };
+	}
+
 	const refresh = async () => {
 		if (ui.connection !== "connected") return;
 		const read = ++detailsRead;
 		if (ui.section === "memory") void loadGraph();
 		const version = missionVersion;
+		if (ui.planFresh) set("state", (ui) => { ui.planFresh = false; });
 		try {
 			const next = await port.details();
 			if (destroyed || read !== detailsRead) return;
@@ -122,6 +150,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 					mission: version === missionVersion ? next.mission : (ui.details?.mission ?? next.mission),
 				};
 				noteDraftConflict(ui.details.mission);
+				if (version === missionVersion) recordPlanStatus(ui, next.mission);
 				ui.detailsFailed = false;
 			});
 		} catch {
@@ -132,6 +161,27 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			});
 		}
 	};
+
+	async function refreshPlan(): Promise<void> {
+		if (ui.connection !== "connected" || ui.planChange.kind === "writing") return;
+		const version = ++missionVersion;
+		set("state", (ui) => { ui.planFresh = false; });
+		try {
+			const mission = await port.mission();
+			if (destroyed || version !== missionVersion) return;
+			++missionVersion;
+			set("state", (ui) => {
+				if (ui.details) ui.details = { ...ui.details, mission };
+				noteDraftConflict(mission);
+				recordPlanStatus(ui, mission);
+			});
+		} catch {
+			if (destroyed || version !== missionVersion || ui.planChange.kind !== "idle") return;
+			set("state", (ui) => {
+				ui.planChange = { kind: "idle", notice: "The current plan status could not be read. Refresh to check again." };
+			});
+		}
+	}
 
 	async function searchMemory(query: string): Promise<void> {
 		const read = ++recallRead;
@@ -155,7 +205,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 	}
 
 	function openMissionDraft(): void {
-		if (!missionEntryAvailable(ui)) return;
+		if (!missionEntryAvailable(ui) || ui.planDraft) return;
 		const alreadyOpen = ui.missionDraft !== null;
 		set("state", (ui) => {
 			ui.missionDraft ??= { editRevision: null, unsaved: null, status: "ready", notice: "", localAgreementRevision: null };
@@ -169,11 +219,12 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 
 	async function refreshMissionDraft(notice = ui.missionDraft?.notice ?? "", intent: "keep-edits" | "discard-edits" = "keep-edits"): Promise<void> {
 		const current = ui.missionDraft;
-		if (!current || current.status === "saving" || ui.connection !== "connected") return;
+		if (!current || current.status === "saving" || ui.planChange.kind === "writing" || ui.connection !== "connected") return;
 		const panel = intent === "discard-edits" ? { ...current, unsaved: null } : current;
 		const version = ++missionVersion;
 		set("state", (ui) => {
 			ui.missionDraft = { ...panel, editRevision: null, status: "refreshing", notice };
+			ui.planFresh = false;
 		});
 		try {
 			const mission = await port.mission();
@@ -183,6 +234,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 				if (ui.details) ui.details = { ...ui.details, mission };
 				ui.missionDraft = { ...panel, editRevision: null, status: "ready", notice };
 				noteDraftConflict(mission);
+				recordPlanStatus(ui, mission);
 			});
 		} catch {
 			if (destroyed || version !== missionVersion) return;
@@ -195,7 +247,8 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 	async function mutateMission(change: MissionMutation, shown: MissionSnapshot): Promise<void> {
 		const panel = ui.missionDraft;
 		const mission = ui.details?.mission;
-		if (!panel || panel.status !== "ready" || !mission || ui.connection !== "connected" || ui.detailsFailed || ui.details?.owner?.held) return;
+		if (!panel || panel.status !== "ready" || !mission || ui.connection !== "connected" ||
+			ui.detailsFailed || ui.details?.owner?.held || ui.planChange.kind === "writing") return;
 		const expected = missionRevision(mission);
 		const matches = change.operation === "agree"
 			? mission.canAgree && mission.authority === "developer-local" && mission.formationAvailable && mission.draft?.status === "proposed" &&
@@ -210,6 +263,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		++missionVersion;
 		set("state", (ui) => {
 			ui.missionDraft = { ...panel, status: "saving", notice: "" };
+			ui.planFresh = false;
 		});
 		let result: MissionMutationOutcome;
 		try {
@@ -224,6 +278,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			const updated = result.mission;
 			set("state", (ui) => {
 				if (ui.details) ui.details = { ...ui.details, mission: updated };
+				recordPlanStatus(ui, updated);
 				ui.missionDraft = { editRevision: null, unsaved: null, status: "ready", notice: "", localAgreementRevision: change.operation === "agree" ? change.revision : null };
 			});
 			return;
@@ -236,6 +291,132 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			ui.missionDraft = { ...panel, status: "needs-refresh", notice };
 		});
 		await refreshMissionDraft(notice);
+	}
+
+	function openPlanDraft(): void {
+		const mission = ui.details?.mission;
+		if (!mission || ui.missionDraft || !ui.planFresh || !hasPlanProtocol(mission)) return;
+		set("state", (ui) => {
+			ui.planDraft ??= { editRevision: null, unsaved: null };
+			ui.section = "chat";
+			ui.navOpen = false;
+		});
+		focusKey("mission-plan-draft-heading");
+	}
+
+	async function mutatePlan(change: MissionPlanMutation, shown: MissionSnapshot): Promise<void> {
+		const mission = ui.details?.mission;
+		if (!mission || !planWritesAvailable(ui, mission)) return;
+		const { plan, runnablePurposeBinding } = mission;
+		const draft = plan?.draft;
+		const head = plan?.head;
+		switch (change.operation) {
+			case "plan-draft":
+				if (!ui.planDraft || ui.planDraft.unsaved?.conflicted || !samePlanDraft(shown, mission) ||
+					change.expectedRevision !== planRevision(plan) || !bindingsMatch(change.terms, runnablePurposeBinding)) return;
+				break;
+			case "plan-propose":
+				if (!ui.planDraft || ui.planDraft.unsaved || !samePlanDraft(shown, mission) ||
+					!plan || draft?.status !== "editing" || draft.revision !== change.expectedRevision ||
+					draft.missing.length || plan.history.length >= 32 || !bindingsMatch(draft.terms, runnablePurposeBinding)) return;
+				break;
+			case "plan-agree": {
+				const exact = planProposal(ui, mission);
+				if (!ui.planDraft || ui.planDraft.unsaved || !samePlanDraft(shown, mission) ||
+					mission.authority !== "developer-local" || !mission.canAgreePlan ||
+					exact?.revision !== change.revision || exact.digest !== change.digest) return;
+				break;
+			}
+			case "review-now":
+				if (!head || shown.plan !== plan) return;
+				break;
+			case "review-dismiss":
+				if (!plan?.reviews.some((review) => review.reviewId === change.reviewId && review.disposition === null)) return;
+				break;
+		}
+		const requestId = crypto.randomUUID();
+		const connection = planConnection;
+		++missionVersion;
+		set("state", (ui) => {
+			ui.planFresh = false;
+			ui.planChange = { kind: "writing" };
+		});
+		let result: MissionPlanMutationOutcome;
+		try {
+			result = await port.mutateMissionPlan(change, requestId);
+		} catch {
+			result = { state: "unknown" };
+		}
+		if (destroyed) return;
+		++missionVersion;
+		if (result.state === "completed") {
+			const updated = result.mission;
+			if (change.operation === "plan-draft" || change.operation === "plan-propose") planEditor = null;
+			set("state", (ui) => {
+				if (ui.details) ui.details = { ...ui.details, mission: updated };
+				ui.planChange = { kind: "idle", notice: "" };
+				if (ui.planDraft && (change.operation === "plan-draft" || change.operation === "plan-propose"))
+					ui.planDraft = { editRevision: null, unsaved: null };
+				if (connection === planConnection) recordPlanStatus(ui, updated);
+			});
+			if (connection !== planConnection && ui.connection === "connected") void refresh();
+			if (change.operation === "plan-agree") notify(`Plan revision ${change.revision} agreed. This did not open or start work.`);
+			return;
+		}
+		const notice = result.state === "refused"
+			? result.code === "managed-requires-gateway" ? "Managed plan approval is available only in a terminal." : describeMissionRefusal(result.code)
+			: result.state === "rejected" ? "The gateway rejected the plan change before dispatch."
+				: "The plan change outcome is unknown. Check the current status before acting again. Nothing was retried.";
+		set("state", (ui) => {
+			const unsaved = ui.planDraft?.unsaved;
+			if (unsaved && result.state === "refused" && result.code === "stale-revision") unsaved.conflicted = true;
+			ui.planChange = change.operation === "plan-agree" && (result.state === "issued" || result.state === "unknown")
+				? { kind: "unresolved", revision: change.revision, digest: change.digest, requestId,
+					receiptId: result.state === "issued" ? result.receiptId : null }
+				: { kind: "idle", notice };
+		});
+		announce(planNotice(ui) || notice);
+		await refreshPlan();
+	}
+
+	function planActions(mission: MissionSnapshot | undefined): Parameters<typeof renderMission>[2] {
+		if (!mission || (mission.plan === undefined && mission.planError == null && ui.planChange.kind === "idle")) return;
+		const plan = mission.plan;
+		const access = planWritesAvailable(ui, mission);
+		const exact = planProposal(ui, mission);
+		const notice = planNotice(ui);
+		return {
+			notice: notice ? callout({
+				tone: ui.planChange.kind === "idle" ? "warn" : "info", role: "status", body: notice,
+				children: ui.planChange.kind === "unresolved" && ui.connection === "connected"
+					? [button({ label: "Refresh plan status", key: "mission-plan-refresh", onClick: () => void refreshPlan() })] : [],
+			}) : null,
+			openDraft: ui.planFresh && hasPlanProtocol(mission) && !ui.missionDraft ? openPlanDraft : undefined,
+			onReviewNow: access && plan?.head ? () => void mutatePlan({ operation: "review-now" }, mission) : undefined,
+			onDismissReview: access ? (reviewId) => void mutatePlan({ operation: "review-dismiss", reviewId }, mission) : undefined,
+			onDraftFromReview: access ? (reviewId) => {
+				const current = ui.details?.mission;
+				const head = current?.plan?.head;
+				if (!current || !planWritesAvailable(ui, current) || !head || !current.plan?.headValid ||
+					!current.plan.reviews.some((review) => review.reviewId === reviewId && review.disposition === null &&
+						review.planRevision === head.revision && review.planDigest === head.digest)) return;
+				if (ui.draft.trim()) {
+					notify("Chat already has a draft. Clear it before prefilling a review request.");
+					return;
+				}
+				act.useDraft(`Draft a revision from review ${reviewId}`);
+			} : undefined,
+			terminalApproval: exact ? terminalPlanApproval(mission, exact) : undefined,
+			terminalOpen: access && plan?.gate.reason === "reopen-needed" && plan.headValid &&
+				(mission.authority === "managed-administrator" || mission.authority === "developer-local")
+				? missionPlanTerminalCommand(context(), "open") : undefined,
+		};
+	}
+
+	function terminalPlanApproval(mission: MissionSnapshot, exact: ExactPlanProposal) {
+		if (mission.authority !== "managed-administrator" && (mission.authority !== "developer-local" || mission.canAgreePlan === true))
+			return undefined;
+		return { ...exact, ...missionPlanTerminalCommand(context(), exact) };
 	}
 
 	const act: Actions = {
@@ -487,17 +668,28 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 	const dismissMissionDraft = button({
 		label: "Close mission draft", key: "mission-draft-close", variant: "ghost",
 		onClick: () => {
-			set("state", (ui) => { ui.missionDraft = null; });
+			set("state", (ui) => {
+				ui.missionDraft = null;
+				ui.planDraft = null;
+			});
 			if (!coarsePointer()) chat.focus();
 			else main.focus({ preventScroll: true });
 		},
 	});
 	const checkMissionDraft = button({
-		label: "Refresh draft", key: "mission-draft-refresh", onClick: () => void refreshMissionDraft(),
+		label: "Refresh draft", key: "mission-draft-refresh",
+		onClick: () => void (ui.planDraft ? refreshPlan() : refreshMissionDraft()),
 	});
 	const discardMissionEdits = button({
 		label: "Discard edits and review latest", key: "mission-draft-discard", variant: "ghost",
 		onClick: () => {
+			if (ui.planDraft) {
+				planEditor = null;
+				set("state", (ui) => { ui.planDraft = { editRevision: null, unsaved: null }; });
+				void refreshPlan();
+				focusKey("mission-plan-draft-heading");
+				return;
+			}
 			void refreshMissionDraft("", "discard-edits");
 			focusKey("mission-draft-heading");
 		},
@@ -653,18 +845,24 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		if (change === "stream" && pageShown === ui.section) return;
 		pageShown = ui.section;
 		preserve(main, () => ui.section === "mission"
-			? renderMission(context(), missionEntryAvailable(ui) ? openMissionDraft : undefined)
+			? renderMission(context(), missionEntryAvailable(ui) && !ui.planDraft ? openMissionDraft : undefined, planActions(ui.details?.mission))
 			: pages[ui.section as Exclude<Section, "chat" | "mission">](context()));
 	}
 
 	function patchMissionDraft(): void {
 		const panel = ui.missionDraft;
 		const mission = ui.details?.mission;
+		if (ui.planDraft && mission) {
+			missionPanel.hidden = false;
+			patchPlanDraft(ui.planDraft, mission);
+			return;
+		}
 		missionPanel.hidden = panel === null || !mission;
 		if (!panel || !mission) {
 			if (missionPanelKey === "") return;
 			missionPanelKey = "";
 			missionEditor = null;
+			planEditor = null;
 			missionDraftBody.replaceChildren();
 			missionDraftNotices.replaceChildren();
 			return;
@@ -675,19 +873,20 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		const expectedRevision = missionRevision(mission);
 		const blocked = ui.details?.owner?.held === true || !["not-implemented", "not-started", "stopped", "completed"].includes(mission.execution);
 		const offline = ui.connection !== "connected";
-		const key = JSON.stringify([panel, ui.connection, ui.detailsFailed, blocked, mission.formationAvailable, mission.canAgree,
+		const planWriting = ui.planChange.kind === "writing";
+		const key = JSON.stringify([panel, ui.connection, ui.detailsFailed, blocked, planWriting, mission.formationAvailable, mission.canAgree,
 			mission.authority, draft, review, agreement, recorded, missing]);
 		if (key === missionPanelKey) return;
 		missionPanelKey = key;
 
 		const busy = panel.status === "saving" || panel.status === "refreshing";
 		const unavailable = panel.status === "needs-refresh" || !mission.formationAvailable;
-		const disabled = offline || blocked || ui.detailsFailed;
-		checkMissionDraft.disabled = offline || busy;
+		const disabled = offline || blocked || ui.detailsFailed || planWriting;
+		checkMissionDraft.disabled = offline || busy || planWriting;
 		dismissMissionDraft.disabled = busy;
 		dismissMissionDraft.textContent = unsaved ? "Discard edits and close" : "Close mission draft";
 		discardMissionEdits.hidden = unsaved === null;
-		discardMissionEdits.disabled = offline || busy;
+		discardMissionEdits.disabled = offline || busy || planWriting;
 
 		const progress = panel.status === "saving" ? "Applying the mission change…"
 			: panel.status === "refreshing" ? "Reading the latest mission draft…"
@@ -710,7 +909,6 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			return;
 		}
 
-		const restoreFocus = missionDraftBody.contains(document.activeElement);
 		const previous = agreement ? { revision: agreement.revision, terms: agreedTerms(mission, agreement) } : undefined;
 		let body: HTMLElement;
 		missionEditor = null;
@@ -755,10 +953,88 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			missionEditor = { base: mission, view };
 			body = view.root;
 		}
+		mountDraftBody(body, "mission-draft-heading");
+	}
+
+	function patchPlanDraft(panel: NonNullable<Ui["planDraft"]>, mission: MissionSnapshot): void {
+		const { plan, runnablePurposeBinding } = mission;
+		const { unsaved, editRevision } = panel;
+		const draft = plan?.draft;
+		const head = plan?.head;
+		const expectedRevision = planRevision(plan);
+		const canSave = planWritesAvailable(ui, mission) && !unsaved?.conflicted;
+		const canReview = canSave && draft?.status === "editing" && !!plan && plan.history.length < 32 &&
+			bindingsMatch(draft.terms, runnablePurposeBinding);
+		const exact = planProposal(ui, mission);
+		const writing = ui.planChange.kind === "writing";
+		const offline = ui.connection !== "connected";
+		const notice = planNotice(ui);
+		const key = JSON.stringify(["plan", panel, plan?.missionId, head, draft, plan?.gate, runnablePurposeBinding,
+			mission.authority, mission.creator, mission.execution, name(), ui.view?.installationId, mission.canAgreePlan,
+			ui.planFresh, canSave, canReview, exact, writing, offline, notice]);
+		if (key === missionPanelKey) return;
+		missionPanelKey = key;
+
+		checkMissionDraft.disabled = offline || writing;
+		dismissMissionDraft.disabled = writing;
+		dismissMissionDraft.textContent = unsaved ? "Discard edits and close" : "Close plan draft";
+		discardMissionEdits.hidden = unsaved === null;
+		discardMissionEdits.disabled = offline || writing;
+		missionDraftNotices.replaceChildren(...[
+			notice ? callout({ tone: "info", role: "status", body: notice }) : null,
+			unsaved?.conflicted ? callout({ tone: "warn", role: "alert",
+				body: `Your edits based on revision ${unsaved.revision} are kept here, but the saved draft, plan or runnable purpose binding has changed. Copy any text you want to keep, then discard edits to review the latest status.`,
+			}) : null,
+			!ui.planFresh && !writing ? callout({ tone: "warn", body: "A fresh plan status is required to save, propose or agree." }) : null,
+		].filter((item) => item !== null));
+
+		const access = { canSave, canReview, locked: writing };
+		if (unsaved && planEditor) {
+			// Keep native partial text and focus on failure, reconnect or CAS conflict.
+			planEditor.view.update(access);
+			return;
+		}
+
+		let body: HTMLElement;
+		planEditor = null;
+		if (plan && draft?.status === "proposed" && editRevision !== draft.revision) {
+			const terminalApproval = exact ? terminalPlanApproval(mission, exact) : undefined;
+			body = renderMissionPlanDraftCard({
+				missionId: plan.missionId, draft, head: head ?? null, authority: mission.authority, currentEffect: mission.execution,
+				gate: plan.gate, creator: mission.creator, installationId: ui.view?.installationId,
+				approval: terminalApproval ? { kind: "terminal", ...terminalApproval }
+					: exact && mission.authority === "developer-local" && mission.canAgreePlan === true ? {
+						kind: "web", ...exact, onAgree: (proposal) => void mutatePlan({ operation: "plan-agree", ...proposal, confirmed: true }, mission),
+					} : { kind: "unavailable" },
+				onEdit: canSave ? () => set("state", (ui) => { ui.planDraft = { ...panel, editRevision: draft.revision }; }) : undefined,
+			});
+		} else if (ui.planFresh || (hasPlanProtocol(mission) && ui.planChange.kind === "idle")) {
+			const view = createMissionPlanDraftEditor({
+				terms: draft?.terms ?? head?.terms ?? newPlanTerms,
+				expectedRevision,
+				draft: draft ?? null,
+				bindings: runnablePurposeBinding ? [runnablePurposeBinding] : [],
+				access,
+				onDirty: () => set("state", (ui) => {
+					if (ui.planDraft) ui.planDraft.unsaved = { revision: expectedRevision, conflicted: false };
+				}),
+				onSave: (expectedRevision, terms) => void mutatePlan({ operation: "plan-draft", expectedRevision, terms }, mission),
+				onReview: (expectedRevision) => void mutatePlan({ operation: "plan-propose", expectedRevision }, mission),
+			});
+			planEditor = { base: mission, view };
+			body = view.root;
+		} else {
+			body = attrs(el("h2", "font-semibold", "Plan draft"), { id: "mission-plan-draft-heading" });
+		}
+		mountDraftBody(body, "mission-plan-draft-heading");
+	}
+
+	function mountDraftBody(body: HTMLElement, headingId: string): void {
+		const restoreFocus = missionDraftBody.contains(document.activeElement);
 		const top = missionPanel.scrollTop;
 		missionDraftBody.replaceChildren(body);
 		missionPanel.scrollTop = top;
-		const heading = missionDraftBody.querySelector<HTMLElement>("#mission-draft-heading");
+		const heading = missionDraftBody.querySelector<HTMLElement>(`#${headingId}`);
 		if (heading) heading.tabIndex = -1;
 		if (restoreFocus) heading?.focus({ preventScroll: true });
 	}
@@ -897,9 +1173,12 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		if (destroyed) return;
 		if (event.type === "connection") {
 			if (ui.connection === event.state) return;
-			if (ui.missionDraft?.status === "refreshing") ++missionVersion;
+			++planConnection;
+			++detailsRead;
+			++missionVersion;
 			set("state", (ui) => {
 				ui.connection = event.state;
+				ui.planFresh = false;
 				if (ui.missionDraft?.status === "ready" || ui.missionDraft?.status === "refreshing")
 					ui.missionDraft = { ...ui.missionDraft, status: "needs-refresh" };
 			});
@@ -939,11 +1218,23 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		if (wasBusy && !next.busy) {
 			if (document.hidden) document.title = `● ${name()} replied`;
 		}
-		if (reconnect || (wasBusy && !next.busy)) void refresh();
-		if (ui.missionDraft && ui.missionDraft.status !== "saving" && (reconnect || next.tools.some((tool) =>
+		if (reconnect) {
+			void refresh().then(() => {
+				if (ui.missionDraft?.status === "needs-refresh") void refreshMissionDraft();
+			});
+			return;
+		}
+		if (wasBusy && !next.busy) void refresh();
+		else if ((ui.planDraft || ui.section === "mission") && next.tools.some((tool) =>
+			tool.name === "unit_plan_draft" && tool.status === "succeeded" &&
+			!previous?.tools.some((seen) => seen.callId === tool.callId && seen.status === "succeeded")
+		)) {
+			void refreshPlan();
+		}
+		if (ui.missionDraft && ui.missionDraft.status !== "saving" && next.tools.some((tool) =>
 			tool.name === "unit_mission_draft" && tool.status === "succeeded" &&
 			!previous?.tools.some((seen) => seen.callId === tool.callId && seen.status === "succeeded")
-		))) void refreshMissionDraft();
+		)) void refreshMissionDraft();
 	});
 	render("state");
 	return () => {
@@ -970,6 +1261,57 @@ function sameMissionDraft(a: MissionSnapshot, b: MissionSnapshot): boolean {
 
 function missionEntryAvailable(ui: Readonly<Ui>): boolean {
 	return ui.connection === "connected" && !ui.detailsFailed && ui.details?.mission.formationAvailable === true;
+}
+
+function hasPlanProtocol(mission: MissionSnapshot): boolean {
+	return mission.plan !== undefined && mission.planError == null;
+}
+
+function planWritesAvailable(ui: Readonly<Ui>, mission: MissionSnapshot): boolean {
+	return ui.connection === "connected" && ui.planFresh && hasPlanProtocol(mission) &&
+		ui.details?.owner?.held !== true && ui.planChange.kind === "idle" &&
+		ui.missionDraft?.status !== "saving" && ui.missionDraft?.status !== "refreshing";
+}
+
+function planRevision(plan: PlanView | null | undefined): number {
+	return plan?.draft?.revision ?? plan?.head?.revision ?? 0;
+}
+
+function samePlanDraft(a: MissionSnapshot, b: MissionSnapshot): boolean {
+	const { plan: left, runnablePurposeBinding: leftBinding } = a;
+	const { plan: right, runnablePurposeBinding: rightBinding } = b;
+	return left?.missionId === right?.missionId && planRevision(left) === planRevision(right) &&
+		left?.head?.digest === right?.head?.digest && left?.head?.receiptId === right?.head?.receiptId &&
+		left?.draft?.status === right?.draft?.status && left?.draft?.digest === right?.draft?.digest &&
+		samePlanBinding(leftBinding, rightBinding);
+}
+
+function samePlanBinding(a?: PlanBinding | null, b?: PlanBinding | null): boolean {
+	return a?.missionId === b?.missionId && a?.purposeRevision === b?.purposeRevision && a?.purposeDigest === b?.purposeDigest;
+}
+
+function bindingsMatch(terms: PlanTerms, choice: PlanBinding | null | undefined): boolean {
+	return terms.tacticals.every((tactical) => tactical.mode !== "runnable" || samePlanBinding(tactical.binding, choice));
+}
+
+function planProposal(ui: Readonly<Ui>, mission: MissionSnapshot): ExactPlanProposal | null {
+	const plan = mission.plan;
+	const draft = plan?.draft;
+	if (!planWritesAvailable(ui, mission) || ui.planDraft?.unsaved || !plan?.missionId || draft?.status !== "proposed" ||
+		draft.digest === null || !/^[a-f0-9]{64}$/.test(draft.digest) || draft.missing.length ||
+		draft.revision <= draft.baseRevision || draft.baseRevision !== (plan.head?.revision ?? 0) ||
+		(plan.head !== null && !plan.headValid) || (plan.head === null && plan.adopted) ||
+		plan.gate.reason === "receipt" || plan.gate.reason === "head-missing") return null;
+	return { revision: draft.revision, digest: draft.digest };
+}
+
+function planNotice(ui: Readonly<Ui>): string {
+	const change = ui.planChange;
+	if (change.kind === "idle") return change.notice;
+	if (change.kind === "writing") return "Applying the plan change…";
+	return change.receiptId
+		? `Plan approval receipt ${change.receiptId} was issued for revision ${change.revision}, but the agreement is not confirmed in status. Refresh to check. Do not submit again.`
+		: `Plan approval for revision ${change.revision} is unconfirmed. Request ID ${change.requestId}. Refresh to check. Do not submit again.`;
 }
 
 function agreedTerms(mission: MissionSnapshot, agreement: NonNullable<MissionSnapshot["agreement"]>): MissionDraftTerms {

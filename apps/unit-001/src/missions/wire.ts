@@ -13,6 +13,8 @@ import {
 	parseMissionDraftTerms,
 } from "./contract.ts";
 import { parseMissionExecutionView } from "./execution-view.ts";
+import { parsePlanTerms } from "./plan-terms.ts";
+import { parsePlanView } from "./plan-wire.ts";
 import { parsePurposeCeiling, parsePurposeTerms } from "./purpose-authority.ts";
 import { parseMissionPurposeView } from "./purpose-view.ts";
 
@@ -160,10 +162,14 @@ export function parseMissionView(value: unknown): MissionView {
 			? {}
 			: { purposeError: input.purposeError === null ? null : missionText(input.purposeError, 1000) }),
 		...(loopRollback === undefined ? {} : { loopRollback }),
+		...(input.plan === undefined ? {} : { plan: input.plan === null ? null : parsePlanView(input.plan) }),
+		...(input.planError === undefined
+			? {}
+			: { planError: input.planError === null ? null : missionText(input.planError, 1000) }),
 	};
 }
 
-// Purpose formation and operation commands; owner-wire callers name only exact revisions, digests and request IDs.
+// Purpose and plan formation, review and operation commands; owner-wire callers name only exact revisions, digests and request IDs.
 function parsePurposeRequest(input: Record<string, unknown>): MissionRequest | undefined {
 	const only = (...fields: string[]) => {
 		if (Object.keys(input).some((key) => key !== "operation" && !fields.includes(key)))
@@ -212,6 +218,45 @@ function parsePurposeRequest(input: Record<string, unknown>): MissionRequest | u
 				...(input.runId === undefined ? {} : { runId: missionText(input.runId, 400) }),
 			};
 		}
+		case "plan-draft":
+			only("expectedRevision", "requestId", "terms", "fromReview");
+			return {
+				operation: "plan-draft",
+				expectedRevision: revision(input.expectedRevision, 0),
+				requestId: requestId(),
+				terms: parsePlanTerms(input.terms),
+				// The owner wire never speaks for the agent: only its own draft tool records "bob".
+				savedBy: "owner",
+				fromReview: input.fromReview === undefined || input.fromReview === null ? null : missionText(input.fromReview),
+			};
+		case "plan-propose":
+			only("expectedRevision", "requestId");
+			return { operation: "plan-propose", expectedRevision: revision(input.expectedRevision, 0), requestId: requestId() };
+		case "plan-agree":
+			only("revision", "digest", "requestId");
+			return {
+				operation: "plan-agree",
+				revision: revision(input.revision, 1),
+				digest: digest(input.digest),
+				requestId: requestId(),
+			};
+		case "prepare-plan":
+			only("revision", "digest", "requestId");
+			return {
+				operation: "prepare-plan",
+				revision: revision(input.revision, 1),
+				digest: digest(input.digest),
+				requestId: requestId(),
+			};
+		case "reconcile-plan":
+			only("receiptId");
+			return { operation: "reconcile-plan", receiptId: missionText(input.receiptId) };
+		case "review-now":
+			only("requestId");
+			return { operation: "review-now", requestId: requestId() };
+		case "review-dismiss":
+			only("reviewId", "requestId");
+			return { operation: "review-dismiss", reviewId: missionText(input.reviewId), requestId: requestId() };
 		default:
 			return undefined;
 	}

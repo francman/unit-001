@@ -1,5 +1,7 @@
 // Regresses #65 browser-side outcome classification, gateway restart and explicit stable-ID requests.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { MissionPlanMutation } from "./contract.ts";
+import type { PlanTerms, PlanView, ReviewNote } from "./mission-plan-contract.ts";
 import { browserWorkspacePort, parseMemoryGraph, parseWorkspaceView } from "./port.ts";
 
 const csrfToken = "b".repeat(64);
@@ -669,6 +671,241 @@ describe("browser operator details", () => {
 			),
 		);
 		expect(await (await connectedPort()).recall("q")).toEqual({ count: null, stats: null, records: [] });
+	});
+});
+
+const charter: PlanTerms = {
+	overall: { purpose: "Ship café", scope: "Repository", askFirst: ["deploy"], reviewEveryMs: 500 },
+	strategics: [],
+	tacticals: [],
+};
+const exactDigest = "b".repeat(64);
+const charterDraft = {
+	revision: 2, baseRevision: 0, status: "editing", terms: charter, digest: null, savedBy: "owner",
+	fromReview: null, missing: [],
+} as const;
+const proposedCharter: PlanView = {
+	missionId: "m1",
+	adopted: false,
+	head: null,
+	headValid: false,
+	previous: null,
+	history: [],
+	draft: { ...charterDraft, status: "proposed", digest: exactDigest },
+	gate: { state: "not-adopted", reason: null },
+	runs: { used: 0, limit: 32 },
+	due: [],
+	preview: null,
+	reviews: [],
+};
+const approvedCharter: PlanView = {
+	...proposedCharter,
+	adopted: true,
+	head: { revision: 2, digest: exactDigest, previousDigest: null, terms: charter, agreedAt: 100, receiptId: "receipt-2" },
+	headValid: true,
+	history: [{ revision: 2, digest: exactDigest, agreedAt: 100 }],
+	draft: null,
+	gate: { state: "closed", reason: "binding" },
+};
+const recordedReview: ReviewNote = {
+	reviewId: "review-a",
+	key: "2:owner:click",
+	trigger: { kind: "owner", key: "2:owner:click", subject: "click" },
+	planRevision: 2,
+	planDigest: exactDigest,
+	window: { from: 100, to: 200 },
+	createdAt: 200,
+	outcome: "no-change",
+	items: [],
+	facts: { runsUsed: 0, runsLimit: 32, cycles: 0, maxCycles: 0, requests: 0, maxRequests: 0, estimatedCost: 0, maxEstimatedCost: null },
+	uncertainty: [],
+	disposition: null,
+};
+const agreeCharter = { operation: "plan-agree", revision: 2, digest: exactDigest, confirmed: true } as const;
+
+function missionReply(fields: Record<string, unknown>) {
+	return {
+		type: "mission",
+		result: {
+			stage: "agreed", formation: { agreement: null, draft: null }, creator: null,
+			authority: "developer-local", agreementValid: false, authorityError: null, missing: [], execution: "not-started",
+			tools: [], plan: proposedCharter, planError: null, canAgreePlan: true, runnablePurposeBinding: null, ...fields,
+		},
+	};
+}
+
+describe("browser plan transport", () => {
+	it("reads plan status through the existing mission status operation and projects only the exact binding", async () => {
+		const binding = { missionId: "m1", purposeRevision: 7, purposeDigest: "c".repeat(64) };
+		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+			completed(init, missionReply({ runnablePurposeBinding: binding })),
+		);
+		vi.stubGlobal("fetch", fetch);
+		await expect((await connectedPort()).mission()).resolves.toMatchObject({
+			plan: proposedCharter, planError: null, canAgreePlan: true, runnablePurposeBinding: binding,
+		});
+		expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)).operation).toEqual({
+			type: "mission", request: { operation: "status" },
+		});
+		fetch.mockImplementationOnce(async (_input, init) =>
+			completed(init, missionReply({ plan: undefined, planError: undefined, canAgreePlan: undefined, runnablePurposeBinding: undefined })),
+		);
+		const older = await (await connectedPort()).mission();
+		expect(older).not.toHaveProperty("plan");
+		expect(older).not.toHaveProperty("runnablePurposeBinding");
+		fetch.mockImplementationOnce(async (_input, init) =>
+			completed(init, missionReply({ plan: null, planError: "invalid-plan" })),
+		);
+		await expect((await connectedPort()).mission()).resolves.toMatchObject({ plan: null, planError: "invalid-plan", canAgreePlan: false });
+		fetch.mockImplementationOnce(async (_input, init) =>
+			completed(init, missionReply({ runnablePurposeBinding: { ...binding, uid: 501 } })),
+		);
+		await expect((await connectedPort()).mission()).rejects.toThrow("Invalid mission plan projection.");
+	});
+
+	it("sends each exact DTO with the supplied stable ID and reads the matching completed view", async () => {
+		const changes: MissionPlanMutation[] = [
+			{ operation: "plan-draft", expectedRevision: 1, terms: charter },
+			{ operation: "plan-propose", expectedRevision: 2 },
+			agreeCharter,
+			{ operation: "review-now" },
+			{ operation: "review-dismiss", reviewId: recordedReview.reviewId },
+		];
+		const replies = [
+			{ ...proposedCharter, draft: charterDraft },
+			proposedCharter,
+			approvedCharter,
+			{ ...approvedCharter, reviews: [recordedReview] },
+			{ ...approvedCharter, reviews: [{ ...recordedReview, disposition: { kind: "dismissed", at: 250, draftRevision: null } }] },
+		];
+		let next = 0;
+		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+			completed(init, missionReply({ plan: replies[next++] })),
+		);
+		vi.stubGlobal("fetch", fetch);
+		const port = await connectedPort();
+		for (const [index, change] of changes.entries()) {
+			// A wider same-host object must not send protected or operation-irrelevant keys.
+			const wider = { ...change, claim: "administrator", requestId: "payload-id" };
+			await expect(port.mutateMissionPlan(wider, `click-${index}`)).resolves.toMatchObject({
+				state: "completed", mission: { plan: replies[index] },
+			});
+			expect(JSON.parse(String(fetch.mock.calls[index]?.[1]?.body))).toEqual({
+				requestId: `click-${index}`, operation: { type: "mission", request: change },
+			});
+		}
+		expect(fetch).toHaveBeenCalledTimes(5);
+	});
+
+	it.each([
+		["no capability", { canAgreePlan: undefined, canAgree: true }],
+		["negative capability", { canAgreePlan: false }],
+		["string capability", { canAgreePlan: "true" }],
+		["managed authority despite affirmative capability", { authority: "managed-administrator", canAgreePlan: true }],
+		["withheld proposal digest", { plan: { ...proposedCharter, draft: { ...proposedCharter.draft, digest: null } } }],
+		["projected stale bindings", { plan: { ...proposedCharter, draft: { ...proposedCharter.draft, missing: ["Stale binding"] } } }],
+	])("does not dispatch Agree with %s", async (_name, fields) => {
+		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => completed(init, missionReply(fields)));
+		vi.stubGlobal("fetch", fetch);
+		const port = await connectedPort();
+		await expect(port.mutateMissionPlan(agreeCharter, "without-read")).resolves.toEqual({ state: "rejected" });
+		await port.mission();
+		await expect(port.mutateMissionPlan(agreeCharter, "click")).resolves.toEqual({ state: "rejected" });
+		expect(fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps plan agreement exact, distinct from issuance and never retries after an unknown result", async () => {
+		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => completed(init, missionReply({})));
+		vi.stubGlobal("fetch", fetch);
+		const port = await connectedPort();
+		await port.mission();
+		await expect(port.mutateMissionPlan({ ...agreeCharter, digest: "c".repeat(64) }, "wrong")).resolves.toEqual({ state: "rejected" });
+		expect(fetch).toHaveBeenCalledTimes(1);
+		fetch.mockImplementationOnce(async () => Response.json({ requestId: "click", state: "issued", receiptId: "receipt-2", reconciled: false }));
+		await expect(port.mutateMissionPlan(agreeCharter, "click")).resolves.toEqual({ state: "issued", receiptId: "receipt-2", reconciled: false });
+		await expect(port.mutateMissionPlan(agreeCharter, "without-refresh")).resolves.toEqual({ state: "rejected" });
+		await port.mission();
+		fetch.mockImplementationOnce(async (_input, init) =>
+			completed(init, missionReply({
+				plan: { ...approvedCharter, head: { ...approvedCharter.head, digest: "c".repeat(64) },
+					history: [{ revision: 2, digest: "c".repeat(64), agreedAt: 100 }] },
+			})),
+		);
+		await expect(port.mutateMissionPlan(agreeCharter, "wrong-digest")).resolves.toEqual({ state: "unknown" });
+		expect(fetch).toHaveBeenCalledTimes(4);
+		fetch.mockImplementationOnce(async (_input, init) => completed(init, missionReply({ plan: approvedCharter })));
+		await expect(port.mission()).resolves.toMatchObject({ plan: { head: { digest: exactDigest } } });
+		expect(fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).operation.request.operation)).toEqual([
+			"status", "plan-agree", "status", "plan-agree", "status",
+		]);
+	});
+
+	it("distinguishes closed refusal codes, pre-dispatch rejection and malformed or mismatched replies without replay", async () => {
+		const change = { operation: "review-dismiss", reviewId: recordedReview.reviewId } as const;
+		const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+			completed(init, missionReply({ plan: { ...approvedCharter, reviews: [recordedReview] } })),
+		);
+		vi.stubGlobal("fetch", fetch);
+		const port = await connectedPort();
+		fetch.mockImplementationOnce(async () => Response.json({ requestId: "refused", state: "refused", code: "stale-revision" }));
+		await expect(port.mutateMissionPlan(change, "refused")).resolves.toEqual({ state: "refused", code: "stale-revision" });
+		fetch.mockImplementationOnce(async () => Response.json({ requestId: "other", state: "refused", code: "stale-revision" }));
+		await expect(port.mutateMissionPlan(change, "other-id")).resolves.toEqual({ state: "unknown" });
+		fetch.mockImplementationOnce(async () => Response.json({ requestId: "bad-code", state: "refused", code: "superseded" }));
+		await expect(port.mutateMissionPlan(change, "bad-code")).resolves.toEqual({ state: "unknown" });
+		fetch.mockImplementationOnce(async () => Response.json({ requestId: "wrong-result", state: "issued", receiptId: "unused", reconciled: true }));
+		await expect(port.mutateMissionPlan(change, "wrong-result")).resolves.toEqual({ state: "unknown" });
+		await expect(port.mutateMissionPlan(change, "not-dismissed")).resolves.toEqual({ state: "unknown" });
+		fetch.mockImplementationOnce(async (_input, init) =>
+			completed(init, missionReply({ plan: { ...approvedCharter, reviews: [{ ...recordedReview, facts: null }] } })),
+		);
+		await expect(port.mutateMissionPlan(change, "malformed-review")).resolves.toEqual({ state: "unknown" });
+		fetch.mockImplementationOnce(async () => new Response(null, { status: 403 }));
+		await expect(port.mutateMissionPlan(change, "denied")).resolves.toEqual({ state: "rejected" });
+		await expect(port.mutateMissionPlan(change, "after-denial")).resolves.toEqual({ state: "rejected" });
+		expect(fetch).toHaveBeenCalledTimes(7);
+	});
+
+	it.each([workspaceId, differentId])("does not carry plan actions across an unverified stream (%s)", async (nextId) => {
+		vi.useFakeTimers();
+		let closeFirst!: () => void;
+		let streams = 0;
+		const posts = vi.fn(async (init?: RequestInit) => {
+			const { operation } = JSON.parse(String(init?.body));
+			return completed(init, missionReply(operation.request.operation === "plan-agree" ? { plan: approvedCharter } : {}));
+		});
+		vi.stubGlobal("fetch", async (path: string, init?: RequestInit) => {
+			if (path.endsWith("session")) return sessionResponse(csrfToken);
+			if (path.endsWith("requests")) return posts(init);
+			const first = ++streams === 1;
+			return eventResponse(new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(frame()));
+					if (first) closeFirst = () => controller.close();
+				},
+			}), first ? workspaceId : nextId);
+		});
+		const port = createPort();
+		const receive = vi.fn();
+		stopWatches.add(port.watch(receive));
+		await vi.advanceTimersByTimeAsync(0);
+		await port.mission();
+		closeFirst();
+		await vi.advanceTimersByTimeAsync(0);
+		await expect(port.mutateMissionPlan({ operation: "review-now" }, "offline")).resolves.toEqual({ state: "rejected" });
+		await vi.advanceTimersByTimeAsync(3000);
+		await expect(port.mutateMissionPlan(agreeCharter, "retired-proposal")).resolves.toEqual({ state: "rejected" });
+		if (nextId === differentId) {
+			expect(receive).toHaveBeenLastCalledWith({ type: "connection", state: "workspace-changed" });
+			await expect(port.mutateMissionPlan({ operation: "review-now" }, "other-workspace")).resolves.toEqual({ state: "rejected" });
+			expect(posts).toHaveBeenCalledTimes(1);
+		} else {
+			expect(receive).toHaveBeenLastCalledWith({ type: "view", view: ownerView });
+			expect(posts).toHaveBeenCalledTimes(1);
+			await port.mission();
+			await expect(port.mutateMissionPlan(agreeCharter, "new-click")).resolves.toMatchObject({ state: "completed" });
+			expect(posts).toHaveBeenCalledTimes(3);
+		}
 	});
 });
 

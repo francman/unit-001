@@ -65,6 +65,7 @@ import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import { MissionControl } from "./missions/control.ts";
 import { missionController } from "./missions/controller.ts";
 import { missionDraftTool } from "./missions/draft-tool.ts";
+import { planDraftTool } from "./missions/plan-draft-tool.ts";
 import { MissionOwner } from "./missions/owner.ts";
 import { isLoopTask, loopParkedForMaintenance } from "./missions/loop-drain.ts";
 import { MissionPurposeDoc } from "./missions/purpose.ts";
@@ -222,6 +223,7 @@ export class Agent {
 						}),
 					}),
 					missionDraftTool((request, ctx) => mission.handle(request, ctx)),
+					planDraftTool((request, ctx) => mission.handle(request, ctx)),
 				],
 			}),
 		);

@@ -7,8 +7,11 @@ import { type MissionLocation, readMissionAuthority, writeMissionAuthority } fro
 import type { MissionAuthority, MissionRequest, OperationAcknowledgment, OperationIntent } from "./contract.ts";
 import { MissionExecutionDoc } from "./execution-state.ts";
 import { abandonRuns, type missionLoop, operationDenial } from "./loop.ts";
+import { matchingPlanApproval } from "./plan-authority.ts";
+import { planHistoryBound, planIssued } from "./plan-gate.ts";
+import { type PlanAgreement, type PlanState, readMissionPlan, storedPlan } from "./plan-state.ts";
 import { MissionPurposeDoc, readMissionPurpose, storedLoop, validPurposeLoop } from "./purpose.ts";
-import { type LoopState, loopAgreement, rememberAcknowledgment } from "./purpose-loop.ts";
+import { type LoopState, loopAgreement, type PurposeReceiptAgreement, rememberAcknowledgment } from "./purpose-loop.ts";
 
 type Operate = Extract<MissionRequest, { operation: "operate-local" }>;
 type Scheduling = "inhibited" | "permitted";
@@ -56,7 +59,9 @@ export class PurposeOperation {
 		const authority = await readMissionAuthority(this.#location);
 		const loop = (await readMissionPurpose(this.#harness, context))?.loop;
 		if (!authority || !loop) throw new Error("Approve a purpose before operating it.");
-		await writeMissionAuthority(this.#location, nextOperationAuthority(authority, loop, request, this.#now()));
+		// Only an open is bound to the plan: a malformed plan never blocks suspend, close or acknowledgment.
+		const plan = request.action === "open" ? await readMissionPlan(this.#harness, context) : undefined;
+		await writeMissionAuthority(this.#location, nextOperationAuthority(authority, loop, plan, request, this.#now()));
 	}
 
 	/**
@@ -127,8 +132,9 @@ export class PurposeOperation {
 		};
 		loop.operation.revision++;
 		loop.operation.applied = { requestId: intent.requestId, sequence: intent.sequence };
-		const denial = operationDenial(authority, loop, intent.sequence, this.#now());
+		const denial = operationDenial(authority, loop, await storedPlan(tx), intent.sequence, this.#now());
 		if (denial === "deadline") throw new Error("The purpose lifetime deadline has passed.");
+		if (denial === "plan") throw new Error("Operation intent was not issued under the current agreed mission plan.");
 		if (denial !== undefined)
 			throw new Error("Operation intent does not match its current protected purpose agreement.");
 		await this.#arm(tx, loop, intent.missionId);
@@ -186,7 +192,7 @@ export class PurposeOperation {
 		if (loop.runs.some((run) => run.settlement === "unsettled")) return false;
 		if (loop.operation.loop && (await tx.task(loop.operation.loop))?.state.status !== "terminal") return false;
 		if ((await tx.doc(MaintenanceDoc)).current.state === "held") return false;
-		if (operationDenial(authority, loop, state.sequence, this.#now()) !== undefined) return false;
+		if (operationDenial(authority, loop, await storedPlan(tx), state.sequence, this.#now()) !== undefined) return false;
 		await this.#arm(tx, loop, loop.missionId!);
 		return true;
 	}
@@ -214,10 +220,15 @@ export class PurposeOperation {
 	}
 }
 
-/** Builds the authority file carrying one new protected operation intent or acknowledgment, idempotent by request ID. */
+/**
+ * Builds the authority file carrying one new protected operation intent or acknowledgment, idempotent by request ID.
+ * Once a plan is adopted, an open names the purpose revision its runnable tactical binds and records the exact plan
+ * head it was issued under.
+ */
 export function nextOperationAuthority(
 	authority: MissionAuthority,
 	loop: LoopState,
+	plan: PlanState | undefined,
 	request: Operate,
 	now: number,
 ): MissionAuthority {
@@ -259,7 +270,15 @@ export function nextOperationAuthority(
 	}
 	if (loop.operation.revision !== request.expectedOperationRevision) throw new Error("Stale operation revision.");
 	const state = loop.operation.state;
-	const agreement = request.action === "open" ? loop.agreements.at(-1) : state.status === "closed" ? undefined : loopAgreement(loop, state.purposeRevision);
+	const head = request.action === "open" ? openPlanHead(authority, plan) : undefined;
+	const agreement =
+		request.action === "open"
+			? head
+				? planBoundAgreement(loop, head)
+				: loop.agreements.at(-1)
+			: state.status === "closed"
+				? undefined
+				: loopAgreement(loop, state.purposeRevision);
 	if (!agreement)
 		throw new Error(request.action === "open" ? "Approve a purpose before opening operation." : "Operation is not open.");
 	if (request.action === "open" && state.status === "open") throw new Error("Operation is already open.");
@@ -277,8 +296,34 @@ export function nextOperationAuthority(
 			expectedOperationRevision: request.expectedOperationRevision,
 			action: request.action,
 			issuedAt: now,
+			...(head ? { planDigest: head.digest } : {}),
 		},
 	};
+}
+
+// The agreed plan head an open must be issued under, if a plan is adopted or its first receipt is published. An
+// absent plan document is no plan; the caller has already refused an invalid one.
+function openPlanHead(authority: MissionAuthority, plan: PlanState | undefined): PlanAgreement | undefined {
+	const head = plan?.agreed.at(-1);
+	if (!head && planIssued(authority))
+		throw new Error("A plan agreement is issued but not recorded; reconcile the plan before opening.");
+	if (!planHistoryBound(authority, plan))
+		throw new Error("Protected plan request history is unavailable; operation stays closed.");
+	// Refused before any intent is written: an open under a head the protected receipts no longer agree never admits.
+	if (
+		head &&
+		!matchingPlanApproval(authority, head.approval.receiptId, head.missionId, head.revision, head.previousDigest, head.terms)
+	)
+		throw new Error("The protected plan receipt does not agree the recorded plan; reconcile the plan before opening.");
+	return head;
+}
+
+function planBoundAgreement(loop: LoopState, head: PlanAgreement): PurposeReceiptAgreement {
+	const binding = head.terms.tacticals.find((tactical) => tactical.mode === "runnable")?.binding;
+	const agreement = binding && loopAgreement(loop, binding.purposeRevision);
+	if (!agreement || agreement.digest !== binding?.purposeDigest)
+		throw new Error("The agreed plan has no runnable tactical bound to an agreed purpose.");
+	return agreement;
 }
 
 // Admission closes in this commit, before any abort; the loop identity stays as the drain target until it is terminal.

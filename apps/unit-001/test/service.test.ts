@@ -23,6 +23,7 @@ import { Agent } from "../src/agent.ts";
 import { parseArguments } from "../src/args.ts";
 import { HostFactEntry } from "../src/commands/facts.ts";
 import { acquireSessionLock } from "../src/lock.ts";
+import { MissionPlanIssued } from "../src/missions/plan-formation.ts";
 import { sendDigest } from "../src/send-receipt.ts";
 import {
 	parseServiceResponse,
@@ -418,6 +419,8 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 			{ operation: "reconcile-purpose", receiptId: "operator" },
 			{ operation: "operate-local", action: "open", expectedOperationRevision: 0, requestId: "operator" },
 			{ operation: "reconcile-operation", requestId: "operator" },
+			{ operation: "prepare-plan", revision: 1, digest: "b".repeat(64), requestId: "operator" },
+			{ operation: "reconcile-plan", receiptId: "operator" },
 		])
 			expect(await requestService(operatorPath, { type: "mission", request } as never, signal())).toEqual(refused);
 		expect(mission).toHaveBeenCalledTimes(3);
@@ -441,6 +444,17 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 		expect(await requestService(service.path, purpose as never, signal())).toMatchObject({ type: "mission" });
 		expect(mission).toHaveBeenCalledTimes(4);
 		expect(mission.mock.calls[3]?.[0]).toMatchObject({ operation: "purpose-propose" });
+	});
+	it("preserves a known issued plan receipt without the private reconcile error", async () => {
+		const service = await launch([], undefined, join(directory, "operator"));
+		const receiptId = "11111111-1111-4111-8111-111111111111";
+		const mission = vi.spyOn(service.agent, "mission").mockRejectedValue(new MissionPlanIssued(receiptId, "private"));
+		const request = { operation: "plan-agree", revision: 1, digest: "a".repeat(64), requestId: "reviewed" } as const;
+		expect(await requestService(service.operatorPath!, { type: "mission", request }, signal())).toEqual({
+			type: "mission-plan-issued",
+			receiptId,
+		});
+		expect(mission).toHaveBeenCalledWith(request, BACKGROUND_CONTEXT);
 	});
 	it("#33 retains coding tools for trusted operator chat", async () => {
 		const service = await launch(

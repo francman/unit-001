@@ -29,6 +29,22 @@ describe("parseArguments", () => {
 		expect(parseArguments(["--session", "x", "--version"])).toEqual({ kind: "version" });
 	});
 
+	it("requires an exact positive revision and full digest for terminal plan approval", () => {
+		const digest = "a".repeat(64);
+		const command = ["mission", "plan", "approve", "--revision", "2", "--digest", digest, "--request-id", "r1"];
+		expect(parseArguments(command)).toEqual({
+			kind: "mission",
+			command: { action: "plan-approve", revision: 2, digest, requestId: "r1", json: false },
+			options: { session: "default" },
+		});
+		expect(() => parseArguments(["mission", "plan", "approve", "--revision", "0", "--digest", digest])).toThrow(
+			"positive revision",
+		);
+		expect(() => parseArguments(["mission", "plan", "approve", "--revision", "2", "--digest", "a"])).toThrow(
+			"exact --digest",
+		);
+	});
+
 	it.each([
 		[["--bogus"], /Unknown option: --bogus/],
 		[["-x"], /Unknown option: -x/],
