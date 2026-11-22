@@ -1,10 +1,12 @@
 // Chat page: transcript, live reply, tool rows and the composer; built once and patched in place so typing is never interrupted.
+import type { ChatEntries, ChatHistory } from "../history.ts";
 import type { Change, Ctx, Tool, Ui } from "../state.ts";
 import { callout, spinner } from "../ui/blocks.ts";
 import { text } from "../ui/classes.ts";
 import { button, iconButton } from "../ui/controls.ts";
 import { attrs, coarsePointer, el, paragraphs, srOnly } from "../ui/dom.ts";
 import { icon } from "../ui/icons.ts";
+import { markdown } from "../ui/markdown.ts";
 
 /** The chat page instance the shell keeps for the whole session. */
 export interface ChatView {
@@ -18,7 +20,7 @@ export interface ChatView {
 	destroy(): void;
 }
 
-type Entry = NonNullable<Ui["view"]>["entries"][number];
+type Entry = ChatEntries[number];
 
 /**
  * One reading column shared by the purpose line, the thread and the composer, so their edges line up. Each row that holds
@@ -34,13 +36,16 @@ const suggestions = ["What needs my attention?", "What are you working on right 
 export function createChat(context: () => Ctx): ChatView {
 	const purposeRow = attrs(el("div", `${gutterRow} xl:hidden`), { "data-chat-top": "" });
 	const noticeRow = el("div", gutterRow);
-	const columnNode = attrs(el("div", `${column} flex min-h-full flex-col pt-6 pb-8 max-md:pt-4 max-md:pb-6`), { "data-column": "" });
-	const thread = attrs(el("div", "h-full overflow-y-auto overscroll-contain [scrollbar-gutter:stable] focus-visible:-outline-offset-2", columnNode), {
-		id: "thread",
-		role: "log",
-		tabindex: "0",
-		"aria-live": "off",
-	});
+	const earlier = button({ label: "Load earlier messages", key: "load-earlier", onClick: () => context().act.loadEarlier() });
+	earlier.classList.add("aria-disabled:opacity-50");
+	const earlierError = el("p", `text-center ${text.meta}`, "Could not load earlier messages.");
+	const earlierRow = el("div", "mb-4 flex flex-col items-center gap-1", earlier, earlierError);
+	const messages = el("div", "flex flex-1 flex-col");
+	const columnNode = attrs(el("div", `${column} flex min-h-full flex-col pt-6 pb-8 max-md:pt-4 max-md:pb-6`, earlierRow, messages), { "data-column": "" });
+	const thread = attrs(
+		el("div", "h-full overflow-y-auto overscroll-contain [overflow-anchor:none] [scrollbar-gutter:stable] focus-visible:-outline-offset-2", columnNode),
+		{ id: "thread", role: "log", tabindex: "0", "aria-live": "off" },
+	);
 	const jump = attrs(
 		el(
 			"button",
@@ -68,6 +73,8 @@ export function createChat(context: () => Ctx): ChatView {
 	);
 
 	let historyKey = "";
+	let shownEntries: ChatEntries | null = null;
+	let shownHistory: ChatHistory | null = null;
 	let purposeKey = "";
 	let noticeKey = "";
 	let live: HTMLElement | null = null;
@@ -78,6 +85,12 @@ export function createChat(context: () => Ctx): ChatView {
 			const ctx = context();
 			const focused = document.activeElement instanceof HTMLElement && root.contains(document.activeElement) ? document.activeElement : null;
 			const focusedKey = focused?.dataset.key ?? null;
+			const history = ctx.ui.chatHistory;
+			const historyChanged = shownHistory !== null && shownHistory !== history;
+			const pageLoaded = shownHistory?.kind === "loading" && (history.kind === "ready" || history.kind === "exhausted");
+			shownHistory = history;
+			const top = historyChanged ? thread.scrollTop : 0;
+			const anchor = pageLoaded ? visibleAnchor(thread) : null;
 			thread.setAttribute("aria-label", `Conversation with ${ctx.name}`);
 			if (change === "state") {
 				const nextPurpose = purposeSignature(ctx);
@@ -90,20 +103,32 @@ export function createChat(context: () => Ctx): ChatView {
 					noticeKey = nextNotice;
 					noticeRow.replaceChildren(...(ctx.ui.unknown ? [el("div", `${column} pt-3`, unknownNotice(ctx))] : []));
 				}
+				earlierRow.hidden = history.kind === "unstarted" ? !ctx.ui.view?.historyTruncated : history.kind === "exhausted";
+				earlierError.hidden = history.kind !== "failed";
+				earlier.setAttribute("aria-disabled", String(history.kind === "loading" || ctx.ui.connection !== "connected"));
+				const label = history.kind === "loading" ? "Loading earlier messages…" : history.kind === "failed" ? "Retry loading earlier messages" : "Load earlier messages";
+				if (earlier.textContent !== label) earlier.textContent = label;
 			}
 			const nextHistory = historySignature(ctx);
-			if (nextHistory !== historyKey) {
+			if (nextHistory !== historyKey || shownEntries !== ctx.ui.chatEntries) {
 				historyKey = nextHistory;
-				columnNode.replaceChildren(...history(ctx));
+				shownEntries = ctx.ui.chatEntries;
+				messages.replaceChildren(...renderHistory(ctx));
 				live = null;
 			}
-			live = patchLive(ctx, columnNode, live);
+			live = patchLive(ctx, messages, live);
 			composer.update(ctx);
 			// A rebuilt row loses focus; give it back to the control with the same key (copy, restore, purpose).
-			if (focusedKey && !root.contains(focused))
+			if (focused === earlier && earlierRow.hidden) thread.focus({ preventScroll: true });
+			else if (focusedKey && !root.contains(focused))
 				root.querySelector<HTMLElement>(`[data-key="${CSS.escape(focusedKey)}"]`)?.focus({ preventScroll: true });
 			if (!root.isConnected) return;
-			if (following) thread.scrollTop = thread.scrollHeight;
+			if (historyChanged) {
+				const row = anchor === null ? null : messages.querySelector<HTMLElement>(`[data-chat-entry="${anchor.id}"]`);
+				thread.scrollTop = row && anchor ? thread.scrollTop + row.getBoundingClientRect().top - thread.getBoundingClientRect().top - anchor.offset : top;
+				savedTop = thread.scrollTop;
+				following = nearBottom(thread);
+			} else if (following) thread.scrollTop = thread.scrollHeight;
 			else if (thread.scrollTop !== savedTop) thread.scrollTop = savedTop;
 			jump.hidden = nearBottom(thread);
 		},
@@ -120,8 +145,20 @@ function nearBottom(node: HTMLElement): boolean {
 	return node.scrollHeight - node.scrollTop - node.clientHeight < 80;
 }
 
+// Anchor normal-flow positions, not the user bubble, which sticks while its turn scrolls past.
+function visibleAnchor(thread: HTMLElement): { id: string; offset: number } | null {
+	const viewport = thread.getBoundingClientRect();
+	for (const row of thread.querySelectorAll<HTMLElement>("[data-chat-entry]")) {
+		const box = row.getBoundingClientRect();
+		const id = row.dataset.chatEntry;
+		if (box.top >= viewport.bottom) break;
+		if (id && box.bottom > viewport.top) return { id, offset: box.top - viewport.top };
+	}
+	return null;
+}
+
 function isEmpty(ui: Readonly<Ui>): boolean {
-	return !ui.view?.entries.length && !ui.view?.busy;
+	return !ui.chatEntries.length && !ui.view?.busy;
 }
 
 // ── Purpose line ──
@@ -155,13 +192,7 @@ function purposeLine(ctx: Ctx): HTMLElement[] {
 function historySignature(ctx: Ctx): string {
 	const view = ctx.ui.view;
 	if (!view) return `none|${ctx.ui.connection}`;
-	const last = view.entries.at(-1);
 	return [
-		view.entries.length,
-		last?.id,
-		last?.text.length,
-		view.historyTruncated,
-		isEmpty(ctx.ui),
 		view.busy,
 		ctx.ui.finishedTools.length,
 		ctx.ui.stopped,
@@ -170,17 +201,18 @@ function historySignature(ctx: Ctx): string {
 	].join("|");
 }
 
-/** The column's content: a note when history is cut, then one group per turn (the owner's message and the replies to it). */
-function history(ctx: Ctx): HTMLElement[] {
+/** The thread groups closed rows by turn, starting with the user's message when present. */
+function renderHistory(ctx: Ctx): HTMLElement[] {
 	const view = ctx.ui.view;
-	if (!view) return [loading(ctx)];
+	// Offline and expired sessions already have recovery instructions above the thread.
+	if (!view) return ctx.ui.connection === "connecting" ? [loading(ctx)] : [];
 	if (isEmpty(ctx.ui)) return [emptyChat(ctx)];
 	const nodes: HTMLElement[] = [];
-	if (view.historyTruncated) nodes.push(el("p", `mb-4 text-center ${text.meta}`, "Earlier messages are kept but not shown here."));
 	let turn: HTMLElement | null = null;
-	for (const entry of view.entries) {
+	for (const entry of ctx.ui.chatEntries) {
 		if (entry.role === "user" || !turn) {
 			turn = attrs(el("div", "flex flex-col gap-3 pb-3 last:pb-0"), { "data-turn": "" });
+			if (entry.role === "user") turn.dataset.chatEntry = String(entry.id);
 			nodes.push(turn);
 		}
 		turn.append(entry.role === "user" ? userMessage(ctx, entry) : agentMessage(ctx, entry));
@@ -211,16 +243,16 @@ function userMessage(ctx: Ctx, entry: Entry): HTMLElement {
 	return el("div", "sticky top-0 z-10 -mx-1 bg-canvas px-1 pt-1", box);
 }
 
-// The agent's reply: plain text, no bubble, indented to the user box's text; a copy action appears on hover or focus.
+// The agent's reply has no bubble and is indented to the user box's text; Copy keeps the source Markdown.
 function agentMessage(ctx: Ctx, entry: Entry): HTMLElement {
-	const body = el("div", "[overflow-wrap:anywhere]");
-	paragraphs(body, entry.text, "mt-3 first:mt-0 whitespace-pre-wrap");
+	const body = markdown(entry.text);
 	const actions = el(
 		"div",
 		"flex h-6 items-center gap-0.5 opacity-0 transition-opacity duration-100 group-hover/reply:opacity-100 group-focus-within/reply:opacity-100 pointer-coarse:hidden",
 		iconButton({ icon: "copy", label: "Copy reply", key: `copy-reply-${entry.id}`, onClick: () => void ctx.act.copy(entry.text, "Reply") }),
 	);
 	const message = el("article", "group/reply flex flex-col gap-0.5 pl-3 text-chat text-fg", srOnly(`${ctx.name} said:`), body);
+	message.dataset.chatEntry = String(entry.id);
 	if (entry.source === "host") message.append(el("p", notes, `Sent from the computer ${ctx.name} runs on`));
 	if (entry.truncated) message.append(el("p", notes, "Shortened in this view."));
 	message.append(el("div", "-ml-1.5", actions));
@@ -243,14 +275,10 @@ function patchLive(ctx: Ctx, columnNode: HTMLElement, current: HTMLElement | nul
 	}
 	const parts: Node[] = [srOnly(`${ctx.name} is replying:`)];
 	if (view.text) {
-		const body = el("div", "[overflow-wrap:anywhere]");
-		paragraphs(body, view.text, "mt-3 first:mt-0 whitespace-pre-wrap");
-		body.lastElementChild?.append(
-			attrs(el("span", "ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] bg-accent animate-caret forced-colors:bg-[CanvasText]"), {
-				"aria-hidden": "true",
-			}),
-		);
-		parts.push(body);
+		const caret = attrs(el("span", "ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] bg-accent animate-caret forced-colors:bg-[CanvasText]"), {
+			"aria-hidden": "true",
+		});
+		parts.push(markdown(view.text, caret));
 	}
 	if (view.tools.length) parts.push(toolRows(view.tools));
 	parts.push(statusLine(ctx));
@@ -272,8 +300,7 @@ function failed(tool: Tool): boolean {
 	return tool.status === "error" || tool.status === "failed";
 }
 
-// Hermes.app tool rows: 12 px lines (state glyph, tool name, its argument), dimmed until hovered so the answer stays the loudest
-// thing. The state is also a word for screen readers; a failed call stays at full strength in the danger color.
+// Compact tool rows: a state glyph, tool name and readable argument. The state is also a word for screen readers.
 function toolRows(tools: readonly Tool[]): HTMLElement {
 	const list = attrs(el("ul", "m-0 flex list-none flex-col p-0"), { role: "list", "aria-label": "Tool calls" });
 	for (const tool of tools) {
@@ -288,9 +315,9 @@ function toolRows(tools: readonly Tool[]): HTMLElement {
 				"li",
 				bad
 					? "flex min-h-6 min-w-0 items-center gap-1.5 text-[0.75rem] text-danger"
-					: "flex min-h-6 min-w-0 items-center gap-1.5 text-[0.75rem] text-fg-2 opacity-70 transition-opacity duration-100 hover:opacity-100",
+					: "flex min-h-6 min-w-0 items-center gap-1.5 text-[0.75rem] text-fg-2",
 				el("span", "grid size-3.5 shrink-0 place-items-center", glyph),
-				el("span", "min-w-0 truncate", el("span", "font-medium", command), rest.length ? el("span", "font-mono text-fg-3", ` ${rest.join(" ")}`) : null),
+				el("span", "min-w-0 truncate", el("span", "font-medium", command), rest.length ? el("span", "font-mono text-fg-2", ` ${rest.join(" ")}`) : null),
 				el("span", bad ? "shrink-0 text-xs" : "sr-only", tool.status === "running" ? ", running" : bad ? "failed" : ", done"),
 			),
 		);
@@ -318,11 +345,9 @@ function toolSummary(tools: readonly Tool[]): HTMLElement {
 // ── Empty and loading ──
 
 function loading(ctx: Ctx): HTMLElement {
-	return el(
-		"div",
-		"m-auto flex flex-col items-center gap-2 py-16",
-		spinner("size-5 shrink-0 text-fg-3"),
-		el("p", text.meta, ctx.ui.connection === "connecting" ? `Connecting to ${ctx.name}` : `Waiting for ${ctx.name}`),
+	return attrs(
+		el("div", "m-auto flex flex-col items-center gap-2 py-16", spinner("size-5 shrink-0 text-fg-3"), el("p", text.meta, `Connecting to ${ctx.name}`)),
+		{ role: "status" },
 	);
 }
 
@@ -406,7 +431,7 @@ function createComposer(context: () => Ctx): { row: HTMLElement; input: HTMLText
 	const send = el("button", "");
 	send.dataset.key = "send";
 	send.dataset.send = "";
-	const hint = attrs(el("p", "min-h-0 px-1 pt-1 text-xs text-fg-3 empty:hidden"), { id: "composer-hint", "aria-live": "polite" });
+	const hint = attrs(el("p", "min-h-0 px-1 pt-1 text-xs text-fg-3 empty:sr-only"), { id: "composer-hint", role: "status" });
 	const card = el(
 		"div",
 		"flex min-w-0 items-end gap-1 rounded-lg border border-accent/25 bg-card py-[5px] pr-[5px] pl-2 shadow-composer transition-colors duration-200 hover:border-accent/45 focus-within:border-accent forced-colors:border-[CanvasText]",
@@ -440,7 +465,7 @@ function createComposer(context: () => Ctx): { row: HTMLElement; input: HTMLText
 			icon(running ? "stop" : "send", running ? "size-3 shrink-0" : "size-3.5 shrink-0"),
 			srOnly(running ? "Cancel chat" : "Send message"),
 		);
-		send.title = running ? "Cancel chat (Esc)" : "Send (Enter)";
+		send.title = running ? "Cancel chat" : "Send (Enter)";
 		send.disabled = running ? false : !ctx.ui.draft.trim() || ctx.ui.sending || ctx.ui.connection !== "connected";
 		send.setAttribute("aria-disabled", String(running && ctx.ui.cancelling));
 	};
@@ -473,6 +498,7 @@ function createComposer(context: () => Ctx): { row: HTMLElement; input: HTMLText
 		grow();
 	});
 	observer.observe(input);
+	let replyStartedWhileSending = false;
 
 	return {
 		row,
@@ -492,7 +518,10 @@ function createComposer(context: () => Ctx): { row: HTMLElement; input: HTMLText
 				model.replaceChildren(...(modelId ? [icon("cpu", "size-3 shrink-0"), el("span", "truncate", modelId)] : []));
 				model.title = modelId ? `Model: ${ctx.ui.view?.model?.provider}/${modelId}` : "";
 			}
-			const words = ctx.ui.cancelling ? "Stopping after the current step." : "";
+			// A reply can finish before the send response arrives. Don't go back to “Sending…” in that gap.
+			if (!ctx.ui.sending) replyStartedWhileSending = false;
+			else if (ctx.ui.view?.busy) replyStartedWhileSending = true;
+			const words = ctx.ui.cancelling ? "Stopping after the current step." : ctx.ui.sending && !replyStartedWhileSending ? "Sending…" : "";
 			if (hint.textContent !== words) hint.textContent = words;
 			sync(ctx);
 		},

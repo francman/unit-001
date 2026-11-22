@@ -104,13 +104,13 @@ export function edgeOpacity(scene: Pick<Scene, "focus" | "mix" | "matches">, edg
 	return matched * (touches ? base + scene.mix * (0.9 - base) : base + scene.mix * (dimmedEdge - base));
 }
 
-/** Paints one frame, replacing the last. The canvas stays transparent so the page shows through. */
-export function draw(ctx: CanvasRenderingContext2D, scene: Scene): void {
+/** Paints one frame, replacing the last. When requested, records the painted node shapes in screen pixels. */
+export function draw(ctx: CanvasRenderingContext2D, scene: Scene, painted?: Placed[]): void {
 	ctx.setTransform(scene.dpr, 0, 0, scene.dpr, 0, 0);
 	ctx.clearRect(0, 0, scene.width, scene.height);
 	if (scene.outline) drawOutline(ctx, scene, scene.outline);
 	drawEdges(ctx, scene);
-	drawNodes(ctx, scene);
+	drawNodes(ctx, scene, painted);
 	drawRings(ctx, scene);
 	drawLabels(ctx, scene);
 }
@@ -223,11 +223,14 @@ function drawHead(ctx: CanvasRenderingContext2D, head: "triangle" | "chevron" | 
 }
 
 // Dimmed memories first, then the lit ones on top. Working memories are circles, episodic ones rounded squares.
-function drawNodes(ctx: CanvasRenderingContext2D, scene: Scene): void {
+function drawNodes(ctx: CanvasRenderingContext2D, scene: Scene, painted?: Placed[]): void {
 	const { model, view, bodies, theme, form } = scene;
 	const order = model.nodes.map((_, index) => ({ index, alpha: nodeOpacity(scene, index) })).sort((a, b) => a.alpha - b.alpha);
+	if (painted) painted.length = model.nodes.length;
 	ctx.lineWidth = 1.5;
 	for (const { index, alpha } of order) {
+		const previous = painted?.[index];
+		if (previous) previous.radius = 0;
 		const body = bodies[index];
 		const entry = model.nodes[index];
 		if (!body || !entry) continue;
@@ -238,11 +241,18 @@ function drawNodes(ctx: CanvasRenderingContext2D, scene: Scene): void {
 		const reveal = form ? (form.reveal[index] ?? 1) : 1;
 		if (reveal <= 0) continue;
 		const radius = screenRadius(body.radius, view.k) * (0.6 + 0.4 * reveal);
+		const square = entry.node.tier === "episodic";
+		if (previous) {
+			previous.x = x;
+			previous.y = y;
+			previous.radius = radius;
+			previous.square = square;
+		} else if (painted) painted[index] = { x, y, radius, square };
 		// Importance is the secondary cue: the more important a memory, the more solid it is.
 		ctx.globalAlpha = alpha * reveal * (0.68 + 0.32 * Math.min(1, Math.max(0, entry.node.importance)));
 		ctx.fillStyle = kindColors[entry.node.kind](theme);
 		ctx.strokeStyle = theme.canvas;
-		shape(ctx, entry.node.tier === "working", x, y, radius);
+		shape(ctx, !square, x, y, radius);
 		ctx.fill();
 		ctx.stroke();
 	}

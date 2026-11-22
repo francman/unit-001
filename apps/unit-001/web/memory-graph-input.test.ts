@@ -19,8 +19,8 @@ class FakeFrame extends EventTarget {
 		// A browser fires this after any release, ours included.
 		this.pointer("lostpointercapture", 0, 0);
 	}
-	pointer(type: string, x: number, y: number) {
-		const event = Object.assign(new Event(type), { pointerId: 1, pointerType: "mouse", button: 0, clientX: x, clientY: y });
+	pointer(type: string, x: number, y: number, pointerType = "mouse") {
+		const event = Object.assign(new Event(type), { pointerId: 1, pointerType, button: 0, clientX: x, clientY: y });
 		this.dispatchEvent(event);
 	}
 	// What a browser does when the captured element leaves the document: capture is gone, then lostpointercapture fires.
@@ -30,7 +30,7 @@ class FakeFrame extends EventTarget {
 	}
 }
 
-function setup(nodeAt = 0) {
+function setup(nodeAt = 0, gestures = true) {
 	const frame = new FakeFrame();
 	const calls: string[] = [];
 	const target: InputTarget = {
@@ -49,8 +49,8 @@ function setup(nodeAt = 0) {
 		fit: () => calls.push("fit"),
 		leave: () => calls.push("leave"),
 	};
-	const input = wireInput(frame as unknown as HTMLElement, target);
-	return { frame, calls, input };
+	const input = wireInput(frame as unknown as HTMLElement, target, () => gestures);
+	return { frame, calls, input, aimAt: (index: number) => { nodeAt = index; } };
 }
 
 const drag = (frame: FakeFrame) => {
@@ -58,6 +58,36 @@ const drag = (frame: FakeFrame) => {
 	frame.pointer("pointermove", 30, 30);
 	frame.pointer("pointermove", 40, 40);
 };
+
+describe("memory graph gesture mode", () => {
+	it("does not capture a native touch scroll or turn movement into a tap", () => {
+		const { frame, calls } = setup(0, false);
+		frame.pointer("pointerdown", 10, 10, "touch");
+		expect(frame.captured.size).toBe(0);
+		frame.pointer("pointermove", 10, 60, "touch");
+		frame.pointer("pointercancel", 10, 60, "touch");
+		expect(calls).toEqual([]);
+		frame.pointer("pointerdown", 10, 10, "touch");
+		frame.pointer("pointerup", 10, 60, "touch");
+		expect(calls).toEqual([]);
+	});
+
+	it("inspects the painted target from the start of a tap even if the map moves under it", () => {
+		const { frame, calls, aimAt } = setup(2, false);
+		frame.pointer("pointerdown", 10, 10, "touch");
+		aimAt(3);
+		frame.pointer("pointerup", 10, 10, "touch");
+		expect(calls).toEqual(["click 2"]);
+	});
+
+	it("drags a touch target only after opting in", () => {
+		const { frame, calls } = setup();
+		frame.pointer("pointerdown", 10, 10, "touch");
+		frame.pointer("pointermove", 10, 60, "touch");
+		frame.pointer("pointerup", 10, 60, "touch");
+		expect(calls).toEqual(["grabbing true", "drag 0 start", "grabbing false", "drop 0"]);
+	});
+});
 
 describe("memory graph input presses", () => {
 	// Codex review (high): a state redraw reparented the frame during a drag; the press survived and blocked every later gesture.

@@ -6,6 +6,7 @@ import { text } from "../ui/classes.ts";
 import { attrs, el } from "../ui/dom.ts";
 import { ago, dateTime } from "../ui/format.ts";
 import { facts, listRow, rowList } from "../ui/page.ts";
+import type { GraphModel } from "./memory-graph-model.ts";
 
 /** One memory as the backend reports it. */
 export type GraphNode = MemoryGraphView["nodes"][number];
@@ -65,8 +66,6 @@ export interface DetailsOptions {
 	conversations: ReadonlyMap<string, string>;
 	/** True while the map shows only this memory and what is near it. */
 	focused: boolean;
-	/** False in the List view, which has no map to focus. */
-	canFocus: boolean;
 	onSelect(id: string): void;
 	onClose(): void;
 	/** Shows only this memory and its neighbours, or all memories again when it already does. */
@@ -81,12 +80,12 @@ export function renderDetails(options: DetailsOptions): HTMLElement {
 	const close = iconButton({ icon: "close", label: "Close details", key: "graph-close", onClick: options.onClose });
 	// Focus sits in the head, not at the foot: on a phone the foot of the sheet is below the fold.
 	const focus = button({ label: options.focused ? "Show all" : "Focus", key: "graph-focus", variant: "ghost", onClick: options.onFocus });
-	focus.setAttribute("aria-label", options.focused ? "Show all memories again" : "Focus the map on this memory and its neighbours");
+	focus.setAttribute("aria-label", options.focused ? "Clear memory focus" : "Focus on this memory and its neighbours");
 	const head = el(
 		"div",
 		"flex items-center justify-between gap-2",
 		el("div", "flex items-center gap-1.5", tag(kindLabels[node.kind]), tag(tierLabels[node.tier])),
-		el("div", "flex items-center gap-0.5", options.canFocus ? focus : null, close),
+		el("div", "flex items-center gap-0.5", focus, close),
 	);
 	const body = el("p", `${text.strong} whitespace-pre-wrap`, node.content);
 	const forgetKey = `graph-forget-${node.id}`;
@@ -133,7 +132,7 @@ function relatedList(options: DetailsOptions): HTMLElement | null {
 
 /** What the List view needs: the memories newest first, who matches the search, and what is selected. */
 export interface ListOptions {
-	nodes: readonly GraphNode[];
+	nodes: GraphModel["nodes"];
 	selected: string | null;
 	/** Ids that match the typed search, or null when nothing is typed. */
 	matches: ReadonlySet<string> | null;
@@ -143,26 +142,25 @@ export interface ListOptions {
 }
 
 /** The List view: the same memories as the graph, as rows a keyboard and a screen reader can use. */
-export function renderList(options: ListOptions): HTMLElement {
-	const shown = options.nodes.filter((node) => options.matches === null || options.matches.has(node.id));
-	if (shown.length === 0) return el("p", text.description, "No memory in the map matches that search.");
-	return rowList(
-		...shown.map((node) => {
-			const open = button({
-				label: "Details",
-				key: `list-open-${node.id}`,
-				variant: "ghost",
-				onClick: () => options.onSelect(node.id),
-			});
-			open.setAttribute("aria-label", `Show details: ${preview(node, 60)}`);
-			open.setAttribute("aria-pressed", String(options.selected === node.id));
-			const row = listRow({
-				title: el("span", "line-clamp-2", node.content),
-				meta: `${kindLabels[node.kind]} · ${tierLabels[node.tier]} · ${originLabel(node.origin, options.name)} · ${options.conversations.get(node.conversation) ?? "A conversation"} · ${ago(node.createdAt)}`,
-				trailing: [open],
-			});
-			if (options.selected === node.id) row.className = `${row.className} bg-fill`;
-			return row;
-		}),
-	);
+export function renderList(options: ListOptions): HTMLElement | null {
+	const shown: HTMLLIElement[] = [];
+	for (const { node } of options.nodes) {
+		if (options.matches && !options.matches.has(node.id)) continue;
+		const open = button({
+			label: "Details",
+			key: `list-open-${node.id}`,
+			variant: "ghost",
+			onClick: () => options.onSelect(node.id),
+		});
+		open.setAttribute("aria-label", `Show details: ${preview(node, 60)}`);
+		open.setAttribute("aria-pressed", String(options.selected === node.id));
+		const row = listRow({
+			title: el("span", "line-clamp-2", node.content),
+			meta: `${kindLabels[node.kind]} · ${tierLabels[node.tier]} · ${originLabel(node.origin, options.name)} · ${options.conversations.get(node.conversation) ?? "A conversation"} · ${ago(node.createdAt)}`,
+			trailing: [open],
+		});
+		if (options.selected === node.id) row.className = `${row.className} bg-fill`;
+		shown.push(row);
+	}
+	return shown.length > 0 ? rowList(...shown) : null;
 }

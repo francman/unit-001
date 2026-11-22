@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import type { MemoryGraphView } from "./contract.ts";
 import { type Scene, dimmedEdge, dimmedNode, draw, edgeOpacity, nodeOpacity } from "./views/memory-graph-draw.ts";
+import { hitTest, type Placed } from "./views/memory-graph-geometry.ts";
 import type { Theme } from "./views/memory-graph-theme.ts";
 import { degreesOf, nothingHidden, shownGraph } from "./views/memory-graph-model.ts";
 
@@ -127,6 +128,17 @@ describe("memory graph forming", () => {
 		const whole = recorder();
 		draw(whole.ctx, { ...base, form: { reveal: Float32Array.of(1, 0, 0, 0), edgeProgress: new Float32Array(3) } });
 		expect(half.calls.join("|")).not.toEqual(whole.calls.join("|"));
+	});
+
+	it("hits the last painted center and radius but not a node that has yet to appear", () => {
+		const { ctx } = recorder();
+		const painted: Placed[] = [];
+		draw(ctx, base, painted);
+		expect(hitTest(painted, 200, 100, 22)).toBe(1);
+		draw(ctx, { ...base, form: { reveal: Float32Array.of(0.5, 0, 0, 0), edgeProgress: new Float32Array(3) } }, painted);
+		expect(hitTest(painted, 200, 100, 22)).toBe(-1);
+		expect(hitTest(painted, 106, 100, 0)).toBe(0);
+		expect(hitTest(painted, 107, 100, 0)).toBe(-1);
 	});
 });
 

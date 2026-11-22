@@ -5,7 +5,7 @@ import { assignByBisection } from "./memory-graph-assign.ts";
 import { type BrainFrame, brainFrame, brainTargets, worldPoints } from "./memory-graph-brain.ts";
 import { type DrawnLabel, draw, type FormScene, nodeOpacity, type OutlineScene } from "./memory-graph-draw.ts";
 import { createForm, edgeProgressAt, fadeAt, type Form, holdStrength, outlineAlphaAt, type Plan, planFor, revealAt, startTimes, strengthAt, traceAt } from "./memory-graph-form.ts";
-import { fitBox, hitTest, nodeInDirection, panIntoView, screenRadius, toWorld, type View, zoomAt } from "./memory-graph-geometry.ts";
+import { fitBox, hitTest, nodeInDirection, panIntoView, type Placed, screenRadius, toWorld, type View, zoomAt } from "./memory-graph-geometry.ts";
 import { type Input, type InputTarget, wireInput } from "./memory-graph-input.ts";
 import { type LabelCandidate, labelOrder, placeLabels, zoomFade } from "./memory-graph-labels.ts";
 import { bounds, createSimulation, type LayoutEdge, type LayoutNode, type Simulation, settleWithin } from "./memory-graph-layout.ts";
@@ -43,14 +43,10 @@ export interface GraphCanvas {
 	setSelected(id: string | null): void;
 	/** The ids that match the typed search, or null when nothing is typed. */
 	setMatches(ids: ReadonlySet<string> | null): void;
-	/** Moves the view so a memory is in the middle. */
-	center(id: string): void;
-	/** Pans only as far as needed to keep a memory in view outside the strips `reserved` for floating panels (pixels on the right, on the bottom). */
-	reveal(id: string, reserved: Strips): void;
-	/** Fits the whole map in the frame, outside the strips `reserved` for floating panels; later automatic fits keep that. */
-	fit(reserved?: Strips): void;
-	/** Sets the strips floating panels cover, for automatic fits; the view is refitted only when the person has not moved it. */
-	reserve(reserved: Strips): void;
+	/** Lets pointer drags and wheel events manipulate the map instead of scrolling the page. */
+	setGestures(enabled: boolean): void;
+	/** Fits the map around the details panel. */
+	fit(): void;
 	zoomBy(factor: number): void;
 	/** Tells screen readers something through the map's polite live region. */
 	announce(text: string): void;
@@ -61,13 +57,6 @@ export interface GraphCanvas {
 	dispose(): void;
 }
 
-/** Strips of the frame, in pixels, that a floating panel covers: on the right edge or along the bottom. */
-export interface Strips {
-	right: number;
-	bottom: number;
-}
-
-const noStrips: Strips = { right: 0, bottom: 0 };
 const mixSeconds = 0.14;
 const labelEase = 0.25;
 const maxZoomOnFit = 1.6;
@@ -93,8 +82,8 @@ interface Pending {
 }
 
 /** Builds the canvas. It draws nothing until it has a model and a size. */
-export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
-	const canvas = attrs(el("canvas", "absolute inset-0 block size-full touch-none select-none"), { role: "img", "aria-label": "Memory graph" });
+export function createGraphCanvas(handlers: CanvasHandlers, panel: HTMLElement): GraphCanvas {
+	const canvas = attrs(el("canvas", "absolute inset-0 block size-full select-none"), { role: "img", "aria-label": "Memory graph" });
 	const context = canvas.getContext("2d");
 	const probes = createProbes();
 	const hover = attrs(
@@ -108,7 +97,7 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 	);
 	hint.id = "graph-hint";
 	const live = attrs(el("p", "sr-only"), { role: "status", "aria-live": "polite", "aria-atomic": "true" });
-	const frame = attrs(el("div", "relative size-full min-w-0 cursor-grab overflow-hidden", canvas, hover, hint, live, probes.root), {
+	const frame = attrs(el("div", "relative size-full min-w-0 overflow-hidden", canvas, hover, hint, live, probes.root), {
 		tabindex: "0",
 		role: "group",
 		"aria-describedby": "graph-hint",
@@ -116,15 +105,19 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 	});
 
 	let model: GraphModel = { nodes: [], edges: [], neighbours: [], indexOf: new Map() };
+	let paintedModel = model;
+	const painted: Placed[] = [];
 	let simulation: Simulation | null = null;
 	let pending: Pending | null = null;
 	let settleTimer: ReturnType<typeof setTimeout> | null = null;
-	// Work that needs the shown model to be the new one (centering on a memory that may only exist in it).
-	let afterCommit: (() => void)[] = [];
 	let view: View = { x: 0, y: 0, k: 1 };
 	// False until the person pans or zooms; until then the view keeps fitting the map.
 	let touched = false;
-	let reserved: Strips = noStrips;
+	let usableWidth = 0;
+	let usableHeight = 0;
+	let viewportDirty = true;
+	let followSelection = false;
+	let gestures = false;
 	let width = 0;
 	let height = 0;
 	let dpr = 1;
@@ -196,22 +189,38 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		const nextWidth = frame.clientWidth;
 		const nextHeight = frame.clientHeight;
 		const nextDpr = Math.min(window.devicePixelRatio || 1, 2);
-		if (nextWidth === width && nextHeight === height && nextDpr === dpr) return;
-		width = nextWidth;
-		height = nextHeight;
-		dpr = nextDpr;
-		// The backing store is sized by attributes; the canvas's CSS size comes from classes, so no style attribute is ever set.
-		canvas.width = Math.max(1, Math.round(width * dpr));
-		canvas.height = Math.max(1, Math.round(height * dpr));
-		if (!touched) fit(reserved);
+		viewportDirty = false;
+		const resized = nextWidth !== width || nextHeight !== height || nextDpr !== dpr;
+		if (resized) {
+			width = nextWidth;
+			height = nextHeight;
+			dpr = nextDpr;
+			// Resizing the backing store clears the last painted shapes too.
+			canvas.width = Math.max(1, Math.round(width * dpr));
+			canvas.height = Math.max(1, Math.round(height * dpr));
+			painted.length = 0;
+		}
+		let freeWidth = width;
+		let freeHeight = height;
+		if (!panel.hidden) {
+			const box = frame.getBoundingClientRect();
+			const cover = panel.getBoundingClientRect();
+			// The floating panel docks right at Tailwind's lg breakpoint, bottom otherwise.
+			if (matchMedia("(min-width: 64rem)").matches) freeWidth = Math.max(1, cover.left - box.left);
+			else freeHeight = Math.max(1, cover.top - box.top);
+		}
+		if (!resized && usableWidth === freeWidth && usableHeight === freeHeight) return;
+		usableWidth = freeWidth;
+		usableHeight = freeHeight;
+		followSelection = selectedId !== null;
+		if (!touched && simulation) view = fitView(simulation);
 		invalidate(true);
 	}
 
-	function fit(strips: Strips = noStrips): void {
-		reserved = strips;
-		if (width <= 0 || height <= 0 || !simulation) return;
+	function fit(): void {
 		touched = false;
-		view = fitView(simulation);
+		followSelection = selectedId !== null;
+		if (width > 0 && height > 0 && simulation) view = fitView(simulation);
 		invalidate(true);
 	}
 
@@ -226,7 +235,7 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 			box.y0 = Math.min(box.y0, -brainBox.height / 2 - margin);
 			box.y1 = Math.max(box.y1, brainBox.height / 2 + margin);
 		}
-		return fitBox(box, Math.max(1, width - reserved.right), Math.max(1, height - reserved.bottom), maxZoomOnFit);
+		return fitBox(box, Math.max(1, usableWidth), Math.max(1, usableHeight), maxZoomOnFit);
 	}
 
 	function measure(text: string): number {
@@ -284,10 +293,11 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 			lastTime = 0;
 			return;
 		}
+		activate();
 		const seconds = Math.min(0.1, lastTime === 0 ? 0.016 : (now - lastTime) / 1000);
 		lastTime = now;
 		if (theme === null) theme = probes.read();
-		if (frame.clientWidth !== width || frame.clientHeight !== height) resize();
+		if (viewportDirty || frame.clientWidth !== width || frame.clientHeight !== height) resize();
 		if (form) advanceForm(seconds);
 		let moving = false;
 		// While a reduced-motion layout settles to the side, the shown one stands still.
@@ -299,6 +309,18 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 			ticksSinceLabels += 1;
 			// While the layout moves the kept labels stay; they are decided again now and then, and once it stops.
 			if (!moving || ticksSinceLabels > 20) relabelNeeded = true;
+		}
+		if (followSelection) {
+			const body = simulation?.bodies[selected()];
+			if (body) {
+				const margin = screenRadius(body.radius, view.k) + 8;
+				const { dx, dy } = panIntoView(body.x * view.k + view.x, body.y * view.k + view.y, usableWidth, usableHeight, margin);
+				if (dx !== 0 || dy !== 0) {
+					view = { ...view, x: view.x + dx, y: view.y + dy };
+					relabelNeeded = true;
+				}
+			}
+			if (!moving && !form && !pending) followSelection = false;
 		}
 		const wanted = focus() >= 0 ? 1 : 0;
 		const stepMix = reduced() ? 1 : seconds / mixSeconds;
@@ -343,7 +365,8 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 				labels: drawn,
 				form: form ? formScene : null,
 				outline: outlineFor(),
-			});
+			}, painted);
+			paintedModel = model;
 			if (model.nodes.length > 0) played = true;
 		}
 		if (moving || mixing || fading || dragging || form !== null) schedule();
@@ -430,7 +453,7 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		layout.snap(mine);
 	}
 
-	// The first pointer, wheel or key press during the animation skips to its end, so clicks and keys land on memories that are in place.
+	// An intentional map action skips the remaining animation; the pointer target still comes from the last paint.
 	function skipForm(): void {
 		if (!form) return;
 		form.skip();
@@ -442,7 +465,7 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		hovered = index;
 		showPreview(index >= 0 ? index : current);
 		frame.classList.toggle("cursor-pointer", index >= 0);
-		frame.classList.toggle("cursor-grab", index < 0);
+		frame.classList.toggle("cursor-grab", gestures && index < 0);
 		invalidate(true);
 	}
 
@@ -467,14 +490,18 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 	}
 
 	function pan(dx: number, dy: number): void {
+		skipForm();
 		view = { ...view, x: view.x + dx, y: view.y + dy };
 		touched = true;
+		followSelection = false;
 		invalidate(true);
 	}
 
 	function zoom(factor: number, px: number, py: number): void {
+		skipForm();
 		view = zoomAt(view, factor, px, py);
 		touched = true;
+		followSelection = false;
 		invalidate(true);
 	}
 
@@ -484,7 +511,7 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		current = index;
 		const body = simulation.bodies[index];
 		if (body) {
-			const { dx, dy } = panIntoView(body.x * view.k + view.x, body.y * view.k + view.y, width, height, 48);
+			const { dx, dy } = panIntoView(body.x * view.k + view.x, body.y * view.k + view.y, usableWidth, usableHeight, 48);
 			if (dx !== 0 || dy !== 0) pan(dx, dy);
 		}
 		showPreview(index);
@@ -537,6 +564,8 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 			settleTimer = setTimeout(settleBatch, 0);
 			return;
 		}
+		// A new layout can reorder the indices that an active press holds.
+		input?.cancel();
 		pending = null;
 		commit(next);
 	}
@@ -545,7 +574,6 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		if (settleTimer !== null) clearTimeout(settleTimer);
 		settleTimer = null;
 		pending = null;
-		afterCommit = [];
 	}
 
 	// Makes a laid-out model the shown one, keeping what the person is on by id.
@@ -560,11 +588,8 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		describeModel();
 		labels.clear();
 		startForm(plan, next);
-		if (!touched || next.fresh) {
-			touched = false;
-			if (width > 0) fit(reserved);
-		}
-		for (const run of afterCommit.splice(0)) run();
+		if (!touched || next.fresh) fit();
+		followSelection = selectedId !== null;
 		invalidate(true);
 	}
 
@@ -595,18 +620,17 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		showPreview(hovered >= 0 ? hovered : current);
 	}
 
-	// Runs once the shown model is the newest one; at once when no layout is waiting.
-	function whenShown(run: () => void): void {
-		if (pending) afterCommit.push(run);
-		else run();
-	}
-
 	// ── Input ──
 
 	const target: InputTarget = {
-		hit: (px, py, slop) => (simulation ? hitTest(simulation.bodies, view, px, py, slop) : -1),
+		hit(px, py, slop) {
+			const index = hitTest(painted, px, py, slop);
+			if (paintedModel === model) return index;
+			return indexOfId(paintedModel.nodes[index]?.node.id ?? null);
+		},
 		hover: setHovered,
 		click(index) {
+			skipForm();
 			const node = nodeAt(index);
 			if (node) {
 				current = -1;
@@ -615,8 +639,10 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		},
 		dragNode(index, px, py, start) {
 			if (!simulation) return;
+			if (start) skipForm();
 			const point = toWorld(view, px, py);
 			touched = true;
+			followSelection = false;
 			simulation.pin(index, point.x, point.y);
 			// Reduced motion: the node moves but the others do not wiggle; they settle once when it is let go.
 			if (start && !reduced()) simulation.reheat();
@@ -627,6 +653,7 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 			dragging = false;
 			if (!simulation) return;
 			simulation.release(index);
+			if (pending) return;
 			// Reduced motion: the dragged memory goes back to its place in the brain, or a new layout starts warm from where everything is now and settles to the side.
 			if (reduced() && shapeOn && places) {
 				simulation.attract(places, holdStrength);
@@ -637,14 +664,16 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		pan,
 		grabbing(on) {
 			frame.classList.toggle("cursor-grabbing", on);
-			frame.classList.toggle("cursor-grab", !on && hovered < 0);
+			frame.classList.toggle("cursor-grab", gestures && !on && hovered < 0);
 		},
 		zoom,
 		arrow(dx, dy, panView) {
+			skipForm();
 			if (current >= 0 && !panView && simulation) moveCurrent(nodeInDirection(simulation.bodies, current, dx, dy));
 			else pan(-dx * 48, -dy * 48);
 		},
 		activate() {
+			skipForm();
 			const node = nodeAt(current);
 			if (node) handlers.onSelect(node.id);
 			else if (model.nodes.length > 0) {
@@ -667,7 +696,10 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 			return handlers.onEscapeIdle();
 		},
 		zoomStep: (factor) => zoom(factor, width / 2, height / 2),
-		fit: () => fit(reserved),
+		fit: () => {
+			skipForm();
+			fit();
+		},
 		leave() {
 			if (current < 0) return;
 			current = -1;
@@ -683,7 +715,11 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 
 	function activate(): void {
 		if (input) return;
-		input = wireInput(frame, target);
+		input = wireInput(frame, target, () => gestures);
+		// The preference may have changed while the frame was detached and had no listener.
+		applyReducedMotion();
+		viewportDirty = true;
+		followSelection = selectedId !== null;
 		// Colors may have changed while the map was away.
 		theme = null;
 		widths.clear();
@@ -693,30 +729,22 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 				widths.clear();
 				invalidate(true);
 			}),
-			watchMedia(reducedQuery, () => {
-				if (!reduced()) return;
-				// Reduced motion switched on while the map forms: it ends where it was going. While a layout runs it settles to the side.
-				if (form) {
-					form = null;
-					frame.dataset.formed = "true";
-					relabelNeeded = true;
-					if (shapeOn && simulation) settleIntoBrain(simulation);
-					else if (simulation?.active && pending === null) settleLater(layoutFor(model, shapeOn));
-					invalidate(true);
-				} else if (simulation?.active && pending === null) settleLater(layoutFor(model, shapeOn));
-			}),
+			watchMedia(reducedQuery, applyReducedMotion),
 			watchPixelRatio(resize),
-			skipOnInput(),
 		];
 		if (pending && settleTimer === null) settleTimer = setTimeout(settleBatch, 0);
 		invalidate(true);
 	}
 
-	// The listeners that skip the animation, as one thing to stop.
-	function skipOnInput(): () => void {
-		const listening = new AbortController();
-		for (const type of ["pointerdown", "wheel", "keydown"] as const) frame.addEventListener(type, skipForm, { capture: true, passive: true, signal: listening.signal });
-		return () => listening.abort();
+	function applyReducedMotion(): void {
+		if (!reduced()) return;
+		if (form) {
+			form = null;
+			frame.dataset.formed = "true";
+			if (shapeOn && simulation) settleIntoBrain(simulation);
+			invalidate(true);
+		}
+		if (simulation?.active && pending === null) settleLater(layoutFor(model, shapeOn));
 	}
 
 	function deactivate(): void {
@@ -749,6 +777,7 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 		}
 	});
 	watcher.observe(frame);
+	watcher.observe(panel);
 
 	return {
 		frame,
@@ -772,7 +801,10 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 			else commit(laidOut);
 		},
 		setSelected(id) {
+			if (selectedId === id) return;
 			selectedId = id;
+			viewportDirty = true;
+			followSelection = id !== null;
 			invalidate(true);
 		},
 		setMatches(ids) {
@@ -780,28 +812,14 @@ export function createGraphCanvas(handlers: CanvasHandlers): GraphCanvas {
 			findMatches();
 			invalidate(true);
 		},
-		center(id) {
-			whenShown(() => {
-				const body = simulation?.bodies[indexOfId(id)];
-				if (!body) return;
-				view = { ...view, x: width / 2 - body.x * view.k, y: height / 2 - body.y * view.k };
-				touched = true;
-				invalidate(true);
-			});
+		setGestures(enabled) {
+			if (gestures === enabled) return;
+			input?.cancel();
+			gestures = enabled;
+			frame.classList.toggle("touch-none", enabled);
+			frame.classList.toggle("cursor-grab", enabled && hovered < 0);
 		},
-		reveal(id, strips) {
-			whenShown(() => {
-				const body = simulation?.bodies[indexOfId(id)];
-				if (!body) return;
-				const { dx, dy } = panIntoView(body.x * view.k + view.x, body.y * view.k + view.y, width - strips.right, height - strips.bottom, 48);
-				if (dx !== 0 || dy !== 0) pan(dx, dy);
-			});
-		},
-		fit: (strips) => fit(strips),
-		reserve(strips) {
-			if (touched) reserved = strips;
-			else fit(strips);
-		},
+		fit,
 		zoomBy: (factor) => zoom(factor, width / 2, height / 2),
 		announce,
 		dispose() {

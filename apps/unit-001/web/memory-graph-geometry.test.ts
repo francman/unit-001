@@ -42,51 +42,46 @@ describe("memory graph geometry", () => {
 
 	it.each([[0.5], [1], [3]])("finds the node at its own center at zoom %s, and nothing 40 px from every node", (k) => {
 		const view = { x: 120, y: 80, k };
-		bodies.forEach((body, index) => {
-			const at = toScreen(view, body.x, body.y);
-			expect(hitTest(bodies, view, at.x, at.y, 8)).toBe(index);
-		});
-		// A point 40 px (screen) away from the nearest node, beyond its radius and the slop.
-		const nearest = toScreen(view, 100, 100);
-		expect(hitTest(bodies, view, nearest.x + 40 + screenRadius(6, k), nearest.y, 8)).toBe(-1);
+		const painted = bodies.map((body) => ({ ...toScreen(view, body.x, body.y), radius: screenRadius(body.radius, k) }));
+		painted.forEach(({ x, y }, index) => expect(hitTest(painted, x, y, 8)).toBe(index));
+		const nearest = painted[2];
+		expect(hitTest(painted, nearest.x + 40 + nearest.radius, nearest.y, 8)).toBe(-1);
 	});
 
 	it("hits within the drawn radius or the slop, whichever is larger", () => {
-		const view = { x: 0, y: 0, k: 1 };
-		expect(hitTest(bodies, view, 9, 0, 8)).toBe(0);
-		expect(hitTest(bodies, view, 100, 12, 8)).toBe(-1);
-		expect(hitTest(bodies, view, 100, 12, 22)).toBe(1);
+		expect(hitTest(bodies, 9, 0, 8)).toBe(0);
+		expect(hitTest(bodies, 100, 12, 8)).toBe(-1);
+		expect(hitTest(bodies, 100, 12, 22)).toBe(1);
 	});
 
 	// Codex review: episodic nodes are drawn as rounded squares, so their corners must hit too.
 	it.each([[0.5], [1], [3]])("hits just inside the corner of an episodic (rounded square) node after pan and zoom %s", (k) => {
 		const view = { x: -35, y: 62, k };
-		const square = [{ x: 40, y: 30, radius: 12, square: true }];
-		const circle = [{ x: 40, y: 30, radius: 12 }];
-		const half = screenRadius(12, k);
 		const center = toScreen(view, 40, 30);
+		const half = screenRadius(12, k);
+		const circle = [{ ...center, radius: half }];
+		const square = [{ ...center, radius: half, square: true }];
 		// 1 px inside the straight edges' extremes: the corner region lies beyond the inscribed circle, so a circle misses it.
 		const corner = { x: center.x + half - 1.2, y: center.y + half - 1.2 };
 		expect(Math.hypot(corner.x - center.x, corner.y - center.y)).toBeGreaterThan(half);
-		expect(hitTest(square, view, corner.x, corner.y, 0)).toBe(0);
-		expect(hitTest(circle, view, corner.x, corner.y, 0)).toBe(-1);
+		expect(hitTest(square, corner.x, corner.y, 0)).toBe(0);
+		expect(hitTest(circle, corner.x, corner.y, 0)).toBe(-1);
 		// Just outside the square on a side is still a miss, and so is the rounded-off tip of the corner.
-		expect(hitTest(square, view, center.x + half + 1, center.y, 0)).toBe(-1);
-		expect(hitTest(square, view, center.x + half + 0.2, center.y + half + 0.2, 0)).toBe(-1);
+		expect(hitTest(square, center.x + half + 1, center.y, 0)).toBe(-1);
+		expect(hitTest(square, center.x + half + 0.2, center.y + half + 0.2, 0)).toBe(-1);
 	});
 
 	it("takes the nearest node, and the smaller one on a tie", () => {
-		const view = { x: 0, y: 0, k: 1 };
 		const close = [
 			{ x: 0, y: 0, radius: 12 },
 			{ x: 14, y: 0, radius: 6 },
 		];
-		expect(hitTest(close, view, 9, 0, 8)).toBe(1);
+		expect(hitTest(close, 9, 0, 8)).toBe(1);
 		const tie = [
 			{ x: -10, y: 0, radius: 12 },
 			{ x: 10, y: 0, radius: 6 },
 		];
-		expect(hitTest(tie, view, 0, 0, 12)).toBe(1);
+		expect(hitTest(tie, 0, 0, 12)).toBe(1);
 	});
 
 	it("moves between nodes by direction: cone first, then anywhere ahead, -1 when nothing is ahead", () => {
@@ -105,5 +100,9 @@ describe("memory graph geometry", () => {
 		expect(panIntoView(100, 100, 800, 400, 36)).toEqual({ dx: 0, dy: 0 });
 		expect(panIntoView(10, 100, 800, 400, 36)).toEqual({ dx: 26, dy: 0 });
 		expect(panIntoView(790, 395, 800, 400, 36)).toEqual({ dx: -26, dy: -31 });
+	});
+
+	it("centers the target when a bottom sheet leaves less room than both margins", () => {
+		expect(panIntoView(180, 395, 400, 70, 48)).toEqual({ dx: 0, dy: -360 });
 	});
 });

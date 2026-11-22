@@ -44,10 +44,10 @@ export function slopFor(pointerType: string): number {
 }
 
 /** Listens on the frame and calls the target. */
-export function wireInput(frame: HTMLElement, target: InputTarget): Input {
+export function wireInput(frame: HTMLElement, target: InputTarget, gesturesEnabled: () => boolean): Input {
 	const listeners = new AbortController();
 	const { signal } = listeners;
-	let press: { id: number; x: number; y: number; node: number; moved: boolean; slop: number } | null = null;
+	let press: { id: number; x: number; y: number; node: number; moved: boolean; gesture: boolean } | null = null;
 	const local = (event: PointerEvent | WheelEvent) => {
 		const box = frame.getBoundingClientRect();
 		return { px: event.clientX - box.left, py: event.clientY - box.top };
@@ -57,28 +57,39 @@ export function wireInput(frame: HTMLElement, target: InputTarget): Input {
 		(event) => {
 			if (event.button !== 0 || press) return;
 			const { px, py } = local(event);
-			const slop = slopFor(event.pointerType);
-			press = { id: event.pointerId, x: event.clientX, y: event.clientY, node: target.hit(px, py, slop), moved: false, slop };
-			frame.setPointerCapture(event.pointerId);
+			const gesture = gesturesEnabled();
+			press = { id: event.pointerId, x: event.clientX, y: event.clientY, node: target.hit(px, py, slopFor(event.pointerType)), moved: false, gesture };
+			if (gesture) frame.setPointerCapture(event.pointerId);
 		},
 		{ signal },
 	);
 	frame.addEventListener(
 		"pointermove",
 		(event) => {
-			const { px, py } = local(event);
 			if (!press) {
-				if (event.pointerType !== "touch") target.hover(target.hit(px, py, slopFor(event.pointerType)));
+				if (event.pointerType !== "touch") {
+					const { px, py } = local(event);
+					target.hover(target.hit(px, py, slopFor(event.pointerType)));
+				}
 				return;
 			}
 			if (press.id !== event.pointerId) return;
 			if (!press.moved && Math.hypot(event.clientX - press.x, event.clientY - press.y) < dragThreshold) return;
+			if (!press.gesture) {
+				press.moved = true;
+				return;
+			}
 			const first = !press.moved;
 			const dx = event.clientX - press.x;
 			const dy = event.clientY - press.y;
-			press = { ...press, x: event.clientX, y: event.clientY, moved: true };
+			press.x = event.clientX;
+			press.y = event.clientY;
+			press.moved = true;
 			target.grabbing(true);
-			if (press.node >= 0) target.dragNode(press.node, px, py, first);
+			if (press.node >= 0) {
+				const { px, py } = local(event);
+				target.dragNode(press.node, px, py, first);
+			}
 			// The first move only crosses the threshold; panning starts from there so the map does not jump.
 			else if (!first) target.pan(dx, dy);
 		},
@@ -89,21 +100,28 @@ export function wireInput(frame: HTMLElement, target: InputTarget): Input {
 		if (!press) return;
 		const done = press;
 		press = null;
-		if (frame.hasPointerCapture(done.id)) frame.releasePointerCapture(done.id);
-		target.grabbing(false);
-		if (done.moved && done.node >= 0) target.dropNode(done.node);
-		else if (!done.moved && !cancelled) target.click(done.node);
+		if (done.gesture) {
+			if (frame.hasPointerCapture(done.id)) frame.releasePointerCapture(done.id);
+			target.grabbing(false);
+			if (done.moved && done.node >= 0) target.dropNode(done.node);
+		}
+		if (!done.moved && !cancelled) target.click(done.node);
 	};
 	const forPress = (event: PointerEvent, cancelled: boolean) => {
 		if (press?.id === event.pointerId) finish(cancelled);
 	};
-	frame.addEventListener("pointerup", (event) => forPress(event, false), { signal });
+	frame.addEventListener("pointerup", (event) => {
+		if (press?.id !== event.pointerId) return;
+		const moved = !press.gesture && Math.hypot(event.clientX - press.x, event.clientY - press.y) >= dragThreshold;
+		finish(moved);
+	}, { signal });
 	frame.addEventListener("pointercancel", (event) => forPress(event, true), { signal });
 	// Moving the frame to another parent drops pointer capture without a pointerup; the press must not outlive it.
 	frame.addEventListener("lostpointercapture", (event) => forPress(event, true), { signal });
 	frame.addEventListener(
 		"pointerleave",
 		() => {
+			if (press && !press.gesture) finish(true);
 			if (!press) target.hover(-1);
 		},
 		{ signal },
@@ -111,6 +129,7 @@ export function wireInput(frame: HTMLElement, target: InputTarget): Input {
 	frame.addEventListener(
 		"wheel",
 		(event) => {
+			if (!gesturesEnabled()) return;
 			event.preventDefault();
 			const { px, py } = local(event);
 			target.zoom(Math.exp(-event.deltaY * (event.deltaMode === 1 ? 0.05 : 0.0015)), px, py);

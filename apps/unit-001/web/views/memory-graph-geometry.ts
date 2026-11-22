@@ -48,20 +48,19 @@ export function fitBox(box: { x0: number; y0: number; x1: number; y1: number }, 
 }
 
 /**
- * The node under a screen point, or -1. A node can be hit anywhere on its drawn shape (a circle, or a rounded square
- * for episodic memories) or within `slop` pixels of its center (fingers need more than mice); the node whose center
- * is nearest wins, the smaller node on a tie.
+ * The painted node under a screen point, or -1. A node can be hit on its screen shape (a circle or rounded square)
+ * or within `slop` pixels of its center. The nearest center wins, the smaller node on a tie.
  */
-export function hitTest(bodies: readonly Placed[], view: View, px: number, py: number, slop: number): number {
+export function hitTest(bodies: readonly Placed[], px: number, py: number, slop: number): number {
 	let best = -1;
 	let bestDistance = Infinity;
 	for (let index = 0; index < bodies.length; index++) {
 		const body = bodies[index];
-		if (!body) continue;
-		const dx = body.x * view.k + view.x - px;
-		const dy = body.y * view.k + view.y - py;
+		if (!body || body.radius <= 0) continue;
+		const dx = body.x - px;
+		const dy = body.y - py;
 		const distance = Math.hypot(dx, dy);
-		if (distance > slop && !insideShape(body, screenRadius(body.radius, view.k), dx, dy)) continue;
+		if (distance > slop && !insideShape(body, body.radius, dx, dy)) continue;
 		const closer = distance < bestDistance - 0.001;
 		const tie = Math.abs(distance - bestDistance) <= 0.001 && body.radius < (bodies[best]?.radius ?? Infinity);
 		if (closer || tie) {
@@ -106,7 +105,9 @@ export function nodeInDirection(bodies: readonly Placed[], from: number, dx: num
 
 /** The pan that brings a screen point at least `margin` pixels inside a `width` x `height` area; zero when it is already inside. */
 export function panIntoView(px: number, py: number, width: number, height: number, margin: number): { dx: number; dy: number } {
-	const dx = px < margin ? margin - px : px > width - margin ? width - margin - px : 0;
-	const dy = py < margin ? margin - py : py > height - margin ? height - margin - py : 0;
+	const insetX = Math.min(margin, width / 2);
+	const insetY = Math.min(margin, height / 2);
+	const dx = Math.max(insetX, Math.min(width - insetX, px)) - px;
+	const dy = Math.max(insetY, Math.min(height - insetY, py)) - py;
 	return { dx, dy };
 }
