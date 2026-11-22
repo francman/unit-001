@@ -36,7 +36,7 @@ describe("independent persistent memory acceptance", () => {
 		);
 		const recall = new MemoryRecall();
 		for (const topK of [1, 5, 20])
-			expect(recall.recall(state, "redis", { now: 10000, topK }).map((record) => record.id)).toEqual(
+			expect(recall.recall(state, undefined, "redis", { now: 10000, topK }).map((record) => record.id)).toEqual(
 				expected.slice(0, topK).map((record) => record.id),
 			);
 		recall.clear();

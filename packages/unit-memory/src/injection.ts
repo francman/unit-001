@@ -3,6 +3,7 @@ import { type GenerationHooks, LiveDoc } from "@earendil-works/pi-durable";
 import { MemoryInputsDoc } from "./inputs.ts";
 import { MemoryDoc } from "./memory.ts";
 import type { MemoryRecall, MemoryRecallResult } from "./recall.ts";
+import { MemoryRelationsDoc } from "./relations-doc.ts";
 
 /** Build a bounded evidence block, keeping complete records within the total budget. */
 export function memoryEvidence(results: readonly MemoryRecallResult[]): string {
@@ -40,7 +41,8 @@ export function memoryBeforeRequest(recall: MemoryRecall, now: () => number): Ge
 		for (const id of placed) if (inputs.inputs[id] !== undefined) query = inputs.inputs[id].query;
 		if (query === undefined) return;
 		const state = await api.snapshot(MemoryDoc, context);
-		const block = memoryEvidence(recall.recall(state, query, { now: now(), topK: 5 }));
+		const relations = await api.snapshot(MemoryRelationsDoc, context);
+		const block = memoryEvidence(recall.recall(state, relations, query, { now: now(), topK: 5 }));
 		if (!block) return;
 		for (let index = request.messages.length - 1; index >= 0; index--) {
 			const message = request.messages[index];

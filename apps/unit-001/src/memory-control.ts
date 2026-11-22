@@ -5,8 +5,10 @@ import {
 	MEMORY_GRAPH_EDGE_LIMIT,
 	MEMORY_GRAPH_NODE_LIMIT,
 	MEMORY_RELATION_KINDS,
+	MEMORY_RELATIONS_PER_REMEMBER,
 	type MemoryGraph,
 	type MemoryGraphNode,
+	type MemoryRelationRequest,
 } from "unit-memory";
 import { UsageError } from "./errors.ts";
 import { sanitizeTerminalText } from "./render.ts";
@@ -14,7 +16,12 @@ import { sanitizeTerminalText } from "./render.ts";
 export type MemoryRequest =
 	| { readonly operation: "stats" | "sleep" | "graph" }
 	| { readonly operation: "recall"; readonly query: string }
-	| { readonly operation: "remember"; readonly content: string; readonly requestId: string }
+	| {
+			readonly operation: "remember";
+			readonly content: string;
+			readonly requestId: string;
+			readonly relations?: readonly MemoryRelationRequest[];
+	  }
 	| { readonly operation: "forget"; readonly id: string; readonly requestId: string; readonly confirmed: true };
 
 export type MemoryResult =
@@ -23,6 +30,7 @@ export type MemoryResult =
 			readonly working: number;
 			readonly episodic: number;
 			readonly tombstones: number;
+			readonly relations: number;
 			readonly pendingCaptures: number;
 			readonly failedCaptures: number;
 			readonly consolidation: "idle" | "scheduled";
@@ -53,7 +61,12 @@ export function parseMemoryRequest(value: unknown): MemoryRequest {
 	if (!("requestId" in value) || !bounded(value.requestId, 200))
 		throw new UsageError("Memory mutation requires a request ID (1 to 200 characters).");
 	if (value.operation === "remember" && "content" in value && bounded(value.content, 2000))
-		return { operation: "remember", content: value.content, requestId: value.requestId };
+		return {
+			operation: "remember",
+			content: value.content,
+			requestId: value.requestId,
+			...("relations" in value ? { relations: parseRelationRequests(value.relations) } : {}),
+		};
 	if (
 		value.operation === "forget" &&
 		"id" in value &&
@@ -77,6 +90,8 @@ export function parseMemoryResult(value: unknown): MemoryResult {
 		count(value.episodic) &&
 		"tombstones" in value &&
 		count(value.tombstones) &&
+		"relations" in value &&
+		count(value.relations) &&
 		"pendingCaptures" in value &&
 		count(value.pendingCaptures) &&
 		"failedCaptures" in value &&
@@ -89,6 +104,7 @@ export function parseMemoryResult(value: unknown): MemoryResult {
 			working: value.working,
 			episodic: value.episodic,
 			tombstones: value.tombstones,
+			relations: value.relations,
 			pendingCaptures: value.pendingCaptures,
 			failedCaptures: value.failedCaptures,
 			consolidation: value.consolidation,
@@ -240,12 +256,39 @@ function member<const T extends string>(value: unknown, allowed: readonly T[]): 
 	return typeof value === "string" && allowed.some((item) => item === value);
 }
 
+// Local wire input is untrusted; storage validates target liveness and capacity inside its transaction.
+function parseRelationRequests(value: unknown): MemoryRelationRequest[] {
+	if (!Array.isArray(value) || value.length > MEMORY_RELATIONS_PER_REMEMBER)
+		throw new UsageError(`Memory remember accepts at most ${MEMORY_RELATIONS_PER_REMEMBER} relations.`);
+	const relations: MemoryRelationRequest[] = [];
+	const targets = new Set<string>();
+	for (const relation of value as readonly unknown[]) {
+		if (
+			typeof relation !== "object" ||
+			relation === null ||
+			!("id" in relation) ||
+			!bounded(relation.id, 1000) ||
+			!("kind" in relation) ||
+			!member(relation.kind, MEMORY_RELATION_KINDS) ||
+			Object.keys(relation).some((key) => key !== "id" && key !== "kind")
+		)
+			throw new UsageError("Memory relation requires an ID and kind: relates, supports, contradicts or updates.");
+		if (targets.has(relation.id)) throw new UsageError("Memory relation targets must be distinct.");
+		targets.add(relation.id);
+		relations.push({ id: relation.id, kind: relation.kind });
+	}
+	return relations;
+}
+
 /** Parses shared slash/CLI operands; forgetting is deliberately a separate confirmed step. */
 export function memoryCommand(
 	operation: string = "stats",
 	argument: string = "",
 	requestId: string = randomUUID(),
+	relations?: readonly MemoryRelationRequest[],
 ): MemoryRequest | { readonly operation: "confirm-forget"; readonly id: string; readonly requestId: string } {
+	if (relations !== undefined && operation !== "remember")
+		throw new UsageError("--relation applies only to memory remember.");
 	if ((operation === "stats" || operation === "sleep" || operation === "graph") && argument.trim() !== "")
 		throw new UsageError(`Memory ${operation} takes no argument.`);
 	if (operation === "forget") {
@@ -257,7 +300,7 @@ export function memoryCommand(
 		...(operation === "recall"
 			? { query: argument }
 			: operation === "remember"
-				? { content: argument, requestId }
+				? { content: argument, requestId, ...(relations === undefined ? {} : { relations }) }
 				: {}),
 	});
 }
@@ -265,7 +308,7 @@ export function memoryCommand(
 /** Renders only memory operation output, never provider credentials or host configuration. */
 export function describeMemory(result: MemoryResult): string {
 	if (result.operation === "stats")
-		return `Session memory: ${result.working} working, ${result.episodic} episodic, ${result.tombstones} forgotten; captures ${result.pendingCaptures} pending, ${result.failedCaptures} failed; consolidation ${result.consolidation}.`;
+		return `Session memory: ${result.working} working, ${result.episodic} episodic, ${result.tombstones} forgotten, ${result.relations} relations; captures ${result.pendingCaptures} pending, ${result.failedCaptures} failed; consolidation ${result.consolidation}.`;
 	if (result.operation === "remember") return `Remembered ${sanitizeTerminalText(result.id)}.`;
 	if (result.operation === "forget")
 		return result.removed

@@ -49,56 +49,26 @@ export type CaptureReceipt = {
 		| { state: "aborted" };
 };
 
-/** How two memories relate: `relates` is symmetric; the others read "from supports/contradicts/updates to". */
-export type MemoryRelationKind = "relates" | "supports" | "contradicts" | "updates";
-
 /** A memory identity pinned to the revision a relation or summary was made against. */
 export type MemoryRef = { id: string; revision: number };
-
-/** Who established a relation: the author of a memory that named it, or background consolidation. */
-export type MemoryRelationProvenance =
-	| {
-			derivation: "explicit";
-			origin: MemoryProvenance["origin"];
-			conversationId: ConversationId;
-			entryIds: EntryId[];
-	  }
-	| { derivation: "consolidation"; taskId: TaskId };
-
-/** A typed link between two memories; it holds only while both endpoints are live at their pinned revisions. */
-export type MemoryRelation = {
-	id: string;
-	kind: MemoryRelationKind;
-	from: MemoryRef;
-	to: MemoryRef;
-	createdAt: number;
-	provenance: MemoryRelationProvenance;
-};
 
 /** Current memory shared by every conversation and fork of one Durable Session. */
 export type MemoryState = {
 	revision: number;
 	records: Record<string, MemoryRecord>;
-	relations: Record<string, MemoryRelation>;
 	receipts: Record<string, MemoryReceipt>;
 	captures: Record<string, CaptureReceipt>;
 	consolidation: { state: "idle" } | { state: "scheduled"; taskId: TaskId };
 };
 
-/** Session memory has one current value; it is never copied or rewound by a fork. */
+/**
+ * Session memory has one current value; it is never copied or rewound by a fork. Version 1 is the contract published
+ * readers open and write, so relations live in `MemoryRelationsDoc` (`relations-doc.ts`), not here.
+ */
 export const MemoryDoc = defineDoc<MemoryState>({
 	kind: "unit.memory",
-	version: 2,
+	version: 1,
 	scope: "session",
-	initial: () => ({
-		revision: 0,
-		records: {},
-		relations: {},
-		receipts: {},
-		captures: {},
-		consolidation: { state: "idle" },
-	}),
-	// Version 1 is the same shape without relations; Durable has already checked the stored version.
-	migrate: (value) => ({ ...(value as Omit<MemoryState, "relations">), relations: {} }),
+	initial: () => ({ revision: 0, records: {}, receipts: {}, captures: {}, consolidation: { state: "idle" } }),
 	checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 63,
 });

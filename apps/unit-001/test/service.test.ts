@@ -10,6 +10,7 @@ import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@ear
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "../src/agent.ts";
+import { parseArguments } from "../src/args.ts";
 import { acquireSessionLock } from "../src/lock.ts";
 import { requestService, runService, type ServiceView, serviceEndpoint, watchService } from "../src/service.ts";
 
@@ -267,6 +268,36 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 				signal(),
 			),
 		).toMatchObject({ result: { records: [{ content: "violet approval" }] } });
+		const linked = parseArguments([
+			"memory",
+			"remember",
+			"The revised approval",
+			"--relation",
+			"updates:memory:operator:admin",
+			"--request-id",
+			"operator-linked",
+		]);
+		if (linked.kind !== "memory" || linked.request.operation !== "remember")
+			throw new Error("Expected operator remember command");
+		const remembered = await requestService(operatorPath, { type: "memory", request: linked.request }, signal());
+		expect(remembered).toMatchObject({ type: "memory", result: { operation: "remember" } });
+		expect(await requestService(operatorPath, { type: "memory", request: linked.request }, signal())).toEqual(
+			remembered,
+		);
+		expect(
+			await requestService(operatorPath, { type: "memory", request: { operation: "graph" } }, signal()),
+		).toMatchObject({
+			result: {
+				edges: [
+					{
+						from: "memory:operator:operator-linked",
+						to: "memory:operator:admin",
+						kind: "updates",
+						derivation: "explicit",
+					},
+				],
+			},
+		});
 		for (const request of [
 			{ type: "maintenance-enter", operationId: "operator-denied", timeoutMs: 0 },
 			{ type: "maintenance-release", operationId: "operator-denied" },
@@ -277,7 +308,7 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 			});
 		expect(
 			await requestService(operatorPath, { type: "memory", request: { operation: "stats" } }, signal()),
-		).toMatchObject({ result: { working: 1 } });
+		).toMatchObject({ result: { working: 2, relations: 1 } });
 		expect(await requestService(service.path, { type: "status" }, signal())).toMatchObject({
 			maintenance: { state: "open" },
 		});
@@ -294,6 +325,11 @@ describe.skipIf(process.platform === "win32")("headless local service", () => {
 				signal(),
 			),
 		).toMatchObject({ type: "memory", result: { operation: "forget", removed: true } });
+		expect(
+			await requestService(operatorPath, { type: "memory", request: { operation: "stats" } }, signal()),
+		).toMatchObject({
+			result: { relations: 0 },
+		});
 		expect(service.faux.state.callCount).toBe(0);
 	});
 	it("#33 retains coding tools for trusted operator chat", async () => {

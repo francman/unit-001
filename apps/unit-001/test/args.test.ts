@@ -125,6 +125,52 @@ describe("parseArguments service commands", () => {
 		])
 			expect(() => parseArguments(args)).toThrow(UsageError);
 	});
+	it("parses repeated typed relations while preserving IDs, options and literal statements", () => {
+		expect(
+			parseArguments([
+				"memory",
+				"remember",
+				"New policy",
+				"--relation",
+				"supports:memory:operator:old",
+				"--relation=updates:memory:tool:42",
+				"--request-id=retry",
+				"--session",
+				"work",
+				"--data-dir=/d",
+			]),
+		).toEqual({
+			kind: "memory",
+			request: {
+				operation: "remember",
+				content: "New policy",
+				requestId: "retry",
+				relations: [
+					{ id: "memory:operator:old", kind: "supports" },
+					{ id: "memory:tool:42", kind: "updates" },
+				],
+			},
+			yes: false,
+			options: { session: "work", dataDir: "/d" },
+		});
+		expect(parseArguments(["memory", "remember", "--", "--relation relates:literal"])).toMatchObject({
+			request: { operation: "remember", content: "--relation relates:literal" },
+		});
+		for (const args of [
+			["memory", "remember", "x", "--relation"],
+			["memory", "remember", "x", "--relation="],
+			["memory", "remember", "x", "--relation", "relates"],
+			["memory", "remember", "x", "--relation", "relatesx"],
+			["memory", "remember", "x", "--relation", "supports:"],
+			["memory", "remember", "x", "--relation", "causes:memory:a"],
+			["memory", "remember", "x", "--relation", "relates:memory:a", "--relation", "updates:memory:a"],
+			["memory", "stats", "--relation", "relates:memory:a"],
+			["memory", "recall", "x", "--relation", "relates:memory:a"],
+			["memory", "forget", "memory:a", "--yes", "--relation", "relates:memory:b"],
+			["memory", "remember", "x", ...Array.from({ length: 9 }, (_, i) => `--relation=relates:memory:${i}`)],
+		])
+			expect(() => parseArguments(args)).toThrow(UsageError);
+	});
 	it("parses inhibited startup and bounded maintenance controls", () => {
 		// #18: Inhibition belongs to service startup, never a client-side admission override.
 		expect(parseArguments(["serve", "--inhibited"])).toEqual({

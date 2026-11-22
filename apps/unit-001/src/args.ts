@@ -1,3 +1,4 @@
+import { MEMORY_RELATION_KINDS, type MemoryRelationRequest } from "unit-memory";
 import { commandCatalog } from "./commands/catalog.ts";
 import { UsageError } from "./errors.ts";
 import { inspectionCommand } from "./introspection/command.ts";
@@ -104,6 +105,7 @@ Options:
 
 Use agent send [options] -- <prompt> when the prompt starts with a hyphen.
 Memory commands contact the running owner. Forget asks for confirmation; --yes confirms for scripts.
+Memory remember accepts up to 8 repeated --relation <relates|supports|contradicts|updates>:<id> options.
 
 A provider is used when you have signed in to it or set its key (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY,
 OPENROUTER_API_KEY), checked in that order. A stored sign-in wins over a key for the same provider.`;
@@ -281,6 +283,7 @@ export function parseArguments(argv: readonly string[]): Command {
 	if (first === "memory") {
 		const values = new Map<string, string>();
 		const operands: string[] = [];
+		const relations: MemoryRelationRequest[] = [];
 		let yes = false;
 		for (let index = 1; index < argv.length; index++) {
 			const argument = argv[index];
@@ -300,6 +303,15 @@ export function parseArguments(argv: readonly string[]): Command {
 			}
 			const equals = argument.indexOf("=");
 			const flag = equals < 0 ? argument : argument.slice(0, equals);
+			if (flag === "--relation") {
+				const value = equals < 0 ? argv[++index] : argument.slice(equals + 1);
+				const separator = value?.indexOf(":") ?? -1;
+				const kind = MEMORY_RELATION_KINDS.find((kind) => kind === value?.slice(0, separator));
+				if (kind === undefined || value === undefined || separator < 1 || separator === value.length - 1)
+					throw new UsageError("Usage: --relation <relates|supports|contradicts|updates>:<id>");
+				relations.push({ kind, id: value.slice(separator + 1) });
+				continue;
+			}
 			if (!["--session", "--data-dir", "--request-id"].includes(flag))
 				throw new UsageError(`Unknown memory option: ${flag}`);
 			const value = equals < 0 ? argv[++index] : argument.slice(equals + 1);
@@ -312,7 +324,12 @@ export function parseArguments(argv: readonly string[]): Command {
 		if (yes && operation !== "forget") throw new UsageError("--yes applies only to memory forget.");
 		return {
 			kind: "memory",
-			request: memoryCommand(operation, operands[1], values.get("--request-id")),
+			request: memoryCommand(
+				operation,
+				operands[1],
+				values.get("--request-id"),
+				relations.length === 0 ? undefined : relations,
+			),
 			yes,
 			options: {
 				session: values.get("--session") ?? DEFAULT_SESSION,

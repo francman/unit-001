@@ -40,6 +40,60 @@ describe("memory control", () => {
 		expect(() => memoryCommand("stats", "extra")).toThrow();
 	});
 
+	it("validates explicit typed relations at the owner wire boundary", () => {
+		const request = { operation: "remember", content: "policy", requestId: "retry" };
+		const relations = ["relates", "supports", "contradicts", "updates"].map((kind) => ({
+			id: `memory:${kind}`,
+			kind,
+		}));
+		expect(parseMemoryRequest(request)).toEqual(request);
+		expect(parseMemoryRequest({ ...request, relations })).toEqual({ ...request, relations });
+		expect(parseMemoryRequest({ ...request, relations: [] })).toEqual({ ...request, relations: [] });
+		for (const relations of [
+			null,
+			undefined,
+			{},
+			"relates:memory:a",
+			[null],
+			[{}],
+			[{ id: "", kind: "relates" }],
+			[{ id: "x".repeat(1001), kind: "relates" }],
+			[{ id: "memory:a", kind: "causes" }],
+			[{ id: "memory:a", kind: "supports", revision: 1 }],
+			[
+				{ id: "memory:a", kind: "supports" },
+				{ id: "memory:a", kind: "updates" },
+			],
+			Array.from({ length: 9 }, (_, i) => ({ id: `memory:${i}`, kind: "relates" })),
+		])
+			expect(() => parseMemoryRequest({ ...request, relations })).toThrow();
+		expect(
+			parseMemoryRequest({
+				...request,
+				relations: Array.from({ length: 8 }, (_, i) => ({ id: `memory:${i}`, kind: "relates" })),
+			}),
+		).toHaveProperty("relations.length", 8);
+	});
+
+	it("keeps live relation counts in stats frames and terminal output", () => {
+		const stats = {
+			operation: "stats",
+			working: 2,
+			episodic: 1,
+			tombstones: 3,
+			relations: 4,
+			pendingCaptures: 0,
+			failedCaptures: 0,
+			consolidation: "idle",
+		};
+		expect(parseMemoryResult(stats)).toEqual(stats);
+		expect(describeMemory(parseMemoryResult(stats))).toBe(
+			"Session memory: 2 working, 1 episodic, 3 forgotten, 4 relations; captures 0 pending, 0 failed; consolidation idle.",
+		);
+		for (const relations of [undefined, -1, 1.5, Infinity, "4"])
+			expect(() => parseMemoryResult({ ...stats, relations })).toThrow();
+	});
+
 	it("#8 sanitizes terminal memory content and reports transcript retention on forget", () => {
 		expect(describeMemory({ operation: "remember", id: "memory:a\u001b]52;c;bad\u0007" })).toBe(
 			"Remembered memory:a.",

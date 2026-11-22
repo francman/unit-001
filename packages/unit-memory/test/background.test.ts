@@ -21,6 +21,7 @@ import {
 } from "../src/background.ts";
 import { MemoryDoc } from "../src/memory.ts";
 import { forgetMemory, rememberMemory } from "../src/operations.ts";
+import { MemoryRelationsDoc } from "../src/relations-doc.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -321,7 +322,11 @@ setInterval(() => {}, 1000);
 			const checkpoint = await root.commit((tx) => tx.task(id), context);
 			expect(JSON.stringify(checkpoint)).not.toContain("private original");
 			await root.commit(async (tx) => {
-				forgetMemory(await tx.doc(MemoryDoc), { writeKey: "forget-race", id: sourceId });
+				forgetMemory(
+					await tx.doc(MemoryDoc),
+					{ writeKey: "forget-race", id: sourceId },
+					await tx.doc(MemoryRelationsDoc),
+				);
 			}, context);
 			release();
 			await completed;

@@ -4,6 +4,7 @@ import { type ConversationId, defineTask, type TaskId, type Tx } from "@earendil
 import { type LiveMemory, MemoryDoc, type MemoryRef, type MemoryState } from "./memory.ts";
 import { memoryTokens } from "./recall.ts";
 import { addConsolidationRelations } from "./relations.ts";
+import { MemoryRelationsDoc } from "./relations-doc.ts";
 
 type Source = MemoryRef;
 type Summary = { id: string; content: string; sources: Source[] };
@@ -211,8 +212,18 @@ export const MemoryConsolidation = defineTask<null, ConsolidationCheckpoint, nul
 					for (const record of records)
 						record.tier = { kind: "working", consolidation: { state: "done", summaryIds: [summary.id] } };
 				}
-				// Pairs were found on the snapshot; each endpoint is checked again at its pinned revision here.
-				const relations = addConsolidationRelations(state, related, runtime.taskId, runtime.now());
+				// Pairs were found on the snapshot; each endpoint is checked again at its pinned revision here. The
+				// relations document is opened only when there are pairs, so a batch without any writes memory alone.
+				const relations =
+					related.length === 0
+						? []
+						: addConsolidationRelations(
+								state,
+								await tx.doc(MemoryRelationsDoc),
+								related,
+								runtime.taskId,
+								runtime.now(),
+							);
 				state.revision++;
 				await tx.appendEntry(runtime.conversationId, {
 					kind: "unit.memory.consolidated",

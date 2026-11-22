@@ -1,8 +1,10 @@
 // Transaction-local memory mutations and content-free operational counts.
 import type { LiveMemory, MemoryProvenance, MemoryState } from "./memory.ts";
+import type { MemoryRelationsState } from "./relations-doc.ts";
 import {
 	addExplicitRelations,
 	checkRelationRequests,
+	isLiveRelation,
 	type MemoryRelationRequest,
 	removeRelations,
 } from "./relations.ts";
@@ -20,8 +22,11 @@ export type RememberMemory = {
 	now: number;
 };
 
-/** Store one statement, returning the original identity on every replay. */
-export function rememberMemory(state: MemoryState, input: RememberMemory): string {
+/**
+ * Store one statement, returning the original identity on every replay. Pass the relations document, from the same
+ * commit, whenever `input.relations` names any.
+ */
+export function rememberMemory(state: MemoryState, input: RememberMemory, relations?: MemoryRelationsState): string {
 	const receipt = Object.hasOwn(state.receipts, input.writeKey) ? state.receipts[input.writeKey] : undefined;
 	if (receipt !== undefined) {
 		if (receipt.kind !== "remember") throw new Error("Memory write key already belongs to forget");
@@ -34,8 +39,11 @@ export function rememberMemory(state: MemoryState, input: RememberMemory): strin
 	if (!Number.isFinite(importance) || importance < 0 || importance > 1)
 		throw new Error("Memory importance must be between 0 and 1");
 	if (!Number.isFinite(input.now)) throw new Error("Memory timestamp must be finite");
-	const relations = input.relations ?? [];
-	checkRelationRequests(state, relations);
+	const requests = input.relations ?? [];
+	if (requests.length > 0) {
+		if (relations === undefined) throw new Error("Naming memory relations requires the relations document");
+		checkRelationRequests(state, relations, requests);
+	}
 	const id = `memory:${input.writeKey}`;
 	const record: LiveMemory = {
 		state: "live",
@@ -51,25 +59,31 @@ export function rememberMemory(state: MemoryState, input: RememberMemory): strin
 		tier: { kind: "working", consolidation: { state: "pending" } },
 	};
 	state.records[id] = record;
-	addExplicitRelations(
-		state,
-		record,
-		relations,
-		{
-			derivation: "explicit",
-			origin: input.provenance.origin,
-			conversationId: input.provenance.conversationId,
-			entryIds: input.provenance.entryIds,
-		},
-		input.now,
-	);
+	if (relations !== undefined)
+		addExplicitRelations(
+			state,
+			relations,
+			record,
+			requests,
+			{
+				derivation: "explicit",
+				origin: input.provenance.origin,
+				conversationId: input.provenance.conversationId,
+				entryIds: input.provenance.entryIds,
+			},
+			input.now,
+		);
 	state.receipts[input.writeKey] = { kind: "remember", memoryId: id };
 	state.revision++;
 	return id;
 }
 
 /** Forget a statement, dependent summaries and their relations atomically, preserving the first replay result. */
-export function forgetMemory(state: MemoryState, input: { writeKey: string; id: string }): boolean {
+export function forgetMemory(
+	state: MemoryState,
+	input: { writeKey: string; id: string },
+	relations: MemoryRelationsState,
+): boolean {
 	const receipt = Object.hasOwn(state.receipts, input.writeKey) ? state.receipts[input.writeKey] : undefined;
 	if (receipt !== undefined) {
 		if (receipt.kind !== "forget") throw new Error("Memory write key already belongs to remember");
@@ -95,7 +109,7 @@ export function forgetMemory(state: MemoryState, input: { writeKey: string; id: 
 				changed = true;
 			}
 		}
-		removeRelations(state, forgotten);
+		removeRelations(relations, forgotten);
 	}
 	state.receipts[input.writeKey] = { kind: "forget", removed };
 	state.revision++;
@@ -103,11 +117,12 @@ export function forgetMemory(state: MemoryState, input: { writeKey: string; id: 
 }
 
 /** Return operational counts without exposing memory content or credentials. */
-export function memoryStats(state: MemoryState | undefined) {
+export function memoryStats(state: MemoryState | undefined, relations: MemoryRelationsState | undefined) {
 	const result = {
 		working: 0,
 		episodic: 0,
 		tombstones: 0,
+		relations: 0,
 		pendingCaptures: 0,
 		failedCaptures: 0,
 		consolidation: state?.consolidation ?? { state: "idle" as const },
@@ -121,5 +136,7 @@ export function memoryStats(state: MemoryState | undefined) {
 		if (capture.outcome.state === "pending") result.pendingCaptures++;
 		if (capture.outcome.state === "failed") result.failedCaptures++;
 	}
+	for (const relation of Object.values(relations?.relations ?? {}))
+		if (isLiveRelation(state, relation)) result.relations++;
 	return result;
 }

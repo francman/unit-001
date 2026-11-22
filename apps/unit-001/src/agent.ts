@@ -28,9 +28,12 @@ import {
 	isMemoryBackgroundTask,
 	MemoryDoc,
 	MemoryInputEntry,
+	type MemoryRelationRequest,
 	type MemoryService,
 	memoryGraph,
+	MemoryRelationsDoc,
 	memoryStats,
+	reconcileMemoryLayout,
 	reconcileMemoryTasks,
 	recordMemoryInput,
 	rememberMemory,
@@ -83,7 +86,11 @@ export type Reply =
 
 type Message = { readonly role?: string; readonly content?: unknown };
 
-const MemoryOperatorEntry = defineEntry<{ operation: "remember"; content: string }>("unit.memory.operator");
+const MemoryOperatorEntry = defineEntry<{
+	operation: "remember";
+	content: string;
+	relations?: MemoryRelationRequest[];
+}>("unit.memory.operator");
 const CommandInterpretationEntry = defineEntry<{ usage: InterpretationUsage }>("unit.command.interpretation");
 
 function textOf(message: Message | undefined): string | undefined {
@@ -202,6 +209,8 @@ export class Agent {
 			context,
 		);
 		try {
+			// Before anything reads memory: stored memory must be in the layout every supported reader opens.
+			await reconcileMemoryLayout(harness, context);
 			await missionAdmission.bind(harness, context);
 			const root = await harness.root(context, { agent: options.model === null ? {} : { model: options.model } });
 			// The model is stored with the session; this launch's choice wins, so changing provider keys never strands it.
@@ -260,7 +269,10 @@ export class Agent {
 			if (!inhibited && canSchedule) {
 				await mission.initialize(context, "permitted");
 				await root.commit((tx) => reconcileMemoryTasks(tx, root.id, Date.now()), context);
-				memory.recall.prepare(await harness.snapshot(MemoryDoc, context));
+				memory.recall.prepare(
+					await harness.snapshot(MemoryDoc, context),
+					await harness.snapshot(MemoryRelationsDoc, context),
+				);
 				harness.resume();
 			}
 			return new Agent(
@@ -458,16 +470,26 @@ export class Agent {
 	async memory(request: MemoryRequest, context: Context): Promise<MemoryResult> {
 		const input = parseMemoryRequest(request);
 		if (input.operation === "stats") {
-			const stats = memoryStats(await this.#harness.snapshot(MemoryDoc, context));
+			const stats = memoryStats(
+				await this.#harness.snapshot(MemoryDoc, context),
+				await this.#harness.snapshot(MemoryRelationsDoc, context),
+			);
 			return { operation: "stats", ...stats, consolidation: stats.consolidation.state };
 		}
 		if (input.operation === "graph")
-			return { operation: "graph", ...memoryGraph(await this.#harness.snapshot(MemoryDoc, context)) };
+			return {
+				operation: "graph",
+				...memoryGraph(
+					await this.#harness.snapshot(MemoryDoc, context),
+					await this.#harness.snapshot(MemoryRelationsDoc, context),
+				),
+			};
 		if (input.operation === "recall") {
 			const state = await this.#harness.snapshot(MemoryDoc, context);
+			const relations = await this.#harness.snapshot(MemoryRelationsDoc, context);
 			return {
 				operation: "recall",
-				records: this.#memory.recall.recall(state, input.query, { topK: 5, now: Date.now() }).map((record) => ({
+				records: this.#memory.recall.recall(state, relations, input.query, { topK: 5, now: Date.now() }).map((record) => ({
 					id: record.id,
 					content: record.content,
 					origin: record.provenance.origin,
@@ -483,7 +505,11 @@ export class Agent {
 			if (input.operation === "forget")
 				return {
 					operation: "forget",
-					removed: forgetMemory(state, { writeKey: `operator:${input.requestId}`, id: input.id }),
+					removed: forgetMemory(
+						state,
+						{ writeKey: `operator:${input.requestId}`, id: input.id },
+						await tx.doc(MemoryRelationsDoc),
+					),
 				};
 			if (input.operation === "remember") {
 				const writeKey = `operator:${input.requestId}`;
@@ -493,19 +519,28 @@ export class Agent {
 					return { operation: "remember", id: receipt.memoryId };
 				}
 				const entry = await tx.appendEntry(MemoryOperatorEntry, this.#root.id, {
-					data: { operation: "remember", content: input.content },
-				});
-				const id = rememberMemory(state, {
-					writeKey,
-					content: input.content,
-					now: Date.now(),
-					provenance: {
-						origin: "user",
-						conversationId: this.#root.id,
-						entryIds: [entry.id],
-						derivation: "explicit",
+					data: {
+						operation: "remember",
+						content: input.content,
+						...(input.relations === undefined ? {} : { relations: [...input.relations] }),
 					},
 				});
+				const id = rememberMemory(
+					state,
+					{
+						writeKey,
+						content: input.content,
+						relations: input.relations,
+						now: Date.now(),
+						provenance: {
+							origin: "user",
+							conversationId: this.#root.id,
+							entryIds: [entry.id],
+							derivation: "explicit",
+						},
+					},
+					input.relations?.length ? await tx.doc(MemoryRelationsDoc) : undefined,
+				);
 				await scheduleMemoryConsolidation(tx, this.#root.id, Date.now());
 				return { operation: "remember", id };
 			}
@@ -596,7 +631,10 @@ export class Agent {
 			document.current = { protocol: 1, state: "open", operationId: null };
 		}, context);
 		await this.#root.commit((tx) => reconcileMemoryTasks(tx, this.#root.id, Date.now()), context);
-		this.#memory.recall.prepare(await this.#harness.snapshot(MemoryDoc, context));
+		this.#memory.recall.prepare(
+			await this.#harness.snapshot(MemoryDoc, context),
+			await this.#harness.snapshot(MemoryRelationsDoc, context),
+		);
 		this.#inhibited = false;
 		const inspection = this.#configuration === "unconfigured" ? await this.#harness.inspect(context) : undefined;
 		const legacy = (await this.#harness.snapshot(MissionDoc, context))?.current ?? null;

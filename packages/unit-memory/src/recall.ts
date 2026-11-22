@@ -1,5 +1,6 @@
 // Owner-scoped lexical index and bounded deterministic memory retrieval, following relations one hop.
-import type { LiveMemory, MemoryRelation, MemoryRelationKind, MemoryState } from "./memory.ts";
+import type { LiveMemory, MemoryState } from "./memory.ts";
+import type { MemoryRelation, MemoryRelationKind, MemoryRelationsState } from "./relations-doc.ts";
 import { isLiveRelation } from "./relations.ts";
 
 /** Why a record was recalled: it matched the query, or it is related to a record that did. */
@@ -33,25 +34,29 @@ export function memoryTokens(text: string): Set<string> {
 	return tokens;
 }
 
+// One shared empty bucket stands for an absent relations document, so repeated preparation stays a no-op.
+const noRelations: MemoryRelationsState["relations"] = {};
+
 /** Cache one Harness owner's index; clear it when that owner closes. */
 export class MemoryRecall {
 	private state: MemoryState | undefined;
 	private revision = -1;
 	private index = new Map<string, Set<string>>();
 	private records = new Map<string, LiveMemory>();
-	private relations: MemoryState["relations"] | undefined;
+	private relations: MemoryRelationsState["relations"] | undefined;
 	private adjacency = new Map<string, MemoryRelation[]>();
 
 	/** Prepare committed evidence before owner readiness; receipt-only snapshots retain their shared record index. */
-	prepare(state: MemoryState | undefined): void {
+	prepare(state: MemoryState | undefined, relations: MemoryRelationsState | undefined): void {
 		if (state === undefined) {
 			this.clear();
 			return;
 		}
-		if (this.state === state && this.revision === state.revision) return;
+		const links = relations?.relations ?? noRelations;
+		if (this.state === state && this.revision === state.revision && this.relations === links) return;
 		// Durable shares unchanged document buckets. Same-object callers may instead mutate a transaction-local state.
 		if (this.state === state || this.state?.records !== state.records) this.rebuild(state);
-		if (this.state === state || this.relations !== state.relations) this.rebuildAdjacency(state);
+		if (this.state === state || this.relations !== links) this.rebuildAdjacency(links);
 		this.state = state;
 		this.revision = state.revision;
 	}
@@ -59,6 +64,7 @@ export class MemoryRecall {
 	/** Retrieve relevant evidence without writes, transcript scans, or external calls. */
 	recall(
 		state: MemoryState | undefined,
+		relations: MemoryRelationsState | undefined,
 		query: string,
 		options: { topK?: number; now: number },
 	): MemoryRecallResult[] {
@@ -67,7 +73,7 @@ export class MemoryRecall {
 		if (!Number.isFinite(options.now)) throw new Error("Memory timestamp must be finite");
 		const tokens = memoryTokens(query);
 		if (state === undefined || tokens.size === 0) return [];
-		this.prepare(state);
+		this.prepare(state, relations);
 		const matches = new Map<string, number>();
 		for (const token of tokens)
 			for (const id of this.index.get(token) ?? []) matches.set(id, (matches.get(id) ?? 0) + 1);
@@ -121,15 +127,15 @@ export class MemoryRecall {
 		return [...pool.values()];
 	}
 
-	private rebuildAdjacency(state: MemoryState): void {
+	private rebuildAdjacency(relations: MemoryRelationsState["relations"]): void {
 		this.adjacency.clear();
-		for (const relation of Object.values(state.relations))
+		for (const relation of Object.values(relations))
 			for (const id of [relation.from.id, relation.to.id]) {
 				const list = this.adjacency.get(id);
 				if (list === undefined) this.adjacency.set(id, [relation]);
 				else list.push(relation);
 			}
-		this.relations = state.relations;
+		this.relations = relations;
 	}
 
 	private rebuild(state: MemoryState): void {

@@ -14,6 +14,7 @@ import { MemoryDoc } from "./memory.ts";
 import { forgetMemory, memoryStats, rememberMemory } from "./operations.ts";
 import { MemoryRecall } from "./recall.ts";
 import { MEMORY_RELATIONS_PER_REMEMBER } from "./relations.ts";
+import { MemoryRelationsDoc } from "./relations-doc.ts";
 
 /** One host's extension and disposable recall cache. */
 export type MemoryService = { extension: Extension; recall: MemoryRecall; close(): void };
@@ -72,20 +73,25 @@ export function createMemoryExtension(options: { now?: () => number } = {}): Mem
 							: [];
 					const id = await api.commit(async (tx) => {
 						const state = await tx.doc(MemoryDoc);
-						const id = rememberMemory(state, {
-							writeKey: `tool:${api.taskId}`,
-							content: args.content,
-							source: args.source,
-							importance: args.importance,
-							relations: args.relations,
-							now,
-							provenance: {
-								origin: "agent",
-								conversationId: api.conversationId,
-								entryIds,
-								derivation: "explicit",
+						const relations = args.relations?.length ? await tx.doc(MemoryRelationsDoc) : undefined;
+						const id = rememberMemory(
+							state,
+							{
+								writeKey: `tool:${api.taskId}`,
+								content: args.content,
+								source: args.source,
+								importance: args.importance,
+								relations: args.relations,
+								now,
+								provenance: {
+									origin: "agent",
+									conversationId: api.conversationId,
+									entryIds,
+									derivation: "explicit",
+								},
 							},
-						});
+							relations,
+						);
 						await scheduleMemoryConsolidation(tx, api.conversationId, now);
 						return id;
 					}, context);
@@ -105,10 +111,15 @@ export function createMemoryExtension(options: { now?: () => number } = {}): Mem
 						{
 							type: "text",
 							text: JSON.stringify(
-								recall.recall(await api.snapshot(MemoryDoc, context), args.query, {
-									topK: args.top_k,
-									now: api.now(),
-								}),
+								recall.recall(
+									await api.snapshot(MemoryDoc, context),
+									await api.snapshot(MemoryRelationsDoc, context),
+									args.query,
+									{
+										topK: args.top_k,
+										now: api.now(),
+									},
+								),
 							),
 						},
 					],
@@ -121,7 +132,12 @@ export function createMemoryExtension(options: { now?: () => number } = {}): Mem
 				parameters: Type.Object({ id: Type.String() }),
 				execute: async (args, api, context) => {
 					const removed = await api.commit(
-						async (tx) => forgetMemory(await tx.doc(MemoryDoc), { writeKey: `tool:${api.taskId}`, id: args.id }),
+						async (tx) =>
+							forgetMemory(
+								await tx.doc(MemoryDoc),
+								{ writeKey: `tool:${api.taskId}`, id: args.id },
+								await tx.doc(MemoryRelationsDoc),
+							),
 						context,
 					);
 					return { output: [{ type: "text", text: JSON.stringify({ removed }) }] };
@@ -133,7 +149,17 @@ export function createMemoryExtension(options: { now?: () => number } = {}): Mem
 				replay: "safe",
 				parameters: Type.Object({}),
 				execute: async (_args, api, context) => ({
-					output: [{ type: "text", text: JSON.stringify(memoryStats(await api.snapshot(MemoryDoc, context))) }],
+					output: [
+						{
+							type: "text",
+							text: JSON.stringify(
+								memoryStats(
+									await api.snapshot(MemoryDoc, context),
+									await api.snapshot(MemoryRelationsDoc, context),
+								),
+							),
+						},
+					],
 				}),
 			}),
 		],

@@ -7,10 +7,21 @@ import { memoryEvidence } from "../src/injection.ts";
 import { MemoryDoc, type MemoryState } from "../src/memory.ts";
 import { forgetMemory, rememberMemory } from "../src/operations.ts";
 import { MemoryRecall, memoryTokens } from "../src/recall.ts";
+import { MemoryRelationsDoc, type MemoryRelationsState } from "../src/relations-doc.ts";
 import { sqliteFixture } from "./sqlite-fixture.ts";
 
-function state(): MemoryState {
-	return { revision: 0, records: {}, relations: {}, receipts: {}, captures: {}, consolidation: { state: "idle" } };
+// Plain values stand for the memory document and the relations document one commit changes together.
+type Store = MemoryState & { links: MemoryRelationsState };
+
+function state(): Store {
+	return {
+		revision: 0,
+		records: {},
+		receipts: {},
+		captures: {},
+		consolidation: { state: "idle" },
+		links: { relations: {} },
+	};
 }
 function add(memory: MemoryState, key: string, content: string) {
 	return rememberMemory(memory, {
@@ -64,11 +75,16 @@ describe("bounded lexical recall", () => {
 					return typeof key === "string" ? target[key] : undefined;
 				},
 			});
-			recall.prepare({ ...first, records });
+			recall.prepare({ ...first, records }, undefined);
 			expect(recordReads).toBeGreaterThan(0);
 			expect(normalization).toHaveBeenCalledTimes(1);
 			await fixture.session.commit(
-				async (tx) => forgetMemory(await tx.doc(MemoryDoc), { writeKey: "missing", id: "absent" }),
+				async (tx) =>
+					forgetMemory(
+						await tx.doc(MemoryDoc),
+						{ writeKey: "missing", id: "absent" },
+						await tx.doc(MemoryRelationsDoc),
+					),
 				context,
 			);
 			const second = await fixture.session.snapshot(MemoryDoc, context);
@@ -78,15 +94,15 @@ describe("bounded lexical recall", () => {
 			normalization.mockClear();
 			recordReads = 0;
 			const shared = { ...second, records };
-			recall.prepare(shared);
+			recall.prepare(shared, undefined);
 			expect(recordReads).toBe(0);
 			expect(normalization).not.toHaveBeenCalled();
-			expect(recall.recall(shared, "violet", { now: 0 })[0]?.id).toBe("memory:one");
+			expect(recall.recall(shared, undefined, "violet", { now: 0 })[0]?.id).toBe("memory:one");
 			expect(recordReads).toBe(0);
 			expect(normalization).toHaveBeenCalledTimes(1);
-			recall.prepare(undefined);
+			recall.prepare(undefined, undefined);
 			normalization.mockClear();
-			recall.prepare(shared);
+			recall.prepare(shared, undefined);
 			expect(recordReads).toBeGreaterThan(0);
 			expect(normalization).toHaveBeenCalledTimes(1);
 		} finally {
@@ -100,30 +116,33 @@ describe("bounded lexical recall", () => {
 		const recall = new MemoryRecall();
 		add(memory, "redis", "redis --force db_name ＣＡＦÉ");
 		add(memory, "other", "redistribution force -force");
-		expect(recall.recall(memory, "redis", { now: 0 }).map((result) => result.id)).toEqual(["memory:redis"]);
+		expect(recall.recall(memory, memory.links, "redis", { now: 0 }).map((result) => result.id)).toEqual([
+			"memory:redis",
+		]);
 		for (const query of ["--force", "db_name", "name", "café"])
-			expect(recall.recall(memory, query, { now: 0 })[0]?.id).toBe("memory:redis");
-		expect(recall.recall(memory, "force", { now: 0 })[0]?.id).toBe("memory:other");
-		for (const query of ["the and", "unrelated", ""]) expect(recall.recall(memory, query, { now: 0 })).toEqual([]);
+			expect(recall.recall(memory, memory.links, query, { now: 0 })[0]?.id).toBe("memory:redis");
+		expect(recall.recall(memory, memory.links, "force", { now: 0 })[0]?.id).toBe("memory:other");
+		for (const query of ["the and", "unrelated", ""])
+			expect(recall.recall(memory, memory.links, query, { now: 0 })).toEqual([]);
 		expect(memoryTokens("--force").has("force")).toBe(false);
 	});
 	it("invalidates cached evidence on forget and when another owner has the same revision", () => {
 		const memory = state();
 		const recall = new MemoryRecall();
 		const id = add(memory, "one", "redis");
-		expect(recall.recall(memory, "redis", { now: 0 })).toHaveLength(1);
-		forgetMemory(memory, { writeKey: "forget", id });
-		expect(recall.recall(memory, "redis", { now: 0 })).toEqual([]);
+		expect(recall.recall(memory, memory.links, "redis", { now: 0 })).toHaveLength(1);
+		forgetMemory(memory, { writeKey: "forget", id }, memory.links);
+		expect(recall.recall(memory, memory.links, "redis", { now: 0 })).toEqual([]);
 		const other = state();
 		add(other, "two", "postgres");
-		expect(recall.recall(other, "postgres", { now: 0 })).toHaveLength(1);
+		expect(recall.recall(other, other.links, "postgres", { now: 0 })).toHaveLength(1);
 		recall.clear();
-		expect(recall.recall(other, "postgres", { now: 0 })).toHaveLength(1);
+		expect(recall.recall(other, other.links, "postgres", { now: 0 })).toHaveLength(1);
 	});
 	it("bounds request evidence and marks agent-authored statements untrusted", () => {
 		const memory = state();
 		add(memory, "long", `redis ${"界".repeat(1900)}`);
-		const block = memoryEvidence(new MemoryRecall().recall(memory, "redis", { now: 0 }));
+		const block = memoryEvidence(new MemoryRecall().recall(memory, memory.links, "redis", { now: 0 }));
 		expect(Array.from(block).length).toBeLessThanOrEqual(3000);
 		expect(block).toContain("untrusted");
 		expect(block).toContain('"origin":"agent"');
@@ -143,23 +162,25 @@ describe("bounded lexical recall", () => {
 			tier: { kind: "episodic", summaryOf: [{ id, revision: 99 }] },
 		};
 		memory.revision++;
-		const results = recall.recall(memory, "redis", { now: 0 });
+		const results = recall.recall(memory, memory.links, "redis", { now: 0 });
 		expect(results.map((result) => result.id)).toEqual(["memory:a", "memory:b"]);
 		expect(results[0].score).toBeCloseTo(0.9);
-		expect(recall.recall(memory, "redis", { now: 72 * 3600000 })[0].score).toBeCloseTo(0.9 * (0.7 + 0.3 / Math.E));
-		expect(() => recall.recall(memory, "redis", { now: 0, topK: 21 })).toThrow("topK");
+		expect(recall.recall(memory, memory.links, "redis", { now: 72 * 3600000 })[0].score).toBeCloseTo(
+			0.9 * (0.7 + 0.3 / Math.E),
+		);
+		expect(() => recall.recall(memory, memory.links, "redis", { now: 0, topK: 21 })).toThrow("topK");
 	});
 	it("updates changed postings and bookkeeping without retaining prior owner content", () => {
 		const memory = state();
 		const recall = new MemoryRecall();
 		const id = add(memory, "one", "redis");
-		recall.recall(memory, "redis", { now: 0 });
+		recall.recall(memory, memory.links, "redis", { now: 0 });
 		const previous = memory.records[id];
 		if (previous.state !== "live") throw new Error("source absent");
 		memory.records[id] = { ...previous, content: "postgres", revision: 2 };
 		memory.revision++;
-		expect(recall.recall(memory, "redis", { now: 0 })).toEqual([]);
-		expect(recall.recall(memory, "postgres", { now: 0 })[0]?.revision).toBe(2);
+		expect(recall.recall(memory, memory.links, "redis", { now: 0 })).toEqual([]);
+		expect(recall.recall(memory, memory.links, "postgres", { now: 0 })[0]?.revision).toBe(2);
 		memory.records[id] = {
 			...previous,
 			content: "postgres",
@@ -167,7 +188,7 @@ describe("bounded lexical recall", () => {
 			tier: { kind: "working", consolidation: { state: "done", summaryIds: [] } },
 		};
 		memory.revision++;
-		expect(recall.recall(memory, "postgres", { now: 0 })[0]?.tier).toEqual({
+		expect(recall.recall(memory, memory.links, "postgres", { now: 0 })[0]?.tier).toEqual({
 			kind: "working",
 			consolidation: { state: "done", summaryIds: [] },
 		});
@@ -175,19 +196,23 @@ describe("bounded lexical recall", () => {
 });
 
 describe("one-hop relation recall", () => {
-	function note(memory: MemoryState, key: string, conversation: number, content: string, relates?: string) {
-		return rememberMemory(memory, {
-			writeKey: key,
-			content,
-			now: 0,
-			provenance: {
-				origin: "agent",
-				conversationId: conversation as ConversationId,
-				entryIds: [],
-				derivation: "explicit",
+	function note(memory: Store, key: string, conversation: number, content: string, relates?: string) {
+		return rememberMemory(
+			memory,
+			{
+				writeKey: key,
+				content,
+				now: 0,
+				provenance: {
+					origin: "agent",
+					conversationId: conversation as ConversationId,
+					entryIds: [],
+					derivation: "explicit",
+				},
+				...(relates === undefined ? {} : { relations: [{ id: relates, kind: "contradicts" as const }] }),
 			},
-			...(relates === undefined ? {} : { relations: [{ id: relates, kind: "contradicts" as const }] }),
-		});
+			memory.links,
+		);
 	}
 
 	it("brings a related memory from another conversation at half the matching score", () => {
@@ -196,7 +221,7 @@ describe("one-hop relation recall", () => {
 		const budget = note(memory, "budget", 1, "The launch budget is ten thousand");
 		const cut = note(memory, "cut", 2, "Finance cut spending for next quarter", budget);
 		note(memory, "noise", 3, "Unrelated gardening note");
-		const results = recall.recall(memory, "launch budget", { now: 0 });
+		const results = recall.recall(memory, memory.links, "launch budget", { now: 0 });
 		expect(results.map((result) => [result.id, result.via])).toEqual([
 			[budget, { kind: "match" }],
 			[cut, { kind: "relation", relation: "contradicts", memoryId: budget }],
@@ -211,10 +236,12 @@ describe("one-hop relation recall", () => {
 		const a = note(memory, "a", 1, "violet approval");
 		const b = note(memory, "b", 2, "second statement", a);
 		note(memory, "c", 3, "third statement", b);
-		expect(recall.recall(memory, "violet", { now: 0 }).map((result) => result.id)).toEqual([a, b]);
-		expect(recall.recall(memory, "violet", { now: 0, topK: 1 }).map((result) => result.id)).toEqual([a]);
-		forgetMemory(memory, { writeKey: "forget-b", id: b });
-		expect(recall.recall(memory, "violet", { now: 0 }).map((result) => result.id)).toEqual([a]);
+		expect(recall.recall(memory, memory.links, "violet", { now: 0 }).map((result) => result.id)).toEqual([a, b]);
+		expect(recall.recall(memory, memory.links, "violet", { now: 0, topK: 1 }).map((result) => result.id)).toEqual([
+			a,
+		]);
+		forgetMemory(memory, { writeKey: "forget-b", id: b }, memory.links);
+		expect(recall.recall(memory, memory.links, "violet", { now: 0 }).map((result) => result.id)).toEqual([a]);
 	});
 
 	it("ignores a relation pinned to a stale revision", () => {
@@ -222,9 +249,9 @@ describe("one-hop relation recall", () => {
 		const recall = new MemoryRecall();
 		const a = note(memory, "a", 1, "violet approval");
 		note(memory, "b", 2, "second statement", a);
-		const relation = Object.values(memory.relations)[0]!;
-		memory.relations = { [relation.id]: { ...relation, to: { id: a, revision: 2 } } };
+		const relation = Object.values(memory.links.relations)[0]!;
+		memory.links = { relations: { [relation.id]: { ...relation, to: { id: a, revision: 2 } } } };
 		memory.revision++;
-		expect(recall.recall(memory, "violet", { now: 0 }).map((result) => result.id)).toEqual([a]);
+		expect(recall.recall(memory, memory.links, "violet", { now: 0 }).map((result) => result.id)).toEqual([a]);
 	});
 });

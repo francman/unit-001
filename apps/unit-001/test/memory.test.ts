@@ -8,9 +8,11 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { createMemoryExtension } from "unit-memory";
+import { createMemoryExtension, MEMORY_RELATION_KINDS, MemoryDoc } from "unit-memory";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "../src/agent.ts";
+import { parseArguments } from "../src/args.ts";
+import { parseMemoryResult } from "../src/memory-control.ts";
 
 const context = BACKGROUND_CONTEXT;
 let directory: string;
@@ -49,6 +51,92 @@ async function launch(
 }
 
 describe("default owner memory", () => {
+	it("stores operator CLI relations atomically with user provenance, replay and restart", async () => {
+		const first = await launch("operator-relations.sqlite");
+		const targets: string[] = [];
+		for (const kind of MEMORY_RELATION_KINDS) {
+			const target = await first.agent.memory(
+				{ operation: "remember", content: `original ${kind}`, requestId: kind },
+				context,
+			);
+			if (target.operation !== "remember") throw new Error("Expected remember");
+			targets.push(target.id);
+		}
+		const command = parseArguments([
+			"memory",
+			"remember",
+			"The new policy",
+			"--request-id",
+			"linked",
+			...MEMORY_RELATION_KINDS.map((kind, index) => `--relation=${kind}:${targets[index]}`),
+		]);
+		if (command.kind !== "memory" || command.request.operation !== "remember")
+			throw new Error("Expected remember command");
+		const result = await first.agent.memory(command.request, context);
+		if (result.operation !== "remember") throw new Error("Expected remember");
+		expect(await first.agent.memory(command.request, context)).toEqual(result);
+		expect(parseMemoryResult(await first.agent.memory({ operation: "stats" }, context))).toMatchObject({
+			relations: 4,
+		});
+		const invalid = {
+			operation: "remember",
+			content: "must roll back",
+			requestId: "invalid",
+			relations: [{ id: "memory:absent", kind: "supports" }],
+		} as const;
+		await expect(first.agent.memory(invalid, context)).rejects.toThrow("not live");
+		expect(await first.agent.memory({ operation: "stats" }, context)).toMatchObject({ working: 5, relations: 4 });
+		expect(first.faux.state.callCount).toBe(0);
+		await first.agent.close(context);
+		const second = await launch("operator-relations.sqlite");
+		expect(await second.agent.memory(command.request, context)).toEqual(result);
+		const graph = await second.agent.memory({ operation: "graph" }, context);
+		if (graph.operation !== "graph") throw new Error("Expected graph");
+		expect(graph.edges).toHaveLength(4);
+		for (const [index, kind] of MEMORY_RELATION_KINDS.entries())
+			expect(graph.edges).toContainEqual({ from: result.id, to: targets[index], kind, derivation: "explicit" });
+		expect(graph.nodes.find((node) => node.id === result.id)).toMatchObject({ origin: "user" });
+		for (const id of targets)
+			await second.agent.memory({ operation: "forget", id, requestId: `forget-${id}`, confirmed: true }, context);
+		expect(await second.agent.memory({ operation: "stats" }, context)).toMatchObject({ relations: 0 });
+		await expect(
+			second.agent.memory({ ...invalid, relations: [{ id: targets[0]!, kind: "supports" }] }, context),
+		).rejects.toThrow("not live");
+		expect(await second.agent.memory(command.request, context)).toEqual(result);
+		expect(second.faux.state.callCount).toBe(0);
+		await second.agent.close(context);
+		const memory = createMemoryExtension();
+		const registry = createRegistry();
+		registry.install(memory.extension);
+		const harness = await Harness.open(
+			await openNodeSqliteStorage(join(directory, "operator-relations.sqlite")),
+			{ models: createModels(), registry },
+			context,
+		);
+		try {
+			const state = await harness.snapshot(MemoryDoc, context);
+			const stored = state?.records[result.id];
+			expect(stored).toMatchObject({ state: "live", provenance: { origin: "user", derivation: "explicit" } });
+			if (stored?.state !== "live") throw new Error("Expected stored memory");
+			expect(stored.provenance.entryIds).toHaveLength(1);
+			const root = await harness.root(context);
+			const { items } = await root.entries({}, 20, undefined, context);
+			const entry = items.find((entry) => entry.id === stored.provenance.entryIds[0]);
+			expect(entry).toMatchObject({
+				kind: "unit.memory.operator",
+				data: { content: command.request.content, relations: command.request.relations },
+			});
+			expect(
+				items.some(
+					(entry) => entry.kind === "unit.memory.operator" && JSON.stringify(entry).includes("must roll back"),
+				),
+			).toBe(false);
+		} finally {
+			await harness.close(context);
+			memory.close();
+		}
+	});
+
 	it("#6 prepares reopened memory before readiness and refreshes real record changes after receipt-only capture", async () => {
 		const content = "Violet approval policy seed";
 		const first = await launch("prepared.sqlite");

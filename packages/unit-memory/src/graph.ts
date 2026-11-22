@@ -1,7 +1,8 @@
 // Bounded, read-only projection of live memories, their summary links and their relations for display.
 import { createHmac, randomBytes } from "node:crypto";
 import type { ConversationId } from "@earendil-works/pi-durable";
-import type { LiveMemory, MemoryRelation, MemoryRelationKind, MemoryState } from "./memory.ts";
+import type { LiveMemory, MemoryState } from "./memory.ts";
+import type { MemoryRelation, MemoryRelationKind, MemoryRelationsState } from "./relations-doc.ts";
 import { isLiveRelation } from "./relations.ts";
 
 /** One live memory as shown in a graph; content is truncated and provenance is reduced to an opaque cluster key. */
@@ -44,7 +45,7 @@ export const MEMORY_GRAPH_CONTENT_LIMIT = 280;
 export const MEMORY_GRAPH_EDGE_LIMIT = 1000;
 
 /** Project live memories newest first, never forgotten records, with live edges only between returned nodes. */
-export function memoryGraph(state: MemoryState | undefined): MemoryGraph {
+export function memoryGraph(state: MemoryState | undefined, relations: MemoryRelationsState | undefined): MemoryGraph {
 	if (state === undefined) return { nodes: [], edges: [], total: 0, limited: false };
 	const live: LiveMemory[] = [];
 	for (const record of Object.values(state.records)) if (record.state === "live") live.push(record);
@@ -59,10 +60,10 @@ export function memoryGraph(state: MemoryState | undefined): MemoryGraph {
 			if (present.has(source.id)) edges.push({ from: record.id, to: source.id, kind: "summary" });
 		}
 	}
-	const relations = Object.values(state.relations)
+	const linked = Object.values(relations?.relations ?? {})
 		.filter((relation) => present.has(relation.from.id) && present.has(relation.to.id))
 		.sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-	for (const relation of relations) {
+	for (const relation of linked) {
 		if (edges.length === MEMORY_GRAPH_EDGE_LIMIT) break;
 		if (!isLiveRelation(state, relation)) continue;
 		edges.push({

@@ -38,9 +38,6 @@ export {
 	type MemoryReceipt,
 	type MemoryRecord,
 	type MemoryRef,
-	type MemoryRelation,
-	type MemoryRelationKind,
-	type MemoryRelationProvenance,
 	type MemoryState,
 } from "./memory.ts";
 export { forgetMemory, memoryStats, type RememberMemory, rememberMemory } from "./operations.ts";
@@ -53,3 +50,11 @@ export {
 	MEMORY_RELATIONS_PER_REMEMBER,
 	type MemoryRelationRequest,
 } from "./relations.ts";
+export {
+	type MemoryRelation,
+	type MemoryRelationKind,
+	type MemoryRelationProvenance,
+	MemoryRelationsDoc,
+	type MemoryRelationsState,
+	reconcileMemoryLayout,
+} from "./relations-doc.ts";

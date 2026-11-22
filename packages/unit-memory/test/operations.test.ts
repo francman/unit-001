@@ -3,6 +3,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { describe, expect, it } from "vitest";
 import { MemoryDoc } from "../src/memory.ts";
 import { forgetMemory, memoryStats, rememberMemory } from "../src/operations.ts";
+import { MemoryRelationsDoc } from "../src/relations-doc.ts";
 import { sqliteFixture } from "./sqlite-fixture.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -33,20 +34,23 @@ describe("replay-safe memory mutations", () => {
 			).toBe(id);
 			expect(
 				await fixture.session.commit(
-					async (tx) => forgetMemory(await tx.doc(MemoryDoc), { writeKey: "forget:1", id }),
+					async (tx) =>
+						forgetMemory(await tx.doc(MemoryDoc), { writeKey: "forget:1", id }, await tx.doc(MemoryRelationsDoc)),
 					context,
 				),
 			).toBe(true);
 			await fixture.reopen();
 			expect(
 				await fixture.session.commit(
-					async (tx) => forgetMemory(await tx.doc(MemoryDoc), { writeKey: "forget:1", id }),
+					async (tx) =>
+						forgetMemory(await tx.doc(MemoryDoc), { writeKey: "forget:1", id }, await tx.doc(MemoryRelationsDoc)),
 					context,
 				),
 			).toBe(true);
 			expect(
 				await fixture.session.commit(
-					async (tx) => forgetMemory(await tx.doc(MemoryDoc), { writeKey: "forget:2", id }),
+					async (tx) =>
+						forgetMemory(await tx.doc(MemoryDoc), { writeKey: "forget:2", id }, await tx.doc(MemoryRelationsDoc)),
 					context,
 				),
 			).toBe(false);
@@ -56,7 +60,10 @@ describe("replay-safe memory mutations", () => {
 			const state = await fixture.session.snapshot(MemoryDoc, context);
 			expect(state?.records[id]).toEqual({ state: "forgotten", id, revision: 2 });
 			expect(JSON.stringify(state)).not.toContain("private redis preference");
-			expect(memoryStats(state)).toMatchObject({ working: 0, tombstones: 1 });
+			expect(memoryStats(state, await fixture.session.snapshot(MemoryRelationsDoc, context))).toMatchObject({
+				working: 0,
+				tombstones: 1,
+			});
 		} finally {
 			await fixture.close();
 		}
@@ -113,7 +120,7 @@ describe("replay-safe memory mutations", () => {
 				return id;
 			}, context);
 			await fixture.session.commit(async (tx) => {
-				forgetMemory(await tx.doc(MemoryDoc), { writeKey: "forget", id });
+				forgetMemory(await tx.doc(MemoryDoc), { writeKey: "forget", id }, await tx.doc(MemoryRelationsDoc));
 			}, context);
 			await fixture.reopen();
 			const state = await fixture.session.snapshot(MemoryDoc, context);

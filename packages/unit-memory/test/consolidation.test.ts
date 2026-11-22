@@ -17,6 +17,7 @@ import {
 } from "../src/consolidation.ts";
 import { type LiveMemory, MemoryDoc } from "../src/memory.ts";
 import { forgetMemory, rememberMemory } from "../src/operations.ts";
+import { MemoryRelationsDoc } from "../src/relations-doc.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -276,7 +277,12 @@ describe("durable consolidation checkpoints", () => {
 								interleaved = true;
 								await harness.commit(async (tx) => {
 									const memory = await tx.doc(MemoryDoc);
-									if (mutation === "forget") forgetMemory(memory, { writeKey: "atomic-forget", id: sourceId });
+									if (mutation === "forget")
+										forgetMemory(
+											memory,
+											{ writeKey: "atomic-forget", id: sourceId },
+											await tx.doc(MemoryRelationsDoc),
+										);
 									else {
 										const source = memory.records[sourceId]!;
 										if (source.state !== "live") throw new Error("Expected a live race fixture.");
@@ -364,7 +370,7 @@ describe("durable consolidation checkpoints", () => {
 			);
 			expect(summaries).toHaveLength(2);
 			for (const summary of summaries) expect(summary.tier).toMatchObject({ summaryOf: [expect.anything()] });
-			expect(Object.values(memory.relations)).toEqual([
+			expect(Object.values((await harness.snapshot(MemoryRelationsDoc, context))!.relations)).toEqual([
 				expect.objectContaining({
 					kind: "relates",
 					from: { id: "memory:first", revision: 1 },

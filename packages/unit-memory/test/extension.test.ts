@@ -6,6 +6,7 @@ import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durab
 import { describe, expect, it } from "vitest";
 import { createMemoryExtension } from "../src/extension.ts";
 import { MemoryDoc } from "../src/memory.ts";
+import { MemoryRelationsDoc } from "../src/relations-doc.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -101,7 +102,7 @@ describe("in-process memory tools", () => {
 				record.state === "live" ? record.content : "",
 			);
 			expect(contents).toEqual(["Budget is ten thousand", "Finance cut the budget"]);
-			expect(Object.values(memory.relations)).toEqual([
+			expect(Object.values((await harness.snapshot(MemoryRelationsDoc, context))!.relations)).toEqual([
 				expect.objectContaining({
 					kind: "updates",
 					to: { id: target, revision: 1 },
