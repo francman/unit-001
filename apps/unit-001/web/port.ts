@@ -40,21 +40,30 @@ export function browserWorkspacePort(initialSession: GatewaySession): WorkspaceP
 	const requestEnvelope = async (operation: JsonObject, requestId: string): Promise<JsonObject> => {
 		const connection = active;
 		if (!connection) throw new GatewayRejection("The workspace connection is not verified. No request was sent.");
+		const csrfToken = connection.csrfToken;
 		const response = await browserApiFetch("/api/v1/requests", {
 			method: "POST",
-			headers: { "Content-Type": "application/json", "X-Unit-CSRF": connection.csrfToken },
+			headers: { "Content-Type": "application/json", "X-Unit-CSRF": csrfToken },
 			body: JSON.stringify({ requestId, operation }),
 			signal: AbortSignal.timeout(125_000),
 		});
 		if (!response.ok) {
 			// Only statuses the gateway uses before dispatch can establish that the owner was not called.
 			if (![400, 403, 409, 429].includes(response.status)) throw new Error("Owner outcome is unknown.");
-			if (response.status === 403 && active === connection) connection.invalidate();
-			throw new GatewayRejection(
-				response.status === 429
-					? "Request capacity reached. Wait for active requests; if the action budget is exhausted, restart the web command."
-					: "The gateway rejected this request before dispatch. Check the connection, request size and arguments.",
-			);
+			void response.body?.cancel().catch(() => {});
+			switch (response.status) {
+				case 403:
+					if (active === connection && connection.csrfToken === csrfToken) connection.invalidate();
+					throw new GatewayRejection(workspaceChanged
+						? "Request not sent. Return to the original workspace before trying again."
+						: active
+							? "Request not sent. Try the action again on the current workspace connection."
+							: "Request not sent. Wait for this workspace to reconnect, then try the action again.");
+				case 429:
+					throw new GatewayRejection("Request not sent: the gateway is at capacity. Wait for active requests to finish, then try again.");
+				default:
+					throw new GatewayRejection("The gateway rejected this request before dispatch. Check the connection, request size and arguments.");
+			}
 		}
 		if (active !== connection) {
 			void response.body?.cancel().catch(() => {});
@@ -63,6 +72,16 @@ export function browserWorkspacePort(initialSession: GatewaySession): WorkspaceP
 		const result = object(await response.json());
 		if (active !== connection) throw new Error("The workspace connection changed before the reply arrived.");
 		if (result.requestId !== requestId) throw new Error("Owner outcome is unknown.");
+		// A delayed response must not overwrite a credential adopted while this POST was in flight.
+		const nextCsrf = response.headers.get("X-Unit-Next-CSRF");
+		if (nextCsrf !== null && connection.csrfToken === csrfToken) {
+			if (response.headers.get("X-Unit-Workspace") === workspaceId && /^[!-~]+$/.test(nextCsrf)) {
+				connection.csrfToken = nextCsrf;
+			} else {
+				// Refresh the credential without discarding the matching request outcome.
+				connection.invalidate();
+			}
+		}
 		return result;
 	};
 	const request = async (operation: JsonObject, requestId: string = crypto.randomUUID()): Promise<JsonObject> => {

@@ -24,6 +24,12 @@ afterEach(() => {
 
 const createPort = () => browserWorkspacePort({ csrfToken, workspaceId });
 
+function deferredResponse() {
+	let resolve!: (response: Response) => void;
+	const promise = new Promise<Response>((finish) => { resolve = finish; });
+	return { promise, resolve };
+}
+
 async function connectedPort() {
 	const fetch = globalThis.fetch;
 	vi.stubGlobal("fetch", () => eventResponse(new ReadableStream({
@@ -51,6 +57,13 @@ function eventResponse(body: ReadableStream<Uint8Array> | string, id: string | n
 function completed(init: RequestInit | undefined, response: unknown) {
 	const { requestId } = JSON.parse(String(init?.body));
 	return Response.json({ requestId, state: "completed", response });
+}
+
+function rolloverReply(init: RequestInit | undefined, token: string, id = workspaceId) {
+	const response = completed(init, { type: "sent" });
+	response.headers.set("X-Unit-Next-CSRF", token);
+	response.headers.set("X-Unit-Workspace", id);
+	return response;
 }
 
 describe("browser operator transport", () => {
@@ -85,6 +98,97 @@ describe("browser operator transport", () => {
 		expect(await port.send("work", "stable")).toMatchObject({ state: "failed" });
 		expect(await port.forget("memory-id", "forget-stable")).toMatchObject({ state: "failed" });
 	});
+
+	it("reports 429 as not sent and leaves the verified connection available for a deliberate new action", async () => {
+		const fetch = vi.fn(async (_path: string, init?: RequestInit) => completed(init, { type: "sent" }));
+		fetch.mockResolvedValueOnce(new Response(null, { status: 429 }));
+		vi.stubGlobal("fetch", fetch);
+		const port = await connectedPort();
+		await expect(port.send("work", "capacity")).resolves.toEqual({
+			state: "failed",
+			message: "Request not sent: the gateway is at capacity. Wait for active requests to finish, then try again.",
+		});
+		expect(fetch).toHaveBeenCalledTimes(1);
+		await expect(port.send("work", "deliberate")).resolves.toEqual({ state: "completed" });
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(new Headers(fetch.mock.calls[1]?.[1]?.headers).get("X-Unit-CSRF")).toBe(csrfToken);
+	});
+
+	it("adopts rollover credentials in place across 100 deliberate sends", async () => {
+		let admitted = 0;
+		let credential = csrfToken;
+		const fetch = vi.fn(async (_path: string, init?: RequestInit) => {
+			if (new Headers(init?.headers).get("X-Unit-CSRF") !== credential) return new Response(null, { status: 403 });
+			if (++admitted % 24 !== 0) return completed(init, { type: "sent" });
+			credential = `generation-${admitted}`;
+			return rolloverReply(init, credential);
+		});
+		vi.stubGlobal("fetch", fetch);
+		const port = await connectedPort();
+		for (let i = 0; i < 100; i++) {
+			await expect(port.send("work", `click-${i}`)).resolves.toEqual({ state: "completed" });
+		}
+		expect(admitted).toBe(100);
+		expect(fetch).toHaveBeenCalledTimes(100);
+	});
+
+	it("keeps a matching outcome when rollover metadata cannot verify the endpoint or credential", async () => {
+		const fetch = vi.fn(async (_path: string, init?: RequestInit) => rolloverReply(init, restartedCsrf, differentId));
+		vi.stubGlobal("fetch", fetch);
+		const port = await connectedPort();
+		await expect(port.send("work", "settled")).resolves.toEqual({ state: "completed" });
+		await expect(port.send("work", "while-unverified")).resolves.toMatchObject({ state: "failed" });
+		expect(fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not adopt a hint on a mismatched reply or replay a lost rollover reply", async () => {
+		const fetch = vi.fn(async (_path: string, init?: RequestInit) => {
+			const { requestId } = JSON.parse(String(init?.body));
+			if (requestId === "lost") throw new Error("response lost at rollover");
+			return new Response(null, { status: 403 });
+		});
+		fetch.mockResolvedValueOnce(rolloverReply({ body: '{"requestId":"different"}' }, "unverified-hint"));
+		vi.stubGlobal("fetch", fetch);
+		const port = await connectedPort();
+		await expect(port.send("work", "wrong-id")).resolves.toMatchObject({ state: "unknown" });
+		await expect(port.send("work", "lost")).resolves.toMatchObject({ state: "unknown" });
+		expect(fetch).toHaveBeenCalledTimes(2);
+		await expect(port.send("fresh action", "after-loss")).resolves.toMatchObject({ state: "failed" });
+		expect(fetch).toHaveBeenCalledTimes(3);
+		for (const [, init] of fetch.mock.calls) expect(new Headers(init?.headers).get("X-Unit-CSRF")).toBe(csrfToken);
+	});
+
+	it("keeps the new credential through delayed old replies and another tab's stale rejection", async () => {
+		const late = deferredResponse();
+		const stale = deferredResponse();
+		const fetch = vi.fn(async (_path: string, init?: RequestInit) => {
+			const { requestId } = JSON.parse(String(init?.body));
+			switch (requestId) {
+				case "late": return late.promise;
+				case "stale": return stale.promise;
+				case "capacity": return new Response(null, { status: 429 });
+				case "settled": return rolloverReply(init, restartedCsrf);
+				default: return new Headers(init?.headers).get("X-Unit-CSRF") === restartedCsrf
+					? completed(init, { type: "sent" })
+					: new Response(null, { status: 403 });
+			}
+		});
+		vi.stubGlobal("fetch", fetch);
+		const port = await connectedPort();
+		const otherTab = await connectedPort();
+		const lateOutcome = port.send("earlier write", "late");
+		const staleOutcome = port.send("delayed rejection", "stale");
+		await expect(port.send("capacity", "capacity")).resolves.toMatchObject({ state: "failed" });
+		await expect(port.send("settling write", "settled")).resolves.toEqual({ state: "completed" });
+		late.resolve(rolloverReply(fetch.mock.calls[0]?.[1], "obsolete-hint"));
+		stale.resolve(new Response(null, { status: 403 }));
+		await expect(lateOutcome).resolves.toEqual({ state: "completed" });
+		await expect(staleOutcome).resolves.toMatchObject({ state: "failed" });
+		await expect(otherTab.send("old tab", "other-tab")).resolves.toMatchObject({ state: "failed" });
+		await expect(port.send("new click", "new-click")).resolves.toEqual({ state: "completed" });
+		expect(fetch).toHaveBeenCalledTimes(6);
+	});
+
 	it("#65 retains unknown delivery after gateway loss without replay", async () => {
 		const fetch = vi.fn(async () => Response.json({ requestId: "stable", state: "unknown" }));
 		vi.stubGlobal("fetch", fetch);
@@ -199,7 +303,12 @@ describe("browser operator transport", () => {
 		const receive = vi.fn();
 		const unwatch = port.watch(receive);
 		await vi.advanceTimersByTimeAsync(0);
-		expect(await port.send("work", "stable")).toMatchObject({ state: failure === "EOF" ? "unknown" : "failed" });
+		const outcome = await port.send("work", "stable");
+		if (failure === "EOF") expect(outcome).toMatchObject({ state: "unknown" });
+		else expect(outcome).toEqual({
+			state: "failed",
+			message: "Request not sent. Wait for this workspace to reconnect, then try the action again.",
+		});
 		if (failure === "EOF") closeFirst();
 		await vi.advanceTimersByTimeAsync(0);
 		await vi.advanceTimersByTimeAsync(2999);
@@ -214,11 +323,11 @@ describe("browser operator transport", () => {
 		expect(fetch.mock.calls.map(([path]) => path)).toEqual([
 			"/api/v1/events", "/api/v1/requests", "/api/v1/session", "/api/v1/events",
 		]);
-		await expect(port.send("after reconnect", "new-id")).resolves.toEqual({ state: "completed" });
+		await expect(port.send("work", "new-id")).resolves.toEqual({ state: "completed" });
 		const [first, next] = fetch.mock.calls.filter(([path]) => path === "/api/v1/requests");
 		expect(new Headers(first?.[1]?.headers).get("X-Unit-CSRF")).toBe(csrfToken);
 		expect(new Headers(next?.[1]?.headers).get("X-Unit-CSRF")).toBe(restartedCsrf);
-		expect(JSON.parse(String(next?.[1]?.body))).toMatchObject({ requestId: "new-id" });
+		expect(JSON.parse(String(next?.[1]?.body))).toEqual({ requestId: "new-id", operation: { type: "send", prompt: "work" } });
 		for (const [path, init] of fetch.mock.calls) {
 			expect(init?.credentials).toBe("omit");
 			expect(new Headers(init?.headers).has("Authorization")).toBe(false);
@@ -228,6 +337,41 @@ describe("browser operator transport", () => {
 		expect(cancel).toHaveBeenCalledTimes(failure === "EOF" ? 1 : 2);
 		await vi.advanceTimersByTimeAsync(6000);
 		expect(fetch).toHaveBeenCalledTimes(5);
+	});
+
+	it.each([200, 403])("does not let a late HTTP %s from the old connection affect the verified stream", async (status) => {
+		vi.useFakeTimers();
+		const late = deferredResponse();
+		let closeFirst!: () => void;
+		const fetch = vi.fn(async (path: string, init?: RequestInit) => {
+			if (path.endsWith("session")) return sessionResponse(restartedCsrf);
+			if (path.endsWith("requests")) {
+				return JSON.parse(String(init?.body)).requestId === "late" ? late.promise : completed(init, { type: "sent" });
+			}
+			return eventResponse(new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(frame()));
+					closeFirst ??= () => controller.close();
+				},
+			}));
+		});
+		vi.stubGlobal("fetch", fetch);
+		const port = createPort();
+		const receive = vi.fn();
+		stopWatches.add(port.watch(receive));
+		await vi.advanceTimersByTimeAsync(0);
+		const pending = port.send("work", "late");
+		closeFirst();
+		await vi.advanceTimersByTimeAsync(3000);
+		expect(receive).toHaveBeenLastCalledWith({ type: "view", view: ownerView });
+		late.resolve(status === 200
+			? Response.json({ requestId: "late", state: "completed", response: { type: "sent" } })
+			: new Response(null, { status }));
+		await expect(pending).resolves.toMatchObject({ state: status === 200 ? "unknown" : "failed" });
+		await vi.advanceTimersByTimeAsync(3000);
+		expect(receive).toHaveBeenCalledTimes(3);
+		expect(fetch).toHaveBeenCalledTimes(4);
+		await expect(port.send("work", "deliberate")).resolves.toEqual({ state: "completed" });
 	});
 
 	it("stays offline without dispatching when reconnect metadata is malformed", async () => {

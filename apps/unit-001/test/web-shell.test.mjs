@@ -29,6 +29,7 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 	let streamId = originalId;
 	let malformedMetadata = false;
 	const requests = [];
+	const sends = [];
 	const eventStreams = new Set();
 	let cancellations = 0;
 	const agreeRequests = [];
@@ -45,7 +46,8 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 	};
 	const view = {
 		name: "Test agent", version: "0.0.0", installationId: null, busy: true, model: { provider: "test", modelId: "test" },
-		usage: null, entries: [], tools: [], text: "", textTruncated: false, historyTruncated: false,
+		usage: null, entries: [{ id: 1, role: "assistant", text: "Retained history before rollover", truncated: false }],
+		tools: [], text: "", textTruncated: false, historyTruncated: false,
 	};
 	const server = createServer(async (request, response) => {
 		const asset = assets[request.url];
@@ -78,17 +80,21 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 			eventStreams.add(response);
 			response.once("close", () => eventStreams.delete(response));
 		} else if (request.url === "/api/v1/requests" && request.method === "POST") {
-			if (origin !== `http://127.0.0.1:${request.socket.localPort}` || requestCsrf !== csrf ||
+			if (origin !== `http://127.0.0.1:${request.socket.localPort}` ||
 				request.headers["content-type"] !== "application/json") return json(403, {});
 			let body = "";
 			for await (const chunk of request) body += chunk;
 			const { operation, requestId } = JSON.parse(body);
+			if (operation.type === "send") sends.push({ prompt: operation.prompt, requestId, csrf: requestCsrf });
+			if (requestCsrf !== csrf) return json(403, {});
 			const complete = (reply) => json(200, { requestId, state: "completed", response: reply });
 			if (operation.type === "cancel") {
 				cancellations++;
 				response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ requestId, state: "completed", response: { type: "cancelled" } }));
 				for (const stream of eventStreams)
 					stream.write(`event: view\ndata: ${JSON.stringify({ ...view, busy: false })}\n\n`);
+			} else if (operation.type === "send") {
+				return complete({ type: "sent" });
 			} else if (operation.type === "mission" && operation.request.operation === "status") {
 				return complete({ type: "mission", result: mission });
 			} else if (operation.type === "status") {
@@ -203,6 +209,31 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 		await click('[data-key="send"]');
 		await until(() => cancellations === 1);
 		await until(() => evaluate(`${footer}?.innerText.includes('Ready')`));
+
+		// A stale tab gets one pre-dispatch 403; the replacement view has no history to replay.
+		const rolloverDraft = "Keep this across credential rollover";
+		await evaluate(`{ const input = document.querySelector('#composer'); input.value = ${JSON.stringify(rolloverDraft)};
+			input.dispatchEvent(new Event('input', { bubbles: true })); }`);
+		assert.equal(await evaluate(`document.querySelector('#thread').innerText.includes('Retained history before rollover')`), true);
+		const oldCsrf = csrf;
+		csrf = "d".repeat(64);
+		const priorEntries = view.entries;
+		view.entries = [];
+		view.busy = false;
+		await click('[data-key="send"]');
+		await until(() => evaluate(`document.body.innerText.includes('Request not sent. Wait for this workspace to reconnect')`));
+		assert.equal(await evaluate(`document.querySelector('#composer').value`), rolloverDraft);
+		await until(() => evaluate(`!document.querySelector('[data-key="send"]').disabled`));
+		assert.equal(await evaluate(`document.querySelector('#composer').value`), rolloverDraft);
+		assert.equal(await evaluate(`document.querySelector('#thread').innerText.includes('Retained history before rollover')`), true);
+		assert.deepEqual(sends.map(({ prompt, csrf }) => [prompt, csrf]), [[rolloverDraft, oldCsrf]], "reconnect never replays the send");
+		await click('[data-key="send"]');
+		await until(() => sends.length === 2);
+		assert.deepEqual(sends.map(({ prompt, csrf }) => [prompt, csrf]), [[rolloverDraft, oldCsrf], [rolloverDraft, csrf]]);
+		assert.notEqual(sends[0].requestId, sends[1].requestId);
+		view.entries = priorEntries;
+		view.busy = true;
+
 		// New gateway lifetime: the old stream ends and future actions need the new token.
 		csrf = "c".repeat(64);
 		streamId = null;
@@ -257,8 +288,8 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 			});
 			return result.value === true;
 		});
-		assert.equal(requests.filter(({ method, path }) => method === "GET" && path === "/api/v1/session").length, 6);
-		assert.equal(requests.filter(({ method, path }) => method === "GET" && path === "/api/v1/events").length, 4);
+		assert.equal(requests.filter(({ method, path }) => method === "GET" && path === "/api/v1/session").length, 7);
+		assert.equal(requests.filter(({ method, path }) => method === "GET" && path === "/api/v1/events").length, 5);
 		assert.ok(requests.every(({ authorization, cookie }) => authorization === undefined && cookie === undefined));
 		assert.ok(requests.every(({ path }) => ["/api/v1/session", "/api/v1/events", "/api/v1/requests"].includes(path)));
 

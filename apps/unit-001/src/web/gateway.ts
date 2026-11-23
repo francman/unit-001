@@ -41,6 +41,9 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 	const requests = new Map<string, { fingerprint: string; result: Promise<WebResult> }>();
 	let streams = 0;
 	let inFlight = 0;
+	let unsettledMutations = 0;
+	const receiptLimit = 32;
+	const rolloverThreshold = 24;
 	const server = createServer({ headersTimeout: 5000, requestTimeout: 10_000, maxHeaderSize: 8192 }, (req, res) => {
 		void handle(req, res).catch(() => {
 			if (!res.headersSent) json(res, 400, { error: "Invalid request." });
@@ -135,8 +138,12 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 					req.headers["content-type"] !== "application/json"
 				)
 					return json(res, 403, { error: "Same-origin JSON is required." });
-				if (req.headers["x-unit-csrf"] !== session.csrfToken) return json(res, 403, { error: "CSRF check failed." });
-				const parsed = parseWebRequest(await readJson(req));
+				const csrfToken = req.headers["x-unit-csrf"];
+				if (csrfToken !== session.csrfToken) return json(res, 403, { error: "CSRF check failed." });
+				const body = await readJson(req);
+				// Another request may have retired this token while the body was arriving.
+				if (csrfToken !== session.csrfToken) return json(res, 403, { error: "CSRF check failed." });
+				const parsed = parseWebRequest(body);
 				if (shutdown.signal.aborted) return json(res, 503, { error: "Gateway is closing." });
 				const fingerprint = JSON.stringify(parsed);
 				const missionMutation = isWebMissionMutation(parsed.operation);
@@ -152,9 +159,15 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 				if (record !== undefined && record.fingerprint !== fingerprint)
 					return json(res, 409, { error: "Request ID already belongs to another operation." });
 				if (record === undefined) {
-					if ((mutation && requests.size >= 32) || inFlight >= 4)
-						return json(res, 429, { error: "Session request limit reached." });
+					if (mutation && requests.size >= receiptLimit) {
+						if (unsettledMutations > 0)
+							return json(res, 429, { error: "Mutation receipts are full. Wait for pending mutations to settle." });
+						rotateSession();
+						return json(res, 403, { error: "Mutation session renewed. Refresh the session before acting again." });
+					}
+					if (inFlight >= 4) return json(res, 429, { error: "Session request limit reached." });
 					inFlight++;
+					if (mutation) unsettledMutations++;
 					const signal = AbortSignal.any([shutdown.signal, AbortSignal.timeout(120_000)]);
 					const result = (async (): Promise<WebResult> => {
 						if (managed && parsed.operation.type === "mission" && parsed.operation.request.operation === "plan-agree")
@@ -233,6 +246,7 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 						)
 						.finally(() => {
 							inFlight--;
+							if (mutation) unsettledMutations--;
 						});
 					record = { fingerprint, result };
 					if (mutation) requests.set(parsed.requestId, record);
@@ -244,6 +258,18 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 						state: "unknown",
 						message: "Session ended after dispatch. Inspect the owner before acting again.",
 					});
+				// Only a workspace-bound mutation reply can hand the new token to its caller.
+				if (
+					mutation &&
+					options.workspaceId !== undefined &&
+					csrfToken === session.csrfToken &&
+					requests.size >= rolloverThreshold &&
+					unsettledMutations === 0
+				) {
+					rotateSession();
+					res.setHeader("X-Unit-Next-CSRF", session.csrfToken);
+					res.setHeader("X-Unit-Workspace", options.workspaceId);
+				}
 				return json(res, 200, result);
 			}
 			return json(res, 404, { error: "Unknown endpoint." });
@@ -253,6 +279,11 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 			return json(res, 404, { error: "Not found." });
 		res.writeHead(200, { "Content-Type": asset.contentType, "Content-Length": asset.body.byteLength });
 		res.end(req.method === "HEAD" ? undefined : asset.body);
+	}
+
+	function rotateSession(): void {
+		session.csrfToken = randomBytes(32).toString("hex");
+		requests.clear();
 	}
 }
 

@@ -15,6 +15,7 @@ import { planTerms } from "./missions/fixtures/plan.ts";
 
 const directories: string[] = [];
 const servers: ReturnType<typeof createWebGateway>[] = [];
+const workspaceId = "a".repeat(64);
 
 afterEach(async () => {
 	vi.restoreAllMocks();
@@ -24,7 +25,7 @@ afterEach(async () => {
 });
 
 async function startGateway(
-	options: Pick<WebGatewayOptions, "managed" | "managedReview" | "planReview"> = {},
+	options: Pick<WebGatewayOptions, "managed" | "managedReview" | "planReview" | "workspaceId"> = {},
 	transport: "tcp" | "unix" = "tcp",
 ) {
 	const requests: ServiceRequest[] = [];
@@ -80,7 +81,7 @@ async function startGateway(
 			req.once("error", reject);
 			req.end(body);
 		});
-	return { origin, requests, client, call };
+	return { origin, requests, client, call, server: server.server };
 }
 
 async function fixture(options?: Parameters<typeof startGateway>[0]) {
@@ -233,32 +234,167 @@ describe("web gateway", () => {
 		});
 		expect(oversized.status).toBe(400);
 		expect(requests).toHaveLength(40);
-		for (let index = 0; index < 32; index++) {
-			const response = await fetch(`${origin}/api/v1/requests`, {
-				method: "POST",
-				headers,
-				body: JSON.stringify({ requestId: `cancel-${index}`, operation: { type: "cancel" } }),
+	});
+
+	it.each([
+		{ mode: "without a workspace binding", workspace: undefined },
+		{ mode: "with a workspace binding", workspace: workspaceId },
+	])("keeps a full generation while a write is pending ($mode)", async ({ workspace }) => {
+		const f = await fixture(workspace === undefined ? {} : { workspaceId: workspace });
+		const admitted = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		f.client.request = async (operation) => {
+			f.requests.push(operation);
+			if (operation.type === "send") {
+				admitted.resolve();
+				await finish.promise;
+				throw new Error("Synthetic owner outcome unavailable");
+			}
+			return { type: "cancelled" };
+		};
+		const post = (requestId: string, operation: unknown = { type: "cancel" }, headers = f.headers) =>
+			f.call("/api/v1/requests", headers, JSON.stringify({ requestId, operation }));
+		const pending = post("pending", { type: "send", prompt: "Work" });
+		try {
+			await admitted.promise;
+			for (let index = 1; index < 32; index++) expect((await post(`write-${index}`)).status).toBe(200);
+			const boundary = await post("boundary");
+			expect(boundary.status).toBe(429);
+			expect(JSON.parse(boundary.body)).toEqual({
+				error: "Mutation receipts are full. Wait for pending mutations to settle.",
 			});
-			expect(response.status).toBe(200);
+			expect((await post("write-1")).status).toBe(200);
+			expect((await post("write-1", { type: "send", prompt: "Different" })).status).toBe(409);
+			expect(f.requests).toHaveLength(32);
+			expect(JSON.parse((await f.call("/api/v1/session")).body)).toEqual(f.session);
+			expect((await post("inspect", { type: "status" })).status).toBe(200);
+			expect(f.requests.at(-1)).toEqual({ type: "status" });
+		} catch (error) {
+			finish.resolve();
+			await pending;
+			throw error;
 		}
-		expect(
-			(
-				await fetch(`${origin}/api/v1/requests`, {
+
+		const body = JSON.stringify({ requestId: "delayed", operation: { type: "cancel" } });
+		const headersReceived = once(f.server, "request");
+		const delayed = request(`${f.origin}/api/v1/requests`, {
+			method: "POST",
+			headers: { ...f.headers, "Content-Length": Buffer.byteLength(body) },
+		});
+		const delayedReply = once(delayed, "response");
+		try {
+			delayed.flushHeaders();
+			await headersReceived;
+			finish.resolve();
+			const settled = await pending;
+			expect(settled.status).toBe(200);
+			expect(JSON.parse(settled.body)).toMatchObject({ requestId: "pending", state: "unknown" });
+			if (workspace === undefined) {
+				const boundary = await post("boundary");
+				expect(boundary.status).toBe(403);
+				expect(JSON.parse(boundary.body)).toEqual({
+					error: "Mutation session renewed. Refresh the session before acting again.",
+				});
+			}
+			delayed.end(body);
+			const [response] = await delayedReply;
+			response.resume();
+			expect(response.statusCode).toBe(403);
+		} finally {
+			finish.resolve();
+			delayed.destroy();
+			await delayedReply.catch(() => {});
+		}
+		expect((await post("write-1")).status).toBe(403);
+		expect(f.requests).toHaveLength(33);
+
+		const session = JSON.parse((await f.call("/api/v1/session")).body) as { csrfToken: string };
+		expect(session.csrfToken).not.toBe(f.session.csrfToken);
+		const headers = { ...f.headers, "X-Unit-CSRF": session.csrfToken };
+		expect((await post("write-1", { type: "cancel" }, headers)).status).toBe(200);
+		expect((await post("deliberate-next-write", { type: "cancel" }, headers)).status).toBe(200);
+		expect(f.requests.filter(({ type }) => type !== "status")).toHaveLength(34);
+	});
+
+	it("rotates on the 24th reply, keeps the stream, and admits 100 consecutive deliberate writes", async () => {
+		const f = await fixture({ workspaceId });
+		const subscriber = Promise.withResolvers<Parameters<ServiceClient["watch"]>[0]>();
+		f.client.watch = async (listener, signal) => {
+			subscriber.resolve(listener);
+			await once(signal, "abort");
+		};
+		const stream = new AbortController();
+		try {
+			const events = await fetch(`${f.origin}/api/v1/events`, { signal: stream.signal });
+			expect(events.headers.get("X-Unit-Workspace")).toBe(workspaceId);
+			const reader = events.body?.getReader();
+			if (!reader) throw new Error("Gateway did not open an event stream.");
+			const publish = await subscriber.promise;
+			let token = f.session.csrfToken;
+			for (let number = 1; number <= 100; number++) {
+				const requestId = `write-${number}`;
+				const reply = await fetch(`${f.origin}/api/v1/requests`, {
 					method: "POST",
-					headers,
-					body: JSON.stringify({ requestId: "exhausted", operation: { type: "cancel" } }),
-				})
-			).status,
-		).toBe(429);
-		expect(
-			(
-				await fetch(`${origin}/api/v1/requests`, {
-					method: "POST",
-					headers,
-					body: JSON.stringify({ requestId: "still-inspect", operation: { type: "status" } }),
-				})
-			).status,
-		).toBe(200);
+					headers: { ...f.headers, "X-Unit-CSRF": token },
+					body: JSON.stringify({ requestId, operation: { type: "cancel" } }),
+				});
+				expect(reply.status).toBe(200);
+				expect(await reply.json()).toEqual({ requestId, state: "completed", response: { type: "cancelled" } });
+				const next = reply.headers.get("X-Unit-Next-CSRF");
+				if (number % 24 === 0) {
+					expect(next).toMatch(/^[0-9a-f]{64}$/);
+					expect(next).not.toBe(token);
+					expect(reply.headers.get("X-Unit-Workspace")).toBe(workspaceId);
+					token = next ?? token;
+				} else {
+					expect(next).toBeNull();
+					expect(reply.headers.get("X-Unit-Workspace")).toBeNull();
+				}
+			}
+			expect(f.requests).toHaveLength(100);
+			publish({ type: "connecting", message: "Synthetic owner event" });
+			expect(new TextDecoder().decode((await reader.read()).value)).toContain("event: connecting");
+		} finally {
+			stream.abort();
+		}
+	});
+
+	it("does not replay a write when its rollover reply is lost", async () => {
+		const f = await fixture({ workspaceId });
+		for (let number = 1; number < 24; number++) await postOwnerReply(f, `write-${number}`, { type: "cancel" });
+		const admitted = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		f.client.request = async (operation) => {
+			f.requests.push(operation);
+			admitted.resolve();
+			await finish.promise;
+			return { type: "cancelled" };
+		};
+		const controller = new AbortController();
+		const lost = fetch(`${f.origin}/api/v1/requests`, {
+			method: "POST",
+			headers: f.headers,
+			body: JSON.stringify({ requestId: "lost", operation: { type: "cancel" } }),
+			signal: controller.signal,
+		});
+		const rejected = expect(lost).rejects.toMatchObject({ name: "AbortError" });
+		try {
+			await admitted.promise;
+			controller.abort();
+			await rejected;
+		} finally {
+			finish.resolve();
+		}
+		await expect
+			.poll(async () => JSON.parse((await f.call("/api/v1/session")).body).csrfToken)
+			.not.toBe(f.session.csrfToken);
+		const stale = await f.call(
+			"/api/v1/requests",
+			f.headers,
+			JSON.stringify({ requestId: "later", operation: { type: "cancel" } }),
+		);
+		expect(stale.status).toBe(403);
+		expect(f.requests).toHaveLength(24);
 	});
 	it("requires exact-origin JSON and the launcher CSRF token", async () => {
 		const { origin, headers, requests } = await fixture();
@@ -309,7 +445,7 @@ describe("web gateway", () => {
 		expect(requests).toEqual([]);
 	});
 
-	it("serves only GET session, with a CSRF token stable for the launch", async () => {
+	it("serves only GET session, with a CSRF token stable absent mutation rollover", async () => {
 		const f = await fixture();
 		const excess = Object.fromEntries(Array.from({ length: 33 }, (_, i) => [`X-Fixture-${i}`, "1"]));
 		expect((await f.call("/api/v1/session", { Host: new URL(f.origin).host, ...excess })).status).toBe(431);
