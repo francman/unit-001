@@ -21,6 +21,8 @@ import { MISSION_PROVIDER_PREFIX, type MissionAdmission } from "./admission.ts";
 import { MANAGED_MISSION_ACTIONS, type MissionExecutionIntent } from "./contract.ts";
 import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts";
 import { missionLoop } from "./loop.ts";
+import { NO_RESEARCH_SOURCES, type ResearchSources } from "./research-sources.ts";
+import { RESEARCH_CHILD_TOOLS, RESEARCH_COORDINATOR_TOOLS, researchTools } from "./research-tools.ts";
 import { missionReview } from "./review-turn.ts";
 import { storedLoop } from "./purpose.ts";
 import { MissionDoc } from "./state.ts";
@@ -30,7 +32,7 @@ import { WORK_TOOL, workWriteTool } from "./work-tool.ts";
 type Checkpoint = { phase: "cycle" } | { phase: "observe"; requestId: string } | { phase: "wake"; until: number };
 
 /** Registers the execution task before opening storage; start remains an explicit host operation. */
-export function missionController(admission: MissionAdmission, cwd: string) {
+export function missionController(admission: MissionAdmission, cwd: string, sources: ResearchSources = NO_RESEARCH_SOURCES) {
 	const controller = defineTask<{ missionId: string; revision: number }, Checkpoint, null>({
 		name: "unit.mission.controller",
 		version: 1,
@@ -179,7 +181,7 @@ export function missionController(admission: MissionAdmission, cwd: string) {
 				return { status: "terminal", outcome: { status: "aborted" } };
 			}, context),
 	});
-	const loop = missionLoop(admission, cwd);
+	const loop = missionLoop(admission, cwd, sources);
 	const review = missionReview(admission);
 	return {
 		controller,
@@ -188,7 +190,7 @@ export function missionController(admission: MissionAdmission, cwd: string) {
 		extension: defineExtension({
 			name: "unit.mission.execution",
 			tasks: [controller, loop, review],
-			tools: [workWriteTool(cwd)],
+			tools: [workWriteTool(cwd), ...researchTools(sources)],
 			hooks: [
 				hook(ToolTask, {
 					beforeTool: admission.beforeTool.bind(admission),
@@ -196,7 +198,7 @@ export function missionController(admission: MissionAdmission, cwd: string) {
 				}),
 			],
 			// Selected by default in every conversation, so fresh calls and saved mission checkpoints resolve the guarded tools.
-			wraps: [...MANAGED_MISSION_ACTIONS, WORK_TOOL].map((name) => ({
+			wraps: [...MANAGED_MISSION_ACTIONS, WORK_TOOL, ...RESEARCH_COORDINATOR_TOOLS, ...RESEARCH_CHILD_TOOLS].map((name) => ({
 				tool: name,
 				wrap: (tool: ToolRegistration) => admission.guard(tool),
 			})),

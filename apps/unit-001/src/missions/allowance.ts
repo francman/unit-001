@@ -1,5 +1,5 @@
 // Charges a purpose's lifetime allowance where each effect is admitted, in the same commit, and settles attempts by ID.
-import type { PurposeLifetime, WorkTerms } from "./contract.ts";
+import type { ArtifactWorkTerms, PurposeLifetime, WorkTerms } from "./contract.ts";
 import type { LoopAttempt, LoopRun, LoopState } from "./purpose-loop.ts";
 
 /** Charges one work admission; refuses, charging nothing, unless the lifetime allowance can pay for its first cycle. */
@@ -28,7 +28,12 @@ export function workAllowanceDenial(loop: LoopState, lifetime: PurposeLifetime):
 }
 
 /** Charges one cycle submission against the run's and the purpose's cycle allowances. */
-export function chargeCycle(loop: LoopState, run: LoopRun, work: WorkTerms, lifetime: PurposeLifetime): string | undefined {
+export function chargeCycle(
+	loop: LoopState,
+	run: LoopRun,
+	work: ArtifactWorkTerms,
+	lifetime: PurposeLifetime,
+): string | undefined {
 	if (run.cycles >= work.maxCycles) return "cycle_limit";
 	if (run.noProgress >= work.maxConsecutiveNoProgress) return "no_progress_limit";
 	if (loop.ledger.cycles >= lifetime.maxCycles) return "allowance_exhausted";

@@ -2,7 +2,7 @@
 
 Design for [#27](https://github.com/francman/unit-001/issues/27), 2026-11-21. Nothing here is implemented. It grants no authority, selects no live source, spend amount or GitHub write, and changes no existing command. Those remain operator choices, listed under [open owner decisions](#open-owner-decisions).
 
-Research is one kind of bounded work under the [purpose and work contract](purpose.md). It reuses the existing sole storage owner, Durable scheduler, protected creator receipts and request/tool admission ([design](design.md), [execution](execution.md), [controls](controls.md)). It adds no gateway, worker runtime or second SQLite writer. Record names below use the names slice 1 of #72 shipped in `src/missions/purpose.ts` ([purpose.md, Slice 1 status](purpose.md#slice-1-status)): the `unit.mission.purpose` document holds the purpose agreement (`purpose`), work definitions (`work[]`, IDs `legacy-N` so far) and agent operation (`operation`). Work execution is the existing `unit.mission.execution` ledger.
+Research is one kind of bounded work under the [purpose and work contract](purpose.md). It reuses the existing sole storage owner, Durable scheduler, protected creator receipts and request/tool admission ([design](design.md), [execution](execution.md), [controls](controls.md)). It adds no gateway, worker runtime or second SQLite writer. The [contract with missions v2](#contract-with-missions-v2) section (2026-11-22) binds this design to what #72 and missions v2 shipped: the continuous purpose loop, the agreed mission plan and its reviews. Where the older text below names `work[]`/`legacy-N` records or the one-shot `unit.mission.execution` ledger, that section supersedes it.
 
 ## Problem
 
@@ -24,6 +24,52 @@ Example. Purpose: "keep this repository's dependencies secure". Work: "compare t
 6. Draft-only policy (the default) ends the work here. With an approved posting policy, the host (never a model tool) records a **post intent**, calls GitHub once and settles a **post receipt**, or marks the outcome uncertain and reconciles by marker.
 
 A child result is evidence, not authority: it cannot grant tools, change allowances, select itself or trigger a post.
+
+## Contract with missions v2
+
+Proposal for review by the leads (2026-11-22). It changes no shipped record until slice R1 is agreed.
+
+**What shipped.** A creator agrees a purpose revision, and that agreement is the only spend authority. A purpose lists bounded works under one lifetime ledger (`unit.mission.purpose`, `loop.ledger`). The continuous loop admits only the `artifact-digest` work kind. A mission plan (overall, up to 3 strategics, up to 6 tacticals) is agreed by one receipt and grants nothing. Its one runnable tactical binds an exact purpose revision; tacticals with no host verifier are `planned` and never run. Every admission passes `operationDenial`: purpose receipt, plan-bound open intent, and plan gate. Reviews are deterministic notes; slice 1b adds one bounded model turn per due window, paid from the plan's `reviewAllowance`, that can only save a plan draft.
+
+**Problem.** Research must spend model requests and fetches and may write outside the host. A trace of the wrong placement: the owner puts a research allowance into the plan terms; a plan revision raises it; the next research run spends under an agreement that the purpose receipt never covered. The plan would become a second spend authority, which missions v2 decided against.
+
+**Decision (proposed): research is a purpose work kind.**
+- **Work terms.** `WorkTerms` becomes a tagged union:
+  - `artifact-digest`, unchanged;
+  - `research` = `{ question, sourcePolicy, selection: "agent" | "creator", posting: null | { repository, credential }, maxChildren, maxConcurrentChildren, maxRequests, maxFetches, maxFetchBytes, maxToolRoundsPerChild }`.
+
+  The purpose digest covers it like any work. The purpose ceiling gains a `research` capability, which the administrator opts into, plus research caps; `validatePurposeTerms` checks each research work against them. Missing values are refused, never defaulted.
+- **One run per work.** The loop's `admit` phase creates the coordinator task for a research work instead of a cycle conversation. The run keeps one `LoopRun`; children and the coordinator charge their requests as that run's attempts, so the lifetime ledger, `checkLoopState`'s recount and the 32-run cap hold unchanged. Run detail (plan receipt, children, artifacts, candidates, decisions, selection, draft, post state) lives in `unit.research`, keyed by the loop run ID.
+- **Host-verified completion.** The run is `verified` only when `unit.research` holds a selection receipt for a candidate the verifier accepted, plus the ticket draft (and `posted` when a posting policy exists). `no_selection` blocks the run with that reason, and an `uncertain` post blocks it as `unsettled_effects`. Model text never completes work. Until slice R3 adds selection and the draft, R1 runs end with a candidate result and are never `verified`.
+- **Bound posting.** The posting opt-in is a protected record bound to the exact repository identity (owner/name and repository ID), the credential binding, the selection digest and the draft digest; the host rechecks it immediately before its one dispatch. The post intent and receipt are never evicted. An ambiguous write is reconciled by verified repository, author and marker, never resent automatically, and an operator's protected resolution is separate from any later consent to post again.
+- **Same gates.** Coordinator and child conversations are loop-run conversations. Every request and tool call passes `operationDenial` (purpose receipt, open intent, plan gate) and the hold check, exactly as artifact work does. Suspend, close, a new plan revision or a creator rotation therefore stop research admissions at the next request.
+- **Plan binding.** A tactical that needs research binds the purpose revision that lists the research work, as any runnable tactical does. A `planned` tactical becomes runnable only through a purpose amendment the creator agrees. The slice-1 rule of one runnable tactical stays, so research and artifact work run one at a time.
+
+## Review model
+
+**Notes.**
+- The deterministic note gains research facts per tactical: run state, children settled out of total, candidates accepted and rejected, selection, draft and post state, and fetches and bytes used against caps.
+- New uncertainty lines: an uncertain post, lost artifacts, and children that ended without a result.
+- Notes carry IDs, decisions and digests only. Remote text stays in artifacts and never enters a note, because a note is shown to the owner and given to the model review turn.
+
+**Triggers.** Two new trigger kinds, deduplicated per revision like the others:
+- `research-selected`, key `REV:research-selected:RUN`: a selection receipt exists, so review whether to act on the drafted ticket.
+- `post-uncertain`, key `REV:post-uncertain:RUN`: needs the owner and blocks model turns as `unsettled`.
+
+**Model turn (1b).**
+- The turn reads the same note. It may save a plan draft, for example a tactical for the ticketed work or marking the research tactical done.
+- It never selects, posts, edits a purpose or reads artifacts.
+- With `selection: "creator"` the coordinator waits for the protected creator command. A review can only remind the owner of it.
+
+**Authority summary.**
+
+| Step | Who | Through |
+|---|---|---|
+| Research allowance | Creator | Purpose receipt; administrator ceiling |
+| Running | Owner | Open intent bound to the plan digest |
+| Selection | Agent (default) or creator | `research_select`, or a protected creator command |
+| Posting | Host only | Approved posting policy in the purpose |
+| Reacting to results | Bob drafts | The owner agrees a plan, and a purpose amendment where needed |
 
 ## Components and interfaces
 
@@ -175,8 +221,8 @@ Each slice ships code, tests on real SQLite with the faux provider, terminal out
 
 | Slice | Depends on | Deliverable | Acceptance |
 |---|---|---|---|
-| R0 | #72 slices 1 to 3 | Purpose/work records, separate operation intent, work admission with preserved accounting. | As purpose.md. |
-| R1 single branch | R0 | `unit.research` v1, research work kind, plan receipt, one child, fixture adapter, artifact store, `research_submit_candidate`, verifier, `mission status` lines. | Faux run produces an accepted candidate; forged quote rejected; `bash` from the child blocked; kill after plan and after fetch, reopen, no second plan or fetch. |
+| R0 | #72 and missions v2 slices 1 and 1b (shipped or built) | Continuous purpose loop with lifetime ledger, plan gate, plan-bound open, deterministic and bounded model reviews. | Done; see [contract with missions v2](#contract-with-missions-v2). |
+| R1 single branch | R0 | `WorkTerms` union with `research`, ceiling capability and caps, `unit.research` v1 keyed by loop run, loop `admit` path for research, plan receipt, one child, fixture adapter, artifact store, `research_submit_candidate`, verifier, host-verified completion, note facts, `mission status` lines. | Faux run produces an accepted candidate and a verified run; forged quote rejected; `bash` from the child blocked; suspend and a new plan revision stop the next child request; kill after plan and after fetch, reopen, no second plan or fetch; one `LoopRun`, ledger recount holds. |
 | R2 fan-out | R1 | Coordinator window, child lineage, admission extension, cancellation, resume. Capacity measurement. | 3 children with window 2: never more than 2 live, including across kill/reopen mid-child; exhausted request allowance spawns no child; pause during a child request drains and resume keeps settled children. |
 | R3 selection and draft | R2 | Verifier decisions, synthesis, `research_select`, selection receipt, ticket draft, creator-selection boundary. | Selecting a rejected candidate refused; second selection refused; kill during synthesis reopens the same submission; draft identical after reopen. |
 | R4 live fetch | R3, owner decisions 1 and 2 | `live` adapter behind source policy. | Local HTTP/HTTPS fixture servers: allowlist, IP-literal, private address, rebinding resolver, redirect to private and to off-list host, oversize and slow bodies, gzip bomb, header capture proving no `Authorization`/`Cookie`, canary provider key absent from requests, artifacts and tool results. |
@@ -193,7 +239,7 @@ Search engines or paid source APIs, research by ordinary chat or side conversati
 ## Open owner decisions
 
 1. **Live sources.** May any research work fetch the network? Default: no (`fixtures` only). If yes: allowlist only (recommended) or open web with address filtering, and which hosts.
-2. **Spend per run.** Ceiling for requests, fetches, fetch bytes and estimated cost per research run, and whether these come from the existing creator ceiling or a separate research ceiling. Default: none approved, so no run is admissible outside tests.
+2. **Spend per run.** Ceiling for requests, fetches, fetch bytes and estimated cost per research run. Recommended (missions v2 contract): they come from the purpose ceiling and lifetime ledger, with a `research` capability the administrator opts into, never from the plan. Default: capability not granted, so no run is admissible outside tests.
 3. **Ticket posting.** May the agent post issues itself? Default: draft only. If yes: which repository, and a fine-grained token limited to Issues read/write on that repository.
 4. **Selection authority.** May the agent select a candidate itself, or must the creator select? Default proposed here: agent selects, because selection alone only produces a local draft; posting stays behind decision 3.
 5. **Concurrency defaults.** Accept 2 concurrent children (ceiling 3) as provisional until R2's measurement, or wait for #64's native result.

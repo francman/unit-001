@@ -144,7 +144,11 @@ export type IssuedAgreement = {
 };
 
 /** The only work kind a purpose can list: write one declared workspace file whose SHA-256 the creator fixed. */
-export type WorkTerms = {
+/** One listed work item: an artifact the host verifies by digest, or a bounded research run (#27). */
+export type WorkTerms = ArtifactWorkTerms | ResearchWorkTerms;
+
+/** Write one declared workspace file whose SHA-256 the creator fixed. */
+export type ArtifactWorkTerms = {
 	kind: "artifact-digest";
 	path: string;
 	sha256: string;
@@ -153,6 +157,33 @@ export type WorkTerms = {
 	maxRequests: number;
 	maxRetries: number;
 	maxConsecutiveNoProgress: number;
+};
+
+/**
+ * Answer one question from host-provided sources: one child gathers cited evidence, the host verifies the quotes,
+ * and a selected candidate becomes a local ticket draft. Fixtures only, agent selection only and no posting in this
+ * slice; every cap is finite and within the creator's research ceiling.
+ */
+export type ResearchWorkTerms = {
+	kind: "research";
+	question: string;
+	sourcePolicy: { kind: "fixtures" };
+	selection: "agent";
+	posting: null;
+	maxChildren: 1;
+	maxConcurrentChildren: 1;
+	maxRequests: number;
+	maxFetches: number;
+	maxFetchBytes: number;
+	maxToolRoundsPerChild: number;
+};
+
+/** The administrator's research grant inside the purpose ceiling; absent means no research work can be agreed. */
+export type ResearchCeiling = {
+	maxRequests: number;
+	maxFetches: number;
+	maxFetchBytes: number;
+	maxToolRoundsPerChild: number;
 };
 
 /** Lifetime limits of one purpose: absolute totals per mission, never renewed by restart, completion or reopen. */
@@ -175,7 +206,7 @@ export type PurposeTerms = {
 
 /** The protected, purpose-only grant: the `artifact-digest` capability under these path prefixes and caps. */
 export type PurposeCeiling = {
-	capabilities: ["artifact-digest"];
+	capabilities: ["artifact-digest"] | ["artifact-digest", "research"];
 	paths: string[];
 	maxWorkItems: number;
 	maxCycles: number;
@@ -184,6 +215,8 @@ export type PurposeCeiling = {
 	maxConsecutiveNoProgress: number;
 	maxDurationMs: number;
 	maxEstimatedCost?: number;
+	/** Present exactly when `capabilities` includes "research". */
+	research?: ResearchCeiling;
 };
 
 /** One issued plan receipt's protected request binding. */
@@ -297,6 +330,8 @@ export type MissionView = {
 	purposeError?: string | null;
 	/** From live task inspection, not the purpose records: whether a loop task is live; rollback needs "no-live-loop". */
 	loopRollback?: "no-live-loop" | "live-loop";
+	/** Whether this Session has research records an older reader cannot safely open. */
+	researchRollback?: "no-research" | "research-present" | "unknown";
 	plan?: PlanView | null;
 	/** Why the stored plan records failed validation; the plan gate then stays closed. */
 	planError?: string | null;

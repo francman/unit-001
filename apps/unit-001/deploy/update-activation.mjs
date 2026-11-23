@@ -1133,8 +1133,9 @@ export async function activateUpdate(record, candidate, context) {
 		const dropsPlan = currentFeatures.includes("mission-plan-gate") && !features.includes("mission-plan-gate");
 		const dropsLoop = currentFeatures.includes("mission-loop") && !features.includes("mission-loop");
 		const dropsReview = currentFeatures.includes("mission-review-turn") && !features.includes("mission-review-turn");
-		const guarded = dropsPlan || dropsLoop || dropsReview;
-		const boundHold = dropsPlan || dropsReview;
+		const dropsResearch = currentFeatures.includes("mission-research") && !features.includes("mission-research");
+		const guarded = dropsPlan || dropsLoop || dropsReview || dropsResearch;
+		const boundHold = dropsPlan || dropsReview || dropsResearch;
 		if (guarded && closedRepair)
 			return {
 				status: "incompatible",
@@ -1145,7 +1146,7 @@ export async function activateUpdate(record, candidate, context) {
 		if (boundHold && (status.installationId !== record.id || status.version !== record.releaseVersion))
 			return { status: "deferred", reason: "Cannot verify the current installation owner for mission downgrade." };
 		// Asked before the journal, so the common refusal never holds admissions or touches the journal.
-		const guard = { dropsPlan, dropsReview, dropsLoop };
+		const guard = { dropsPlan, dropsReview, dropsResearch, dropsLoop };
 		const refusal = await missionDowngradeRefusal(guard, record, context, "before-hold");
 		if (refusal) return { status: "deferred", reason: refusal };
 		const unitPlan = legacyRollback
@@ -1271,15 +1272,15 @@ function sameFeatures(declared, signed) {
 
 // The owner inspects tasks and reconciled state. Only the administrator-owned file can attest which intent a
 // predecessor would read at startup. The management lock serializes its writer with both downgrade checks.
-async function missionDowngradeRefusal({ dropsPlan, dropsReview, dropsLoop }, record, context, phase) {
-	if (!dropsPlan && !dropsReview && !dropsLoop) return null;
+async function missionDowngradeRefusal({ dropsPlan, dropsReview, dropsResearch, dropsLoop }, record, context, phase) {
+	if (!dropsPlan && !dropsReview && !dropsResearch && !dropsLoop) return null;
 	try {
 		const view = await context.missionStatus(record);
 		// A matched hold ends a parked review task. Before the hold, accept that task's presence only with
 		// affirmative review status and a restricted purpose. Under the hold all tasks and drains must be gone.
 		const allowParkedReview = dropsReview && phase === "before-hold";
 		if (view?.loopRollback === "no-live-loop" || (allowParkedReview && view?.loopRollback === "live-loop")) {
-			if (!dropsPlan && !dropsReview) return null;
+			if (!dropsPlan && !dropsReview && !dropsResearch) return null;
 			const path = join(installationPaths(record.id, context.root).config, "mission-authority.json");
 			const authority = readProtectedJson(path, context.root, 65536);
 			const protectedAuthority =
@@ -1289,25 +1290,45 @@ async function missionDowngradeRefusal({ dropsPlan, dropsReview, dropsLoop }, re
 				authority.installationId === record.id &&
 				authority.session === "default";
 			const restricted = protectedAuthority && appliedRestriction(authority, view.purpose, allowParkedReview);
-			const noPurpose =
-				dropsReview &&
+			const withoutOperation =
+				(dropsReview || dropsResearch) &&
 				(view.purpose === null ||
-					(view.purpose?.missionId === null &&
-						view.purpose.revision === null &&
+					(view.purpose?.operation === "closed" &&
 						view.purpose.appliedSequence === 0 &&
-						view.purpose.operation === "closed")) &&
+						((view.purpose.missionId === null && view.purpose.revision === null) ||
+							(dropsResearch && !dropsReview && !dropsPlan && view.purpose.operationRevision === 0)))) &&
 				((protectedAuthority && authority.operationIntent == null) ||
 					(authority === null && view.authority === "unconfigured" && view.authorityError === null));
-			if (view.purposeError === null && (restricted || noPurpose) && (!dropsReview || settledReview(view))) return null;
+			if (
+				view.purposeError === null &&
+				(restricted || withoutOperation) &&
+				(!dropsReview || settledReview(view)) &&
+				(!dropsResearch || (view.researchRollback === "no-research" && researchFreeAuthority(authority)))
+			)
+				return null;
 		}
 	} catch {
 		// Unavailable status or untrusted protected metadata cannot establish rollback safety.
 	}
+	if (dropsResearch)
+		return `The target lacks mission research. Keep a research-capable release unless ${record.name} can confirm no stored research, no protected research grant and drained mission work.`;
 	if (dropsReview)
 		return `The target cannot run mission reviews. Confirm no active or unresolved review and a closed or suspended purpose with ${record.name} mission status before retrying.`;
 	if (dropsPlan)
 		return `The target lacks the mission plan gate. Confirm a protected close or completed suspend and no live loop with ${record.name} mission status before retrying.`;
 	return `A mission loop is live and the target release cannot run it. Run sudo ${record.name} mission operate close until mission status shows no live loop, then retry.`;
+}
+
+// A protected grant alone would make the older authority parser fail, even when research never ran.
+function researchFreeAuthority(authority) {
+	const ceiling = authority?.purposeCeiling;
+	return (
+		ceiling === undefined ||
+		(Array.isArray(ceiling?.capabilities) &&
+			ceiling.capabilities.length === 1 &&
+			ceiling.capabilities[0] === "artifact-digest" &&
+			ceiling.research === undefined)
+	);
 }
 
 function settledReview(view) {

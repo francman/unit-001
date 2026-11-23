@@ -608,7 +608,7 @@ test("#72 the shipped release declares continuous operation, protected plan admi
 	const declared = JSON.parse(
 		readFileSync(fileURLToPath(new URL("../deploy/release-compatibility.json", import.meta.url)), "utf8"),
 	);
-	assert.deepEqual(declared.features, ["mission-loop", "mission-plan-gate", "mission-review-turn"]);
+	assert.deepEqual(declared.features, ["mission-loop", "mission-plan-gate", "mission-review-turn", "mission-research"]);
 });
 
 const planCompatibility = { ...compatibility, features: ["mission-loop", "mission-plan-gate"] };
@@ -668,6 +668,81 @@ test("#72 review downgrade allows a plan-only owner after the held owner drains 
 		calls.some((call) => call[1] === "maintenance-enter") ? view : { ...view, loopRollback: "live-loop" };
 	assert.equal((await rollbackUpdate(record, context)).status, "updated");
 	assert.equal(readInstallation(id, root).releaseVersion, "0.0.17");
+});
+
+// #27: Releases without research cannot parse research-bearing purpose history or the protected grant.
+test("#27 downgrade checks research absence before journaling and again under the matching hold", async () => {
+	const fixture = setup("healthy", { baseline: "0.0.18", candidate: "0.0.19" });
+	const researchCompatibility = { ...reviewCompatibility, features: [...reviewCompatibility.features, "mission-research"] };
+	release(fixture.root, "0.0.18", reviewCompatibility);
+	release(fixture.root, "0.0.19", researchCompatibility);
+	const { calls, context, paths, root } = fixture;
+	assert.equal((await activateUpdate(fixture.record, { ...fixture.candidate, compatibility: researchCompatibility }, context)).status, "updated");
+	const record = readInstallation(id, root);
+	const journal = updatePaths(id, root).journal;
+	const committed = readFileSync(journal);
+	const view = {
+		authority: "unconfigured", authorityError: null, purpose: null, purposeError: null,
+		loopRollback: "no-live-loop", researchRollback: "no-research",
+	};
+	calls.length = 0;
+	for (const change of [
+		{ researchRollback: "research-present" }, { researchRollback: "unknown" }, { researchRollback: undefined },
+		{ purposeError: "Unreadable purpose" }, { loopRollback: "live-loop" },
+	]) {
+		context.missionStatus = () => ({ ...view, ...change });
+		assert.match((await rollbackUpdate(record, context)).reason, /lacks mission research/);
+	}
+	const authorityPath = join(paths.config, "mission-authority.json");
+	writeFileSync(authorityPath, JSON.stringify({
+		schemaVersion: 1, installationId: id, session: "default",
+		purposeCeiling: { capabilities: ["artifact-digest", "research"], research: {} },
+	}));
+	context.missionStatus = () => ({ ...view, authority: "managed-administrator" });
+	assert.match((await rollbackUpdate(record, context)).reason, /lacks mission research/);
+	rmSync(authorityPath);
+	assert.deepEqual(readFileSync(journal), committed);
+	assert.ok(!calls.some((call) => call[1] === "maintenance-enter" || call[1] === "stop"));
+
+	const control = context.control.bind(context);
+	context.control = async (...args) => {
+		const result = await control(...args);
+		return args[1][0] === "maintenance-enter" && result.result === "drained"
+			? { ...result, operationId: "different-hold" }
+			: result;
+	};
+	context.missionStatus = () => view;
+	assert.equal((await rollbackUpdate(record, context)).status, "deferred");
+	assert.deepEqual(readFileSync(journal), committed);
+	assert.ok(!calls.some((call) => call[1] === "stop"));
+	context.control = control;
+
+	let probes = 0;
+	context.missionStatus = () => ++probes === 1 ? view : { ...view, researchRollback: "research-present" };
+	assert.equal((await rollbackUpdate(record, context)).status, "deferred");
+	assert.equal(probes, 2);
+	assert.deepEqual(readFileSync(journal), committed);
+	assert.equal(readInstallation(id, root).releaseVersion, "0.0.19");
+	assert.ok(calls.some((call) => call[1] === "maintenance-release"));
+	assert.ok(!calls.some((call) => call[1] === "stop"));
+
+	writeFileSync(authorityPath, JSON.stringify({
+		schemaVersion: 1, installationId: id, session: "default",
+		purposeCeiling: { capabilities: ["artifact-digest"] },
+	}));
+	const artifactOnly = {
+		...view,
+		authority: "managed-administrator",
+		purpose: { missionId: "artifact-only", revision: 1, operation: "closed", operationRevision: 0, appliedSequence: 0 },
+	};
+	probes = 0;
+	context.missionStatus = () => {
+		probes++;
+		return artifactOnly;
+	};
+	assert.equal((await rollbackUpdate(record, context)).status, "updated");
+	assert.equal(probes, 2);
+	assert.equal(readInstallation(id, root).releaseVersion, "0.0.18");
 });
 
 async function planFixture() {

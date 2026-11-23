@@ -20,6 +20,7 @@ import type {
 	ToolRegistration,
 	Tx,
 } from "@earendil-works/pi-durable";
+import { ProviderDoc } from "@earendil-works/pi-durable";
 import { MaintenanceDoc } from "../maintenance.ts";
 import { releaseAttempt, reserveAttempt, settleAttempt } from "./allowance.ts";
 import { type MissionLocation, matchingApproval, readMissionAuthority } from "./authority.ts";
@@ -29,7 +30,10 @@ import { operationDenial } from "./loop.ts";
 import { planHeadValid } from "./plan-gate.ts";
 import { storedPlan } from "./plan-state.ts";
 import { MissionPurposeDoc, storedLoop } from "./purpose.ts";
-import { type LoopState, listedWork, loopAgreement } from "./purpose-loop.ts";
+import { type LoopRun, type LoopState, listedWork, loopAgreement } from "./purpose-loop.ts";
+import { researchBound } from "./research-run.ts";
+import { MissionResearchDoc, researchRole, researchRunBySession, storedResearch } from "./research-state.ts";
+import { RESEARCH_CHILD_TOOLS, RESEARCH_COORDINATOR_TOOLS } from "./research-tools.ts";
 import {
 	purposeUnsettled,
 	REVIEW_PROVIDER_PREFIX,
@@ -81,6 +85,9 @@ export class MissionAdmission {
 			() => undefined,
 		);
 		for (const run of loop?.runs ?? []) this.#loopConversations.add(run.conversation);
+		// Research children run in their own conversations; they are routed to the same decision.
+		const research = await harness.snapshot(MissionResearchDoc, context).catch(() => undefined);
+		for (const run of research?.runs ?? []) if (run.child) this.#loopConversations.add(run.child.conversation);
 	}
 
 	/** Tracks the one created conversation before publishing activation; a rolled-back identity has no runnable work. */
@@ -150,7 +157,7 @@ export class MissionAdmission {
 				const loop = await storedLoop(tx);
 				const denial = await this.#loopDenial(tx, loop, api, call.name);
 				if (denial !== undefined) return denial;
-				const run = loop!.runs.find((item) => item.conversation === api.conversationId)!;
+				const run = (await loopRunFor(tx, loop!, api.conversationId))!.run;
 				if (run.pendingTools.includes(api.taskId)) return "An interrupted mission tool needs reconciliation.";
 				run.pendingTools.push(api.taskId);
 				this.#admitted.set(api.taskId, "fresh");
@@ -258,9 +265,11 @@ export class MissionAdmission {
 		options: { pending?: true } = {},
 	): Promise<string | undefined> {
 		if (!loop) return "Mission purpose records are invalid.";
-		const run = loop.runs.find((item) => item.conversation === call.conversationId);
-		if (!run || run.state.status !== "running" || run.state.phase !== "execution") return "Mission admission is closed.";
-		if (name !== WORK_TOOL) return "Tool is outside the approved purpose capability.";
+		const found = await loopRunFor(tx, loop, call.conversationId);
+		const run = found?.run;
+		if (!found || !run || run.state.status !== "running" || run.state.phase !== "execution")
+			return "Mission admission is closed.";
+		if (!found.tools.includes(name)) return "Tool is outside the approved purpose capability.";
 		if ((await tx.doc(MaintenanceDoc)).current.state === "held") return "Maintenance holds mission tools.";
 		if (options.pending && !run.pendingTools.includes(call.taskId)) return "Mission admission is closed.";
 		if (run.pendingTools.some((id) => id !== call.taskId && !this.#admitted.has(id)))
@@ -344,7 +353,8 @@ export class MissionAdmission {
 			await this.#harness!.commit(async (tx) => {
 				if (loopRun) {
 					// An invalid stored loop settles nothing: the intent stays pending, which only keeps admission closed.
-					const run = (await storedLoop(tx))?.runs.find((item) => item.conversation === api.conversationId);
+					const loop = await storedLoop(tx);
+					const run = loop && (await loopRunFor(tx, loop, api.conversationId))?.run;
 					if (run) run.pendingTools = run.pendingTools.filter((id) => id !== api.taskId);
 					return;
 				}
@@ -420,7 +430,10 @@ export class MissionAdmission {
 	async #reserveLoop(tx: Tx, sessionId: string | undefined, model: Model<Api>): Promise<Reservation> {
 		const loop = await storedLoop(tx);
 		if (!loop) throw new Error("Mission purpose records are invalid.");
-		const run = loop.runs.find((item) => item.providerSession === sessionId);
+		let run = loop.runs.find((item) => item.providerSession === sessionId);
+		const work = run && listedWork(loopAgreement(loop, run.purposeRevision)!, run.workId);
+		// Research requests, the coordinator's and the child's, are admitted only through the research record.
+		if (sessionId && (!run || work?.kind === "research")) run = await researchRequestRun(tx, loop, sessionId);
 		if (!run || run.state.status !== "running" || run.state.phase !== "execution")
 			throw new Error("Mission admission is closed.");
 		const denial = operationDenial(await this.readAuthority(), loop, await storedPlan(tx), run.sequence, this.#now());
@@ -669,4 +682,51 @@ function requestCostCeiling(model: Model<Api>): number | null {
 function requestOptions<T extends object>(options: T | undefined, guard: DispatchOptions | undefined): T | undefined {
 	// Both overrides belong to the shared provider options; provider-specific fields retain their exact generic shape.
 	return guard ? ({ ...options, ...guard } as T) : options;
+}
+
+/**
+ * The purpose run a conversation belongs to and the exact tools it may call: an artifact run's own conversation calls
+ * only the work tool; a research run's coordinator only plan and select; its child only fetch and submit. The research
+ * document is read only when the conversation is not an artifact run's, so artifact-only stores never gain it.
+ */
+async function loopRunFor(
+	tx: Tx,
+	loop: LoopState,
+	conversation: ConversationId,
+): Promise<{ run: LoopRun; tools: string[] } | undefined> {
+	const direct = loop.runs.find((item) => item.conversation === conversation);
+	if (direct) {
+		const work = listedWork(loopAgreement(loop, direct.purposeRevision)!, direct.workId);
+		return { run: direct, tools: work?.kind === "research" ? RESEARCH_COORDINATOR_TOOLS : [WORK_TOOL] };
+	}
+	const research = await storedResearch(tx);
+	const found = research && researchRole(research, conversation);
+	if (!found || found.role !== "child") return undefined;
+	const run = loop.runs.find((item) => item.runId === found.run.runId);
+	const work = run && listedWork(loopAgreement(loop, run.purposeRevision)!, run.workId);
+	// A child is admitted only while its stored research is bound to exactly that run and work.
+	if (!run || work?.kind !== "research" || !researchBound(found.run, run, work)) return undefined;
+	return { run, tools: RESEARCH_CHILD_TOOLS };
+}
+
+/**
+ * The run a research provider session may charge now, if any: the stored research is bound to its run; the session is
+ * the coordinator's or the child's; that conversation's live provider record carries exactly this session and its
+ * owner is the current loop task; and that conversation is the one the run is awaiting in its active step (plan or
+ * select for the coordinator, child for the child). Nothing is charged otherwise. Settling an earlier attempt goes by
+ * attempt ID and never through here, so a step change never strands a charge.
+ */
+async function researchRequestRun(tx: Tx, loop: LoopState, sessionId: string): Promise<LoopRun | undefined> {
+	const research = await storedResearch(tx);
+	const stored = research && researchRunBySession(research, sessionId);
+	const run = stored && loop.runs.find((item) => item.runId === stored.runId);
+	const work = run && listedWork(loopAgreement(loop, run.purposeRevision)!, run.workId);
+	if (!stored || !run || work?.kind !== "research" || !researchBound(stored, run, work)) return undefined;
+	const coordinator = stored.coordinator.providerSession === sessionId;
+	const conversation = coordinator ? stored.coordinator.conversation : stored.child?.conversation;
+	const active = coordinator ? stored.step === "plan" || stored.step === "select" : stored.step === "child";
+	if (conversation === undefined || !active || stored.awaiting?.conversation !== conversation) return undefined;
+	if ((await tx.doc(ProviderDoc, conversation)).sessionId !== sessionId) return undefined;
+	const owner = (await tx.conversation(conversation))?.owner?.taskId;
+	return owner !== undefined && owner === loop.operation.loop ? run : undefined;
 }

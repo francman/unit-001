@@ -14,6 +14,7 @@ import { parseMissionAuthority, parseMissionCeiling } from "../src/missions/auth
 import { MANAGED_MISSION_ACTIONS, missionObject, parseMissionCreator } from "../src/missions/contract.ts";
 import { matchingPlanApproval, planDigest, planReceiptsRecorded } from "../src/missions/plan-authority.ts";
 import { missingPlanTerms, reviewAllowanceDenial } from "../src/missions/plan-terms.ts";
+import { parsePurposeCeiling, parsePurposeTerms, purposeDigest, validatePurposeTerms } from "../src/missions/purpose-authority.ts";
 import { MISSION, planTerms, PURPOSE_DIGEST } from "./missions/fixtures/plan.ts";
 
 const temporary = [];
@@ -287,6 +288,10 @@ function managedPlan() {
 			missionObject,
 			parseMissionCreator,
 			parseMissionCeiling,
+			parsePurposeCeiling,
+			parsePurposeTerms,
+			purposeDigest,
+			validatePurposeTerms,
 			MANAGED_MISSION_ACTIONS,
 			isDeepStrictEqual,
 			process: { platform: "linux", geteuid: () => 0, env, stdout: { write() {} }, stderr: { write() {} } },
@@ -371,6 +376,42 @@ function managedPlan() {
 	};
 	return state;
 }
+
+test("#27 managed purpose approval requires an exact fixture-only proposal and protected research grant", async () => {
+	const state = managedPlan();
+	const ceiling = {
+		capabilities: ["artifact-digest"], paths: ["reports/"],
+		maxWorkItems: 2, maxCycles: 4, maxRequests: 8, maxRetries: 0, maxConsecutiveNoProgress: 1, maxDurationMs: 60_000,
+	};
+	const caps = { maxRequests: 4, maxFetches: 2, maxFetchBytes: 4096, maxToolRoundsPerChild: 2 };
+	const work = {
+		kind: "research", question: "Which maintained client?", sourcePolicy: { kind: "fixtures" },
+		selection: "agent", posting: null, maxChildren: 1, maxConcurrentChildren: 1, ...caps,
+	};
+	const terms = parsePurposeTerms({
+		purpose: "Review dependencies", scope: "Fixture evidence", reviewEveryMs: 1_000, works: [work],
+		lifetime: { maxWorkItems: 1, maxCycles: 1, maxRequests: 4, deadlineAt: Date.now() + 30_000 },
+	});
+	state.auth.purposeCeiling = ceiling;
+	const digest = purposeDigest(terms, MISSION, 2, parseMissionAuthority(state.auth));
+	state.view.purpose.proposed = { revision: 2, digest, terms };
+	const args = ["approve-purpose", "--revision", "2", "--digest", digest, "--request-id", "purpose-2"];
+	await assert.rejects(state.run(args), /grants no research/);
+	state.auth.purposeCeiling = { ...ceiling, capabilities: ["artifact-digest", "research"], research: { ...caps, maxFetches: 1 } };
+	await assert.rejects(state.run(args), /maxFetches research ceiling/);
+	state.auth.purposeCeiling.research = caps;
+	state.view.purpose.proposed.terms = { ...terms, works: [{ ...work, posting: { repository: "outside" } }] };
+	await assert.rejects(state.run(args), /posting is not available/);
+	assert.equal(state.writes, 0);
+
+	state.view.purpose.proposed.terms = terms;
+	await state.run(args);
+	await state.run(args);
+	assert.equal(state.writes, 1);
+	assert.equal(state.auth.purposeApprovals[0].digest, digest);
+	assert.equal(state.auth.purposeApprovals[0].approvedBy.uid, 2001);
+	assert.equal(state.events.filter((operation) => operation === "reconcile-purpose").length, 2);
+});
 
 async function rotateCreator(state) {
 	const directory = await mkdtemp(join(tmpdir(), "unit-plan-rotation-"));

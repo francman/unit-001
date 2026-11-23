@@ -3,5 +3,5 @@
 	"minReaderVersion": 1,
 	"maintenanceProtocol": 1,
 	"serviceTemplate": 2,
-	"features": ["mission-loop", "mission-plan-gate", "mission-review-turn"]
+	"features": ["mission-loop", "mission-plan-gate", "mission-review-turn", "mission-research"]
 }

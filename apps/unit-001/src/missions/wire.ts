@@ -131,6 +131,14 @@ export function parseMissionView(value: unknown): MissionView {
 	const loopRollback = input.loopRollback;
 	if (loopRollback !== undefined && loopRollback !== "no-live-loop" && loopRollback !== "live-loop")
 		throw new Error("Invalid loop rollback projection.");
+	const researchRollback = input.researchRollback;
+	if (
+		researchRollback !== undefined &&
+		researchRollback !== "no-research" &&
+		researchRollback !== "research-present" &&
+		researchRollback !== "unknown"
+	)
+		throw new Error("Invalid research rollback projection.");
 	return {
 		stage: input.stage,
 		formation: {
@@ -162,6 +170,7 @@ export function parseMissionView(value: unknown): MissionView {
 			? {}
 			: { purposeError: input.purposeError === null ? null : missionText(input.purposeError, 1000) }),
 		...(loopRollback === undefined ? {} : { loopRollback }),
+		...(researchRollback === undefined ? {} : { researchRollback }),
 		...(input.plan === undefined ? {} : { plan: input.plan === null ? null : parsePlanView(input.plan) }),
 		...(input.planError === undefined
 			? {}

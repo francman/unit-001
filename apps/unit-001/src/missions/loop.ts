@@ -6,7 +6,7 @@ import { MaintenanceDoc } from "../maintenance.ts";
 import type { ModelChoice } from "../provider.ts";
 import { MISSION_PROVIDER_PREFIX, type MissionAdmission } from "./admission.ts";
 import { admitWork, chargeCycle, workAllowanceDenial } from "./allowance.ts";
-import type { MissionAuthority } from "./contract.ts";
+import type { ArtifactWorkTerms, MissionAuthority, ResearchWorkTerms } from "./contract.ts";
 import { type MissionEvidence, MissionExecutionDoc } from "./execution-state.ts";
 import { MissionPurposeDoc, storedLoop, validPurposeLoop } from "./purpose.ts";
 import { planGate } from "./plan-gate.ts";
@@ -22,6 +22,11 @@ import {
 	loopAgreement,
 	type PurposeReceiptAgreement,
 } from "./purpose-loop.ts";
+import { selectionHolds } from "./research-evidence.ts";
+import { advanceAfterAwait, nextResearchAction, researchBound, researchPrompt, verifyRun } from "./research-run.ts";
+import type { ResearchSources } from "./research-sources.ts";
+import { MissionResearchDoc, storedResearch } from "./research-state.ts";
+import { RESEARCH_CHILD_TOOLS, RESEARCH_COORDINATOR_TOOLS } from "./research-tools.ts";
 import { verifyMissionFiles } from "./verification.ts";
 import { WORK_TOOL } from "./work-tool.ts";
 
@@ -32,10 +37,12 @@ type LoopCheckpoint =
 	| { phase: "admit"; proposalId: string }
 	| { phase: "cycle"; runId: string }
 	| { phase: "await"; runId: string; requestId: string }
+	// `step` advances on every research commit: Durable requires each phase to commit a changed checkpoint.
+	| { phase: "research"; runId: string; step: number }
 	| { phase: "wake"; until: number; next: "observe" | { runId: string } };
 
 /** Registers the purpose loop task; one live loop per applied open intent or acknowledgment rearm. */
-export function missionLoop(admission: MissionAdmission, cwd: string) {
+export function missionLoop(admission: MissionAdmission, cwd: string, sources: ResearchSources) {
 	// Read inside each admitting commit: Durable runs commits one at a time, so a revocation published before this read
 	// closes the admission even when the commit was queued before it.
 	const authority = () => admission.readAuthority();
@@ -110,6 +117,13 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					}
 					if (proposal.decision.kind !== "work") return terminal();
 					const work = listedWork(agreement, proposal.decision.workId)!;
+					// Acquired only for research work, so a store without research never gains the research document. Read
+					// before the work slot is charged: a slot without its run record would break the ledger recount.
+					const research = work.kind === "research" ? await storedResearch(tx) : undefined;
+					if (work.kind === "research" && !research) {
+						proposal.status = "stale";
+						return blocked(loop, "research_records");
+					}
 					const exhausted = admitWork(loop, agreement.terms.lifetime);
 					if (exhausted) {
 						proposal.status = "stale";
@@ -118,9 +132,11 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					const conversation = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
 					const agent = await tx.doc(AgentDoc, conversation.id);
 					agent.model = task.input.model;
-					agent.tools = [WORK_TOOL];
-					agent.modelTools = [WORK_TOOL];
-					agent.maxTurns = 1;
+					// A research run's own conversation is its coordinator, with exactly the coordinator tools.
+					const tools = work.kind === "research" ? [...RESEARCH_COORDINATOR_TOOLS] : [WORK_TOOL];
+					agent.tools = tools;
+					agent.modelTools = [...tools];
+					agent.maxTurns = work.kind === "research" ? work.maxToolRoundsPerChild : 1;
 					const providerSession = `${MISSION_PROVIDER_PREFIX}${randomUUID()}`;
 					(await tx.doc(ProviderDoc, conversation.id)).sessionId = providerSession;
 					// Tracked before the commit lands; a rolled-back identity has no run record, so admission denies it.
@@ -146,7 +162,28 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					loop.runs.push(run);
 					proposal.status = "admitted";
 					loop.operation.activity = { kind: "working", runId: run.runId };
-					return { status: "running", checkpoint: { phase: "cycle", runId: run.runId } };
+					if (work.kind !== "research")
+						return { status: "running", checkpoint: { phase: "cycle", runId: run.runId } };
+					research!.runs.push({
+						runId: run.runId,
+						workDigest: run.workDigest,
+						question: work.question,
+						step: "plan",
+						awaiting: null,
+						coordinator: { conversation: conversation.id, providerSession },
+						plan: null,
+						child: null,
+						fetches: 0,
+						fetchBytes: 0,
+						unavailable: 0,
+						artifacts: [],
+						candidate: null,
+						decision: null,
+						selection: null,
+						draft: null,
+						outcome: null,
+					});
+					return { status: "running", checkpoint: { phase: "research", runId: run.runId, step: 0 } };
 				}, context),
 			cycle: async (task, runtime, context) => {
 				const saved = validPurposeLoop(await runtime.snapshot(MissionPurposeDoc, context));
@@ -161,7 +198,8 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					if (!loop || !run || run.state.status !== "running") return terminal();
 					const now = runtime.now();
 					const agreement = loopAgreement(loop, run.purposeRevision)!;
-					const work = listedWork(agreement, run.workId)!;
+					// Only artifact runs reach the cycle phases; research runs use the research phase.
+					const work = listedWork(agreement, run.workId) as ArtifactWorkTerms;
 					run.evidence = evidence;
 					if (evidence.every((item) => item.accepted)) return verified(loop, run, agreement, now);
 					const denial = operationDenial(await authority(), loop, await storedPlan(tx), task.input.sequence, now);
@@ -205,7 +243,8 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					if (!loop || !run || run.state.status !== "running") return terminal();
 					const now = runtime.now();
 					const agreement = loopAgreement(loop, run.purposeRevision)!;
-					const work = listedWork(agreement, run.workId)!;
+					// Only artifact runs reach the cycle phases; research runs use the research phase.
+					const work = listedWork(agreement, run.workId) as ArtifactWorkTerms;
 					const submission = await tx.submissionByRequest(run.conversation, task.state.checkpoint.requestId);
 					if (!submission || submission.status === "queued" || submission.status === "placed")
 						throw new Error("Purpose run submission has not settled.");
@@ -228,6 +267,82 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					return { status: "running", checkpoint: { phase: "cycle", runId: run.runId } };
 				}, context);
 			},
+			research: async (task, runtime, context) => {
+				const runId = task.state.checkpoint.runId;
+				const saved = (await runtime.snapshot(MissionResearchDoc, context))?.runs.find((item) => item.runId === runId);
+				if (!saved) return runtime.commit(() => terminal(), context);
+				const action = nextResearchAction(saved);
+				// Waiting happens outside the commit; the commit then re-reads everything it decides on.
+				if (action.kind === "await") await (await runtime.conversation(saved.awaiting!.conversation, context))?.waitForIdle(context);
+				const target =
+					action.kind === "submit" ? (action.to === "child" ? saved.child!.conversation : saved.coordinator.conversation) : null;
+				const conversation = target ? await runtime.conversation(target, context) : null;
+				if (target && !conversation) throw new Error("Research conversation is unavailable.");
+				return runtime.commit(async (tx) => {
+					const loop = await currentLoop(tx, task.id, task.input.sequence);
+					const run = loop?.runs.find((item) => item.runId === runId);
+					if (!loop || !run || run.state.status !== "running") return terminal();
+					const now = runtime.now();
+					const agreement = loopAgreement(loop, run.purposeRevision)!;
+					// The research phase is reached only for research work.
+					const work = listedWork(agreement, run.workId) as ResearchWorkTerms;
+					const stored = (await storedResearch(tx))?.runs.find((item) => item.runId === runId);
+					// The stored research must be bound to exactly this admitted run: its work, question and identities.
+					if (!stored || !researchBound(stored, run, work)) return blockRun(loop, run, agreement, now, "research_records");
+					const step = nextResearchAction(stored);
+					if (step.kind !== action.kind) return { status: "running", checkpoint: { phase: "research", runId, step: task.state.checkpoint.step + 1 } };
+					if (step.kind === "await") {
+						const submission = await tx.submissionByRequest(stored.awaiting!.conversation, stored.awaiting!.requestId);
+						if (!submission || submission.status === "queued" || submission.status === "placed")
+							throw new Error("Research submission has not settled.");
+						if (uncertain(run))
+							return blockRun(loop, run, agreement, now, run.pendingTools.length ? "unknown_tool_outcome" : "unknown_request_outcome");
+						advanceAfterAwait(stored);
+						return { status: "running", checkpoint: { phase: "research", runId, step: task.state.checkpoint.step + 1 } };
+					}
+					if (step.kind === "settle") {
+						if (stored.outcome !== "selected") return blockRun(loop, run, agreement, now, stored.outcome ?? "no_selection");
+						// A stored outcome is never trusted on its own: the receipt, draft and verdict are rebuilt and re-checked.
+						if (!selectionHolds(loop.missionId!, stored, sources, now))
+							return blockRun(loop, run, agreement, now, "selection_invalid");
+						run.evidence = [
+							{ criterion: "research selection", observedAt: now, accepted: true, detail: stored.selection!.digest },
+						];
+						return verified(loop, run, agreement, now);
+					}
+					if (step.kind === "verify") {
+						verifyRun(stored, sources, now);
+						return { status: "running", checkpoint: { phase: "research", runId, step: task.state.checkpoint.step + 1 } };
+					}
+					// Every new model input or conversation meets the same decision as artifact work.
+					const denial = operationDenial(await authority(), loop, await storedPlan(tx), task.input.sequence, now);
+					if (denial) return blockRun(loop, run, agreement, now, denial);
+					if (await held(tx)) return sleep(loop, agreement, now, "maintenance", { runId });
+					if (uncertain(run)) return blockRun(loop, run, agreement, now, "unknown_request_outcome");
+					if (step.kind === "spawn-child") {
+						const child = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
+						const agent = await tx.doc(AgentDoc, child.id);
+						agent.model = task.input.model;
+						agent.tools = [...RESEARCH_CHILD_TOOLS];
+						agent.modelTools = [...RESEARCH_CHILD_TOOLS];
+						agent.maxTurns = work.maxToolRoundsPerChild;
+						const providerSession = `${MISSION_PROVIDER_PREFIX}${randomUUID()}`;
+						(await tx.doc(ProviderDoc, child.id)).sessionId = providerSession;
+						admission.trackLoopConversation(child.id);
+						stored.child = { conversation: child.id, providerSession };
+						return { status: "running", checkpoint: { phase: "research", runId, step: task.state.checkpoint.step + 1 } };
+					}
+					if (step.kind === "submit") {
+						await conversation!.submit(tx, {
+							type: "input",
+							content: researchPrompt(stored, work, step.to),
+							requestId: step.requestId,
+						});
+						stored.awaiting = { conversation: target!, requestId: step.requestId };
+					}
+					return { status: "running", checkpoint: { phase: "research", runId, step: task.state.checkpoint.step + 1 } };
+				}, context);
+			},
 			wake: (task, runtime, context) =>
 				runtime.commit(async (tx) => {
 					const loop = await currentLoop(tx, task.id, task.input.sequence);
@@ -238,7 +353,12 @@ export function missionLoop(admission: MissionAdmission, cwd: string) {
 					loop.operation.activity = next === "observe" ? { kind: "observing" } : { kind: "working", runId: next.runId };
 					return {
 						status: "running",
-						checkpoint: next === "observe" ? { phase: "observe" } : { phase: "cycle", runId: next.runId },
+						checkpoint:
+							next === "observe"
+								? { phase: "observe" }
+								: researchRun(loop, next.runId)
+									? { phase: "research", runId: next.runId, step: 0 }
+									: { phase: "cycle", runId: next.runId },
 					};
 				}, context),
 		},
@@ -337,8 +457,16 @@ async function legacyActive(tx: Tx): Promise<boolean> {
 }
 
 async function observe(loop: LoopState, run: LoopRun, cwd: string, now: number): Promise<MissionEvidence[]> {
-	const work = listedWork(loopAgreement(loop, run.purposeRevision)!, run.workId)!;
+	// Only artifact runs are observed by file digest.
+	const work = listedWork(loopAgreement(loop, run.purposeRevision)!, run.workId) as ArtifactWorkTerms;
 	return verifyMissionFiles([`sha256:${work.sha256}:${work.path}`], cwd, now);
+}
+
+// Whether a run executes research work, so a wake returns it to the research phase instead of an artifact cycle.
+function researchRun(loop: LoopState, runId: string): boolean {
+	const run = loop.runs.find((item) => item.runId === runId);
+	const agreement = run && loopAgreement(loop, run.purposeRevision);
+	return (agreement && listedWork(agreement, run.workId)?.kind) === "research";
 }
 
 function nextObservation(agreement: PurposeReceiptAgreement, now: number): number {

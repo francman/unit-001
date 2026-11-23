@@ -17,7 +17,7 @@ import { MaintenanceDoc } from "../../src/maintenance.ts";
 import { MissionAdmission } from "../../src/missions/admission.ts";
 import { releaseAttempt, reserveAttempt, settleAttempt } from "../../src/missions/allowance.ts";
 import { readMissionAuthority, writeMissionAuthority } from "../../src/missions/authority.ts";
-import type { MissionRequest, PurposeTerms, WorkTerms } from "../../src/missions/contract.ts";
+import type { ArtifactWorkTerms, MissionRequest, PurposeTerms } from "../../src/missions/contract.ts";
 import { describeMission } from "../../src/missions/command.ts";
 import { MissionControl } from "../../src/missions/control.ts";
 import { missionController, startMissionExecution } from "../../src/missions/controller.ts";
@@ -47,7 +47,7 @@ afterEach(async () => {
 });
 
 const sha = (content: string) => createHash("sha256").update(content).digest("hex");
-const work = (path: string, content: string, limits: Partial<WorkTerms> = {}): WorkTerms => ({
+const work = (path: string, content: string, limits: Partial<ArtifactWorkTerms> = {}): ArtifactWorkTerms => ({
 	kind: "artifact-digest",
 	path,
 	sha256: sha(content),
@@ -58,7 +58,7 @@ const work = (path: string, content: string, limits: Partial<WorkTerms> = {}): W
 	maxConsecutiveNoProgress: 2,
 	...limits,
 });
-const purpose = (works: WorkTerms[], lifetime: Partial<PurposeTerms["lifetime"]> = {}): PurposeTerms => ({
+const purpose = (works: PurposeTerms["works"], lifetime: Partial<PurposeTerms["lifetime"]> = {}): PurposeTerms => ({
 	purpose: "Keep the fixture reports current",
 	scope: "The fixture workspace",
 	reviewEveryMs: 1_000,
@@ -947,7 +947,7 @@ describe("stored loop is a trust boundary", () => {
 		lowered.ledger.requests = 0;
 		expect(() => checkLoopState(lowered)).toThrow("ledger");
 		const changed = structuredClone(loop);
-		changed.agreements[0].terms.works[0].sha256 = "0".repeat(64);
+		(changed.agreements[0].terms.works[0] as ArtifactWorkTerms).sha256 = "0".repeat(64);
 		expect(() => checkLoopState(changed)).toThrow();
 		await host.harness.commit(async (tx) => {
 			(await tx.doc(MissionPurposeDoc)).loop.ledger.cycles = 0;

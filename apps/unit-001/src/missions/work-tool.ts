@@ -35,7 +35,8 @@ export function workWriteTool(cwd: string): ToolRegistration {
 			);
 			const agreement = run && loop && loopAgreement(loop, run.purposeRevision);
 			const work = agreement && run && listedWork(agreement, run.workId);
-			if (!work) return refusal(`${WORK_TOOL} runs only inside an admitted purpose run.`);
+			if (!work || work.kind !== "artifact-digest")
+				return refusal(`${WORK_TOOL} runs only inside an admitted artifact purpose run.`);
 			const content = Buffer.from(args.content, "utf8");
 			if (content.length > MAX_CONTENT_BYTES) return refusal("Work content exceeds 4 MiB.");
 			// The fence: mission admission wraps this commit and throws unless the decision still holds.

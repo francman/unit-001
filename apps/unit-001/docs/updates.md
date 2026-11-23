@@ -108,6 +108,8 @@ A release with model review turns also declares `mission-review-turn`. Before sw
 
 Qualify this downgrade with the actual current and recovery updater binaries and an exact v1 plan reader. A historical core may skip the review guard. A compatible predecessor must preserve the stored plan and review ledger through an owner write. Forward reopen must retain charges and keep admission closed if protected authority was lost.
 
+A research-capable release declares `mission-research`. A target without that capability is eligible only when the running owner confirms that its purpose draft, retained agreements and research records contain no research, and the protected authority has no research grant. The updater checks before journaling and again under its matching drained hold. Existing or unreadable research records keep the older target blocked, including after the research run settles. Use a research-capable release for those stores. Qualify the actual current and recovery updater selections before deploying research state, since an older core may lack the check.
+
 After rollback, the older release follows the purpose reader contract. The purpose history, work digests, acknowledgments and lifetime ledger are kept. Opening operation again needs fresh consent, because the older `deploy/mission.mjs` drops the purpose grant and operation intent when it rewrites the authority file. This was checked with the published 0.0.9 round trip ([Continuous operation](missions/purpose.md)).
 
 Rollback pins the selected previous version before activation so the next timer check cannot reinstall the rejected release. The pin remains if rollback fails. Inspect `update status`, recover as needed, and explicitly `unpin` when ready to follow stable again.

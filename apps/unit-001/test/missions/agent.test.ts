@@ -61,6 +61,11 @@ it("keeps mission drafting, status and memory available without registering a fa
 				"unit_mission_draft",
 				"unit_plan_draft",
 				"unit_work_write",
+				// #27: research tools are deferred and offered only to research run conversations.
+				"research_plan",
+				"research_select",
+				"research_fetch",
+				"research_submit_candidate",
 			].sort(),
 		);
 	expect(saved.stage).toBe("awaiting_creator");

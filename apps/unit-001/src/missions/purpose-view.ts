@@ -1,7 +1,7 @@
 // Projects continuous operation for status clients and validates that projection at the owner-client boundary.
 import { missionNumber, missionObject, missionText, type PurposeTerms } from "./contract.ts";
 import { parsePurposeTerms, workDigest } from "./purpose-authority.ts";
-import { type LoopState, listedWork, listedWorkId, loopAgreement } from "./purpose-loop.ts";
+import { type LoopState, listedWork, listedWorkId, loopAgreement, workLabel } from "./purpose-loop.ts";
 
 type WorkResult = "pending" | "working" | "verified" | "unsettled" | "acknowledged" | "blocked" | "aborted";
 
@@ -47,7 +47,7 @@ export function missionPurposeView(loop: LoopState, live: boolean): MissionPurpo
 			const run = loop.runs.findLast((item) => item.workDigest === digest);
 			return {
 				workId: listedWorkId(agreement!.revision, index),
-				path: work.path,
+				path: workLabel(work),
 				result: run ? result(run) : "pending",
 				runId: run?.runId ?? null,
 			};
@@ -58,7 +58,7 @@ export function missionPurposeView(loop: LoopState, live: boolean): MissionPurpo
 			.map((run) => ({
 				runId: run.runId,
 				workId: run.workId,
-				path: listedWork(loopAgreement(loop, run.purposeRevision)!, run.workId)!.path,
+				path: workLabel(listedWork(loopAgreement(loop, run.purposeRevision)!, run.workId)!),
 				purposeRevision: run.purposeRevision,
 			})),
 		used: {

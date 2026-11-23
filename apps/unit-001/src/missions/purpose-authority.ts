@@ -1,6 +1,7 @@
 // Parses and binds the protected purpose grant, its receipts and operation intents; owner documents never grant them.
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
+import { canonicalResearchWork, parseResearchCeiling, parseResearchWork, researchWorkDenial } from "./research-terms.ts";
 import {
 	type MissionApproval,
 	type MissionAuthority,
@@ -31,19 +32,24 @@ export function parsePurposeCeiling(value: unknown): PurposeCeiling {
 		"maxConsecutiveNoProgress",
 		"maxDurationMs",
 		"maxEstimatedCost",
+		"research",
 	];
 	if (Object.keys(input).some((key) => !fields.includes(key))) throw new Error("Unknown purpose ceiling field.");
+	// Research is an explicit, separate grant: the capability and its finite caps come together or not at all.
+	const capabilities = input.capabilities;
+	const research = Array.isArray(capabilities) && capabilities.length === 2 && capabilities[1] === "research";
 	if (
-		!Array.isArray(input.capabilities) ||
-		input.capabilities.length !== 1 ||
-		input.capabilities[0] !== "artifact-digest"
+		!Array.isArray(capabilities) ||
+		capabilities[0] !== "artifact-digest" ||
+		(capabilities.length !== 1 && !research) ||
+		research !== (input.research !== undefined)
 	)
-		throw new Error("A purpose ceiling grants exactly the artifact-digest capability.");
+		throw new Error("A purpose ceiling grants artifact-digest, and research only with its research caps.");
 	if (!Array.isArray(input.paths) || input.paths.length < 1 || input.paths.length > 16)
 		throw new Error("A purpose ceiling needs 1 to 16 path prefixes.");
 	const paths = input.paths.map((path) => workPath(missionText(path, 512), true));
 	const ceiling: PurposeCeiling = {
-		capabilities: ["artifact-digest"],
+		capabilities: research ? ["artifact-digest", "research"] : ["artifact-digest"],
 		paths,
 		maxWorkItems: count(input.maxWorkItems, 1, MAX_PURPOSE_WORKS),
 		maxCycles: count(input.maxCycles, 1),
@@ -53,6 +59,7 @@ export function parsePurposeCeiling(value: unknown): PurposeCeiling {
 		maxDurationMs: count(input.maxDurationMs, 1),
 	};
 	if (input.maxEstimatedCost !== undefined) ceiling.maxEstimatedCost = positive(input.maxEstimatedCost);
+	if (research) ceiling.research = parseResearchCeiling(input.research);
 	return ceiling;
 }
 
@@ -68,8 +75,8 @@ export function parsePurposeTerms(value: unknown): PurposeTerms {
 	if (!Array.isArray(input.works) || input.works.length < 1 || input.works.length > MAX_PURPOSE_WORKS)
 		throw new Error(`A purpose lists 1 to ${MAX_PURPOSE_WORKS} work items.`);
 	const works = input.works.map(parseWorkTerms);
-	if (new Set(works.map((work) => work.path)).size !== works.length)
-		throw new Error("Purpose work items need distinct paths.");
+	const paths = works.flatMap((work) => (work.kind === "artifact-digest" ? [work.path] : []));
+	if (new Set(paths).size !== paths.length) throw new Error("Purpose work items need distinct paths.");
 	const lifetime = missionObject(input.lifetime);
 	if (
 		Object.keys(lifetime).some(
@@ -92,6 +99,11 @@ export function validatePurposeTerms(terms: PurposeTerms, authority: MissionAuth
 	const ceiling = authority.purposeCeiling;
 	if (!ceiling) throw new Error("The creator authority grants no continuous purpose; provision a purpose ceiling.");
 	for (const work of terms.works) {
+		if (work.kind === "research") {
+			const denial = researchWorkDenial(work, ceiling);
+			if (denial) throw new Error(denial);
+			continue;
+		}
 		if (!ceiling.paths.some((prefix) => work.path.startsWith(prefix)))
 			throw new Error(`Work path ${work.path} is outside the creator's purpose paths.`);
 		for (const key of ["maxCycles", "maxRequests", "maxRetries", "maxConsecutiveNoProgress"] as const)
@@ -135,9 +147,11 @@ export function purposeDigest(
 
 /** Hashes one work definition, so identical work under a later purpose revision counts as already done. */
 export function workDigest(work: WorkTerms): string {
-	return createHash("sha256")
-		.update(JSON.stringify({ kind: work.kind, path: work.path, sha256: work.sha256 }))
-		.digest("hex");
+	const identity =
+		work.kind === "research"
+			? canonicalResearchWork(work)
+			: { kind: work.kind, path: work.path, sha256: work.sha256 };
+	return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }
 
 /**
@@ -211,6 +225,7 @@ export function parseOperationAcknowledgment(value: unknown): OperationAcknowled
 
 function parseWorkTerms(value: unknown): WorkTerms {
 	const input = missionObject(value);
+	if (input.kind === "research") return parseResearchWork(input);
 	const fields = [
 		"kind",
 		"path",
@@ -257,16 +272,21 @@ function canonicalTerms(terms: PurposeTerms): PurposeTerms {
 		purpose: terms.purpose,
 		scope: terms.scope,
 		reviewEveryMs: terms.reviewEveryMs,
-		works: terms.works.map((work) => ({
-			kind: work.kind,
-			path: work.path,
-			sha256: work.sha256,
-			instructions: work.instructions,
-			maxCycles: work.maxCycles,
-			maxRequests: work.maxRequests,
-			maxRetries: work.maxRetries,
-			maxConsecutiveNoProgress: work.maxConsecutiveNoProgress,
-		})),
+		// Artifact works keep their exact former shape, so every agreed artifact-only purpose keeps its digest.
+		works: terms.works.map((work) =>
+			work.kind === "research"
+				? canonicalResearchWork(work)
+				: {
+						kind: work.kind,
+						path: work.path,
+						sha256: work.sha256,
+						instructions: work.instructions,
+						maxCycles: work.maxCycles,
+						maxRequests: work.maxRequests,
+						maxRetries: work.maxRetries,
+						maxConsecutiveNoProgress: work.maxConsecutiveNoProgress,
+					},
+		),
 		lifetime: {
 			maxWorkItems: terms.lifetime.maxWorkItems,
 			maxCycles: terms.lifetime.maxCycles,

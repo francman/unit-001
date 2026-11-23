@@ -146,6 +146,11 @@ export function listedWorkId(revision: number, index: number): string {
 	return `p${revision}-w${index + 1}`;
 }
 
+/** A short label for a listed work item in status: its file path, or the research question's start. */
+export function workLabel(work: WorkTerms): string {
+	return work.kind === "artifact-digest" ? work.path : `research: ${work.question.slice(0, 120)}`;
+}
+
 /** The agreement an operation or run names, if stored. */
 export function loopAgreement(loop: LoopState, revision: number): PurposeReceiptAgreement | undefined {
 	return loop.agreements.find((agreement) => agreement.revision === revision);
@@ -230,7 +235,9 @@ export function checkLoopState(value: unknown): LoopState {
 		)
 			throw new Error("Invalid stored purpose run.");
 		// A run's own approved work bounds its history, released attempts included: each one was a charged request.
-		if (run.cycles > work.maxCycles || run.attempts.length > work.maxRequests)
+		// Research runs make no artifact cycles; their requests are bounded by the same per-work cap.
+		const maxCycles = work.kind === "artifact-digest" ? work.maxCycles : 0;
+		if (run.cycles > maxCycles || run.attempts.length > work.maxRequests)
 			throw new Error("Stored run exceeds its approved work.");
 		totals.cycles += run.cycles;
 		for (const attempt of run.attempts) {

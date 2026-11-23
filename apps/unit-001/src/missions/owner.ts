@@ -20,6 +20,7 @@ import { readMissionPurpose } from "./purpose.ts";
 import { PurposeFormation } from "./purpose-formation.ts";
 import type { LoopState } from "./purpose-loop.ts";
 import { missionPurposeView } from "./purpose-view.ts";
+import { MissionResearchDoc } from "./research-state.ts";
 import { MissionDoc } from "./state.ts";
 import { verifyMissionFiles } from "./verification.ts";
 
@@ -126,23 +127,43 @@ export class MissionOwner {
 	// Status validates exactly what execution validates (`readMissionPurpose`, `validPurposeLoop`), and reports a
 	// failure as such, not as "no purpose". The rollback answer comes from live task inspection, never from the
 	// document alone: invalid records project no purpose, yet a parked loop task can still be live.
-	async #purposeView(context: Context): Promise<Pick<MissionView, "purpose" | "purposeError" | "loopRollback">> {
+	async #purposeView(
+		context: Context,
+	): Promise<Pick<MissionView, "purpose" | "purposeError" | "loopRollback" | "researchRollback">> {
 		const loopRollback = loopRollbackBlocker(await this.#harness.inspect(context)) ?? "no-live-loop";
 		let loop: LoopState | undefined;
 		try {
 			loop = (await readMissionPurpose(this.#harness, context))?.loop;
 		} catch (error) {
 			const reason = error instanceof Error ? error.message : String(error);
-			return { purpose: null, purposeError: reason.slice(0, 500), loopRollback };
+			return { purpose: null, purposeError: reason.slice(0, 500), loopRollback, researchRollback: "unknown" };
 		}
-		if (!loop) return { purpose: null, purposeError: null, loopRollback };
+		const researchRollback = await this.#researchRollback(loop, context);
+		if (!loop) return { purpose: null, purposeError: null, loopRollback, researchRollback };
 		let live = loopRollback === "live-loop";
 		for (const id of [loop.operation.loop, loop.operation.drain?.loop])
 			if (id && (await this.#harness.getTask(id, context))?.state.status !== "terminal") live = true;
 		// A persisted drain is cleanup the owner has not finished (abandoning runs, clearing the target), even after its
 		// task is terminal; rollback needs that completed, so it reports live until the drain record is gone.
 		const pending = loop.operation.drain !== null ? "live-loop" : loopRollback;
-		return { purpose: missionPurposeView(loop, live), purposeError: null, loopRollback: pending };
+		return { purpose: missionPurposeView(loop, live), purposeError: null, loopRollback: pending, researchRollback };
+	}
+
+	// Older readers also parse the inactive revisions and pending draft. A present sidecar needs qualification even
+	// after its last run has settled. The updater repeats this check after it holds the owner.
+	async #researchRollback(loop: LoopState | undefined, context: Context): Promise<MissionView["researchRollback"]> {
+		if (
+			loop?.draft?.terms.works.some((work) => work.kind === "research") ||
+			loop?.agreements.some(({ terms }) => terms.works.some((work) => work.kind === "research"))
+		)
+			return "research-present";
+		try {
+			return (await this.#harness.snapshot(MissionResearchDoc, context)) === undefined
+				? "no-research"
+				: "research-present";
+		} catch {
+			return "unknown";
+		}
 	}
 
 	/**

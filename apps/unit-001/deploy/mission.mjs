@@ -16,7 +16,7 @@ import {
 import { MANAGED_MISSION_ACTIONS, missionObject, parseMissionCreator } from "../app/dist/missions/contract.js";
 import { matchingPlanApproval, planDigest, planReceiptsRecorded } from "../app/dist/missions/plan-authority.js";
 import { missingPlanTerms, reviewAllowanceDenial } from "../app/dist/missions/plan-terms.js";
-import { parsePurposeCeiling, purposeDigest, validatePurposeTerms } from "../app/dist/missions/purpose-authority.js";
+import { parsePurposeCeiling, parsePurposeTerms, purposeDigest, validatePurposeTerms } from "../app/dist/missions/purpose-authority.js";
 import { parseMissionView } from "../app/dist/missions/wire.js";
 import { installationPaths, readInstallation, withManagementLock } from "./installation.mjs";
 import { readUpdateJournal } from "./update-activation.mjs";
@@ -168,7 +168,7 @@ await withManagementLock(async () => {
 		}
 		const creator = parseMissionCreator(input.creator);
 		const ceiling = parseMissionCeiling(input.ceiling);
-		// The purpose-only grant: the artifact-digest capability under path prefixes, never a one-shot tool name.
+		// Purpose capabilities are separate from one-shot tools. Research requires its own explicit caps.
 		const purposeCeiling = input.purposeCeiling === undefined ? undefined : parsePurposeCeiling(input.purposeCeiling);
 		if (creator.uid === null) throw new Error("A managed creator requires a provisioned local OS UID.");
 		const account = execFileSync("getent", ["passwd", String(creator.uid)], { encoding: "utf8" })
@@ -298,7 +298,7 @@ async function approvePurpose(view, previous) {
 	const proposed = purpose?.proposed;
 	if (!proposed || proposed.revision !== revision || proposed.digest !== values.digest || !purpose.missionId)
 		throw new Error("Stale purpose proposal; inspect its current revision and digest.");
-	const terms = validatePurposeTerms(proposed.terms, previous, Date.now());
+	const terms = validatePurposeTerms(parsePurposeTerms(proposed.terms), previous, Date.now());
 	const digest = purposeDigest(terms, purpose.missionId, revision, previous);
 	if (digest !== values.digest) throw new Error("Creator authority changed; propose the exact purpose again.");
 	const receipt = {
