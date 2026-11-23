@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 
 const scriptsDirectory = dirname(fileURLToPath(import.meta.url));
 const profiler = join(scriptsDirectory, "profile-capacity.mjs");
+const profilerModule = join(scriptsDirectory, "capacity-background.mjs");
 const agentBuild = join(scriptsDirectory, "..", "dist", "agent.js");
 const USAGE = `Usage: run-capacity-matrix.mjs --out-dir DIR [--matrix FILE] [--tmpdir DIR] [--only ID[,ID...]] [--repeat N] [--scope auto|system|user|none] [--require-scope] [--keep-fixtures] [--step-timeout-s N] [--reserve-mb N] [--min-free-disk-mb N] [--allow-overcommit] [--meminfo FILE] [--dry-run]`;
 const WATCHED_CGROUP_FILES = [
@@ -200,6 +201,18 @@ export function resolveCells(source) {
 				!cell.split || !cell.seedUnderLimit)
 				fail("growth fixtures need a split, quiescent seed under the same limits, without mutation, relations or forgotten records");
 		}
+		if (cell.backgroundBurst !== undefined || cell.backgroundPairs !== undefined) {
+			if (!Number.isInteger(cell.backgroundBurst) || cell.backgroundBurst < 100 || cell.backgroundBurst > 500)
+				fail("backgroundBurst must be 100..500");
+			if (cell.backgroundPairs !== undefined &&
+				(!Number.isInteger(cell.backgroundPairs) || cell.backgroundPairs < 1 || cell.backgroundPairs > 30))
+				fail("backgroundPairs must be 1..30");
+			if (FIXTURE_FIELDS.some((field) => cell[field] !== undefined) ||
+				cell.mutate !== undefined || cell.durationS !== undefined || cell.mutateOps !== undefined ||
+				cell.mutateIntervalMs !== undefined || cell.relations !== 0 || cell.forgotten !== 0 ||
+				!cell.split || !cell.seedUnderLimit)
+				fail("background needs a split, quiescent seed under the same limits, without growth, mutation, relations or forgotten records");
+		}
 		return cell;
 	});
 }
@@ -288,7 +301,7 @@ async function main() {
 	const cells = allCells.filter((cell) => only === undefined || only.some((pattern) => pattern.test(cell.id)));
 	const uid = process.getuid?.();
 	if (uid === 0 && process.platform === "linux") {
-		const untrusted = untrustedCodePaths([scriptsDirectory, profiler, matrixPath, dirname(agentBuild), agentBuild], 0);
+		const untrusted = untrustedCodePaths([scriptsDirectory, profiler, profilerModule, matrixPath, dirname(agentBuild), agentBuild], 0);
 		if (untrusted.length > 0) {
 			console.error(`refusing to run repository code as root:\n  ${untrusted.join("\n  ")}\nInstall the scripts and dist under a root-owned directory (docs/capacity.md).`);
 			return 2;
@@ -370,7 +383,7 @@ async function main() {
 		matrix: manifestMatrix,
 		git,
 		buildHash,
-		scriptHashes: [hashFile(fileURLToPath(import.meta.url)), hashFile(profiler)],
+		scriptHashes: [fileURLToPath(import.meta.url), profiler, profilerModule].map(hashFile),
 		scope,
 		preflight,
 		tmpdir: runDir,
@@ -469,6 +482,16 @@ function growthArgs(cell) {
 
 // Split cells seed in one process and measure the owner in another, so the owner peak excludes seed construction.
 function planCell(cell, fixture, baseline = `${fixture}-base`) {
+	if (cell.backgroundBurst !== undefined)
+		return [
+			{ step: "seed", limited: true, args: [...fixtureArgs(cell), "--quiescent", "--keep", fixture] },
+			{
+				step: "background",
+				limited: true,
+				args: ["--reuse", fixture, "--background-burst", String(cell.backgroundBurst),
+					...(cell.backgroundPairs === undefined ? [] : ["--background-pairs", String(cell.backgroundPairs)])],
+			},
+		];
 	const workload = growthArgs(cell);
 	if (workload.length > 0)
 		return [

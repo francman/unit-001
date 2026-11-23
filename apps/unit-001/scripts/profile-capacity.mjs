@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Measures a fresh faux-provider owner, persisted memory replay, foreground requests and optional memory mutations without changing latency gates.
+// Measures a fresh faux-provider owner, persisted memory replay, foreground requests and opt-in memory workloads.
 import assert from "node:assert/strict";
 import {
 	closeSync,
@@ -40,9 +40,10 @@ import {
 	rememberMemory,
 } from "unit-memory";
 import { Agent } from "../dist/agent.js";
+import { measureBackground } from "./capacity-background.mjs";
 
 const SCHEMA_VERSION = 2;
-const PHASE_ORDER = ["seed", "grow", "fixture-check", "replay", "startup", "probe", "foreground", "mutate"];
+const PHASE_ORDER = ["seed", "grow", "fixture-check", "replay", "startup", "probe", "foreground", "mutate", "background"];
 const DEFAULT_PHASES = ["seed", "replay", "startup", "foreground"];
 const MUTATE_MIXES = {
 	"remember-heavy": { remember: 1, forget: 0 },
@@ -55,6 +56,8 @@ const FIXTURE_TIME = 1_700_000_000_000;
 const FIXTURE_ANSWER = "Acknowledged.";
 const CHURN_CONTENT = "zinnia bookkeeping fixture";
 const CGROUP_PHASE_FILES = ["memory.current", "memory.peak", "memory.swap.current", "memory.swap.peak", "memory.events"];
+const CGROUP_CURRENT_FILES = ["memory.current"];
+const CGROUP_ARM_CURRENT_FILES = ["memory.current", "memory.swap.current"];
 const CGROUP_FINAL_FILES = [
 	"memory.max",
 	"memory.high",
@@ -70,7 +73,8 @@ const USAGE = `Usage: profile-capacity.mjs --records 1..50000 --relations 0..min
 Mutation runs only seed,mutate (fresh) or mutate (--reuse).
 Growth fixtures: --quiescent --keep BASE; then --reuse BASE --keep GROWN --phases grow
   (--settled-turns 0..20000 [--query-chars 40..2000] | --capture-cycles 0..30000).
-Measure with --reuse GROWN --phases fixture-check|replay|startup|probe (one phase per process).`;
+Measure with --reuse GROWN --phases fixture-check|replay|startup|probe (one phase per process).
+Background: --background-burst 100..500 [--background-pairs 1..30] selects seed,background, or background with a closed --quiescent --keep fixture.`;
 
 const config = parseConfig();
 const { count, relations, tail, forgotten, topology, hubs } = config.fixture;
@@ -81,6 +85,7 @@ const diskPhases = [];
 const samples = [];
 let samplesDropped = 0;
 let currentPhase = "init";
+let currentBackgroundArm;
 let directory = "";
 let file = "";
 // Declared before the top-level run below: function bodies read them once phases start.
@@ -137,6 +142,8 @@ function parseConfig() {
 			"settled-turns": { type: "string" },
 			"query-chars": { type: "string" },
 			"capture-cycles": { type: "string" },
+			"background-burst": { type: "string" },
+			"background-pairs": { type: "string" },
 			"duration-s": { type: "string" },
 			"mutate-ops": { type: "string" },
 			"mutate-interval-ms": { type: "string", default: "1000" },
@@ -187,18 +194,25 @@ function parseConfig() {
 	const footprint = relations === 0 ? 0 : topology === "dense" ? hubs + relations : relations + 1;
 	if (footprint > count || forgotten > count - footprint) fail();
 	const mutate = values.mutate;
+	const background = values["background-burst"] === undefined ? undefined : {
+		burst: Number(values["background-burst"]), pairs: Number(values["background-pairs"] ?? 5),
+	};
+	if (background === undefined ? values["background-pairs"] !== undefined :
+		!Number.isInteger(background.burst) || background.burst < 100 || background.burst > 500 ||
+		!Number.isInteger(background.pairs) || background.pairs < 1 || background.pairs > 30) fail();
 	let phases;
 	if (values.phases !== undefined) {
 		phases = values.phases.split(",");
 		if (phases.length === 0 || phases.some((name) => !PHASE_ORDER.includes(name)) || new Set(phases).size !== phases.length)
 			fail();
-	} else if (values.keep !== undefined) phases = ["seed"];
+	} else if (background !== undefined) phases = values.reuse === undefined ? ["seed", "background"] : ["background"];
+	else if (values.keep !== undefined) phases = ["seed"];
 	else if (mutate !== undefined) phases = values.reuse === undefined ? ["seed", "mutate"] : ["mutate"];
 	else if (values.reuse !== undefined) phases = DEFAULT_PHASES.filter((name) => name !== "seed");
 	else phases = DEFAULT_PHASES;
 	phases = PHASE_ORDER.filter((name) => phases.includes(name));
 	const [phase] = phases;
-	const quiescent = values.quiescent === true || manifest?.quiescent === true;
+	const quiescent = background !== undefined || values.quiescent === true || manifest?.quiescent === true;
 	const hasGrowthArgs = ["settled-turns", "query-chars", "capture-cycles"].some((key) => values[key] !== undefined);
 	let workload = manifest?.workload;
 	if (phase === "grow") {
@@ -223,7 +237,12 @@ function parseConfig() {
 			if (!bounded(workload.turns, 0, 20000) ||
 				(workload.turns === 0 ? workload.queryChars !== 0 : !bounded(workload.queryChars, 40, 2000))) fail();
 		} else if (workload.kind !== "capture-forget" || !bounded(workload.cycles, 0, 30000)) fail();
-	} else if (quiescent && phase !== "seed") fail();
+	} else if (quiescent && phase !== "seed" && background === undefined) fail();
+	if (phases.includes("background") !== (background !== undefined)) fail();
+	if (background !== undefined && (
+		phases.join(",") !== (manifest === undefined ? "seed,background" : "background") ||
+		values.keep !== undefined || (manifest !== undefined && (manifest.quiescent !== true || workload !== undefined))
+	)) fail();
 	if ((phase === "fixture-check" || phase === "probe") && workload === undefined) fail();
 	if (values.keep !== undefined && (phases.length !== 1 || !["seed", "grow"].includes(phase))) fail();
 	if (phases.includes("seed") === (values.reuse !== undefined)) fail();
@@ -254,6 +273,7 @@ function parseConfig() {
 		fixture: { count, relations, tail, forgotten, topology, hubs },
 		quiescent,
 		workload,
+		background,
 		mutate: mutate === undefined ? undefined : { mix: mutate, durationS, ops: mutateOps, intervalMs },
 		sampleMs,
 	};
@@ -272,6 +292,7 @@ async function runPhase(name) {
 	else if (name === "startup") await startupPhase();
 	else if (name === "probe") await probePhase();
 	else if (name === "foreground") await foregroundPhase();
+	else if (name === "background") await backgroundPhase();
 	else await mutatePhase();
 }
 
@@ -711,6 +732,39 @@ async function foregroundPhase() {
 	await diskSnapshot("foreground-closed");
 }
 
+async function backgroundPhase() {
+	const { burst, pairs } = config.background;
+	const qualifying = await measureBackground({
+		file, directory, burst, pairs, records: count, tail, diskSnapshot,
+		sampleArm(pair, arm, milestone) {
+			if (milestone === "before-copy") currentBackgroundArm = { pair, arm };
+			takeSample(milestone);
+			if (milestone === "verified") currentBackgroundArm = undefined;
+		},
+		onPair(observation) {
+			phases.push({ name: "owner-background-pair", ...observation });
+			flush("running");
+		},
+	});
+	const byArm = {};
+	for (const arm of ["idle", "active"]) {
+		const samples = qualifying.map((pair) => pair[arm]);
+		byArm[arm] = Object.fromEntries([
+			["ownerOpen", samples.map((sample) => sample.ownerOpenMs)],
+			["probeSubmitToFaux", samples.map((sample) => sample.probe.submitToFauxMs)],
+			["probeSubmitToSettled", samples.map((sample) => sample.probe.submitToSettledMs)],
+			["captureQueue", samples.map((sample) => sample.capture.queueMs)],
+			["captureRun", samples.map((sample) => sample.capture.runMs)],
+			["consolidationQueue", samples.map((sample) => sample.consolidation.queueMs)],
+			["consolidationRunToSleep", samples.map((sample) => sample.consolidation.runToSleepMs)],
+		].map(([metric, samplesMs]) => [metric, summarizeCommits(samplesMs)]));
+	}
+	const pairedProbeDeltasMs = qualifying.map(({ active, idle }) => active.probe.submitToFauxMs - idle.probe.submitToFauxMs);
+	record("owner-background", {
+		burst, pairs, validPairs: qualifying.length, overlapMisses: pairs - qualifying.length, byArm, pairedProbeDeltasMs,
+	});
+}
+
 // Drives remember, forget and recall through one session, as the owner would, and reports per-operation cost.
 async function mutatePhase() {
 	const { mix, durationS, ops: maxOps, intervalMs } = config.mutate;
@@ -904,6 +958,11 @@ function record(name, fields) {
 
 // Writes the whole result atomically so a killed run still leaves the last completed phase on disk.
 function flush(status, error) {
+	const backgroundFailure = currentPhase === "background" && status === "failed"
+		? error?.code === "CAPACITY_BACKGROUND_NO_OVERLAP" ? "no-overlap"
+			: error?.code === "CAPACITY_BACKGROUND_TIMEOUT" ? "timeout"
+				: error?.code === "ERR_ASSERTION" ? "invariant" : "execution"
+		: undefined;
 	const document = {
 		schemaVersion: SCHEMA_VERSION,
 		status,
@@ -919,6 +978,9 @@ function flush(status, error) {
 		relationTopology: relations === 0 ? "none" : topology === "dense" ? "supports-hubs" : "supports-chain",
 		tail,
 		workload: config.workload ?? null,
+		...(config.background === undefined ? {} : {
+			background: { ...config.background, currentArm: currentBackgroundArm, failure: backgroundFailure },
+		}),
 		operationLog: config.phases[0] === "grow" ? `${config.out}.ops.ndjson` : null,
 		forgotten,
 		phasesRequested: config.phases,
@@ -969,8 +1031,8 @@ function installSignalHandlers() {
 	}
 }
 
-function takeSample() {
-	if (samples.length >= SAMPLE_LIMIT) {
+function takeSample(milestone) {
+	if (milestone === undefined && samples.length >= SAMPLE_LIMIT) {
 		samplesDropped++;
 		return;
 	}
@@ -978,15 +1040,23 @@ function takeSample() {
 	const sample = {
 		t: Math.round(performance.now() - startedMs),
 		phase: currentPhase,
+		...currentBackgroundArm,
+		milestone,
 		rss: memory.rss,
 		heapUsed: memory.heapUsed,
 		external: memory.external,
 		arrayBuffers: memory.arrayBuffers,
 	};
 	const proc = readProcStatus();
-	if (proc !== undefined) Object.assign(sample, proc);
-	const cgroupCurrent = readCgroupFiles(["memory.current"])["memory.current"];
-	if (cgroupCurrent !== null) sample.cgroupCurrent = Number(cgroupCurrent);
+	if (proc !== undefined) {
+		// VmHWM is process-wide even when the sample is tagged with an arm.
+		if (currentBackgroundArm !== undefined) delete proc.vmHWM;
+		Object.assign(sample, proc);
+	}
+	const current = readCgroupFiles(currentBackgroundArm === undefined ? CGROUP_CURRENT_FILES : CGROUP_ARM_CURRENT_FILES);
+	if (current["memory.current"] !== null) sample.cgroupCurrent = Number(current["memory.current"]);
+	if (typeof current["memory.swap.current"] === "string")
+		sample.cgroupSwapCurrent = Number(current["memory.swap.current"]);
 	samples.push(sample);
 }
 
