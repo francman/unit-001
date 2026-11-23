@@ -12,6 +12,8 @@ import type { MissionView } from "../missions/contract.ts";
 import { matchingPlanApproval, planDigest } from "../missions/plan-authority.ts";
 import { localServiceClient } from "../service-client.ts";
 import { createWebGateway } from "./gateway.ts";
+import { acquireListenerLock } from "./listener-lock.ts";
+import { forgetListener, type ListenerPaths, type PreservedPath, recordListener, recoverListener } from "./listener-residue.ts";
 import type { ManagedMissionReview, WebPlanReview } from "./post-response.ts";
 
 /** Serves packaged browser assets until interrupted. */
@@ -67,6 +69,9 @@ export async function runWebWorkspace(
 				: undefined,
 		planReview: location === undefined ? undefined : (view) => reviewPlan(location, view),
 	});
+	let releaseLock: (() => Promise<void>) | undefined;
+	let recorded: ListenerPaths | undefined;
+	let preserved: readonly PreservedPath[] = [];
 	let staging: string | undefined;
 	let published: BigIntStats | undefined;
 	try {
@@ -75,6 +80,14 @@ export async function runWebWorkspace(
 			await once(gateway.server, "listening");
 		} else {
 			const directory = await prepareManagedDirectory(managed.home, managed.uid);
+			// Held through shutdown and cleanup below, so no other launcher can take residue that is still in use.
+			releaseLock = await acquireListenerLock(join(directory, `${managed.installationId}.lock`), managed.uid);
+			const paths: ListenerPaths = {
+				directory,
+				socket: managed.path,
+				record: join(directory, `${managed.installationId}.listener`),
+			};
+			preserved = await recoverListener(paths, managed.uid);
 			staging = await mkdtemp(join(directory, ".listener-"));
 			const bindPath = join(staging, "s");
 			// Node unlinks its bound path on close. Give it a separate name so cleanup cannot unlink a replacement at the public path.
@@ -89,16 +102,20 @@ export async function runWebWorkspace(
 			await once(gateway.server, "listening");
 			await chmod(bindPath, 0o600);
 			const socket = await lstat(bindPath, { bigint: true });
+			await recordListener(paths, staging, socket, managed.uid);
+			recorded = paths;
 			await link(bindPath, managed.path).catch((error: NodeJS.ErrnoException) => {
 				if (error.code !== "EEXIST") throw error;
+				const reason = preserved.find((entry) => entry.path === managed.path)?.reason;
 				throw new ConfigurationError(
-					`Managed web socket path already exists: ${managed.path}. Stop its launcher, or confirm the path is stale before removing it.`,
+					`Managed web socket path already exists: ${managed.path}${reason === undefined ? "" : ` (${reason})`}. Stop its launcher, or confirm the path is stale before removing it.`,
 				);
 			});
 			published = socket;
 		}
+		const notices = preserved.map(({ path, reason }) => `Preserved unrecognized path: ${path} (${reason}).\n`).join("");
 		write(
-			`Browser workspace: ${origin}\n${managed === undefined ? "" : `Managed socket: ${managed.path}\n`}Ctrl+C detaches the web workspace; agent work continues.\n`,
+			`${notices}Browser workspace: ${origin}\n${managed === undefined ? "" : `Managed socket: ${managed.path}\n`}Ctrl+C detaches the web workspace; agent work continues.\n`,
 		);
 		if (!signal.aborted)
 			await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
@@ -110,14 +127,17 @@ export async function runWebWorkspace(
 		} finally {
 			try {
 				await gateway.close();
-			} finally {
 				if (staging !== undefined) await rmdir(staging);
+				// Forget the record only after every inode it names is gone; otherwise the next start finishes the cleanup.
+				if (recorded !== undefined) await forgetListener(recorded);
+			} finally {
+				await releaseLock?.();
 			}
 		}
 	}
 }
 
-function managedListener(installationId: string): { home: string; uid: number; path: string } {
+function managedListener(installationId: string): { installationId: string; home: string; uid: number; path: string } {
 	const uid = process.getuid?.();
 	if (
 		uid === undefined ||
@@ -133,7 +153,7 @@ function managedListener(installationId: string): { home: string; uid: number; p
 		throw new ConfigurationError("The operator requires a protected, absolute account home directory.");
 	const path = join(home, ".unit-001", "web", `${installationId}.sock`);
 	if (Buffer.byteLength(path) > 103) throw new ConfigurationError("The managed web socket path is too long.");
-	return { home, uid, path };
+	return { installationId, home, uid, path };
 }
 
 async function prepareManagedDirectory(home: string, uid: number): Promise<string> {

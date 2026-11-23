@@ -85,7 +85,10 @@ describe.skipIf(account.uid <= 0)("managed web listener", () => {
 		expect(await get(origin)).toEqual({ status: 200, body: "host TCP port" });
 		first.controller.abort();
 		expect(await first.done).toBe(0);
-		expect(await readdir(dirname(socketPath))).toEqual([]);
+		// Only the lock remains: its inode must stay stable for every later launcher.
+		expect(await readdir(dirname(socketPath))).toEqual([`${installationId}.lock`]);
+		const lock = await lstat(join(dirname(socketPath), `${installationId}.lock`));
+		expect(lock.isFile() && lock.uid === account.uid && (lock.mode & 0o7777) === 0o600).toBe(true);
 		const second = await start(address.port);
 		expect(await get(origin, socketPath)).toEqual({ status: 200, body: "workspace fixture" });
 		second.controller.abort();
@@ -119,7 +122,7 @@ describe.skipIf(account.uid <= 0)("managed web listener", () => {
 			"path already exists",
 		);
 		expect(await lstat(socketPath)).toMatchObject({ uid: socket.uid, mode: socket.mode, ino: socket.ino });
-		expect(await readdir(dirname(socketPath))).toEqual([`${installationId}.sock`]);
+		expect(await readdir(dirname(socketPath))).toEqual([`${installationId}.lock`, `${installationId}.sock`]);
 		expect(write).not.toHaveBeenCalled();
 	});
 
