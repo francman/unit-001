@@ -1,11 +1,17 @@
 import { createInterface } from "node:readline/promises";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
-import { commandCatalog } from "./commands/catalog.ts";
-import { isOperatingSystemQuestion } from "./commands/facts.ts";
-import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
+import { describeCommandSuggestions } from "./commands/resolution.ts";
+import {
+	activityLabel,
+	classifySlashInput,
+	confirmsForget,
+	describeInterpretation,
+	parseMemorySlash,
+	unknownCommandNotice,
+} from "./commands/slash.ts";
 import { describeInspection, inspectionText } from "./introspection/command.ts";
-import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-control.ts";
+import { describeMemory, type MemoryRequest } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
 import { DeltaPrinter, liveText, sanitizeTerminalText, ToolAnnouncer } from "./render.ts";
 
@@ -136,12 +142,11 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 		readline.setPrompt("> ");
 		if (interactive) readline.prompt();
 		for await (const line of readline) {
-			let text = line.trim();
 			if (forget !== undefined) {
 				const pending = forget;
 				forget = undefined;
 				try {
-					if (text.toLowerCase() === "yes")
+					if (confirmsForget(line))
 						terminal.err(
 							`${describeMemory(await agent.memory({ operation: "forget", ...pending, confirmed: true }, BACKGROUND_CONTEXT))}\n`,
 						);
@@ -152,52 +157,44 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 				if (interactive) readline.prompt();
 				continue;
 			}
-			if (text.startsWith("/")) {
-				const resolved = resolveLocalCommand(text, "slash");
-				if (resolved.kind === "exact") text = `/${resolved.text}`;
-				else {
-					if (resolved.kind === "suggestions")
-						terminal.err(`${describeCommandSuggestions(resolved.commands, "slash")}\n`);
-					else {
-						const result = await agent.resolveCommand(text, "slash", BACKGROUND_CONTEXT, signal);
-						const commands = commandCatalog("slash").filter((command) => result.commandIds.includes(command.id));
-						terminal.err(
-							`${commands.length === 0 ? result.explanation : describeCommandSuggestions(commands, "slash")}\n`,
-						);
-					}
-					if (interactive) readline.prompt();
-					continue;
-				}
+			const input = classifySlashInput(line);
+			if (input.kind === "suggestions" || input.kind === "unresolved") {
+				if (input.kind === "suggestions") terminal.err(`${describeCommandSuggestions(input.commands, "slash")}\n`);
+				else
+					terminal.err(
+						`${describeInterpretation(await agent.resolveCommand(input.text, "slash", BACKGROUND_CONTEXT, signal))}\n`,
+					);
+				if (interactive) readline.prompt();
+				continue;
 			}
-			if (text === "/exit" || text === "/quit") break;
-			if (text === "/help") terminal.err(`${HELP}\n`);
-			else if (text === "/status") {
+			if (input.kind === "exit") break;
+			if (input.kind === "help") terminal.err(`${HELP}\n`);
+			else if (input.kind === "status") {
 				const status = await agent.status(BACKGROUND_CONTEXT);
 				terminal.err(
-					`${agent.name}: ${status.busy ? "busy" : "idle"}; PID ${status.runtime.pid}; started ${new Date(status.runtime.startedAt).toISOString()}; uptime ${Math.floor(status.runtime.uptimeMs / 1000)}s; observed ${new Date(status.runtime.observedAt).toISOString()}\n`,
+					`${agent.name}: ${activityLabel(status.busy)}; PID ${status.runtime.pid}; started ${new Date(status.runtime.startedAt).toISOString()}; uptime ${Math.floor(status.runtime.uptimeMs / 1000)}s; observed ${new Date(status.runtime.observedAt).toISOString()}\n`,
 				);
-			} else if (text === "/mission" || text === "/mission status" || text === "/mission setup") {
+			} else if (input.kind === "mission") {
 				try {
 					terminal.err(`${describeMission(await agent.mission({ operation: "status" }, BACKGROUND_CONTEXT))}\n`);
-					if (text === "/mission setup")
+					if (input.setup)
 						terminal.err(
 							`Close this foreground session, run ${agent.name} serve, then run ${agent.name} mission setup in another terminal.\n`,
 						);
 				} catch (error) {
 					terminal.err(`Mission: ${error instanceof Error ? error.message : String(error)}\n`);
 				}
-			} else if ((text === "/inspect" || text.startsWith("/inspect ")) && !isOperatingSystemQuestion(text)) {
+			} else if (input.kind === "inspect") {
 				try {
 					terminal.err(
-						`${sanitizeTerminalText(describeInspection(await agent.inspect(inspectionText(text), BACKGROUND_CONTEXT)))}\n`,
+						`${sanitizeTerminalText(describeInspection(await agent.inspect(inspectionText(input.text), BACKGROUND_CONTEXT)))}\n`,
 					);
 				} catch (error) {
 					terminal.err(`Inspection: ${error instanceof Error ? error.message : String(error)}\n`);
 				}
-			} else if (text === "/memory" || text.startsWith("/memory ")) {
+			} else if (input.kind === "memory") {
 				try {
-					const match = /^\/memory(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/.exec(text);
-					const request = memoryCommand(match?.[1], match?.[2]);
+					const request = parseMemorySlash(input.text);
 					if (request.operation === "confirm-forget") {
 						forget = { id: request.id, requestId: request.requestId };
 						terminal.err(
@@ -210,12 +207,14 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 				} catch (error) {
 					terminal.err(`Memory: ${error instanceof Error ? error.message : String(error)}\n`);
 				}
-			} else if (text.startsWith("/") && !isOperatingSystemQuestion(text))
-				terminal.err(`Unknown command ${text.split(/\s/, 1)[0]}. ${HELP}\n`);
-			else if (text !== "") {
+			} else if (input.kind === "unknown" || input.kind === "cancel" || input.kind === "evidence") {
+				// This loop reads no input while a turn runs (Ctrl+C cancels) and shows no tool cards,
+				// so /cancel and /evidence do not exist here.
+				terminal.err(`${unknownCommandNotice(HELP)}\n`);
+			} else if (input.kind === "prompt") {
 				current = new AbortController();
 				try {
-					report(await turn(agent, text, terminal, current.signal), terminal);
+					report(await turn(agent, input.text, terminal, current.signal), terminal);
 				} catch (error) {
 					terminal.err(`error: ${error instanceof Error ? error.message : String(error)}\n`);
 				} finally {

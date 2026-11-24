@@ -2,11 +2,20 @@
 import { randomUUID } from "node:crypto";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import { ATTACH_HELP as HELP } from "./attach-help.ts";
-import { commandCatalog } from "./commands/catalog.ts";
-import { isOperatingSystemQuestion } from "./commands/facts.ts";
-import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
+import { describeCommandSuggestions } from "./commands/resolution.ts";
+import {
+	activityLabel,
+	classifySlashInput,
+	confirmsForget,
+	describeInterpretation,
+	isEvidenceCallId,
+	MAX_INTERPRETED_INPUT,
+	MAX_PROMPT_BYTES,
+	parseMemorySlash,
+	unknownCommandNotice,
+} from "./commands/slash.ts";
 import { describeInspection, inspectionText } from "./introspection/command.ts";
-import { describeMemory, type MemoryRequest, memoryCommand } from "./memory-control.ts";
+import { describeMemory, type MemoryRequest } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
 import { sanitizeTerminalText } from "./render.ts";
 import type { Terminal } from "./repl.ts";
@@ -15,8 +24,6 @@ import type { ServiceView } from "./service.ts";
 import { localServiceClient, type ServiceClient } from "./service-client.ts";
 import { providerProblemSummary, runFailureSummary, toolFailureSummary } from "./service-view.ts";
 import { evidenceLines } from "./tool-evidence.ts";
-
-const MAX_INPUT_BYTES = 16_384;
 
 /** Runs a service terminal client; exit, EOF, signals, or connection loss never abort admitted service work. */
 export async function runAttach(endpoint: string, terminal: Terminal, signal: AbortSignal): Promise<number> {
@@ -135,7 +142,6 @@ export async function runServiceAttach(
 	const onLine = (line: string) => {
 		if (local.signal.aborted) return;
 		flush();
-		let text = line.trim();
 		const runMemory = (request: MemoryRequest) => {
 			if ("requestId" in request)
 				err(`Submitting memory request ${request.requestId}; retain this ID if disconnected.\n`);
@@ -154,53 +160,48 @@ export async function runServiceAttach(
 		if (forget !== undefined) {
 			const pending = forget;
 			forget = undefined;
-			if (text.toLowerCase() === "yes") runMemory({ operation: "forget", ...pending, confirmed: true });
+			if (confirmsForget(line)) runMemory({ operation: "forget", ...pending, confirmed: true });
 			else err("Forget cancelled.\n");
 			return;
 		}
-		if (text.startsWith("/")) {
-			const resolved = resolveLocalCommand(text, "slash");
-			if (resolved.kind === "exact") text = `/${resolved.text}`;
-			else {
-				if (resolved.kind === "suggestions") err(`${describeCommandSuggestions(resolved.commands, "slash")}\n`);
-				else if (text.length <= 256)
-					void client.request({ type: "resolve-command", input: text, surface: "slash" }, local.signal).then(
-						(response) => {
-							if (local.signal.aborted) return;
-							if (response.type !== "command-suggestions") {
-								err("Command suggestions unavailable. Use /help.\n");
-								return;
-							}
-							const commands = commandCatalog("slash").filter((command) =>
-								response.result.commandIds.includes(command.id),
-							);
-							err(
-								`${commands.length === 0 ? response.result.explanation : describeCommandSuggestions(commands, "slash")}\n`,
-							);
-						},
-						() => {
-							if (!local.signal.aborted) err("Command suggestions unavailable. Use /help.\n");
-						},
-					);
-				else err("Unknown command. Use /help.\n");
-				return;
-			}
+		const input = classifySlashInput(line);
+		if (input.kind === "suggestions") {
+			err(`${describeCommandSuggestions(input.commands, "slash")}\n`);
+			return;
 		}
-		if (text === "/exit" || text === "/detach") {
+		if (input.kind === "unresolved") {
+			if (input.text.length <= MAX_INTERPRETED_INPUT)
+				void client.request({ type: "resolve-command", input: input.text, surface: "slash" }, local.signal).then(
+					(response) => {
+						if (local.signal.aborted) return;
+						if (response.type !== "command-suggestions") {
+							err("Command suggestions unavailable. Use /help.\n");
+							return;
+						}
+						err(`${describeInterpretation(response.result)}\n`);
+					},
+					() => {
+						if (!local.signal.aborted) err("Command suggestions unavailable. Use /help.\n");
+					},
+				);
+			else err(`${unknownCommandNotice("Use /help.")}\n`);
+			return;
+		}
+		if (input.kind === "exit") {
 			detach();
 			return;
 		}
-		if (text === "/help") err(`${HELP}\n`);
-		else if (text === "/status") {
+		if (input.kind === "help") err(`${HELP}\n`);
+		else if (input.kind === "status") {
 			if (view !== undefined)
 				err(
-					`${connected ? "" : "Last observed (disconnected): "}${view.name}: ${view.busy ? "working" : "ready"}; PID ${view.pid}; version ${view.version}; session ${client.session}\n`,
+					`${connected ? "" : "Last observed (disconnected): "}${view.name}: ${activityLabel(view.busy)}; PID ${view.pid}; version ${view.version}; session ${client.session}\n`,
 				);
 			void client.request({ type: "status" }, local.signal).then(
 				(response) => {
 					if (response.type === "status")
 						err(
-							`${response.name}: ${response.busy ? "working" : "ready"}; PID ${response.pid}; version ${response.version}; session ${client.session}; started ${new Date(response.runtime.startedAt).toISOString()}; uptime ${Math.floor(response.runtime.uptimeMs / 1000)}s; observed ${new Date(response.runtime.observedAt).toISOString()}\n`,
+							`${response.name}: ${activityLabel(response.busy)}; PID ${response.pid}; version ${response.version}; session ${client.session}; started ${new Date(response.runtime.startedAt).toISOString()}; uptime ${Math.floor(response.runtime.uptimeMs / 1000)}s; observed ${new Date(response.runtime.observedAt).toISOString()}\n`,
 						);
 					else if (response.type === "error") err(`${response.message}\n`);
 				},
@@ -208,14 +209,14 @@ export async function runServiceAttach(
 					if (!local.signal.aborted) err(`Status: ${describeError(error)}\n`);
 				},
 			);
-		} else if (text === "/mission" || text === "/mission status" || text === "/mission setup") {
+		} else if (input.kind === "mission") {
 			void client.request({ type: "mission", request: { operation: "status" } }, local.signal).then(
 				(response) => {
 					if (local.signal.aborted) return;
 					err(
 						`${response.type === "mission" ? describeMission(response.result) : response.type === "error" ? response.message : "Unexpected mission response."}\n`,
 					);
-					if (text === "/mission setup")
+					if (input.setup)
 						err(
 							"Use NAME mission setup in a separate interactive terminal, or mission draft --file for headless formation.\n",
 						);
@@ -224,9 +225,9 @@ export async function runServiceAttach(
 					if (!local.signal.aborted) err(`Mission: ${describeError(error)}\n`);
 				},
 			);
-		} else if ((text === "/inspect" || text.startsWith("/inspect ")) && !isOperatingSystemQuestion(text)) {
+		} else if (input.kind === "inspect") {
 			try {
-				void client.request({ type: "inspection", query: inspectionText(text) }, local.signal).then(
+				void client.request({ type: "inspection", query: inspectionText(input.text) }, local.signal).then(
 					(response) => {
 						if (!local.signal.aborted)
 							err(
@@ -240,9 +241,9 @@ export async function runServiceAttach(
 			} catch (error) {
 				err(`Inspection: ${describeError(error)}\n`);
 			}
-		} else if (text === "/evidence" || text.startsWith("/evidence ")) {
-			const callId = text.slice(9).trim() || view?.tools.at(-1)?.callId;
-			if (callId === undefined || /\s/.test(callId) || callId.length > 200)
+		} else if (input.kind === "evidence") {
+			const callId = input.argument || view?.tools.at(-1)?.callId;
+			if (callId === undefined || !isEvidenceCallId(callId))
 				err("Use /evidence CALL_ID after a tool has run.\n");
 			else
 				void client.request({ type: "tool-evidence", callId }, local.signal).then(
@@ -256,10 +257,9 @@ export async function runServiceAttach(
 						if (!local.signal.aborted) err(`Evidence: ${describeError(error)}\n`);
 					},
 				);
-		} else if (text === "/memory" || text.startsWith("/memory ")) {
+		} else if (input.kind === "memory") {
 			try {
-				const match = /^\/memory(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/.exec(text);
-				const request = memoryCommand(match?.[1], match?.[2]);
+				const request = parseMemorySlash(input.text);
 				if (request.operation === "confirm-forget") {
 					forget = { id: request.id, requestId: request.requestId };
 					err(`Forget ${request.id}? Type yes; any other input cancels. History remains. [No]\n`);
@@ -267,9 +267,10 @@ export async function runServiceAttach(
 			} catch (error) {
 				err(`Memory: ${describeError(error)}\n`);
 			}
-		} else if (text === "/cancel") cancel();
-		else if (text.startsWith("/") && !isOperatingSystemQuestion(text)) err(`Unknown command. ${HELP}\n`);
-		else if (text !== "") {
+		} else if (input.kind === "cancel") cancel();
+		else if (input.kind === "unknown") err(`${unknownCommandNotice(HELP)}\n`);
+		else if (input.kind === "prompt") {
+			const { text } = input;
 			if (!connected) {
 				err("Remote is reconnecting; prompt was not submitted.\n");
 				return;
@@ -278,7 +279,7 @@ export async function runServiceAttach(
 				err("A submission is pending. Wait, /cancel, or /detach; additional prompts are not queued by this client.\n");
 				return;
 			}
-			if (Buffer.byteLength(text) > MAX_INPUT_BYTES) {
+			if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) {
 				err("Prompt exceeds 16 KiB.\n");
 				return;
 			}
@@ -314,10 +315,10 @@ export async function runServiceAttach(
 		detach();
 	};
 	const onData = (chunk: string | Buffer) => {
-		if (Buffer.byteLength(chunk) > MAX_INPUT_BYTES) oversizedInput();
+		if (Buffer.byteLength(chunk) > MAX_PROMPT_BYTES) oversizedInput();
 	};
 	const onKeypress = () => {
-		if (reader !== undefined && Buffer.byteLength(reader.line) > MAX_INPUT_BYTES) oversizedInput();
+		if (reader !== undefined && Buffer.byteLength(reader.line) > MAX_PROMPT_BYTES) oversizedInput();
 		if (!flushQueued && (pendingView !== undefined || pendingNotice !== "")) {
 			flushQueued = true;
 			queueMicrotask(() => {

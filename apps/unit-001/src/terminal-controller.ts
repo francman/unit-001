@@ -3,13 +3,22 @@ import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
 import { ATTACH_HELP } from "./attach-help.ts";
-import { type CommandDefinition, commandCatalog } from "./commands/catalog.ts";
-import { isOperatingSystemQuestion } from "./commands/facts.ts";
+import type { CommandDefinition } from "./commands/catalog.ts";
 import type { CommandInterpretation } from "./commands/interpretation.ts";
-import { resolveLocalCommand } from "./commands/resolution.ts";
+import {
+	activityLabel,
+	classifySlashInput,
+	confirmsForget,
+	interpretedCommands,
+	isEvidenceCallId,
+	MAX_INTERPRETED_INPUT,
+	MAX_PROMPT_BYTES,
+	parseMemorySlash,
+	unknownCommandNotice,
+} from "./commands/slash.ts";
 import { describeInspection, inspectionText } from "./introspection/command.ts";
 import type { InspectionQuery, InspectionWireReport } from "./introspection/contract.ts";
-import { describeMemory, type MemoryRequest, type MemoryResult, memoryCommand } from "./memory-control.ts";
+import { describeMemory, type MemoryRequest, type MemoryResult } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
 import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import type { RuntimeFacts } from "./orientation.ts";
@@ -281,7 +290,6 @@ interface ConversationTransport {
 const HELP = `${ATTACH_HELP}\nDefault rich controls: PageUp/PageDown scroll; Ctrl+Shift+F searches the displayed transcript when forwarded by the terminal; Enter/Shift+Enter moves between matches; Esc closes search.\nUsage covers conversation-model estimates, excluding tool/subagent costs and subscription billing.`;
 const FOREGROUND_HELP =
 	"/help /status /evidence [CALL_ID|close] /mission [setup] /memory [stats|recall <query>|remember <text>|forget <id>|sleep] /cancel /exit. /cancel stops all work in this chat, including queued inputs, not only your latest send. Ctrl+C cancels while busy and exits when idle. Ctrl+D or /exit closes this foreground session; unfinished work resumes on the next launch. The managed agent runs independently.";
-const MAX_INPUT_BYTES = 16_384;
 
 // A wire error acknowledges the request; transport failures leave its outcome unknown.
 class OwnerRequestError extends Error {}
@@ -325,86 +333,92 @@ class OwnerTerminalController implements TerminalController {
 
 	submit(input: string, options: SendOptions = {}): TerminalInputResult {
 		if (this.#finished) return { status: "rejected" };
-		let text = input.trim();
 		if (this.#forget !== undefined) {
 			const pending = this.#forget;
 			this.#forget = undefined;
-			if (text.toLowerCase() === "yes") void this.#memory({ operation: "forget", ...pending, confirmed: true });
+			if (confirmsForget(input)) void this.#memory({ operation: "forget", ...pending, confirmed: true });
 			else this.#notice("Forget cancelled.");
 			return { status: "command" };
 		}
 		this.dismissSuggestions();
-		if (text.startsWith("/")) {
-			const resolved = resolveLocalCommand(text, "slash");
-			if (resolved.kind === "exact") text = `/${resolved.text}`;
-			else {
-				if (resolved.kind === "suggestions") this.#showSuggestions(resolved.commands);
-				else void this.#suggest(text);
+		const command = classifySlashInput(input);
+		switch (command.kind) {
+			case "suggestions":
+				this.#showSuggestions(command.commands);
 				return { status: "rejected" };
-			}
+			case "unresolved":
+				void this.#suggest(command.text);
+				return { status: "rejected" };
+			case "exit":
+				this.detach();
+				return { status: "command" };
+			case "help":
+				this.#notice(this.#transport.ownership === "attached" ? HELP : FOREGROUND_HELP);
+				return { status: "command" };
+			case "status":
+				this.#showStatus();
+				return { status: "command" };
+			case "mission":
+				if (command.setup) return { status: "mission-setup" };
+				void this.#mission();
+				return { status: "command" };
+			case "evidence":
+				return this.#evidenceCommand(command.argument);
+			case "inspect":
+				try {
+					void this.#inspect(inspectionText(command.text));
+					return { status: "command" };
+				} catch (error) {
+					this.#notice(describeError(error), "error");
+					return { status: "rejected" };
+				}
+			case "memory":
+				return this.#memoryCommand(command.text);
+			case "cancel":
+				this.cancel();
+				return { status: "command" };
+			case "unknown":
+				this.#notice(unknownCommandNotice(this.#transport.ownership === "attached" ? HELP : FOREGROUND_HELP));
+				return { status: "rejected" };
+			case "empty":
+				return { status: "command" };
+			case "prompt":
+				return this.#submitPrompt(command.text, options);
 		}
-		if (text === "/exit" || text === "/detach") {
-			this.detach();
-			return { status: "command" };
-		}
-		if (text === "/help") {
-			this.#notice(this.#transport.ownership === "attached" ? HELP : FOREGROUND_HELP);
-			return { status: "command" };
-		}
-		if (text === "/status") {
-			if (this.#state.unresolvedRequestIds?.length)
-				this.#notice(
-					`Unconfirmed requests: ${this.#state.unresolvedRequestIds.join(", ")}. Inspect persisted work before retrying.`,
-				);
-			const view = this.#state.view;
+	}
+
+	// The last observed view answers at once; the owner is then asked for its runtime facts.
+	#showStatus(): void {
+		if (this.#state.unresolvedRequestIds?.length)
 			this.#notice(
-				view === undefined
-					? "Connecting to the service."
-					: `${this.#state.connection === "attached" ? "" : "Last observed (disconnected): "}${view.name}: ${view.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${view.pid}; version ${view.version}.`,
+				`Unconfirmed requests: ${this.#state.unresolvedRequestIds.join(", ")}. Inspect persisted work before retrying.`,
 			);
-			void this.#status();
+		const view = this.#state.view;
+		this.#notice(
+			view === undefined
+				? "Connecting to the service."
+				: `${this.#state.connection === "attached" ? "" : "Last observed (disconnected): "}${view.name}: ${activityLabel(view.busy)}; session ${this.#transport.session}; PID ${view.pid}; version ${view.version}.`,
+		);
+		void this.#status();
+	}
+
+	#memoryCommand(text: string): TerminalInputResult {
+		try {
+			const request = parseMemorySlash(text);
+			if (request.operation === "confirm-forget") {
+				this.#forget = { id: request.id, requestId: request.requestId };
+				this.#notice(
+					`Forget ${request.id}? Type yes to confirm; any other input cancels. Conversation history remains. [No]`,
+				);
+			} else void this.#memory(request);
 			return { status: "command" };
-		}
-		if (text === "/mission setup") return { status: "mission-setup" };
-		if (text === "/evidence" || text.startsWith("/evidence ")) return this.#evidenceCommand(text.slice(9).trim());
-		if ((text === "/inspect" || text.startsWith("/inspect ")) && !isOperatingSystemQuestion(text)) {
-			try {
-				void this.#inspect(inspectionText(text));
-				return { status: "command" };
-			} catch (error) {
-				this.#notice(describeError(error), "error");
-				return { status: "rejected" };
-			}
-		}
-		if (text === "/mission" || text === "/mission status") {
-			void this.#mission();
-			return { status: "command" };
-		}
-		if (text === "/memory" || text.startsWith("/memory ")) {
-			try {
-				const match = /^\/memory(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/.exec(text);
-				const request = memoryCommand(match?.[1], match?.[2]);
-				if (request.operation === "confirm-forget") {
-					this.#forget = { id: request.id, requestId: request.requestId };
-					this.#notice(
-						`Forget ${request.id}? Type yes to confirm; any other input cancels. Conversation history remains. [No]`,
-					);
-				} else void this.#memory(request);
-				return { status: "command" };
-			} catch (error) {
-				this.#notice(describeError(error), "error");
-				return { status: "rejected" };
-			}
-		}
-		if (text === "/cancel") {
-			this.cancel();
-			return { status: "command" };
-		}
-		if (text.startsWith("/") && !isOperatingSystemQuestion(text)) {
-			this.#notice(`Unknown command. ${this.#transport.ownership === "attached" ? HELP : FOREGROUND_HELP}`);
+		} catch (error) {
+			this.#notice(describeError(error), "error");
 			return { status: "rejected" };
 		}
-		if (text === "") return { status: "command" };
+	}
+
+	#submitPrompt(text: string, options: SendOptions): TerminalInputResult {
 		if (this.#state.connection !== "attached") {
 			this.#notice("Still connecting; the prompt was not submitted.");
 			return { status: "rejected" };
@@ -422,7 +436,7 @@ class OwnerTerminalController implements TerminalController {
 			);
 			return { status: "rejected" };
 		}
-		if (Buffer.byteLength(text) > MAX_INPUT_BYTES) {
+		if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) {
 			this.#notice("Prompt exceeds 16 KiB; it was not submitted.");
 			return { status: "rejected" };
 		}
@@ -468,8 +482,8 @@ class OwnerTerminalController implements TerminalController {
 	}
 
 	async #suggest(input: string): Promise<void> {
-		if (input.length > 256 || this.#state.connection !== "attached") {
-			this.#notice("Unknown command. Use /help for available commands.");
+		if (input.length > MAX_INTERPRETED_INPUT || this.#state.connection !== "attached") {
+			this.#notice(unknownCommandNotice("Use /help for available commands."));
 			return;
 		}
 		const pending = new AbortController();
@@ -479,7 +493,7 @@ class OwnerTerminalController implements TerminalController {
 		try {
 			const result = await this.#transport.resolveCommand(input, AbortSignal.any([pending.signal, this.#local.signal]));
 			if (pending.signal.aborted || this.#finished) return;
-			const commands = commandCatalog("slash").filter((command) => result.commandIds.includes(command.id));
+			const commands = interpretedCommands(result);
 			if (commands.length > 0) this.#showSuggestions(commands);
 			else this.#notice(result.explanation);
 		} catch (error) {
@@ -690,7 +704,7 @@ class OwnerTerminalController implements TerminalController {
 			const facts = await this.#transport.runtime(this.#local.signal);
 			if (!this.#finished)
 				this.#notice(
-					`${facts.name}: ${this.#state.view?.busy ? "working" : "ready"}; session ${this.#transport.session}; PID ${facts.pid}; ${facts.configuration === "unconfigured" ? "provider not configured" : `${facts.provider}/${facts.modelId}`}; started ${new Date(facts.startedAt).toISOString()}; uptime ${Math.floor(facts.uptimeMs / 1000)}s; observed ${new Date(facts.observedAt).toISOString()}.`,
+					`${facts.name}: ${activityLabel(this.#state.view?.busy === true)}; session ${this.#transport.session}; PID ${facts.pid}; ${facts.configuration === "unconfigured" ? "provider not configured" : `${facts.provider}/${facts.modelId}`}; started ${new Date(facts.startedAt).toISOString()}; uptime ${Math.floor(facts.uptimeMs / 1000)}s; observed ${new Date(facts.observedAt).toISOString()}.`,
 				);
 		} catch (error) {
 			if (!this.#finished) this.#notice(`Status: ${describeError(error)}`, "error");
@@ -715,7 +729,7 @@ class OwnerTerminalController implements TerminalController {
 			return { status: "command" };
 		}
 		const callId = argument === "" ? this.#state.view?.tools.at(-1)?.callId : argument;
-		if (callId === undefined || /\s/.test(callId) || callId.length > 200) {
+		if (callId === undefined || !isEvidenceCallId(callId)) {
 			this.#notice(
 				callId === undefined ? "No tool call to inspect yet." : "Use /evidence [CALL_ID] or /evidence close.",
 				"error",

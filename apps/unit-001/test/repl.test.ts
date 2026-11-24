@@ -86,8 +86,21 @@ describe("runRepl", () => {
 		const agent = await launch([]);
 		const io = terminal("/status\n/exit\n");
 		await runRepl(agent, io.terminal, signal());
-		expect(io.err()).toMatch(/^agent: idle; PID \d+; started .*; uptime \d+s; observed .*\n$/);
+		// The attached terminal and the rich controller already said "ready"/"working"; the foreground loop said "idle"/"busy".
+		expect(io.err()).toMatch(/^agent: ready; PID \d+; started .*; uptime \d+s; observed .*\n$/);
 		expect(io.out()).toBe("");
+	});
+
+	// The foreground loop named the bad token and the other terminals did not; all three now share one notice.
+	it("reports an unknown slash command like the other terminals, without asking the model", async () => {
+		const agent = await launch([]);
+		const submit = vi.spyOn(agent, "submit");
+		const io = terminal("/mission bogus\n/cancel\n/exit\n");
+		await runRepl(agent, io.terminal, signal());
+		expect(io.err()).toMatch(/^Unknown command\. Commands: \/help/);
+		expect(io.err()).not.toContain("/mission bogus");
+		expect(io.err().match(/^Unknown command\. /gm)).toHaveLength(2);
+		expect(submit).not.toHaveBeenCalled();
 	});
 
 	// #21: each completed turn releases its cancellation listeners.
@@ -182,7 +195,7 @@ describe("runRepl", () => {
 		expect(await running).toBe(0);
 		expect(abort).toHaveBeenCalledTimes(1);
 		expect(io.err()).toContain("^C cancelling the chat");
-		expect(io.err()).toContain("agent: idle");
+		expect(io.err()).toContain("agent: ready");
 	});
 
 	it("ends when the signal aborts", async () => {
