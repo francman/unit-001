@@ -5,7 +5,7 @@ import { setTimeout } from "node:timers/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { createRegistry, defineExtension, defineTask, Harness, LiveDoc } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Agent } from "../src/agent.ts";
@@ -225,6 +225,106 @@ describe("Agent", () => {
 		const second = await launch([reply("Paris.")]);
 		expect(second.agent.interrupted).toBe(true);
 		expect(await second.agent.idle(context)).toBe("Paris.");
+	});
+
+	it("preserves providerless work through idle and maintenance release, and cancels only the chat", async () => {
+		const requested = Promise.withResolvers<void>();
+		const first = await launch([
+			(_request, options) => {
+				const pending = Promise.withResolvers<never>();
+				options?.signal?.addEventListener("abort", () => pending.reject(new Error("closed")), { once: true });
+				requested.resolve();
+				return pending.promise;
+			},
+		]);
+		await first.agent.submit("Interrupted input", context, { requestId: "interrupted" });
+		await requested.promise;
+		await first.agent.submit("Queued input", context, { requestId: "queued" });
+		await first.agent.close(context);
+		open.splice(open.indexOf(first.agent), 1);
+
+		const pending = defineTask<null, { phase: "finish" }, null>({
+			name: "test.agent.pending",
+			version: 1,
+			initial: () => ({ phase: "finish" }),
+			phases: {
+				finish: async (_task, runtime, ctx) =>
+					runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), ctx),
+			},
+			abort: async (_task, runtime, ctx) =>
+				runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
+		});
+		const extension = defineExtension({ name: "test.agent.scheduling", tasks: [pending] });
+		const models = createModels();
+		const faux = fauxProvider();
+		faux.setResponses([reply("Should not run")]);
+		models.setProvider(faux.provider);
+		const registry = createRegistry();
+		registry.install(extension);
+		const seed = await Harness.open(await openNodeSqliteStorage(file), { models, registry }, context);
+		const ids = await seed
+			.root(context)
+			.then(async (root) => {
+				const run = (await seed.snapshot(LiveDoc, root.id, context))?.run;
+				if (!run) throw new Error("Expected the interrupted run.");
+				return root.commit(async (tx) => {
+					const child = await tx.createConversation({ ownership: { kind: "task", taskId: run.taskId } });
+					const other = await tx.createConversation({ ownership: { kind: "ownerless" } });
+					const nested = await tx.createTask(pending, null, {
+						conversationId: child.id,
+						ownership: { kind: "conversation" },
+					});
+					const unrelated = await tx.createTask(pending, null, {
+						conversationId: other.id,
+						ownership: { kind: "conversation" },
+					});
+					const background = await tx.createTask(pending, null, {
+						ownership: { kind: "conversation" },
+						background: true,
+					});
+					return { run: run.taskId, nested, unrelated, background };
+				}, context);
+			})
+			.finally(() => seed.close(context));
+
+		const agent = await Agent.open(
+			{ storage: await openNodeSqliteStorage(file), models, model: null, cwd: directory, extensions: [extension] },
+			context,
+		);
+		open.push(agent);
+		expect(await agent.status(context)).toMatchObject({
+			busy: true,
+			inhibited: false,
+			runtime: { configuration: "unconfigured" },
+		});
+		await expect(agent.idle(context)).rejects.toThrow("Pending work is preserved");
+		expect(await agent.admission("queued", undefined, context)).toMatchObject({ outcome: "queued" });
+		expect(await agent.enterMaintenance("providerless", 0, context)).toMatchObject({ result: "deferred" });
+		await agent.releaseMaintenance("providerless", context);
+		await agent.abort(context);
+		expect(await agent.admission("queued", undefined, context)).toMatchObject({
+			outcome: "unanswered",
+			reason: "aborted",
+		});
+		expect(await agent.admission("interrupted", undefined, context)).toMatchObject({ outcome: "placed" });
+		expect((await agent.inspect({ scope: "tasks" }, context)).data).toMatchObject({ scheduling: "paused" });
+		expect(faux.state.callCount).toBe(0);
+		await agent.close(context);
+		open.splice(open.indexOf(agent), 1);
+
+		const reopened = await Harness.open(await openNodeSqliteStorage(file), { models, registry }, context);
+		try {
+			for (const id of [ids.run, ids.nested])
+				expect(await reopened.getTask(id, context)).toMatchObject({ abortRequested: true });
+			for (const id of [ids.unrelated, ids.background]) {
+				expect(await reopened.getTask(id, context)).toMatchObject({
+					abortRequested: false,
+					state: { status: "pending" },
+				});
+			}
+		} finally {
+			await reopened.close(context);
+		}
 	});
 
 	it("does not submit twice for one request id", async () => {

@@ -7,6 +7,7 @@ import type { Models } from "@earendil-works/pi-ai/models";
 import {
 	AssistantEntry,
 	type Conversation,
+	type ConversationId,
 	type ConversationWatch,
 	createRegistry,
 	type Cursor,
@@ -23,6 +24,8 @@ import {
 	type Storage,
 	type Submission,
 	type SubmissionId,
+	type TaskId,
+	type Tx,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { createPowerShellTool } from "@earendil-works/pi-durable/tools";
@@ -143,6 +146,7 @@ export class Agent {
 	readonly #interpretations = new Map<AbortController, Promise<void>>();
 	#inhibited: boolean;
 	#closing = false;
+	#schedulingPermitted = false;
 	/** True when a run was unfinished at open; it resumes only when execution is not inhibited. */
 	readonly interrupted: boolean;
 
@@ -308,20 +312,14 @@ export class Agent {
 				{ cwd: options.cwd, secrets: environmentSecrets(), credentialRoots },
 			);
 			await initializeSideRegistry(agent.#sides, context);
-			const legacy = (await harness.snapshot(MissionDoc, context))?.current ?? null;
-			const pending = options.model === null ? await harness.inspect(context) : undefined;
-			const canSchedule =
-				pending === undefined ||
-				(pending.submissions.length === 0 &&
-					pending.tasks.every((task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy)));
-			if (!inhibited && canSchedule) {
+			if (!inhibited && (await agent.schedulingEligible(context))) {
 				await mission.initialize(context, "permitted");
 				await root.commit((tx) => reconcileMemoryTasks(tx, root.id, Date.now()), context);
 				memory.recall.prepare(
 					await harness.snapshot(MemoryDoc, context),
 					await harness.snapshot(MemoryRelationsDoc, context),
 				);
-				harness.resume();
+				agent.enableScheduling();
 			}
 			return agent;
 		} catch (error) {
@@ -466,9 +464,10 @@ export class Agent {
 		}
 	}
 
-	/** Waits for the conversation to go idle, and returns the answer a resumed run ended with, if it ended in one. */
+	/** Waits for permitted chat work to go idle and returns the latest answer, if there is one. */
 	async idle(context: Context): Promise<string | undefined> {
 		this.requireActive();
+		if (!this.#schedulingPermitted) throw new ConfigurationError("Pending work is preserved while scheduling is paused.");
 		await this.#root.waitForIdle(context);
 		const { items } = await this.#root.entries({}, 1, undefined, context);
 		const newest = items[0];
@@ -512,12 +511,53 @@ export class Agent {
 	}
 
 	/**
-	 * Aborts all work in the chat: the current run, its tools and every queued input, whoever sent them. Durable has no
-	 * public operation that aborts only an observed run in one decision, so this is deliberately chat-wide.
+	 * Aborts the chat's foreground scope and queued inputs, not unrelated or background work. While scheduling is
+	 * paused to preserve work, commits cancellation without waiting for abort handlers to run.
 	 */
 	abort(context: Context): Promise<void> {
 		this.requireActive();
-		return this.#root.abort(context);
+		return this.#schedulingPermitted ? this.#root.abort(context) : this.abortPreservedChat(context);
+	}
+
+	private async abortPreservedChat(context: Context): Promise<void> {
+		const { submissions, tasks } = await this.#harness.inspect(context);
+		const targets = await this.#harness.commit(async (tx) => {
+			const queued: SubmissionId[] = [];
+			const foreground: TaskId[] = [];
+			for (const submission of submissions) {
+				if (
+					submission.status === "queued" &&
+					submission.type === "input" &&
+					(await this.isChatWork(tx, submission.conversationId, undefined))
+				) {
+					queued.push(submission.id);
+				}
+			}
+			for (const { record } of tasks) {
+				if (!record.background && (await this.isChatWork(tx, record.conversationId, record.owner))) {
+					foreground.push(record.id);
+				}
+			}
+			return { queued, foreground };
+		}, context);
+		// Unlike Conversation.abort() and waitForTask(), these operations do not enable the session scheduler.
+		for (const id of targets.queued) await this.#harness.abortSubmission(id, context);
+		for (const id of targets.foreground) await this.#harness.abortTask(id, context);
+	}
+
+	private async isChatWork(tx: Tx, conversationId: ConversationId, owner: TaskId | undefined): Promise<boolean> {
+		// Follow task ownership, not transcript ancestry. A background owner shields everything below it.
+		for (;;) {
+			if (owner === undefined) {
+				if (conversationId === this.#root.id) return true;
+				owner = (await tx.conversation(conversationId))?.owner?.taskId;
+				if (owner === undefined) return false;
+			}
+			const task = await tx.task(owner);
+			if (task === undefined || task.background) return false;
+			conversationId = task.conversationId;
+			owner = task.owner;
+		}
 	}
 
 	/**
@@ -717,7 +757,7 @@ export class Agent {
 		}
 	}
 
-	/** Releases only the matching persistent hold, then explicitly enables scheduling. */
+	/** Releases only the matching persistent hold; scheduling still requires an eligible session. */
 	async releaseMaintenance(operationId: string, context: Context): Promise<MaintenanceResult> {
 		validateOperationId(operationId);
 		await this.#harness.commit(async (tx) => {
@@ -732,20 +772,27 @@ export class Agent {
 			await this.#harness.snapshot(MemoryDoc, context),
 			await this.#harness.snapshot(MemoryRelationsDoc, context),
 		);
-		this.#inhibited = false;
-		const inspection = this.#configuration === "unconfigured" ? await this.#harness.inspect(context) : undefined;
-		const legacy = (await this.#harness.snapshot(MissionDoc, context))?.current ?? null;
-		if (
-			inspection === undefined ||
-			(inspection.submissions.length === 0 &&
-				inspection.tasks.every(
-					(task) => isMemoryBackgroundTask(task.record) || isMissionHoldTask(task.record, legacy),
-				))
-		) {
+		if (await this.schedulingEligible(context)) {
 			await this.#mission.initialize(context, "permitted");
-			this.#harness.resume();
+			this.enableScheduling();
 		}
+		this.#inhibited = false;
 		return { type: "maintenance", protocol: 1, state: "open", operationId: null };
+	}
+
+	private async schedulingEligible(context: Context): Promise<boolean> {
+		if (this.#configuration === "configured") return true;
+		const inspection = await this.#harness.inspect(context);
+		if (inspection.submissions.length > 0) return false;
+		const legacy = (await this.#harness.snapshot(MissionDoc, context))?.current ?? null;
+		return inspection.tasks.every(
+			({ record }) => isMemoryBackgroundTask(record) || isMissionHoldTask(record, legacy),
+		);
+	}
+
+	private enableScheduling(): void {
+		this.#harness.resume();
+		this.#schedulingPermitted = true;
 	}
 
 	private requireActive(): void {
