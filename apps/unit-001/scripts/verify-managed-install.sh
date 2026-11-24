@@ -9,17 +9,13 @@ umask 022
 
 fail() { printf 'managed acceptance: %s\n' "$*" >&2; exit 1; }
 [[ $# == 1 ]] || fail 'Usage: verify-managed-install.sh EXTRACTED_RELEASE_DIRECTORY'
+[[ ${GITHUB_ACTIONS:-} != true ]] || fail 'GitHub Actions is prohibited.'
 if [[ ${UNIT_001_STANDALONE_ACCEPTANCE:-} == 1 ]]; then
-  [[ ${GITHUB_ACTIONS:-} != true ]] || fail 'GitHub Actions is prohibited.'
   "$1/runtime/bin/node" "$(dirname -- "${BASH_SOURCE[0]}")/disposable-host.mjs"
-  runner=standalone
 elif [[ ${UNIT_001_DISPOSABLE_CONTAINER:-} == 1 ]]; then
-  [[ ${GITHUB_ACTIONS:-} != true ]] || fail 'GitHub Actions is prohibited.'
   [[ -f /.dockerenv && $(hostname) == unit-001-vps-acceptance ]] || fail 'Requires the explicitly named disposable Docker acceptance container.'
-  runner=container
 else
-  [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted && ${UNIT_001_DISPOSABLE_CI:-} == 1 && ${RUNNER_OS:-} == Linux && ${RUNNER_ARCH:-} == X64 ]] || fail 'Requires explicit disposable GitHub-hosted CI authorization, standalone authorization, or the named disposable Docker acceptance container.'
-  runner=ci
+  fail 'Requires explicit standalone authorization or the named disposable Docker acceptance container.'
 fi
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 && $EUID == 0 ]] || fail 'Requires root on Linux x64.'
 # shellcheck source=/dev/null
@@ -113,11 +109,10 @@ stopped() {
   [[ $(systemctl show --property=MainPID --value "unit-001@$id.service") == 0 ]] || fail 'Stopped service still owns a process.'
 }
 
-# #33: Each historical migration fixture proves one published baseline and candidate pair.
-case "$runner:$version" in
-  standalone:0.0.8) "$node" "$(dirname -- "${BASH_SOURCE[0]}")/verify-published-current.mjs" "$release" ;;
-  ci:0.0.7) "$node" "$(dirname -- "${BASH_SOURCE[0]}")/verify-operator-migration.mjs" "$release" ;;
-esac
+# #33: The published 0.0.7 migration fixture qualifies only the exact 0.0.8 candidate.
+if [[ ${UNIT_001_STANDALONE_ACCEPTANCE:-} == 1 && $version == 0.0.8 ]]; then
+  "$node" "$(dirname -- "${BASH_SOURCE[0]}")/verify-published-current.mjs" "$release"
+fi
 
 # #19: default/custom commands must own independent accounts, state and services.
 (umask 077; bash "$release/install.sh")
@@ -152,14 +147,12 @@ grep -q 'installation account' "$work/wrong-account"
 status agent "$first"
 status unit-ci-bob "$second"
 
-python3 "$(dirname -- "${BASH_SOURCE[0]}")/../test/managed-terminal.test.py"
-if [[ $runner != ci ]]; then
-  # #33: Fresh nonroot operators run routine commands and memory edits without direct private state access.
-  python3 "$(dirname -- "${BASH_SOURCE[0]}")/verify-operator-access.py" "$release" "$first" "$second"
+# #33: Fresh nonroot operators run routine commands and memory edits without direct private state access.
+python3 "$(dirname -- "${BASH_SOURCE[0]}")/verify-operator-access.py" "$release" "$first" "$second"
 
-  # #25: The real managed dispatcher must preserve rich terminal behavior and NO_COLOR across runuser.
-  python3 "$(dirname -- "${BASH_SOURCE[0]}")/verify-managed-terminal.py"
-fi
+# #25: The real managed dispatcher must preserve rich terminal behavior and NO_COLOR across runuser.
+python3 "$(dirname -- "${BASH_SOURCE[0]}")/../test/managed-terminal.test.py"
+python3 "$(dirname -- "${BASH_SOURCE[0]}")/verify-managed-terminal.py"
 status agent "$first"
 status unit-ci-bob "$second"
 
@@ -201,7 +194,7 @@ printf 'retained\n' > "$work/marker.fixture"
 install -o "$first_account" -g "$first_account" -m 600 "$work/marker.fixture" "/var/lib/unit-001/agents/$first/workspace/ci-marker"
 cp "/var/lib/unit-001/agents/$first/auth.json" "$work/auth.before"
 cp "/etc/unit-001/agents/$first/environment" "$work/environment.before"
-if [[ $runner == standalone && -f $release/updater/lib/update.mjs ]]; then
+if [[ ${UNIT_001_STANDALONE_ACCEPTANCE:-} == 1 && -f $release/updater/lib/update.mjs ]]; then
   "$node" "$(dirname -- "${BASH_SOURCE[0]}")/verify-managed-updates.mjs" "$release" "$first"
   cmp "$work/auth.before" "/var/lib/unit-001/agents/$first/auth.json"
   cmp "$work/environment.before" "/etc/unit-001/agents/$first/environment"
