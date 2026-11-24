@@ -21,6 +21,11 @@ import type { ManagedMissionReview, WebPlanReview } from "./post-response.ts";
 
 type OwnerStatus = Extract<ServiceResponse, { type: "status" }>;
 type WatchedSocket = { path: string; identity: Pick<BigIntStats, "dev" | "ino"> };
+type ManagedListener = ReturnType<typeof managedListener>;
+/** Managed: the system manager's installation. Developer: loopback on a local data directory, if one is given. */
+type WorkspaceMode = { kind: "managed"; installationId: string } | { kind: "developer"; directory: string | undefined };
+/** Cleanup that must run after the gateway has closed. */
+type AfterClose = { releaseLock?: () => Promise<void> };
 
 /** Serves packaged browser assets until interrupted. */
 export async function runWebWorkspace(
@@ -32,34 +37,21 @@ export async function runWebWorkspace(
 	developerDirectory?: string,
 ): Promise<number> {
 	if (signal.aborted) return 130;
-	const managed = installationId === undefined ? undefined : managedListener(installationId);
+	const mode: WorkspaceMode =
+		installationId === undefined
+			? { kind: "developer", directory: developerDirectory }
+			: { kind: "managed", installationId };
+	const managed = mode.kind === "managed" ? managedListener(mode.installationId) : undefined;
 	const client = localServiceClient(endpoint);
 	const status = await client.request({ type: "status" }, signal);
-	if (status.type !== "status" || status.installationId !== (installationId ?? null))
+	if (status.type !== "status" || status.installationId !== modeInstallationId(mode))
 		throw new ConfigurationError("The operator owner is unavailable.");
 	const origin = `http://127.0.0.1:${port}`;
-	const gateway = await loadWorkspaceGateway(client, endpoint, origin, { installationId, developerDirectory });
-	let releaseLock: (() => Promise<void>) | undefined;
+	const gateway = await loadWorkspaceGateway(client, endpoint, origin, { mode });
+	const afterClose: AfterClose = {};
 	try {
-		if (managed === undefined) {
-			gateway.server.listen(port, "127.0.0.1");
-			await once(gateway.server, "listening");
-		} else {
-			const directory = await prepareManagedDirectory(managed.home, managed.uid);
-			// Held until the gateway has closed, so no other launcher can take the socket path while it is in use.
-			releaseLock = await acquireListenerLock(join(directory, `${managed.installationId}.lock`), managed.uid);
-			await clearListenerResidue(directory, managed.path, managed.installationId, managed.uid);
-			const mask = process.umask();
-			process.umask(mask | 0o077);
-			try {
-				// A filesystem path is bound synchronously. Never hold a process-wide umask across an await.
-				gateway.server.listen({ path: managed.path, exclusive: true });
-			} finally {
-				process.umask(mask);
-			}
-			await once(gateway.server, "listening");
-			await chmod(managed.path, 0o600);
-		}
+		if (managed === undefined) await listenLocal(gateway, port);
+		else await listenManaged(gateway, managed, afterClose);
 		write(
 			`Browser workspace: ${origin}\n${managed === undefined ? "" : `Managed socket: ${managed.path}\n`}Ctrl+C detaches the web workspace; agent work continues.\n`,
 		);
@@ -71,9 +63,36 @@ export async function runWebWorkspace(
 			// Node unlinks the bound socket path when the server closes. A killed launcher leaves it for the next start.
 			await gateway.close();
 		} finally {
-			await releaseLock?.();
+			await afterClose.releaseLock?.();
 		}
 	}
+}
+
+async function listenLocal(gateway: WebGateway, port: number): Promise<void> {
+	gateway.server.listen(port, "127.0.0.1");
+	await once(gateway.server, "listening");
+}
+
+/** Binds the private socket under the operator's home, holding its lock until the caller releases it. */
+async function listenManaged(gateway: WebGateway, managed: ManagedListener, afterClose: AfterClose): Promise<void> {
+	const directory = await prepareManagedDirectory(managed.home, managed.uid);
+	// Held until the gateway has closed, so no other launcher can take the socket path while it is in use.
+	afterClose.releaseLock = await acquireListenerLock(join(directory, `${managed.installationId}.lock`), managed.uid);
+	await clearListenerResidue(directory, managed.path, managed.installationId, managed.uid);
+	const mask = process.umask();
+	process.umask(mask | 0o077);
+	try {
+		// A filesystem path is bound synchronously. Never hold a process-wide umask across an await.
+		gateway.server.listen({ path: managed.path, exclusive: true });
+	} finally {
+		process.umask(mask);
+	}
+	await once(gateway.server, "listening");
+	await chmod(managed.path, 0o600);
+}
+
+function modeInstallationId(mode: WorkspaceMode): string | null {
+	return mode.kind === "managed" ? mode.installationId : null;
 }
 
 const activationTimeoutMs = 5_000;
@@ -112,7 +131,7 @@ export async function runActivatedWebWorkspace(installationId: string, signal: A
 		if (initial.type !== "status" || initial.installationId !== installationId)
 			throw new ConfigurationError("The operator owner is unavailable.");
 		const origin = "http://127.0.0.1:4317";
-		gateway = await loadWorkspaceGateway(client, endpoint, origin, { installationId, startup });
+		gateway = await loadWorkspaceGateway(client, endpoint, origin, { mode: { kind: "managed", installationId }, startup });
 		const owner = await client.request({ type: "status" }, startup);
 		if (!sameOwner(initial, owner) || owner.inhibited || owner.maintenance.state !== "open")
 			throw new ConfigurationError("The operator owner is not open for web activation.");
@@ -178,9 +197,9 @@ async function loadWorkspaceGateway(
 	client: ServiceClient,
 	endpoint: string,
 	origin: string,
-	options: { installationId?: string; developerDirectory?: string; startup?: AbortSignal },
+	options: { mode: WorkspaceMode; startup?: AbortSignal },
 ): Promise<WebGateway> {
-	const { installationId, developerDirectory, startup } = options;
+	const { mode, startup } = options;
 	const assets = new Map<string, { contentType: string; body: Uint8Array }>();
 	for (const [path, contentType] of [
 		["/", "text/html; charset=utf-8"],
@@ -201,21 +220,21 @@ async function loadWorkspaceGateway(
 	const location: MissionLocation | undefined =
 		client.session !== "default"
 			? undefined
-			: installationId !== undefined
-				? { kind: "managed", installationId, session: client.session }
-				: developerDirectory !== undefined
-					? { kind: "developer-local", directory: developerDirectory, session: client.session }
+			: mode.kind === "managed"
+				? { kind: "managed", installationId: mode.installationId, session: client.session }
+				: mode.directory !== undefined
+					? { kind: "developer-local", directory: mode.directory, session: client.session }
 					: undefined;
 	return createWebGateway({
 		client,
-		workspaceId: createHash("sha256").update(JSON.stringify([installationId ?? null, endpoint])).digest("hex"),
+		workspaceId: createHash("sha256").update(JSON.stringify([modeInstallationId(mode), endpoint])).digest("hex"),
 		origin,
 		assets,
-		managed: installationId !== undefined,
+		managed: mode.kind === "managed",
 		...(startup === undefined ? {} : { inheritedUnixListener: true as const }),
 		managedReview:
-			installationId !== undefined && client.session === "default"
-				? (view) => reviewManagedMission(installationId, view)
+			mode.kind === "managed" && client.session === "default"
+				? (view) => reviewManagedMission(mode.installationId, view)
 				: undefined,
 		planReview: location === undefined ? undefined : (view) => reviewPlan(location, view),
 	});
