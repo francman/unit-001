@@ -6,6 +6,7 @@ import { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { Metadata } from "@tufjs/models";
+import { validateArchiveTarget, validateDescriptor, validateDescriptorTarget } from "../deploy/update-trust.mjs";
 import { METADATA_RELEASE, UPDATE_REPOSITORY } from "./update-repository.mjs";
 
 /** Verifies fresh signed metadata and its descriptor, reporting precisely which public evidence was checked. */
@@ -36,22 +37,11 @@ export async function verifyPublicMetadata(rootBytes, readAsset, now = new Date(
 	const targets = Metadata.fromJSON("targets", JSON.parse(targetsBytes));
 	root.verifyDelegate("targets", targets);
 	if (targets.signed.isExpired(now)) throw new Error("Public targets have expired");
-	const info = targets.signed.targets["linux-x64/stable.json"];
-	if (info === undefined || !/^[a-f0-9]{64}$/.test(info.hashes.sha256))
-		throw new Error("Public stable target is missing");
+	const info = validateDescriptorTarget(targets.signed.targets["linux-x64/stable.json"]);
 	const descriptorBytes = await readAsset(`linux-x64-${info.hashes.sha256}.stable.json`);
 	await info.verify(Readable.from([descriptorBytes]));
-	const descriptor = JSON.parse(descriptorBytes);
-	if (
-		!/^\d+\.\d+\.\d+$/.test(descriptor.version) ||
-		descriptor.platform !== "linux-x64" ||
-		!/^[a-f0-9]{40}$/.test(descriptor.sourceCommit) ||
-		descriptor.archiveTarget !== `linux-x64/releases/${descriptor.version}.tar.gz`
-	)
-		throw new Error("Public stable descriptor is invalid");
-	const archive = targets.signed.targets[descriptor.archiveTarget];
-	if (archive === undefined || !/^[a-f0-9]{64}$/.test(archive.hashes.sha256))
-		throw new Error("Public archive target is missing");
+	const descriptor = validateDescriptor(JSON.parse(descriptorBytes));
+	const archive = validateArchiveTarget(targets.signed.targets[descriptor.archiveTarget], descriptor.version);
 	return {
 		observedAt: now.toISOString(),
 		metadataOnly: true,

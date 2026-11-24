@@ -11,6 +11,7 @@ import { isReleaseVersion } from "./release-version.mjs";
 
 const ORIGIN = "https://unit001.invalid/";
 const MAX_METADATA = 4 * 1024 * 1024;
+const MAX_DESCRIPTOR = 16 * 1024;
 const MAX_ARCHIVE = 512 * 1024 * 1024;
 const REDIRECT_HOSTS = new Set(["release-assets.githubusercontent.com", "objects.githubusercontent.com"]);
 
@@ -91,27 +92,19 @@ export async function fetchUpdate(options, context = { fetch: globalThis.fetch, 
 		}
 		if (dirname(directory) === directory) break;
 	}
-	const descriptorInfo = await updater.getTargetInfo("linux-x64/stable.json");
-	if (descriptorInfo === undefined) throw new Error("No signed linux-x64 stable descriptor.");
-	if (!/^[a-f0-9]{64}$/.test(descriptorInfo.hashes.sha256) || descriptorInfo.length > 16_384)
-		throw new Error("Invalid signed descriptor bounds.");
+	const descriptorInfo = validateDescriptorTarget(await updater.getTargetInfo("linux-x64/stable.json"));
 	transport.target(
 		`linux-x64/${descriptorInfo.hashes.sha256}.stable.json`,
 		metadataTag,
 		`linux-x64-${descriptorInfo.hashes.sha256}.stable.json`,
-		16_384,
+		MAX_DESCRIPTOR,
 	);
 	const attempt = await mkdtemp(join(downloadDir, "candidate-"));
 	try {
 		const descriptorFile = await updater.downloadTarget(descriptorInfo, join(attempt, "stable.json"));
 		const descriptor = validateDescriptor(JSON.parse(await readFile(descriptorFile, "utf8")));
-		const info = await updater.getTargetInfo(descriptor.archiveTarget);
-		if (info === undefined || !/^[a-f0-9]{64}$/.test(info.hashes.sha256) || info.length > MAX_ARCHIVE)
-			throw new Error("Missing or oversized signed archive target.");
-		const releaseTag = `unit-v${descriptor.version}`;
-		const assetName = `unit-001-${descriptor.version}-linux-x64.tar.gz`;
-		if (info.custom.releaseTag !== releaseTag || info.custom.assetName !== assetName)
-			throw new Error("Signed archive location does not match its version.");
+		const info = validateArchiveTarget(await updater.getTargetInfo(descriptor.archiveTarget), descriptor.version);
+		const { releaseTag, assetName } = info.custom;
 		if (context.acceptCandidate !== undefined && !context.acceptCandidate(descriptor)) {
 			await rm(attempt, { recursive: true, force: true });
 			return null;
@@ -133,6 +126,30 @@ export async function fetchUpdate(options, context = { fetch: globalThis.fetch, 
 		await rm(attempt, { recursive: true, force: true });
 		throw error;
 	}
+}
+
+/** Validates the signed descriptor target before reading its bytes. */
+export function validateDescriptorTarget(info) {
+	if (info === undefined) throw new Error("No signed linux-x64 stable descriptor.");
+	if (!/^[a-f0-9]{64}$/.test(info.hashes.sha256) || !Number.isSafeInteger(info.length) || info.length < 0)
+		throw new Error("Invalid signed descriptor bounds.");
+	if (info.length > MAX_DESCRIPTOR) throw new Error("Stable descriptor exceeds the client metadata limit.");
+	return info;
+}
+
+/** Validates the exact location, SHA-256 and size of the archive named by an authenticated descriptor. */
+export function validateArchiveTarget(info, version) {
+	if (
+		info === undefined ||
+		!/^[a-f0-9]{64}$/.test(info.hashes.sha256) ||
+		!Number.isSafeInteger(info.length) ||
+		info.length < 0 ||
+		info.length > MAX_ARCHIVE
+	)
+		throw new Error("Missing or oversized signed archive target.");
+	if (info.custom.releaseTag !== `unit-v${version}` || info.custom.assetName !== `unit-001-${version}-linux-x64.tar.gz`)
+		throw new Error("Signed archive location does not match its version.");
+	return info;
 }
 
 /** Rejects remote descriptor data outside the single supported artifact and compatibility contract. */

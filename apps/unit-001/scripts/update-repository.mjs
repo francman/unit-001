@@ -20,6 +20,7 @@ import { parseArgs } from "node:util";
 import { Key, Metadata, MetaFile, Root, Signature, Snapshot, TargetFile, Targets, Timestamp } from "@tufjs/models";
 // The installed updater's own grammar and order: a version the publisher accepts is one every client accepts.
 import { compareReleaseVersions, isReleaseVersion } from "../deploy/release-version.mjs";
+import { validateArchiveTarget, validateDescriptor, validateDescriptorTarget } from "../deploy/update-trust.mjs";
 
 export const UPDATE_REPOSITORY = "francman/unit-001-releases";
 export const METADATA_RELEASE = "unit-updates-stable";
@@ -158,13 +159,16 @@ export function prepareRepository({
 		throw new Error("Publishing requires a clean Linux x64 release with an exact stable version and source commit");
 	if (!/^[a-f0-9]{40}$/.test(expectedSourceCommit) || release.source.commit !== expectedSourceCommit)
 		throw new Error("Archive source commit does not match the trusted build checkout");
-	const compatibility = release.compatibility;
-	if (
-		compatibility?.stateVersion !== 1 ||
-		compatibility.minReaderVersion !== 1 ||
-		compatibility.maintenanceProtocol !== 1
-	)
-		throw new Error("Release compatibility requires an explicitly reviewed supported policy");
+	const version = release.version;
+	const archiveTarget = `linux-x64/releases/${version}.tar.gz`;
+	const descriptor = validatePublisherDescriptor({
+		schemaVersion: 1,
+		version,
+		platform: "linux-x64",
+		sourceCommit: release.source.commit,
+		archiveTarget,
+		compatibility: release.compatibility,
+	});
 	const root = rootMetadata(rootBytes, now);
 	const prior = priorForRoot(previous, root, previousRootBytes);
 	const floor =
@@ -173,21 +177,17 @@ export function prepareRepository({
 			: {};
 	for (const value of Object.values(floor))
 		if (!Number.isSafeInteger(value) || value < 0) throw new Error("Invalid publication version floor");
-	const version = release.version;
 	const assetName = `unit-001-${version}-linux-x64.tar.gz`;
 	if (basename(archive) !== assetName) throw new Error("Archive filename does not match release version");
-	const archiveTarget = `linux-x64/releases/${version}.tar.gz`;
 	const releaseTag = `unit-v${version}`;
-	const descriptor = {
-		schemaVersion: 1,
-		version,
-		platform: "linux-x64",
-		sourceCommit: release.source.commit,
-		archiveTarget,
-		compatibility,
-	};
 	const descriptorBytes = encode(descriptor);
-	if (descriptorBytes.length > 16384) throw new Error("Stable descriptor exceeds the client metadata limit");
+	const descriptorFile = validateDescriptorTarget(
+		new TargetFile({
+			path: "linux-x64/stable.json",
+			length: descriptorBytes.length,
+			hashes: { sha256: digest(descriptorBytes) },
+		}),
+	);
 	const targets = new Targets({
 		version: Math.max(prior?.targets.signed.version ?? 0, floor.targets ?? 0) + 1,
 		expires: expires(now, 30),
@@ -195,12 +195,15 @@ export function prepareRepository({
 	// Preserve every prior archive target so exact-version pins remain downloadable.
 	for (const [path, file] of Object.entries(prior?.targets.signed.targets ?? {}))
 		if (path !== "linux-x64/stable.json") targets.addTarget(file);
-	const archiveFile = new TargetFile({
-		path: archiveTarget,
-		length: archiveBytes.length,
-		hashes: { sha256: digest(archiveBytes) },
-		unrecognizedFields: { custom: { releaseTag, assetName } },
-	});
+	const archiveFile = validateArchiveTarget(
+		new TargetFile({
+			path: archiveTarget,
+			length: archiveBytes.length,
+			hashes: { sha256: digest(archiveBytes) },
+			unrecognizedFields: { custom: { releaseTag, assetName } },
+		}),
+		version,
+	);
 	const oldArchive = targets.targets[archiveTarget];
 	if (oldArchive !== undefined && !oldArchive.equals(archiveFile))
 		throw new Error("Refusing to reuse a release version with different archive bytes");
@@ -218,13 +221,7 @@ export function prepareRepository({
 			? checkRollbackQualification(rollbackQualification, version, archiveBytes, targets.targets)
 			: [];
 	targets.addTarget(archiveFile);
-	targets.addTarget(
-		new TargetFile({
-			path: "linux-x64/stable.json",
-			length: descriptorBytes.length,
-			hashes: { sha256: digest(descriptorBytes) },
-		}),
-	);
+	targets.addTarget(descriptorFile);
 	const targetsMetadata = signed(targets, [privateKey(keys, "targets")]);
 	root.verifyDelegate("targets", targetsMetadata);
 	const targetsBytes = encode(targetsMetadata.toJSON());
@@ -286,6 +283,14 @@ export function prepareRepository({
 		{ flag: "wx" },
 	);
 	return { descriptor, files };
+}
+
+function validatePublisherDescriptor(value) {
+	const descriptor = validateDescriptor(value);
+	const { stateVersion, minReaderVersion, maintenanceProtocol } = descriptor.compatibility;
+	if (stateVersion !== 1 || minReaderVersion !== 1 || maintenanceProtocol !== 1)
+		throw new Error("Release compatibility requires an explicitly reviewed supported policy");
+	return descriptor;
 }
 
 const RELEASE_TARGET = /^linux-x64\/releases\/(.*)\.tar\.gz$/;
@@ -590,24 +595,16 @@ export function renewRepository(
 	fetchRepository(previous, remote);
 	const prior = priorForRoot(previous, rootMetadata(rootBytes, now), previousRootBytes);
 	if (prior === undefined) throw new Error("Cannot renew an empty repository");
-	const info = prior.targets.signed.targets["linux-x64/stable.json"];
+	const info = validateDescriptorTarget(prior.targets.signed.targets["linux-x64/stable.json"]);
 	const name = `linux-x64-${info.hashes.sha256}.stable.json`;
 	const asset = remote.assets(METADATA_RELEASE).find((entry) => entry.name === name);
 	if (asset === undefined) throw new Error("Missing authenticated descriptor asset");
 	const bytes = remote.read(asset);
 	if (info.length !== bytes.length || info.hashes.sha256 !== digest(bytes))
 		throw new Error("Descriptor hash mismatch");
-	const descriptor = JSON.parse(bytes);
-	if (
-		!isReleaseVersion(descriptor.version) ||
-		descriptor.archiveTarget !== `linux-x64/releases/${descriptor.version}.tar.gz`
-	)
-		throw new Error("Invalid descriptor target");
-	const file = prior.targets.signed.targets[descriptor.archiveTarget];
-	const releaseTag = `unit-v${descriptor.version}`;
-	const assetName = `unit-001-${descriptor.version}-linux-x64.tar.gz`;
-	if (file?.custom.releaseTag !== releaseTag || file.custom.assetName !== assetName)
-		throw new Error("Archive location mismatch");
+	const descriptor = validatePublisherDescriptor(JSON.parse(bytes));
+	const file = validateArchiveTarget(prior.targets.signed.targets[descriptor.archiveTarget], descriptor.version);
+	const { releaseTag, assetName } = file.custom;
 	const archiveAsset = remote.assets(releaseTag)?.find((entry) => entry.name === assetName);
 	if (archiveAsset === undefined) throw new Error("Missing archive asset");
 	const archiveBytes = remote.read(archiveAsset);
@@ -661,22 +658,20 @@ function publishSnapshot(directory, rootBytes, remote, now) {
 	)
 		throw new Error("Missing or expired publication metadata");
 	const archiveBytes = readFileSync(plan.archive);
-	const descriptorFile = metadata.targets.signed.targets["linux-x64/stable.json"];
+	const descriptorFile = validateDescriptorTarget(metadata.targets.signed.targets["linux-x64/stable.json"]);
 	const descriptorAsset = `linux-x64-${descriptorFile.hashes.sha256}.stable.json`;
 	const descriptorBytes = readFileSync(join(directory, descriptorAsset));
 	if (descriptorFile.length !== descriptorBytes.length || digest(descriptorBytes) !== descriptorFile.hashes.sha256)
 		throw new Error("Descriptor hash mismatch");
-	const descriptor = JSON.parse(descriptorBytes);
+	const descriptor = validatePublisherDescriptor(JSON.parse(descriptorBytes));
 	if (plan.sourceCommit !== descriptor.sourceCommit)
 		throw new Error("Signed descriptor source commit differs from the trusted publication plan");
-	const archiveFile = metadata.targets.signed.targets[descriptor.archiveTarget];
+	const archiveFile = validateArchiveTarget(metadata.targets.signed.targets[descriptor.archiveTarget], descriptor.version);
 	if (
 		basename(plan.archive) !== plan.assetName ||
-		plan.releaseTag !== `unit-v${descriptor.version}` ||
-		plan.assetName !== `unit-001-${descriptor.version}-linux-x64.tar.gz` ||
-		archiveFile?.custom.releaseTag !== plan.releaseTag ||
+		archiveFile.custom.releaseTag !== plan.releaseTag ||
 		archiveFile.custom.assetName !== plan.assetName ||
-		archiveFile?.length !== archiveBytes.length ||
+		archiveFile.length !== archiveBytes.length ||
 		archiveFile.hashes.sha256 !== digest(archiveBytes)
 	)
 		throw new Error("Archive publication plan mismatch");
@@ -752,9 +747,10 @@ function publishSnapshot(directory, rootBytes, remote, now) {
 	put(plan.releaseTag, DOWNLOAD_ASSET, join(directory, DOWNLOAD_ASSET));
 	if (initial === null) remote.create(METADATA_RELEASE);
 	const names = [
+		// Retention protects unexpired targets even if a later upload is interrupted.
+		descriptorAsset,
 		`${metadata.targets.signed.version}.targets.json`,
 		`${metadata.snapshot.signed.version}.snapshot.json`,
-		descriptorAsset,
 		`${metadata.timestamp.signed.version}.timestamp.json`,
 	];
 	for (const name of names) put(METADATA_RELEASE, name, join(directory, name));

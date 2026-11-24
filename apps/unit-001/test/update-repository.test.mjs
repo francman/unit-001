@@ -35,6 +35,7 @@ import {
 	rotateRepositoryRoot,
 	UPDATE_REPOSITORY,
 } from "../scripts/update-repository.mjs";
+import { verifyPublicMetadata } from "../scripts/verify-public-metadata.mjs";
 
 function fixture(t) {
 	const directory = realpathSync(mkdtempSync(join(tmpdir(), "unit-publisher-")));
@@ -365,8 +366,18 @@ test("rejects unsupported compatibility, dirty source, and stable downgrade", (t
 		/clean/,
 	);
 	assert.throws(
-		() => f.prepare("compatibility", { release: { ...f.release, compatibility: { stateVersion: 2 } } }),
+		() =>
+			f.prepare("compatibility", {
+				release: { ...f.release, compatibility: { ...f.release.compatibility, stateVersion: 2 } },
+			}),
 		/reviewed/,
+	);
+	assert.throws(
+		() =>
+			f.prepare("malformed-features", {
+				release: { ...f.release, compatibility: { ...f.release.compatibility, features: "mission-loop" } },
+			}),
+		/Invalid signed compatibility contract/,
 	);
 	assert.throws(
 		() =>
@@ -382,6 +393,72 @@ test("rejects unsupported compatibility, dirty source, and stable downgrade", (t
 		() => f.prepare("downgrade", { previous: first.out, archive, release: { ...f.release, version: "0.0.0" } }),
 		/downgrade/,
 	);
+});
+
+// #18: a valid signature does not make an unsupported descriptor or archive usable by the updater.
+test("checks signed descriptor and archive contracts before applying publisher compatibility policy", async (t) => {
+	const f = fixture(t);
+	for (const { name, changes, archiveChanges, publisherError } of [
+		{
+			name: "malformed",
+			changes: { features: "mission-loop" },
+			publisherError: /Invalid signed compatibility contract/,
+		},
+		{
+			name: "newer-policy",
+			changes: { stateVersion: 2, maintenanceProtocol: 2, features: ["mission-loop"] },
+			publisherError: /explicitly reviewed supported policy/,
+		},
+		{
+			name: "oversized-descriptor",
+			changes: { padding: "x".repeat(16_384) },
+			publisherError: /descriptor exceeds/,
+		},
+		{
+			name: "oversized-archive-target",
+			archiveChanges: { length: 512 * 1024 * 1024 + 1 },
+			publisherError: /oversized signed archive target/,
+		},
+		{
+			name: "wrong-archive-location",
+			archiveChanges: { custom: { releaseTag: "other", assetName: "other.tar.gz" } },
+			publisherError: /Signed archive location does not match/,
+		},
+	]) {
+		const stage = f.prepare(name);
+		const descriptor = {
+			...stage.descriptor,
+			compatibility: { ...stage.descriptor.compatibility, ...changes },
+		};
+		const bytes = Buffer.from(JSON.stringify(descriptor));
+		const hash = sha256(bytes);
+		const descriptorName = `linux-x64-${hash}.stable.json`;
+		writeFileSync(join(stage.out, descriptorName), bytes);
+		resign(stage.out, f.keys, (targets) => {
+			targets.addTarget(new TargetFile({ path: "linux-x64/stable.json", length: bytes.length, hashes: { sha256: hash } }));
+			if (archiveChanges) {
+				const target = targets.targets[descriptor.archiveTarget];
+				targets.addTarget(TargetFile.fromJSON(descriptor.archiveTarget, { ...target.toJSON(), ...archiveChanges }));
+			}
+		});
+		const receipt = verifyPublicMetadata(f.rootBytes, async (asset) => readFileSync(join(stage.out, asset)));
+		if (name === "newer-policy") assert.equal((await receipt).release, descriptor.version);
+		else await assert.rejects(receipt, publisherError);
+		const remote = fakeGithub();
+		assert.throws(() => publishRepository(stage.out, f.rootBytes, remote), publisherError);
+		assert.deepEqual(remote.operations, []);
+
+		// Simulate an existing feed signed by an older publisher.
+		remote.create(METADATA_RELEASE);
+		for (const asset of [...Object.keys(stage.files).filter((asset) => !asset.endsWith(".stable.json")), descriptorName])
+			remote.upload(METADATA_RELEASE, join(stage.out, asset));
+		remote.create("unit-v0.0.1");
+		remote.upload("unit-v0.0.1", f.archive);
+		assert.throws(
+			() => renewRepository({ out: join(f.directory, `${name}-renewal`), rootBytes: f.rootBytes, keys: f.keys }, remote),
+			publisherError,
+		);
+	}
 });
 
 // #72: automatic rollout must not promise a rollback that was never qualified with the exact artifacts.
@@ -1066,27 +1143,39 @@ test("recovers a failed timestamp replacement after GitHub deleted old freshness
 	assert.equal(JSON.parse(remote.releases.get(METADATA_RELEASE).get("timestamp.json").bytes).signed.version, 3);
 });
 
-test("retry preparation skips orphaned numbered metadata instead of clobbering it", (t) => {
+test("renews the live release after a different release's snapshot upload is interrupted", async (t) => {
 	const f = fixture(t);
 	const remote = fakeGithub();
-	publishRepository(f.prepare("first").out, f.rootBytes, remote);
+	const first = f.prepare("first");
+	publishRepository(first.out, f.rootBytes, remote);
 	const previous = join(f.directory, "previous");
 	fetchRepository(previous, remote);
-	const second = f.prepare("second", { previous });
+	const archive = join(f.directory, "unit-001-0.0.2-linux-x64.tar.gz");
+	writeFileSync(archive, "second archive bytes");
+	const second = f.prepare("second", {
+		previous,
+		archive,
+		release: { ...f.release, version: "0.0.2" },
+		rollbackQualification: [qualification(["0.0.2", archive], ["0.0.1", f.archive])],
+	});
 	const upload = remote.upload.bind(remote);
 	remote.upload = (tag, path, replace) => {
 		if (path.endsWith("/2.snapshot.json")) throw new Error("interrupted snapshot upload");
 		upload(tag, path, replace);
 	};
 	assert.throws(() => publishRepository(second.out, f.rootBytes, remote), /interrupted snapshot/);
-	const orphan = remote.releases.get(METADATA_RELEASE).get("2.targets.json").bytes;
+	const entries = remote.releases.get(METADATA_RELEASE);
+	assert.deepEqual(entries.get("timestamp.json").bytes, first.files["timestamp.json"]);
+	const pendingTargets = entries.get("2.targets.json").bytes;
 	remote.upload = upload;
-	const recovered = join(f.directory, "recovered");
-	fetchRepository(recovered, remote);
-	const third = f.prepare("third", { previous: recovered });
-	publishRepository(third.out, f.rootBytes, remote);
-	assert(third.files["3.targets.json"]);
-	assert.deepEqual(remote.releases.get(METADATA_RELEASE).get("2.targets.json").bytes, orphan);
+	const out = join(f.directory, "renewal");
+	const renewed = renewRepository({ out, rootBytes: f.rootBytes, keys: f.keys }, remote);
+	publishRepository(join(out, "publication"), f.rootBytes, remote);
+	assert.deepEqual(entries.get("2.targets.json").bytes, pendingTargets);
+	assert.deepEqual(entries.get("3.targets.json").bytes, renewed.files["3.targets.json"]);
+	const receipt = await verifyPublicMetadata(f.rootBytes, async (name) => entries.get(name).bytes);
+	assert.equal(receipt.release, "0.0.1");
+	assert.equal(remote.operations.at(-1), "latest:unit-v0.0.1");
 });
 
 // #18: rotation must work for scheduled renewal and remain usable after the first rotated publication.
