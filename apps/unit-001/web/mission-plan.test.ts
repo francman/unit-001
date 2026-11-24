@@ -129,8 +129,6 @@ describe("model review projection", () => {
 		turns: [newest],
 		blocker,
 	};
-	const { allowance: _allowance, turns: _turns, blocker: _blocker, ...legacy } = plan;
-
 	it("keeps the lifetime usage and a pinned blocker outside the retained turns", () => {
 		const turns = Array.from({ length: 16 }, (_, index) => {
 			const key = `cadence:${index}`;
@@ -139,19 +137,27 @@ describe("model review projection", () => {
 		expect(parsePlanView({ ...projected, turns })).toEqual({ ...projected, turns });
 	});
 
-	it("normalizes legacy omissions to inert fields without modifying an existing proposal's allowance", () => {
-		const { purpose, scope, askFirst, reviewEveryMs } = terms.overall;
-		const oldTerms = { ...terms, overall: { purpose, scope, askFirst, reviewEveryMs } };
-		const newTerms = { ...terms, overall: { ...terms.overall, reviewAllowance: allowance } };
-		const read = parsePlanView({ ...legacy, head: { ...head, terms: oldTerms }, draft: { ...draft, terms: newTerms } });
-		expect(read).toEqual({ ...plan, draft: { ...draft, terms: newTerms } });
-		expect(() => parsePlanTerms(oldTerms)).toThrow("Invalid mission plan projection.");
-		expect(parsePlanTerms(newTerms)).toEqual(newTerms);
+	it("keeps an explicit null allowance and an explicit allowance in plan terms", () => {
+		const withAllowance = { ...terms, overall: { ...terms.overall, reviewAllowance: allowance } };
+		expect(parsePlanTerms(withAllowance)).toEqual(withAllowance);
 		expect(parsePlanTerms(terms).overall.reviewAllowance).toBeNull();
 	});
 
-	it("rejects a partial turn projection rather than treating it as legacy", () => {
-		expect(() => parsePlanView({ ...legacy, turns: [] })).toThrow("Invalid mission plan projection.");
+	it.each([
+		["plan terms without reviewAllowance", () => {
+			const { purpose, scope, askFirst, reviewEveryMs } = terms.overall;
+			return parsePlanTerms({ ...terms, overall: { purpose, scope, askFirst, reviewEveryMs } });
+		}],
+		["a plan without the model review fields", () => {
+			const { allowance: _allowance, turns: _turns, blocker: _blocker, ...old } = plan;
+			return parsePlanView(old);
+		}],
+		["a plan with only some model review fields", () => {
+			const { allowance: _allowance, blocker: _blocker, ...partial } = plan;
+			return parsePlanView(partial);
+		}],
+	])("rejects %s", (_name, parse) => {
+		expect(parse).toThrow("Invalid mission plan projection.");
 	});
 
 	it.each([

@@ -128,13 +128,12 @@ function exercise(width) {
 	check(revised?.revision === 12 && revised.submitted.overall.reviewAllowance.maxEstimatedCost === 0.0125 && calls.pop() === "dirty",
 		"editing a proposed scope preserves its non-null review allowance and original revision");
 
-	const { reviewAllowance: _newField, ...legacyOverall } = terms.overall;
-	mount(createMissionPlanDraftEditor({ ...initial, terms: { ...terms, overall: legacyOverall }, draft: null }).root);
+	mount(createMissionPlanDraftEditor({ ...initial, terms: { ...terms, overall: { ...terms.overall, reviewAllowance: null } }, draft: null }).root);
 	const optIn = field("review-opt-in");
 	const maxRequests = field("review-max-requests");
 	const maxPerReview = field("review-max-per-review");
 	const maxCost = field("review-max-cost");
-	check(!optIn.checked && maxRequests.matches(":disabled") && !maxRequests.getClientRects().length, "legacy terms do not opt in or reveal allowance inputs");
+	check(!optIn.checked && maxRequests.matches(":disabled") && !maxRequests.getClientRects().length, "a null allowance does not opt in or reveal allowance inputs");
 	action("save").click();
 	check(calls.pop()?.submitted.overall.reviewAllowance === null, "saving without opt-in sends explicit null");
 	optIn.click();
@@ -180,7 +179,7 @@ function exercise(width) {
 	const proposed = {
 		missionId: "charter-001", draft: { revision: 12, baseRevision: 10, digest, terms, fromReview: "review-42", status: "proposed", missing: [], savedBy: "bob" },
 		head: { revision: 10, digest: baseDigest, receiptId: "receipt-10",
-			terms: { ...terms, overall: { ...legacyOverall, scope: "Prior exact scope\n" } } },
+			terms: { ...terms, overall: { ...terms.overall, reviewAllowance: null, scope: "Prior exact scope\n" } } },
 		currentEffect: "suspended", gate: { state: "closed", reason: "reopen-needed" }, authority: "developer-local",
 		creator: { kind: "human", id: "creator-42" }, session: "default", authorityRevision: 11,
 		approval: { kind: "web", revision: 12, digest, onAgree: (exact) => calls.push(exact) },

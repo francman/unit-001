@@ -38,7 +38,7 @@ export function callout(options: {
 
 /**
  * A terminal command to copy (Hermes approval card's command block): mono, hairline, `$` prompt, a Copy button.
- * This is how anything that changes the agent is offered: never an Approve or Start button.
+ * This is how a step only a terminal can do is offered. The browser's own actions (Agree, Save draft) are buttons.
  * `key` must be unique on the page; the button's text is exactly "Copy".
  */
 export function command(line: string, key: string, copy: (text: string, label: string) => Promise<boolean>): HTMLElement {

@@ -4,7 +4,7 @@ import { callout, emptyState, spinner } from "../ui/blocks.ts";
 import { button, searchField } from "../ui/controls.ts";
 import { dialogContent, dialogTitleId } from "../ui/dialog.ts";
 import { attrs, el, srOnly } from "../ui/dom.ts";
-import { humanize, plural } from "../ui/format.ts";
+import { humanize, memorySentence, plural } from "../ui/format.ts";
 import { listRow, pageFrame, rowList, section } from "../ui/page.ts";
 import { fields, text } from "../ui/classes.ts";
 import { memoryMap } from "./memory-graph.ts";
@@ -131,7 +131,7 @@ function lead(ctx: Ctx): string | undefined {
 	const { stats, count } = memory;
 	if (stats) {
 		if (stats.working + stats.episodic === 0) return undefined;
-		return `${ctx.name} keeps ${plural(stats.working, "memory", "memories")} in mind and ${plural(stats.episodic, "older one", "older ones")}.`;
+		return `${ctx.name} keeps ${memorySentence(stats.working, stats.episodic)}`;
 	}
 	return count ? `${ctx.name} keeps ${plural(count, "memory", "memories")}.` : undefined;
 }

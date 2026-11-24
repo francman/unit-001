@@ -68,3 +68,8 @@ export function count(value: number): string {
 export function plural(value: number, one: string, many: string): string {
 	return `${count(value)} ${value === 1 ? one : many}`;
 }
+
+/** How much memory is kept, in the owner's words: "3 memories in mind and 12 older ones." */
+export function memorySentence(working: number, episodic: number): string {
+	return `${plural(working, "memory", "memories")} in mind and ${plural(episodic, "older one", "older ones")}.`;
+}

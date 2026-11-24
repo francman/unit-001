@@ -1,4 +1,4 @@
-// Shares exact plan terms and diffs between the timeline and the approval card.
+// Shares exact plan terms, diffs and layout classes between the timeline, the approval card and the editors.
 import type { PlanTerms } from "../mission-plan-contract.ts";
 import { text } from "../ui/classes.ts";
 import { type Child, el } from "../ui/dom.ts";
@@ -14,8 +14,10 @@ export type PlanTerminalCommand = { line: string; copy: (line: string, label: st
 export const noSeparateReviewCap = { note: "No separate review cap (purpose limits apply)" };
 const disabledReviewLimit = { note: "Not applicable: model reviews disabled" };
 
-const stack = "flex min-w-0 flex-col gap-3";
-const heading = `${text.heading} [overflow-wrap:anywhere]`;
+/** Layout shared by the plan views and both editors: a column of blocks, a heading, and a label with its field. */
+export const stack = "flex min-w-0 flex-col gap-3";
+export const heading = `${text.heading} [overflow-wrap:anywhere]`;
+export const fieldLayout = "flex min-w-0 flex-col gap-1.5";
 
 /** Renders the reported value, distinguishing empty, absent and unreported terms. */
 export function planTermRows(rows: readonly TermRow[]): HTMLDListElement {

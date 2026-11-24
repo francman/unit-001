@@ -8,7 +8,7 @@ import { attrs, type Child, el } from "../ui/dom.ts";
 import { duration } from "../ui/format.ts";
 import { panel, section } from "../ui/page.ts";
 import { decodeExactText, encodeExactText, visibleExactText } from "./exact-text.ts";
-import { exactPlanTerms, type PlanTerminalCommand, planTermRows, planTermsDiff } from "./mission-plan-display.ts";
+import { exactPlanTerms, fieldLayout, type PlanTerminalCommand, planTermRows, planTermsDiff, stack } from "./mission-plan-display.ts";
 
 type Strategic = PlanTerms["strategics"][number];
 type Tactical = PlanTerms["tacticals"][number];
@@ -56,12 +56,9 @@ export interface MissionPlanDraftCardOptions {
 	onEdit?: () => void;
 }
 
-const stack = "flex min-w-0 flex-col gap-3";
-const fieldLayout = "flex min-w-0 flex-col gap-1.5";
 const actions = "flex flex-wrap gap-2";
 const priorities = ["high", "normal", "low"] as const satisfies readonly Strategic["priority"][];
 const modes = ["planned", "parked", "runnable"] as const satisfies readonly Tactical["mode"][];
-const sha256 = /^[a-f0-9]{64}$/;
 const textHint = "mission-plan-draft-text-hint";
 
 /** Builds a stable native editor. It never proposes local edits or chooses a purpose binding. */
@@ -148,9 +145,9 @@ export function renderMissionPlanDraftCard(options: MissionPlanDraftCardOptions)
 	);
 	const edit = options.onEdit && button({ label: "Edit draft", key: "mission-plan-draft-edit", onClick: options.onEdit });
 	const buttons = el("div", actions, edit);
-	const exact = draft.status === "proposed" && digest !== null && sha256.test(digest) && !!missionId &&
-		Number.isSafeInteger(revision) && revision > draft.baseRevision && draft.missing.length === 0 &&
-		(draft.baseRevision === 0 ? head === null : base !== null && sha256.test(base.digest));
+	// Digest, revision and mission ID shape are checked by the wire parser; this only ties the proposal to its base.
+	const exact = draft.status === "proposed" && digest !== null && draft.missing.length === 0 &&
+		(draft.baseRevision === 0 ? head === null : base !== null);
 	const currentApproval = exact && approval.kind !== "unavailable" && approval.revision === revision && approval.digest === digest;
 	const canAgree = currentApproval && approval.kind === "web" && authority === "developer-local";
 	const canUseTerminal = currentApproval && approval.kind === "terminal" &&
@@ -183,7 +180,7 @@ function overallFields(original: PlanTerms["overall"]): Field<PlanTerms["overall
 	const reviewEveryMs = numberField("review-every", "Review interval (milliseconds)", original.reviewEveryMs, 0,
 		(ms) => ms === 0 ? "0 ms" : `About ${duration(ms)}`);
 	reviewEveryMs.input.required = true;
-	const reviewAllowance = reviewAllowanceFields(original.reviewAllowance ?? null);
+	const reviewAllowance = reviewAllowanceFields(original.reviewAllowance);
 	return {
 		root: fieldset("Overall", purpose.root, scope.root, askFirst.root, reviewEveryMs.root, reviewAllowance.root),
 		read: () => ({ purpose: purpose.read(), scope: scope.read(), askFirst: askFirst.read(),

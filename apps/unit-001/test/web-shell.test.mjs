@@ -1,16 +1,14 @@
 // Exercises the production shell assets in a private Chrome profile, without an owner or live gateway.
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-
-const executable = process.env.UNIT_001_BROWSER_EXECUTABLE;
+import { executable, launchChrome, openTab, stopProcess, until } from "./support/browser.mjs";
 
 test("workspace identity, gateway reconnect, managed review, mobile drawer and Purpose navigation", { skip: !executable, timeout: 45_000 }, async () => {
 	const directory = await mkdtemp(join(tmpdir(), "unit-web-shell-"));
@@ -120,24 +118,11 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 		execFileSync(process.execPath, [fileURLToPath(new URL("../scripts/build-web.mjs", import.meta.url)), directory], { stdio: "inherit" });
 		server.listen(0, "127.0.0.1");
 		await once(server, "listening");
-		browser = spawn(executable, ["--headless=new", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${join(directory, "profile")}`], { stdio: "ignore" });
-		let debugPort;
-		await until(async () => {
-			try {
-				const [port, endpoint] = (await readFile(join(directory, "profile", "DevToolsActivePort"), "utf8")).split("\n");
-				if (!/^[1-9]\d{0,4}$/.test(port ?? "") || Number(port) > 65_535 || !endpoint?.startsWith("/devtools/browser/"))
-					return false;
-				debugPort = port;
-				return true;
-			} catch (error) {
-				if (error.code !== "ENOENT") throw error;
-				return false;
-			}
-		});
-		const target = await (await fetch(`http://127.0.0.1:${debugPort}/json/new?about:blank`, { method: "PUT" })).json();
-		socket = new WebSocket(target.webSocketDebuggerUrl);
-		await once(socket, "open");
-		const call = debugCommands(socket);
+		const { browser: launched, debugPort } = await launchChrome(join(directory, "profile"));
+		browser = launched;
+		const tab = await openTab(debugPort);
+		socket = tab.socket;
+		const call = tab.call;
 		const evaluate = async (expression) => {
 			const result = await call("Runtime.evaluate", { expression, returnByValue: true });
 			assert.ok(!result.exceptionDetails, result.exceptionDetails?.exception?.description);
@@ -255,6 +240,9 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 
 		await click("#nav-about");
 		await until(() => evaluate(`document.querySelector('[data-key="about-purpose"]')?.innerText === 'Open Mission'`));
+		// A managed host never offers browser Agree, so About lists approval as terminal-only.
+		const aboutText = await evaluate(`document.body.innerText`);
+		assert.ok(aboutText.includes("Approve a purpose or plan revision.") && !aboutText.includes("Agree to the exact revision you reviewed."));
 		await evaluate(`window.initialMissionHeading = null; document.querySelector('[data-key="about-purpose"]').click(); initialMissionHeading = document.querySelector('h1');`);
 		assert.equal(await evaluate(`document.querySelector('h1')?.innerText`), "Mission");
 		await until(() => evaluate(`initialMissionHeading !== document.querySelector('h1')`));
@@ -277,10 +265,9 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 		assert.ok(await evaluate(`shellTick.page === document.querySelector('h1')`), "the former 30-second refresh does not replace content");
 		await call("Emulation.setVirtualTimePolicy", { policy: "pauseIfNetworkFetchesPending" });
 
-		const secondTab = await (await fetch(`http://127.0.0.1:${debugPort}/json/new?about:blank`, { method: "PUT" })).json();
-		secondSocket = new WebSocket(secondTab.webSocketDebuggerUrl);
-		await once(secondSocket, "open");
-		const second = debugCommands(secondSocket);
+		const secondTab = await openTab(debugPort);
+		secondSocket = secondTab.socket;
+		const second = secondTab.call;
 		await second("Page.navigate", { url: origin });
 		await until(async () => {
 			const { result } = await second("Runtime.evaluate", {
@@ -325,42 +312,9 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 		sessionReady.resolve();
 		secondSocket?.close();
 		socket?.close();
-		if (browser?.exitCode === null && browser.signalCode === null) {
-			const exited = once(browser, "exit");
-			browser.kill("SIGTERM");
-			await exited;
-		}
+		await stopProcess(browser);
 		server.close();
 		server.closeAllConnections();
 		await rm(directory, { recursive: true, force: true });
 	}
 });
-
-function debugCommands(socket) {
-	let next = 0;
-	const pending = new Map();
-	socket.addEventListener("message", (event) => {
-		const message = JSON.parse(event.data);
-		const call = pending.get(message.id);
-		if (!call) return;
-		pending.delete(message.id);
-		if (message.error) call.reject(new Error(message.error.message));
-		else call.resolve(message.result);
-	});
-	return (method, params = {}) => {
-		const id = ++next;
-		const call = Promise.withResolvers();
-		pending.set(id, call);
-		socket.send(JSON.stringify({ id, method, params }));
-		return call.promise;
-	};
-}
-
-async function until(predicate) {
-	const deadline = Date.now() + 5000;
-	while (Date.now() < deadline) {
-		if (await predicate()) return;
-		await delay(25);
-	}
-	assert.fail("Timed out waiting for browser state");
-}

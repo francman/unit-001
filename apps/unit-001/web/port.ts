@@ -235,7 +235,7 @@ export function browserWorkspacePort(initialSession: GatewaySession): WorkspaceP
 						if (
 							(change.operation === "draft" && draft?.status === "editing" && draft.revision > change.expectedRevision) ||
 							(change.operation === "propose" && draft?.status === "proposed" && draft.revision === change.expectedRevision) ||
-							// The gateway emits completed for Agree only after checking the owner's exact revision and digest.
+							// The gateway checks the owner's revision and digest but not the approver kind or the cleared draft, so the page does.
 							(change.operation === "agree" && mission.authority === "developer-local" && mission.agreementValid &&
 								mission.agreement?.approvedBy === "developer-local" && mission.agreement.revision === change.revision && draft === null)
 						) return { state: "completed", mission };
@@ -404,8 +404,8 @@ function confirmsPlanMutation(change: MissionPlanMutation, mission: WorkspaceDet
 		case "plan-propose":
 			return plan.draft?.status === "proposed" && plan.draft.revision === change.expectedRevision;
 		case "plan-agree":
-			return mission.authority === "developer-local" && plan.headValid &&
-				plan.head?.revision === change.revision && plan.head.digest === change.digest;
+			// The gateway emits completed for plan Agree only after checking the authority, the head and its revision and digest.
+			return true;
 		case "review-now":
 			// The request ID binds the gateway acknowledgement, including replay of an earlier stored note.
 			return plan.reviews.length !== 0;

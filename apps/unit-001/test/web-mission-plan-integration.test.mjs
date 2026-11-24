@@ -34,7 +34,7 @@ async function exercise(mountWorkspace, browserWorkspacePort, width) {
 	const cadence = 604800000;
 	const binding = { missionId: "purpose-on-wire", purposeRevision: 17, purposeDigest: digest(9) };
 	const terms = {
-		overall: { purpose: "Keep releases safe", scope: "New scope", askFirst: ["Publish"], reviewEveryMs: cadence },
+		overall: { purpose: "Keep releases safe", scope: "New scope", askFirst: ["Publish"], reviewEveryMs: cadence, reviewAllowance: null },
 		strategics: [{ id: "releases", title: "Safe releases", intent: "Check candidates", signals: [], priority: "high" }],
 		tacticals: [{ id: "builds", strategic: "releases", objective: "Verify builds", successCriteria: ["Check manifest"],
 			priority: "normal", deadlineAt: null, mode: "runnable", binding }],
@@ -55,6 +55,7 @@ async function exercise(mountWorkspace, browserWorkspacePort, width) {
 	const plan = {
 		missionId: "charter", adopted: true, head, headValid: true, previous: first, history: [head, first].map(historyRow), draft: null,
 		gate: { state: "closed", reason: "reopen-needed" }, runs: { used: 2, limit: 32 }, due: [due], preview, reviews: [],
+		allowance: null, turns: [], blocker: null,
 	};
 	const legacy = {
 		stage: "agreed", missing: [], tools: [], execution: "not-started", runtime: null,

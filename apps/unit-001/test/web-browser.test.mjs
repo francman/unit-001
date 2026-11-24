@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,8 +10,8 @@ import { test } from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { assertFreshWebAssets } from "../scripts/build-web-freshness.mjs";
+import { executable, launchChrome, openTab, stopProcess, until } from "./support/browser.mjs";
 
-const executable = process.env.UNIT_001_BROWSER_EXECUTABLE;
 const fixtureAssets = process.env.UNIT_001_TEST_WEB_ASSETS;
 
 test(
@@ -47,63 +47,20 @@ test(
 		}
 		const owner = startOwner("owner");
 		let replacement;
-		const browser = spawn(
-			executable,
-			[
-				"--headless=new",
-				"--no-first-run",
-				"--no-default-browser-check",
-				// Classic scrollbars, as on Windows, Linux and macOS with always-visible scrollbars: the alignment
-				// checks below must hold with a scrollbar taking width from the thread.
-				"--disable-features=OverlayScrollbar",
-				"--remote-debugging-port=0",
-				`--user-data-dir=${directory}/browser`,
-			],
-			{ stdio: "ignore" },
-		);
+		let browser;
 		let socket;
-		const stop = async (child) => {
-			if (!child || child.exitCode !== null || child.signalCode !== null) return;
-			const exited = once(child, "exit");
-			child.kill("SIGTERM");
-			await exited;
-		};
 		try {
 			await until(
 				() => output.includes(`Browser workspace: ${origin}`),
 				() => errors,
 			);
-			let debugPort;
-			await until(async () => {
-				try {
-					debugPort = (await readFile(join(directory, "browser/DevToolsActivePort"), "utf8")).split("\n")[0];
-					return true;
-				} catch {
-					return false;
-				}
-			});
-			const target = await (
-				await fetch(`http://127.0.0.1:${debugPort}/json/new?about:blank`, { method: "PUT" })
-			).json();
-			socket = new WebSocket(target.webSocketDebuggerUrl);
-			await once(socket, "open");
-			let next = 0;
-			const waiting = new Map();
-			socket.addEventListener("message", (event) => {
-				const value = JSON.parse(event.data);
-				if (value.id) {
-					const call = waiting.get(value.id);
-					waiting.delete(value.id);
-					if (value.error) call?.reject(new Error(value.error.message));
-					else call?.resolve(value.result);
-				}
-			});
-			const call = (method, params = {}) =>
-				new Promise((resolve, reject) => {
-					const id = ++next;
-					waiting.set(id, { resolve, reject });
-					socket.send(JSON.stringify({ id, method, params }));
-				});
+			// Classic scrollbars, as on Windows, Linux and macOS with always-visible scrollbars: the alignment
+			// checks below must hold with a scrollbar taking width from the thread.
+			const { browser: launched, debugPort } = await launchChrome(`${directory}/browser`, ["--disable-features=OverlayScrollbar"]);
+			browser = launched;
+			const tab = await openTab(debugPort);
+			socket = tab.socket;
+			const { call } = tab;
 			const evaluate = async (expression) => {
 				const result = await call("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
 				if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
@@ -672,7 +629,7 @@ test(
 			await click("About");
 			await until(() => has("Data and privacy"));
 			// Group headings are styled uppercase, so innerText upper-cases them; compare the heading without case.
-			assert.equal(await has("needs a terminal on the computer it runs on"), true);
+			assert.equal(await has("need a terminal on the computer"), true);
 			assert.equal(await evaluate(`document.body.innerText.toLowerCase().includes('only a terminal can')`), true);
 			await click("Chat");
 			await fill("#composer", "Wait until cancelled");
@@ -934,7 +891,7 @@ test(
 
 			const wrongOwnerDraft = "This unsent draft belongs to the first owner";
 			await fill("#composer", wrongOwnerDraft);
-			await stop(owner);
+			await stopProcess(owner);
 			await until(() => has("Cannot reach the agent."));
 			const postsBeforeSwitch = await evaluate("window.postsByBrowser");
 			replacement = startOwner("peer", "Second owner");
@@ -959,9 +916,9 @@ test(
 			console.log(`Browser acceptance screenshots: ${directory}`);
 		} finally {
 			socket?.close();
-			await stop(browser);
-			await stop(owner);
-			await stop(replacement);
+			await stopProcess(browser);
+			await stopProcess(owner);
+			await stopProcess(replacement);
 			// Keep screenshots when requested, without retaining the synthetic SQLite state.
 			await rm(join(directory, "owner"), { recursive: true, force: true });
 			await rm(join(directory, "peer"), { recursive: true, force: true });
@@ -970,12 +927,3 @@ test(
 		}
 	},
 );
-
-async function until(predicate, failure = () => "Timed out waiting for browser state.") {
-	const deadline = Date.now() + 10000;
-	while (Date.now() < deadline) {
-		if (await predicate()) return;
-		await setTimeout(25);
-	}
-	throw new Error(failure());
-}

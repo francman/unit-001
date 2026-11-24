@@ -1,7 +1,7 @@
 // Shared display of the work run: state words, meters, limit rows and the unknown-results sentence, used by Status and Mission.
 import type { MissionRunView } from "../contract.ts";
-import { unknownResults } from "../state.ts";
-import { tag } from "./blocks.ts";
+import { type Ctx, commandName, unknownResults } from "../state.ts";
+import { callout, command, tag } from "./blocks.ts";
 import { text } from "./classes.ts";
 import { attrs, el } from "./dom.ts";
 import { plural } from "./format.ts";
@@ -61,13 +61,39 @@ export function unknownSentence(run: MissionRunView): string | null {
 	return sentences.join(" ");
 }
 
+/**
+ * Why a run needs the owner, as one paragraph: the blocker (only when blocked), what is unknown, and what the agent
+ * waits for. The one wording for the Status and Mission callouts and the shell strip.
+ */
+export function blockedExplanation(run: MissionRunView, name: string): { blocked: boolean; body: string } {
+	const blocked = run.status === "blocked";
+	const unknown = unknownSentence(run);
+	const reason = blocked ? (run.blocker ?? `${name} reports it cannot continue.`) : null;
+	const next = unknown
+		? `${name} will not continue until you review ${unknownResults(run) === 1 ? "it" : "them"} in a terminal.`
+		: `${name} will not continue until you look at it in a terminal.`;
+	return { blocked, body: [reason, unknown, next].filter((part) => part !== null).join(" ") };
+}
+
+/** The callout for a run that needs the owner: the explanation and the command that shows the details. */
+export function blockedCallout(ctx: Ctx, run: MissionRunView, key: string): HTMLElement {
+	const { blocked, body } = blockedExplanation(run, ctx.name);
+	return callout({
+		tone: blocked ? "danger" : "warn",
+		title: blocked ? "Blocked." : "Needs your review.",
+		body,
+		role: "status",
+		children: [command(`${commandName(ctx.name)} mission status`, key, ctx.act.copy)],
+	});
+}
+
 /** Inline code chips for a list of identifiers (tool names, chain of command). */
 export function chips(items: readonly string[]): HTMLElement {
 	return el("span", "flex flex-wrap gap-1.5", ...items.map((item) => el("code", "rounded-xs bg-fill px-1.5 py-0.5 font-mono text-xs text-fg [overflow-wrap:anywhere]", item)));
 }
 
 /** A bulleted list, or a plain sentence when the list is empty. */
-export function bullets(items: readonly string[], none: string): HTMLElement {
+export function bullets(items: readonly string[], none = "None listed."): HTMLElement {
 	if (items.length === 0) return el("span", text.body, none);
 	return attrs(el("ul", "m-0 flex list-disc flex-col gap-1 pl-4", ...items.map((item) => el("li", text.strong, item))), { role: "list" });
 }

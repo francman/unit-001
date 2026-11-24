@@ -104,8 +104,7 @@ function exercise() {
 	check(calls.length === 0, "pending or blocked review cannot send agreement");
 	insert(renderMissionDraftCard({ ...proposed, binding: { kind: "developer-local" }, terms: { objective: terms.objective, scope: terms.scope } }));
 	check(!agreeButton() && document.body.textContent.includes("complete proposal is not available"), "partial status projection cannot enable approval");
-	insert(renderMissionDraftCard({ ...proposed, binding: { kind: "developer-local" }, digest: "not-the-full-digest" }));
-	check(!agreeButton(), "a truncated digest cannot enable approval");
+	// A truncated digest never reaches the card: the wire parser rejects it (web/port.test.ts, "rejects malformed mission authority fields").
 	insert(renderMissionDraftCard({ ...proposed, digest: null, approval: { kind: "unavailable" } }));
 	check(!agreeButton() && !document.querySelector("code") && document.body.textContent.includes("workspace only"), "an unarmed proposal retains terms but offers no digest-bound action");
 	const line = `sudo unit-001 mission approve --revision 13 --digest ${digest}`;

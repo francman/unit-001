@@ -18,14 +18,14 @@ import type {
 } from "./mission-plan-contract.ts";
 
 const RUN_LIMIT = PROJECTION.runs;
-const REVIEW_PROJECTION_FIELDS = ["allowance", "turns", "blocker"] as const;
 const ALLOWANCE_CAP_FIELDS = ["maxRequests", "maxRequestsPerReview", "maxEstimatedCost"] as const;
 
 /** Parses the complete plan projection without inferring authority from its recorded history. */
 export function parsePlanView(value: unknown): PlanView {
 	const plan = closed(value, [
 		"missionId", "adopted", "head", "headValid", "previous", "history", "draft", "gate", "runs", "due", "preview", "reviews",
-	], REVIEW_PROJECTION_FIELDS);
+		"allowance", "turns", "blocker",
+	]);
 	const missionId = nullable(plan.missionId, identity);
 	const adopted = flag(plan.adopted);
 	const head = nullable(plan.head, parseRevision);
@@ -44,11 +44,9 @@ export function parsePlanView(value: unknown): PlanView {
 	const runs = closed(plan.runs, ["used", "limit"]);
 	const used = count(runs.used);
 	if (runs.limit !== RUN_LIMIT || used > RUN_LIMIT) return invalid();
-	// Old gateway responses have no review turn projection and confer no model review capability.
-	const hasReviewProjection = Object.hasOwn(plan, "turns");
-	const allowance = hasReviewProjection ? nullable(plan.allowance, parseAllowanceView) : null;
-	const turns = hasReviewProjection ? list(plan.turns, MAX_REVIEW_TURNS, parseReviewTurn) : [];
-	const blocker = hasReviewProjection ? nullable(plan.blocker, parseReviewTurn) : null;
+	const allowance = nullable(plan.allowance, parseAllowanceView);
+	const turns = list(plan.turns, MAX_REVIEW_TURNS, parseReviewTurn);
+	const blocker = nullable(plan.blocker, parseReviewTurn);
 	const due = list(plan.due, MAX_DUE_TRIGGERS, parseTrigger);
 	const preview = nullable(plan.preview, parseReviewNote);
 	const reviews = list(plan.reviews, PROJECTION.reviews, parseReviewNote);
@@ -126,7 +124,7 @@ function parseRevision(value: unknown): PlanRevisionView {
 		revision: count(row.revision, 1),
 		digest: digest(row.digest),
 		previousDigest: nullable(row.previousDigest, digest),
-		terms: parseTerms(row.terms, "projection"),
+		terms: parsePlanTerms(row.terms),
 		agreedAt: count(row.agreedAt),
 		receiptId: identity(row.receiptId),
 	};
@@ -143,7 +141,7 @@ function parseDraft(value: unknown): NonNullable<PlanView["draft"]> {
 	if (revision <= baseRevision || (status === "editing" && proposalDigest !== null)) return invalid();
 	return {
 		revision, baseRevision, status,
-		terms: parseTerms(row.terms, "projection"),
+		terms: parsePlanTerms(row.terms),
 		digest: proposalDigest,
 		savedBy: oneOf(row.savedBy, ["bob", "owner"]),
 		fromReview: nullable(row.fromReview, identity),
@@ -162,27 +160,17 @@ function parseGate(value: unknown): PlanView["gate"] {
 const UTF8 = new TextEncoder();
 const PRIORITIES = ["high", "normal", "low"] as const;
 
-/** Validates authored plan terms without deciding whether they can be proposed. */
+/** Validates plan terms, authored or projected, without deciding whether they can be proposed. */
 export function parsePlanTerms(value: unknown): PlanTerms {
-	return parseTerms(value, "authored");
-}
-
-function parseTerms(value: unknown, source: "authored" | "projection"): PlanTerms {
 	const input = closed(value, ["overall", "strategics", "tacticals"]);
-	const overall = closed(
-		input.overall,
-		["purpose", "scope", "askFirst", "reviewEveryMs"],
-		["reviewAllowance"],
-	);
-	const legacy = !Object.hasOwn(overall, "reviewAllowance");
-	if (legacy && source === "authored") return invalid();
+	const overall = closed(input.overall, ["purpose", "scope", "askFirst", "reviewEveryMs", "reviewAllowance"]);
 	const terms: PlanTerms = {
 		overall: {
 			purpose: text(overall.purpose, TERMS.purposeText),
 			scope: text(overall.scope, TERMS.scopeText),
 			askFirst: list(overall.askFirst, TERMS.askFirst, (value) => text(value, TERMS.askFirstText)),
 			reviewEveryMs: count(overall.reviewEveryMs),
-			reviewAllowance: legacy ? null : nullable(overall.reviewAllowance, (row) => parseAllowanceCaps(closed(row, ALLOWANCE_CAP_FIELDS))),
+			reviewAllowance: nullable(overall.reviewAllowance, (row) => parseAllowanceCaps(closed(row, ALLOWANCE_CAP_FIELDS))),
 		},
 		strategics: list(input.strategics, TERMS.strategics, (value) => {
 			const row = closed(value, ["id", "title", "intent", "signals", "priority"]);
@@ -196,9 +184,7 @@ function parseTerms(value: unknown, source: "authored" | "projection"): PlanTerm
 		}),
 		tacticals: list(input.tacticals, TERMS.tacticals, parseTactical),
 	};
-	// Normalizing an omitted allowance must not make a legacy payload exceed its original byte limit.
-	const legacyBytes = legacy ? ',"reviewAllowance":null'.length : 0;
-	if (UTF8.encode(JSON.stringify(terms)).length > TERMS.termsBytes + legacyBytes) return invalid();
+	if (UTF8.encode(JSON.stringify(terms)).length > TERMS.termsBytes) return invalid();
 	return terms;
 }
 
@@ -321,19 +307,11 @@ function parseDisposition(value: unknown): NonNullable<ReviewNote["disposition"]
 	return { kind, at, draftRevision: null };
 }
 
-function closed<const K extends string, const E extends string = never>(
-	value: unknown,
-	fields: readonly K[],
-	extension?: readonly E[],
-): Record<K, unknown> & Partial<Record<E, unknown>> {
+function closed<const K extends string>(value: unknown, fields: readonly K[]): Record<K, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return invalid();
-	const length = Object.keys(value).length;
-	if (fields.some((key) => !Object.hasOwn(value, key))) return invalid();
-	if (length !== fields.length && (
-		extension === undefined || length !== fields.length + extension.length || extension.some((key) => !Object.hasOwn(value, key))
-	)) return invalid();
-	// Required own fields are present; the legacy extension is either entirely absent or complete.
-	return value as Record<K, unknown> & Partial<Record<E, unknown>>;
+	// Exactly the listed own fields: a missing one or an extra one is invalid.
+	if (Object.keys(value).length !== fields.length || fields.some((key) => !Object.hasOwn(value, key))) return invalid();
+	return value as Record<K, unknown>;
 }
 
 function nullable<T>(value: unknown, parse: (value: unknown) => T): T | null {

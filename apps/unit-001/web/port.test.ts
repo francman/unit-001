@@ -770,16 +770,18 @@ describe("browser operator details", () => {
 		stubOwner({ draft: { ...draft, digest: null }, mission: { authority: "managed-administrator", canAgree: false } });
 		await expect((await connectedPort()).mission()).resolves.toMatchObject({ draft: { digest: null, terms }, canAgree: false, formationAvailable: true });
 	});
-	it("only dispatches legacy Agree for affirmative developer-local status and checks the recorded approver", async () => {
+	it("only dispatches legacy Agree for affirmative developer-local status and checks the recorded approver and cleared draft", async () => {
 		const change = { operation: "agree", revision: 3, digest: "d".repeat(64), confirmed: true } as const;
 		const draft = { missionId: "m", revision: change.revision, digest: change.digest, status: "proposed", terms: agreement.terms };
 		const recorded = { ...agreement, approval: { ...agreement.approval, approvedBy: { kind: "developer-local" } } };
-		for (const [authority, canAgree, approved] of [
-			["managed-administrator", true, recorded],
-			["developer-local", false, recorded],
-			["developer-local", undefined, recorded],
-			["developer-local", true, agreement],
-			["developer-local", true, recorded],
+		// The gateway forwards the stored approver and any remaining draft and still answers completed, so the page decides.
+		for (const [authority, canAgree, approved, remaining] of [
+			["managed-administrator", true, recorded, null],
+			["developer-local", false, recorded, null],
+			["developer-local", undefined, recorded, null],
+			["developer-local", true, agreement, null],
+			["developer-local", true, recorded, draft],
+			["developer-local", true, recorded, null],
 		] as const) {
 			const sent: string[] = [];
 			vi.stubGlobal("fetch", vi.fn(async (_path: string, init?: RequestInit) => {
@@ -787,7 +789,7 @@ describe("browser operator details", () => {
 				sent.push(operation.request.operation);
 				return completed(init, { type: "mission", result: {
 					stage: "awaiting_approval", formation: operation.request.operation === "status"
-						? { draft, agreement: null } : { draft: null, agreement: approved },
+						? { draft, agreement: null } : { draft: remaining, agreement: approved },
 					authority, canAgree, agreementValid: true, authorityError: null,
 					creator: null, missing: [], execution: "not-started", tools: [],
 					plan: null, planError: null, canAgreePlan: false, runnablePurposeBinding: null,
@@ -796,7 +798,7 @@ describe("browser operator details", () => {
 			const port = await connectedPort();
 			const allowed = authority === "developer-local" && canAgree === true;
 			expect(await port.mutateMission(change, "agree")).toMatchObject({
-				state: !allowed ? "rejected" : approved === recorded ? "completed" : "unknown",
+				state: !allowed ? "rejected" : approved === recorded && remaining === null ? "completed" : "unknown",
 			});
 			expect(sent).toEqual(allowed ? ["status", "agree"] : ["status"]);
 		}
@@ -813,6 +815,10 @@ describe("browser operator details", () => {
 		}
 		stubOwner({ draft: { revision: 1, status: "agreed", digest: null } });
 		await expect((await connectedPort()).details()).rejects.toThrow();
+		// The page cards trust the parsed proposal, so a truncated digest has to stop here, at the wire.
+		const proposed = { missionId: "m1", revision: 1, status: "proposed", digest: "a".repeat(64), terms: agreement.terms };
+		stubOwner({ draft: { ...proposed, digest: "not-the-full-digest" } });
+		await expect((await connectedPort()).details()).rejects.toThrow("Invalid mission digest.");
 	});
 	it("recall returns null stats", async () => {
 		vi.stubGlobal(
@@ -976,13 +982,9 @@ describe("browser plan transport", () => {
 		await expect(port.mutateMissionPlan(agreeCharter, "click")).resolves.toEqual({ state: "issued", receiptId: "receipt-2", reconciled: false });
 		await expect(port.mutateMissionPlan(agreeCharter, "without-refresh")).resolves.toEqual({ state: "rejected" });
 		await port.mission();
-		fetch.mockImplementationOnce(async (_input, init) =>
-			completed(init, missionReply({
-				plan: { ...approvedCharter, head: { ...approvedCharter.head, digest: "c".repeat(64) },
-					history: [{ revision: 2, digest: "c".repeat(64), agreedAt: 100 }] },
-			})),
-		);
-		await expect(port.mutateMissionPlan(agreeCharter, "wrong-digest")).resolves.toEqual({ state: "unknown" });
+		// The page does not re-check revision and digest of a completed plan Agree: the gateway does, and answers unknown.
+		fetch.mockImplementationOnce(async (_input, init) => completed(init, { type: "cancelled" }));
+		await expect(port.mutateMissionPlan(agreeCharter, "wrong-reply")).resolves.toEqual({ state: "unknown" });
 		expect(fetch).toHaveBeenCalledTimes(4);
 		fetch.mockImplementationOnce(async (_input, init) => completed(init, missionReply({ plan: approvedCharter })));
 		await expect(port.mission()).resolves.toMatchObject({ plan: { head: { digest: exactDigest } } });

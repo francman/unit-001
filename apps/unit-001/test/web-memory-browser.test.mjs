@@ -1,22 +1,18 @@
 // Drives the Memory page against deferred preview reads in a private Chromium profile.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { once } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
-
-const executable = process.env.UNIT_001_BROWSER_EXECUTABLE;
+import { executable, launchChrome, openTab, stopProcess, until } from "./support/browser.mjs";
 
 test("Memory settles only current reads and keeps the pending Forget dialog locked", { skip: !executable, timeout: 20000 }, async () => {
 	const directory = await mkdtemp(join(tmpdir(), "unit-memory-preview-"));
 	const profile = join(directory, "browser");
 	const index = join(directory, "index.html");
-	let browser, socket;
+	let browser, socket, debugPort;
 	try {
 		await build({
 			entryPoints: [fileURLToPath(new URL("fixtures/web-memory-preview.mjs", import.meta.url))],
@@ -24,37 +20,10 @@ test("Memory settles only current reads and keeps the pending Forget dialog lock
 			outfile: join(directory, "preview.js"),
 		});
 		await writeFile(index, '<!doctype html><meta charset="utf-8"><div id="app"></div><script src="preview.js"></script>');
-		browser = spawn(executable, ["--headless=new", "--no-first-run", "--remote-debugging-port=0", `--user-data-dir=${profile}`], {
-			stdio: "ignore",
-		});
-		await once(browser, "spawn");
-		const debugPort = await until(async () => {
-			try {
-				return (await readFile(join(profile, "DevToolsActivePort"), "utf8")).split("\n")[0];
-			} catch (error) {
-				if (error.code !== "ENOENT") throw error;
-				return false;
-			}
-		}, "Chromium debugger");
-		const target = await (await fetch(`http://127.0.0.1:${debugPort}/json/new?about:blank`, { method: "PUT" })).json();
-		socket = new WebSocket(target.webSocketDebuggerUrl);
-		await once(socket, "open");
-		const pending = new Map();
-		let sequence = 0;
-		socket.addEventListener("message", (event) => {
-			const reply = JSON.parse(event.data);
-			const call = pending.get(reply.id);
-			if (!call) return;
-			pending.delete(reply.id);
-			if (reply.error) call.reject(new Error(reply.error.message));
-			else call.resolve(reply.result);
-		});
-		const call = (method, params) => {
-			const response = Promise.withResolvers();
-			pending.set(++sequence, response);
-			socket.send(JSON.stringify({ id: sequence, method, params }));
-			return response.promise;
-		};
+		({ browser, debugPort } = await launchChrome(profile));
+		const tab = await openTab(debugPort);
+		socket = tab.socket;
+		const { call } = tab;
 		const page = async (expression) => {
 			const result = await call("Runtime.evaluate", { expression, returnByValue: true });
 			if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
@@ -162,20 +131,7 @@ test("Memory settles only current reads and keeps the pending Forget dialog lock
 		assert.equal(await has("Nothing matched"), true);
 	} finally {
 		socket?.close();
-		if (browser?.pid && browser.exitCode === null && browser.signalCode === null) {
-			const exited = once(browser, "exit");
-			browser.kill();
-			await exited;
-		}
+		await stopProcess(browser);
 		await rm(directory, { recursive: true, force: true });
 	}
 });
-
-async function until(read, label) {
-	for (let attempt = 0; attempt < 120; attempt++) {
-		const value = await read();
-		if (value) return value;
-		await delay(25);
-	}
-	assert.fail(`Timed out waiting for ${label}`);
-}

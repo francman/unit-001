@@ -8,8 +8,8 @@ import { duration } from "../ui/format.ts";
 import { facts, panel, section } from "../ui/page.ts";
 import { encodeExactText, visibleExactText as visibleText } from "./exact-text.ts";
 import {
-	exactPlanTerms as exactTerms, noSeparateReviewCap, overallRows, planDisclosure as disclosure, type PlanTerminalCommand,
-	planTermRows as termRows, planTermsDiff as termsDiff, strategicRows, tacticalRows,
+	exactPlanTerms as exactTerms, heading, noSeparateReviewCap, overallRows, planDisclosure as disclosure, type PlanTerminalCommand,
+	planTermRows as termRows, planTermsDiff as termsDiff, stack, strategicRows, tacticalRows,
 } from "./mission-plan-display.ts";
 
 /** The caller supplies closed projection data and chooses which actions are available. */
@@ -28,9 +28,6 @@ export interface MissionPlanOptions {
 	/** Copy-only instruction when fresh status reports that a separate Open is needed. */
 	terminalOpen?: PlanTerminalCommand;
 }
-
-const stack = "flex min-w-0 flex-col gap-3";
-const heading = `${text.heading} [overflow-wrap:anywhere]`;
 
 /** Builds sections for the Mission page; never opens, agrees, saves, or sends a message. */
 export function renderMissionPlan(options: MissionPlanOptions): HTMLElement {

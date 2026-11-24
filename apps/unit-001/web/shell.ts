@@ -21,7 +21,6 @@ import {
 	settleSend,
 	type ThemeChoice,
 	type Ui,
-	unknownResults,
 	unnamed,
 	workspaceRecovery,
 } from "./state.ts";
@@ -31,6 +30,7 @@ import { dialogTitleId } from "./ui/dialog.ts";
 import { attrs, coarsePointer, el, srOnly } from "./ui/dom.ts";
 import { count, money } from "./ui/format.ts";
 import { type IconName, icon } from "./ui/icons.ts";
+import { blockedExplanation } from "./ui/run.ts";
 import { createToaster } from "./ui/toast.ts";
 import { renderAbout } from "./views/about.ts";
 import { type ChatView, createChat } from "./views/chat.ts";
@@ -1297,9 +1297,8 @@ function bindingsMatch(terms: PlanTerms, choice: PlanBinding | null | undefined)
 function planProposal(ui: Readonly<Ui>, mission: MissionSnapshot): ExactPlanProposal | null {
 	const plan = mission.plan;
 	const draft = plan?.draft;
-	if (!planWritesAvailable(ui, mission) || ui.planDraft?.unsaved || !plan?.missionId || draft?.status !== "proposed" ||
-		draft.digest === null || !/^[a-f0-9]{64}$/.test(draft.digest) || draft.missing.length ||
-		draft.revision <= draft.baseRevision || draft.baseRevision !== (plan.head?.revision ?? 0) ||
+	if (!planWritesAvailable(ui, mission) || ui.planDraft?.unsaved || !plan || draft?.status !== "proposed" ||
+		draft.digest === null || draft.missing.length || draft.baseRevision !== (plan.head?.revision ?? 0) ||
 		(plan.head !== null && !plan.headValid) || (plan.head === null && plan.adopted) ||
 		plan.gate.reason === "receipt" || plan.gate.reason === "head-missing") return null;
 	return { revision: draft.revision, digest: draft.digest };
@@ -1452,7 +1451,7 @@ function buildBands(ctx: Ctx): HTMLElement {
 		const run = ui.details?.mission.run ?? null;
 		// The Status and Mission pages explain a blocked run in full; the strip would only repeat it there.
 		if (run && runBlocked(run) && ui.section !== "status" && ui.section !== "mission")
-			owner.append(band("danger", "Blocked.", blockedSentence(run, name), [command(`${cmd} mission status`, "copy-mission", act.copy)]));
+			owner.append(band("danger", "Blocked.", blockedExplanation(run, name).body, [command(`${cmd} mission status`, "copy-mission", act.copy)]));
 		if (ui.details?.owner?.held)
 			owner.append(
 				band("warn", "On hold.", `A maintenance hold is active, so ${name} is not taking new work. Messages you send will wait.`, []),
@@ -1490,17 +1489,4 @@ function band(tone: keyof typeof bandTones, title: string, body: string, trailin
 	);
 	if (role) strip.setAttribute("role", role);
 	return strip;
-}
-
-// Says what happened, what the agent does about it, and where to look; the command shows details, it does not resolve them.
-function blockedSentence(run: NonNullable<NonNullable<Ui["details"]>["mission"]["run"]>, name: string): string {
-	const parts = [
-		run.unknownRequests > 0 ? `${run.unknownRequests} model request${run.unknownRequests === 1 ? "" : "s"}` : "",
-		run.uncertainTools > 0 ? `${run.uncertainTools} tool call${run.uncertainTools === 1 ? "" : "s"}` : "",
-		run.unpricedResponses > 0 ? `${run.unpricedResponses} response${run.unpricedResponses === 1 ? "" : "s"} with no price` : "",
-	].filter(Boolean);
-	if (parts.length === 0) return `${run.blocker ?? `${name} cannot continue scheduled work.`} See the details in a terminal:`;
-	const one = unknownResults(run) === 1;
-	const listed = parts.length < 2 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
-	return `${listed} ${one ? "has an unknown result" : "have unknown results"}, so ${name} will not continue scheduled work until you review ${one ? "it" : "them"}. See ${one ? "it" : "them"} in a terminal:`;
 }

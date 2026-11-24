@@ -1,5 +1,5 @@
 // Sample data for design review and screenshots; built into web-preview only, never into a release.
-import type { Connection, MemoryGraphView, MissionDraftTerms, MissionRunView, WorkspaceDetails, WorkspacePort, WorkspaceView } from "./contract.ts";
+import type { Connection, MemoryGraphView, MissionAgreementView, MissionRunView, WorkspaceDetails, WorkspacePort, WorkspaceView } from "./contract.ts";
 import type { PlanRevisionView, PlanTerms, PlanView, ReviewNote } from "./mission-plan-contract.ts";
 import { sampleMemoryGraph } from "./preview-memory-graph.ts";
 import { mountWorkspace } from "./shell.ts";
@@ -109,6 +109,20 @@ const blockedRun: MissionRunView = {
 	uncertainTools: 1,
 };
 
+/** A well-formed proposal digest for every sample proposal; the preview does not hash terms. */
+const previewDigest = "a".repeat(64);
+
+const sampleAgreement: MissionAgreementView = {
+	revision: 2,
+	successCriteria: ["Advisories are triaged each week", "Patches have passing tests"],
+	approvalBoundary: ["Merging", "Security changes"],
+	reviewEveryMs: 7 * day,
+	approvedAt: now - 2 * day,
+	approvedBy: "local-creator",
+	allowedTools: ["read_file", "run_tests"],
+	limits: { maxCycles: 20, maxRequests: 200, maxRetries: 5, maxNoProgress: 3, deadlineAt: now + 30 * day, maxEstimatedCost: 5 },
+};
+
 const details: WorkspaceDetails = {
 	owner: { uptimeMs: 3 * day + 90 * minute, held: false, inhibited: false, configured: true },
 	mission: {
@@ -130,16 +144,7 @@ const details: WorkspaceDetails = {
 		canAgreePlan: true,
 		runnablePurposeBinding: null,
 		tools: ["read_file", "run_tests"],
-		agreement: {
-			revision: 2,
-			successCriteria: ["Advisories are triaged each week", "Patches have passing tests"],
-			approvalBoundary: ["Merging", "Security changes"],
-			reviewEveryMs: 7 * day,
-			approvedAt: now - 2 * day,
-			approvedBy: "local-creator",
-			allowedTools: ["read_file", "run_tests"],
-			limits: { maxCycles: 20, maxRequests: 200, maxRetries: 5, maxNoProgress: 3, deadlineAt: now + 30 * day, maxEstimatedCost: 5 },
-		},
+		agreement: sampleAgreement,
 		run: sampleRun,
 	},
 	memory: {
@@ -263,47 +268,30 @@ const port: WorkspacePort = {
 		if (!detailsAvailable) throw new Error("Details are not available in this fixture.");
 		return details.mission;
 	},
+	// The mutations return canned snapshots so each state can be reviewed; the owner's rules (stale revision, digest,
+	// missing terms, agree gating) are not re-implemented here.
 	async mutateMission(change) {
 		const current = details.mission;
-		const { draft, agreement } = current;
-		if (details.owner?.held) return { state: "refused", code: "held" };
-		const expected = draft?.revision ?? agreement?.revision ?? 0;
-		if ((change.operation === "agree" ? change.revision : change.expectedRevision) !== expected)
-			return { state: "refused", code: "stale-revision" };
+		const { draft } = current;
 		if (change.operation === "draft") {
-			const terms = change.terms;
+			const revision = (draft?.revision ?? current.agreement?.revision ?? 0) + 1;
 			details.mission = {
 				...current,
 				stage: "drafting",
-				missing: previewMissingTerms(terms),
-				draft: { missionId: "preview-mission", revision: expected + 1, status: "editing", digest: null, terms },
+				missing: [],
+				draft: { missionId: "preview-mission", revision, status: "editing", digest: null, terms: change.terms },
 			};
 		} else if (change.operation === "propose") {
-			if (!draft?.terms || current.missing.length) return { state: "refused", code: "incomplete" };
-			const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(draft)));
-			const digest = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
-			details.mission = { ...current, stage: "awaiting_approval", draft: { ...draft, status: "proposed", digest: current.canAgree ? digest : null } };
+			if (draft) details.mission = { ...current, stage: "awaiting_approval", draft: { ...draft, status: "proposed", digest: current.canAgree ? previewDigest : null } };
 		} else {
-			if (!current.canAgree) return { state: "refused", code: "managed-requires-gateway" };
-			if (draft?.status !== "proposed" || draft.digest !== change.digest) return { state: "refused", code: "stale-digest" };
-			const terms = draft.terms;
-			const policy = terms?.policy;
-			if (!terms || !policy || terms.objective === undefined || terms.scope === undefined || !terms.successCriteria ||
-				!terms.approvalBoundary || terms.reviewEveryMs === undefined || !policy.allowedTools ||
-				policy.maxCycles === undefined || policy.maxRequests === undefined || policy.maxRetries === undefined ||
-				policy.maxConsecutiveNoProgress === undefined || policy.deadlineAt === undefined)
-				return { state: "refused", code: "incomplete" };
 			details.mission = {
-				...current, stage: "agreed", draft: null, objective: terms.objective, scope: terms.scope, agreementValid: true,
-				agreement: {
-					revision: change.revision, approvedAt: Date.now(), approvedBy: "developer-local",
-					successCriteria: terms.successCriteria, approvalBoundary: terms.approvalBoundary, reviewEveryMs: terms.reviewEveryMs,
-					allowedTools: policy.allowedTools,
-					limits: {
-						maxCycles: policy.maxCycles, maxRequests: policy.maxRequests, maxRetries: policy.maxRetries,
-						maxNoProgress: policy.maxConsecutiveNoProgress, deadlineAt: policy.deadlineAt, maxEstimatedCost: policy.maxEstimatedCost ?? null,
-					},
-				},
+				...current,
+				stage: "agreed",
+				draft: null,
+				objective: draft?.terms.objective ?? current.objective,
+				scope: draft?.terms.scope ?? current.scope,
+				agreementValid: true,
+				agreement: { ...sampleAgreement, revision: change.revision, approvedAt: Date.now(), approvedBy: "developer-local" },
 			};
 		}
 		return { state: "completed", mission: details.mission };
@@ -311,57 +299,36 @@ const port: WorkspacePort = {
 	async mutateMissionPlan(change, requestId) {
 		const mission = details.mission;
 		if (mission.planError !== null) return { state: "rejected" };
-		if (details.owner?.held) return { state: "refused", code: "held" };
 		const plan: PlanView = mission.plan ?? {
 			missionId: "sample-charter", adopted: false, head: null, headValid: false, previous: null, history: [], draft: null,
 			gate: { state: "not-adopted", reason: null }, runs: { used: 0, limit: 32 }, due: [], preview: null, reviews: [],
 			allowance: null, turns: [], blocker: null,
 		};
 		const { draft, head } = plan;
-		const revision = draft?.revision ?? head?.revision ?? 0;
-		if ("expectedRevision" in change && change.expectedRevision !== revision) return { state: "refused", code: "stale-revision" };
-		let next: PlanView;
+		let next: PlanView = plan;
 		switch (change.operation) {
-			case "plan-draft": {
-				const { terms } = change;
-				const missing = [
-					!terms.overall.purpose.trim() ? "purpose" : "",
-					!terms.overall.scope.trim() ? "scope" : "",
-					terms.overall.reviewEveryMs < 1 ? "review cadence" : "",
-					...terms.strategics.filter((item) => !item.id || !item.title.trim() || !item.intent.trim()).map((item) => `strategy ${item.id}`),
-					...terms.tacticals.filter((item) => !item.id || !item.objective.trim() || !item.successCriteria.length).map((item) => `tactic ${item.id}`),
-				].filter(Boolean);
-				next = { ...plan, draft: { revision: revision + 1, baseRevision: head?.revision ?? 0, status: "editing",
-					terms, digest: null, savedBy: "owner", fromReview: null, missing } };
+			case "plan-draft":
+				next = { ...plan, draft: { revision: (draft?.revision ?? head?.revision ?? 0) + 1, baseRevision: head?.revision ?? 0, status: "editing",
+					terms: change.terms, digest: null, savedBy: "owner", fromReview: null, missing: [] } };
 				break;
-			}
-			case "plan-propose": {
-				if (draft?.status !== "editing" || draft.missing.length) return { state: "refused", code: "incomplete" };
-				const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([draft.revision, draft.terms])));
-				const digest = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
-				next = { ...plan, draft: { ...draft, status: "proposed", digest } };
+			case "plan-propose":
+				if (draft) next = { ...plan, draft: { ...draft, status: "proposed", digest: previewDigest } };
 				break;
-			}
 			case "plan-agree": {
-				if (!mission.canAgreePlan || mission.authority !== "developer-local") return { state: "refused", code: "managed-requires-gateway" };
-				if (draft?.status !== "proposed" || revision !== change.revision || draft.digest !== change.digest)
-					return { state: "refused", code: "stale-digest" };
-				const { digest } = change;
+				if (!draft) break;
+				const { revision, digest } = change;
 				next = { ...plan, adopted: true, headValid: true, previous: head, draft: null, due: [], preview: null,
 					head: { revision, digest, previousDigest: head?.digest ?? null, terms: draft.terms, agreedAt: now, receiptId: `sample-plan-receipt-${revision}` },
 					history: [{ revision, digest, agreedAt: now }, ...plan.history], gate: { state: "closed", reason: "reopen-needed" } };
 				break;
 			}
 			case "review-now": {
-				if (!head) return { state: "refused", code: "incomplete" };
+				if (!head) break;
 				const trigger = plan.due[0] ?? { kind: "owner", key: `${head.revision}:owner:${requestId}`, subject: null };
-				if (plan.reviews.some((review) => review.key === trigger.key)) return { state: "completed", mission };
 				next = { ...plan, due: [], preview: null, reviews: [previewReview(head, trigger, `sample-${requestId}`), ...plan.reviews].slice(0, 12) };
 				break;
 			}
 			case "review-dismiss":
-				if (!plan.reviews.some((review) => review.reviewId === change.reviewId))
-					return { state: "refused", code: "stale-revision" };
 				next = { ...plan, reviews: plan.reviews.map((review) => review.reviewId !== change.reviewId || review.disposition ? review :
 					{ ...review, disposition: { kind: "dismissed", at: now, draftRevision: null } }) };
 				break;
@@ -428,23 +395,6 @@ const port: WorkspacePort = {
 		return graph;
 	},
 };
-
-function previewMissingTerms(terms: MissionDraftTerms): string[] {
-	const { policy } = terms;
-	return [
-		[terms.objective?.trim(), "objective"],
-		[terms.scope?.trim(), "scope"],
-		[terms.successCriteria?.length, "success criteria"],
-		[terms.approvalBoundary !== undefined, "approval boundary"],
-		[terms.reviewEveryMs, "review cadence"],
-		[policy?.allowedTools !== undefined, "allowed tool actions"],
-		[policy?.maxCycles, "max cycles"],
-		[policy?.maxRequests, "max requests"],
-		[policy?.maxRetries !== undefined, "max retries"],
-		[policy?.maxConsecutiveNoProgress, "max consecutive cycles without progress"],
-		[policy?.deadlineAt, "deadline"],
-	].flatMap(([present, label]) => present ? [] : [String(label)]);
-}
 
 declare global {
 	interface Window {
@@ -517,9 +467,7 @@ if (flag("memory")) details.memory.records = memories;
 
 const root = document.querySelector<HTMLElement>("#app");
 if (!root) throw new Error("Workspace mount element is missing.");
-// "channels" is the old name of the Connections page; keep old preview links working.
-const requested = params.get("section") === "channels" ? "connections" : params.get("section");
-const section = sections.find((entry) => entry.id === requested)?.id;
+const section = sections.find((entry) => entry.id === params.get("section"))?.id;
 let unmount = mountWorkspace(root, port, { preview: true, section });
 
 window.unitPreview = {

@@ -7,6 +7,7 @@ import { attrs, el } from "../ui/dom.ts";
 import { dateTime, humanize } from "../ui/format.ts";
 import { panel, section } from "../ui/page.ts";
 import { decodeExactText, encodeExactText, visibleExactText } from "./exact-text.ts";
+import { fieldLayout } from "./mission-plan-display.ts";
 
 type Editing = {
 	expectedRevision: number;
@@ -68,7 +69,6 @@ const limits = [
 	["maxConsecutiveNoProgress", "Maximum consecutive cycles without progress"],
 	["maxEstimatedCost", "Maximum estimated cost (USD)"],
 ] as const;
-const fieldLayout = "flex min-w-0 flex-col gap-1.5";
 
 /** Keeps the native form and its raw input alive while the shell checks the saved revision. */
 export function createMissionDraftEditor(options: Editing): MissionDraftEditor {
@@ -291,10 +291,9 @@ function review(options: Review): HTMLElement {
 		content.append(callout({ tone: "info", body: "No reviewed digest is available in this session. Inspect mission status in a terminal." }));
 		return content;
 	}
-	// A wire projection without the full proposal cannot support exact review.
-	const exact = Number.isSafeInteger(revision) && revision > 0 && typeof missionId === "string" && missionId.length > 0 &&
-		/^[a-f0-9]{64}$/.test(digest) && rows.every(([, value, optional]) => value !== undefined || optional);
-	if (!exact) {
+	// A wire projection without the full proposal cannot support exact review. Revision, mission ID and digest shape
+	// are checked by the wire parser.
+	if (!rows.every(([, value, optional]) => value !== undefined || optional)) {
 		content.append(callout({ tone: "warn", role: "status", body: "The complete proposal is not available to review. Refresh the draft or inspect it in a terminal." }));
 		return content;
 	}

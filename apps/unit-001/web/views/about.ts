@@ -4,9 +4,10 @@ import { type Ctx, commandName, type Section } from "../state.ts";
 import { command, tag } from "../ui/blocks.ts";
 import { buttons, surfaces, text } from "../ui/classes.ts";
 import { button } from "../ui/controls.ts";
-import { attrs, type Child, el } from "../ui/dom.ts";
-import { duration, plural } from "../ui/format.ts";
+import { type Child, el } from "../ui/dom.ts";
+import { duration, memorySentence } from "../ui/format.ts";
 import { facts, listRow, pageFrame, panel, rowList, section } from "../ui/page.ts";
+import { bullets, chips } from "../ui/run.ts";
 import { connectionSentence } from "./connections.ts";
 
 /** The published releases page named in the README; the only external link, since the docs host is not decided. */
@@ -14,23 +15,36 @@ const releasesUrl = "https://github.com/francman/unit-001-releases/releases";
 
 const notReported = "Not reported yet.";
 
-/** What the browser can do: the gateway's closed operation set, as plain sentences (docs/web-ui.md). */
-const browserCan = [
-	"Read the agent's status, purpose, memory and connections.",
-	"Chat, and stop the reply or work in progress.",
-	"Forget a memory you pick, after you confirm. Conversation history is kept.",
-];
-
-/** What only a terminal can do: every step that changes the agent. */
-const terminalOnly = [
-	"Approve or change its purpose, connections, model or setup.",
-	"Start or approve scheduled work.",
-	"Update, stop or restart the agent.",
-];
-
 type Details = WorkspaceDetails;
 
-/** Renders the About page; anything that changes the agent is a command to copy, never a button. */
+/** True when the gateway offers browser Agree for the purpose or the plan (developer-local installs only). */
+function agreesInBrowser(details: Details | null): boolean {
+	return details?.mission.canAgree === true || details?.mission.canAgreePlan === true;
+}
+
+/** What the browser can do: the gateway's closed operation set, as plain sentences (docs/web-ui.md). */
+function browserCan(details: Details | null): string[] {
+	const items = [
+		"Read the agent's status, purpose, memory and connections.",
+		"Chat, and stop the reply or work in progress.",
+		"Forget a memory you pick, after you confirm. Conversation history is kept.",
+	];
+	if (details) items.push("Draft a purpose or plan and review it for agreement.");
+	if (agreesInBrowser(details)) items.push("Agree to the exact revision you reviewed. Agreeing does not start work.");
+	return items;
+}
+
+/** What only a terminal can do: every other step that changes the agent. */
+function terminalOnly(details: Details | null): string[] {
+	return [
+		...(agreesInBrowser(details) ? [] : ["Approve a purpose or plan revision."]),
+		"Change connections, model or setup.",
+		"Start scheduled work or open plan admission.",
+		"Update, stop or restart the agent.",
+	];
+}
+
+/** Renders the About page; a step only a terminal can do is a command to copy, not a button. */
 export function renderAbout(ctx: Ctx): HTMLElement {
 	const view = ctx.ui.view;
 	const { root, body } = pageFrame({
@@ -69,7 +83,10 @@ function identitySection(ctx: Ctx): HTMLElement {
 
 function purposeSection(ctx: Ctx, details: Details | null): HTMLElement {
 	const objective = details?.mission.objective;
-	const sentence = details === null ? notReported : (objective ?? "No purpose has been agreed yet. Agreeing one happens in a terminal.");
+	const sentence =
+		details === null
+			? notReported
+			: (objective ?? `No purpose has been agreed yet.${agreesInBrowser(details) ? "" : " Agreeing one happens in a terminal."}`);
 	return section({
 		title: "Purpose",
 		icon: "target",
@@ -110,12 +127,17 @@ function inUseSection(ctx: Ctx, details: Details | null): HTMLElement {
 
 function controlSection(ctx: Ctx): HTMLElement {
 	const cmd = commandName(ctx.name);
+	const details = ctx.ui.details;
 	return section({
 		title: "How you control it",
 		icon: "terminal",
 		children: [
-			el("p", text.body, `Anything that changes ${ctx.name} needs a terminal on the computer it runs on. The browser only shows state and lets you talk to it.`),
-			panel(el("div", `grid grid-cols-2 gap-x-6 gap-y-4 max-sm:grid-cols-1 ${surfaces.panelBody}`, group("This browser can", browserCan), group("Only a terminal can", terminalOnly))),
+			el(
+				"p",
+				text.body,
+				`Setup, connections, starting work and updates need a terminal on the computer ${ctx.name} runs on.${details ? ` Purposes and plans are ${agreesInBrowser(details) ? "drafted and agreed in this browser" : "drafted in this browser and approved in a terminal"}.` : ""}`,
+			),
+			panel(el("div", `grid grid-cols-2 gap-x-6 gap-y-4 max-sm:grid-cols-1 ${surfaces.panelBody}`, group("This browser can", browserCan(details)), group("Only a terminal can", terminalOnly(details)))),
 			el("p", text.description, "Run these in the agent's terminal:"),
 			el(
 				"div",
@@ -145,10 +167,10 @@ function limitsSection(details: Details | null): HTMLElement {
 	const agreement = details?.mission.agreement ?? null;
 	const rows: (readonly [string, Child])[] = [];
 	if (details === null) rows.push(["Agreed limits", notReported]);
-	else if (agreement === null) rows.push(["Agreed limits", "None yet. Limits are set when the purpose is approved in a terminal."]);
+	else if (agreement === null) rows.push(["Agreed limits", `None yet. Limits are set when the purpose is ${agreesInBrowser(details) ? "agreed" : "approved in a terminal"}.`]);
 	else {
 		rows.push(
-			["Asks you first about", agreement.approvalBoundary.length ? bullets(agreement.approvalBoundary) : "Nothing listed."],
+			["Asks you first about", bullets(agreement.approvalBoundary, "Nothing listed.")],
 			["Scheduled work stops at", "The cycle, request, retry, no-progress, deadline and cost limits you agreed. Status shows how much is used."],
 		);
 	}
@@ -176,20 +198,8 @@ function group(title: string, items: readonly string[]): HTMLElement {
 	return el("div", "flex min-w-0 flex-col gap-1.5", el("h3", text.label, title), bullets(items));
 }
 
-function bullets(items: readonly string[]): HTMLElement {
-	return attrs(el("ul", "m-0 flex list-disc flex-col gap-1 pl-4", ...items.map((item) => el("li", text.strong, item))), { role: "list" });
-}
-
-function chips(items: readonly string[]): HTMLElement {
-	return el("span", "flex flex-wrap gap-1.5", ...items.map((item) => el("code", "rounded-xs bg-fill px-1.5 py-0.5 font-mono text-xs text-fg [overflow-wrap:anywhere]", item)));
-}
-
 /** A link-style button to another page of the workspace. */
 function openLink(ctx: Ctx, target: Section, label: string, key: string): HTMLButtonElement {
 	return button({ label, key, variant: "link", onClick: () => ctx.act.go(target) });
-}
-
-function memorySentence(working: number, episodic: number): string {
-	return `${plural(working, "memory", "memories")} in mind and ${plural(episodic, "older one", "older ones")}.`;
 }
 

@@ -10,7 +10,7 @@ import { facts, listRow, pageFrame, panel, rowList, section } from "../ui/page.t
 import { type MissionPlanOptions, renderMissionPlan } from "./mission-plan.ts";
 import { encodeExactText } from "./exact-text.ts";
 import type { PlanTerminalCommand } from "./mission-plan-display.ts";
-import { bullets, chips, limitRow, runStates, unknownSentence } from "../ui/run.ts";
+import { blockedCallout, bullets, chips, limitRow, runStates } from "../ui/run.ts";
 
 const approvers: Record<MissionAgreementView["approvedBy"], string> = {
 	"local-creator": "the local creator",
@@ -50,7 +50,7 @@ export function renderMission(ctx: Ctx, openDraft?: () => void, planActions?: Pl
 		return root;
 	}
 	const sections = [
-		...needsYou(ctx, details),
+		run && runBlocked(run) ? blockedCallout(ctx, run, "copy-needs-mission") : null,
 		planActions?.notice,
 		renderMissionPlan({
 			...planActions,
@@ -96,27 +96,6 @@ function terminal(ctx: Ctx, rest: string): string {
 	return `${commandName(ctx.name)} ${rest}`;
 }
 
-/** What the owner has to do, one callout per case, each with one sentence and one command. */
-function needsYou(ctx: Ctx, details: WorkspaceDetails): HTMLElement[] {
-	const items: HTMLElement[] = [];
-	const run = details.mission.run;
-	if (run && runBlocked(run)) {
-		const unknown = unknownSentence(run);
-		const blocked = run.status === "blocked";
-		items.push(
-			callout({
-				tone: blocked ? "danger" : "warn",
-				title: blocked ? "Blocked." : "Needs your review.",
-				body: [blocked ? (run.blocker ?? `${ctx.name} reports it cannot continue.`) : null, unknown, `${ctx.name} will not continue until you look at it in a terminal.`]
-					.filter((part) => part !== null)
-					.join(" "),
-				role: "status",
-				children: [command(terminal(ctx, "mission status"), "copy-needs-mission", ctx.act.copy)],
-			}),
-		);
-	}
-	return items;
-}
 
 function purposeSection(ctx: Ctx, details: WorkspaceDetails, canOpenDraft: boolean): HTMLElement {
 	const { mission } = details;

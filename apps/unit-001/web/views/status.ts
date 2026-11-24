@@ -5,9 +5,9 @@ import { callout, command, dot, emptyState, stat, tag } from "../ui/blocks.ts";
 import { surfaces, text } from "../ui/classes.ts";
 import { button } from "../ui/controls.ts";
 import { attrs, type Child, el } from "../ui/dom.ts";
-import { ago, clock, count, dateTime, duration, money, plural, until } from "../ui/format.ts";
+import { ago, clock, count, dateTime, duration, memorySentence, money, plural, until } from "../ui/format.ts";
 import { facts, pageFrame, panel, section } from "../ui/page.ts";
-import { meter, runStates, unknownSentence } from "../ui/run.ts";
+import { blockedCallout, meter, runStates } from "../ui/run.ts";
 import { connectionSentence } from "./connections.ts";
 
 /** Memories at which the capacity evidence recommends a review; a recommendation, not a limit. */
@@ -20,7 +20,7 @@ interface Facts {
 	limits: MissionAgreementView["limits"] | null;
 }
 
-/** Renders the Status page; read-only, anything needing the owner is a copyable command, never a button. */
+/** Renders the Status page; read-only, a step only a terminal can do is a copyable command. */
 export function renderStatus(ctx: Ctx): HTMLElement {
 	const details = ctx.ui.details;
 	const run = details?.mission.run ?? null;
@@ -61,7 +61,7 @@ export function renderActivity(ctx: Ctx): HTMLElement {
 	root.append(
 		railGroup("Purpose", el("p", text.strong, details.mission.objective ?? "No purpose agreed yet.")),
 		railGroup("Scheduled work", ...railWork(data)),
-		railGroup("Memory", el("p", text.body, details.memory.stats ? memorySentence(details.memory.stats) : "Counts could not be read.")),
+		railGroup("Memory", el("p", text.body, details.memory.stats ? memorySentence(details.memory.stats.working, details.memory.stats.episodic) : "Counts could not be read.")),
 		railGroup("Connections", el("p", text.body, connectionSentence(details.channels))),
 	);
 	if (ctx.ui.connection !== "connected") root.append(el("p", text.description, "Last reported before the connection dropped."));
@@ -69,24 +69,10 @@ export function renderActivity(ctx: Ctx): HTMLElement {
 	return root;
 }
 
-/** The callout for a run that needs the owner: one block that says why, what is unknown and the command to run. */
+/** The callout for a run that needs the owner; null when the run needs nothing. */
 function attention(ctx: Ctx, data: Facts): HTMLElement | null {
 	const { run } = data;
-	if (!run || !runBlocked(run)) return null;
-	const unknown = unknownSentence(run);
-	const blocked = run.status === "blocked";
-	const reviewing = run.unknownRequests + run.uncertainTools === 1 ? "it" : "them";
-	const reason = blocked ? (run.blocker ?? `${ctx.name} reports it cannot continue.`) : null;
-	const next = unknown
-		? `${ctx.name} will not continue until you review ${reviewing} in a terminal.`
-		: `${ctx.name} will not continue until you look at it in a terminal.`;
-	return callout({
-		tone: blocked ? "danger" : "warn",
-		title: blocked ? "Blocked." : "Needs your review.",
-		body: [reason, unknown, next].filter((part) => part !== null).join(" "),
-		role: "status",
-		children: [command(`${commandName(ctx.name)} mission status`, "copy-mission-status", ctx.act.copy)],
-	});
+	return run && runBlocked(run) ? blockedCallout(ctx, run, "copy-mission-status") : null;
 }
 
 /** The totals the run reports, as one strip like Hermes' usage cards; retries and stalls only once they matter. */
@@ -142,10 +128,6 @@ function scheduledWork(ctx: Ctx, data: Facts): HTMLElement {
 
 function openMission(ctx: Ctx): HTMLButtonElement {
 	return button({ label: "Open Mission", key: "open-mission", variant: "link", onClick: () => ctx.act.go("mission") });
-}
-
-function memorySentence(stats: MemoryStatsView): string {
-	return `${plural(stats.working, "memory", "memories")} in mind and ${plural(stats.episodic, "older one", "older ones")}.`;
 }
 
 function memorySection(stats: MemoryStatsView | null): HTMLElement {
