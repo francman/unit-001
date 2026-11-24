@@ -1,4 +1,10 @@
 // Validates the gateway's closed mission plan and review projections before the browser uses them.
+import {
+	MAX_DUE_TRIGGERS,
+	MAX_REVIEW_TURNS,
+	PLAN_PROJECTION_LIMITS as PROJECTION,
+	PLAN_TERMS_LIMITS as TERMS,
+} from "../src/missions/plan-limits.ts";
 import type { MissionPlanBinding } from "./contract.ts";
 import type {
 	PlanRevisionView,
@@ -11,9 +17,7 @@ import type {
 	ReviewTurnView,
 } from "./mission-plan-contract.ts";
 
-const RUN_LIMIT = 32;
-const MAX_REVIEW_TURNS = 16;
-const MAX_REQUESTS_PER_REVIEW = 4;
+const RUN_LIMIT = PROJECTION.runs;
 const REVIEW_PROJECTION_FIELDS = ["allowance", "turns", "blocker"] as const;
 const ALLOWANCE_CAP_FIELDS = ["maxRequests", "maxRequestsPerReview", "maxEstimatedCost"] as const;
 
@@ -27,7 +31,7 @@ export function parsePlanView(value: unknown): PlanView {
 	const head = nullable(plan.head, parseRevision);
 	const headValid = flag(plan.headValid);
 	const previous = nullable(plan.previous, parseRevision);
-	const history = list(plan.history, 32, (value) => {
+	const history = list(plan.history, PROJECTION.history,(value) => {
 		const row = closed(value, ["revision", "digest", "agreedAt"]);
 		return { revision: count(row.revision, 1), digest: digest(row.digest), agreedAt: count(row.agreedAt) };
 	});
@@ -45,9 +49,9 @@ export function parsePlanView(value: unknown): PlanView {
 	const allowance = hasReviewProjection ? nullable(plan.allowance, parseAllowanceView) : null;
 	const turns = hasReviewProjection ? list(plan.turns, MAX_REVIEW_TURNS, parseReviewTurn) : [];
 	const blocker = hasReviewProjection ? nullable(plan.blocker, parseReviewTurn) : null;
-	const due = list(plan.due, 16, parseTrigger);
+	const due = list(plan.due, MAX_DUE_TRIGGERS, parseTrigger);
 	const preview = nullable(plan.preview, parseReviewNote);
-	const reviews = list(plan.reviews, 12, parseReviewNote);
+	const reviews = list(plan.reviews, PROJECTION.reviews, parseReviewNote);
 	if (preview) {
 		const first = due[0];
 		if (
@@ -86,9 +90,9 @@ export function parseReviewNote(value: unknown): ReviewNote {
 		window: { from: count(window.from), to: count(window.to) },
 		createdAt: count(note.createdAt),
 		outcome: oneOf(note.outcome, ["no-change", "attention"]),
-		items: list(note.items, 16, parseReviewItem),
+		items: list(note.items, PROJECTION.noteItems, parseReviewItem),
 		facts: parseReviewFacts(note.facts),
-		uncertainty: list(note.uncertainty, 64, (value) => text(value, 400)),
+		uncertainty: list(note.uncertainty, PROJECTION.uncertainty, (value) => text(value, PROJECTION.uncertaintyText)),
 		disposition: nullable(note.disposition, parseDisposition),
 	};
 }
@@ -134,7 +138,7 @@ function parseDraft(value: unknown): NonNullable<PlanView["draft"]> {
 	const baseRevision = count(row.baseRevision);
 	const status = oneOf(row.status, ["editing", "proposed"]);
 	const proposalDigest = nullable(row.digest, digest);
-	const missing = list(row.missing, 64, (value) => text(value, 200));
+	const missing = list(row.missing, PROJECTION.missing, (value) => text(value, PROJECTION.missingText));
 	// The gateway withholds an unverifiable proposal digest without discarding the draft.
 	if (revision <= baseRevision || (status === "editing" && proposalDigest !== null)) return invalid();
 	return {
@@ -174,27 +178,27 @@ function parseTerms(value: unknown, source: "authored" | "projection"): PlanTerm
 	if (legacy && source === "authored") return invalid();
 	const terms: PlanTerms = {
 		overall: {
-			purpose: text(overall.purpose, 4096),
-			scope: text(overall.scope, 4096),
-			askFirst: list(overall.askFirst, 32, (value) => text(value, 2000)),
+			purpose: text(overall.purpose, TERMS.purposeText),
+			scope: text(overall.scope, TERMS.scopeText),
+			askFirst: list(overall.askFirst, TERMS.askFirst, (value) => text(value, TERMS.askFirstText)),
 			reviewEveryMs: count(overall.reviewEveryMs),
 			reviewAllowance: legacy ? null : nullable(overall.reviewAllowance, (row) => parseAllowanceCaps(closed(row, ALLOWANCE_CAP_FIELDS))),
 		},
-		strategics: list(input.strategics, 3, (value) => {
+		strategics: list(input.strategics, TERMS.strategics, (value) => {
 			const row = closed(value, ["id", "title", "intent", "signals", "priority"]);
 			return {
 				id: itemId(row.id),
-				title: text(row.title, 200),
-				intent: text(row.intent, 2048),
-				signals: list(row.signals, 16, (value) => text(value, 1000)),
+				title: text(row.title, TERMS.titleText),
+				intent: text(row.intent, TERMS.intentText),
+				signals: list(row.signals, TERMS.signals, (value) => text(value, TERMS.signalText)),
 				priority: oneOf(row.priority, PRIORITIES),
 			};
 		}),
-		tacticals: list(input.tacticals, 6, parseTactical),
+		tacticals: list(input.tacticals, TERMS.tacticals, parseTactical),
 	};
 	// Normalizing an omitted allowance must not make a legacy payload exceed its original byte limit.
 	const legacyBytes = legacy ? ',"reviewAllowance":null'.length : 0;
-	if (UTF8.encode(JSON.stringify(terms)).length > 65536 + legacyBytes) return invalid();
+	if (UTF8.encode(JSON.stringify(terms)).length > TERMS.termsBytes + legacyBytes) return invalid();
 	return terms;
 }
 
@@ -212,7 +216,7 @@ function parseAllowanceCaps(row: Record<(typeof ALLOWANCE_CAP_FIELDS)[number], u
 	const maxRequests = count(row.maxRequests, 1);
 	const maxRequestsPerReview = count(row.maxRequestsPerReview, 1);
 	const maxEstimatedCost = nullable(row.maxEstimatedCost, reviewCost);
-	if (maxRequestsPerReview > MAX_REQUESTS_PER_REVIEW || maxRequestsPerReview > maxRequests || maxEstimatedCost === 0)
+	if (maxRequestsPerReview > TERMS.requestsPerReview || maxRequestsPerReview > maxRequests || maxEstimatedCost === 0)
 		return invalid();
 	return { maxRequests, maxRequestsPerReview, maxEstimatedCost };
 }
@@ -227,8 +231,8 @@ function parseTactical(value: unknown): PlanTerms["tacticals"][number] {
 	const base = {
 		id: itemId(row.id),
 		strategic: itemId(row.strategic),
-		objective: text(row.objective, 2048),
-		successCriteria: list(row.successCriteria, 16, (value) => text(value, 1000)),
+		objective: text(row.objective, TERMS.objectiveText),
+		successCriteria: list(row.successCriteria, TERMS.successCriteria, (value) => text(value, TERMS.criterionText)),
 		priority: oneOf(row.priority, PRIORITIES),
 		deadlineAt: nullable(row.deadlineAt, (value) => count(value, 1)),
 	};
@@ -242,8 +246,8 @@ function parseTrigger(value: unknown): ReviewTrigger {
 	const trigger = closed(value, ["kind", "key", "subject"]);
 	return {
 		kind: oneOf(trigger.kind, ["cadence", "completed", "blocked", "runs-low", "deadline-near", "owner"]),
-		key: identity(trigger.key, 400),
-		subject: nullable(trigger.subject, (value) => identity(value, 400)),
+		key: identity(trigger.key, PROJECTION.keyText),
+		subject: nullable(trigger.subject, (value) => identity(value, PROJECTION.keyText)),
 	};
 }
 
@@ -252,7 +256,7 @@ function parseReviewTurn(value: unknown): ReviewTurnView {
 		"key", "planRevision", "trigger", "state", "reason", "reviewId", "draftRevision", "requests", "at",
 	]);
 	const base = {
-		key: identity(row.key, 400),
+		key: identity(row.key, PROJECTION.keyText),
 		planRevision: count(row.planRevision, 1),
 		trigger: parseTrigger(row.trigger),
 		reviewId: nullable(row.reviewId, identity),
@@ -276,15 +280,15 @@ function parseReviewItem(value: unknown): ReviewNote["items"][number] {
 	const item = closed(value, ["id", "level", "status", "verifiedWorks", "listedWorks", "runIds", "blockReasons", "unsettled", "deadlineAt"]);
 	const listedWorks = count(item.listedWorks);
 	const verifiedWorks = count(item.verifiedWorks);
-	const runIds = list(item.runIds, RUN_LIMIT, (value) => identity(value, 400));
+	const runIds = list(item.runIds, PROJECTION.itemRunIds, (value) => identity(value, PROJECTION.keyText));
 	const unsettled = count(item.unsettled);
 	if (verifiedWorks > listedWorks || unsettled > runIds.length) return invalid();
 	return {
-		id: identity(item.id, 64),
+		id: identity(item.id, PROJECTION.itemIdText),
 		level: oneOf(item.level, ["strategic", "tactical", "legacy"]),
 		status: oneOf(item.status, ["on-track", "at-risk", "blocked", "done", "planned", "parked"]),
 		verifiedWorks, listedWorks, runIds,
-		blockReasons: list(item.blockReasons, RUN_LIMIT, (value) => text(value, 200)),
+		blockReasons: list(item.blockReasons, PROJECTION.itemBlockReasons, (value) => text(value, PROJECTION.blockReasonText)),
 		unsettled,
 		deadlineAt: nullable(item.deadlineAt, (value) => count(value, 1)),
 	};
@@ -353,7 +357,7 @@ function identity(value: unknown, max = 200): string {
 }
 
 function itemId(value: unknown): string {
-	const id = text(value, 64);
+	const id = text(value, PROJECTION.itemIdText);
 	if (id !== "" && !/^[a-z0-9][a-z0-9-]*$/.test(id)) return invalid();
 	return id;
 }

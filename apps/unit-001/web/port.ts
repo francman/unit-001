@@ -1,5 +1,21 @@
 // Connects the workspace to the local operator gateway without replaying mutations.
 import { parseMissionRefusalCode } from "../src/missions/refusal.ts";
+import {
+	APPROVER_KINDS,
+	CHANNEL_FAILURES,
+	CHANNEL_STEPS,
+	CREATOR_KINDS,
+	DRAFT_STATUSES,
+	MEMORY_DERIVATIONS,
+	MEMORY_GRAPH_LIMITS,
+	MEMORY_KINDS,
+	MEMORY_ORIGINS,
+	MEMORY_RELATIONS,
+	MEMORY_TIERS,
+	MISSION_AUTHORITIES,
+	memoryGraphProblem,
+	RUN_STATES,
+} from "../src/web/payload.ts";
 import { browserApiFetch, type GatewaySession, readGatewaySession, requireWorkspaceIdentity, WorkspaceChanged } from "./client-auth.ts";
 import { readEventStream } from "./client-stream.ts";
 import type {
@@ -304,8 +320,8 @@ export function browserWorkspacePort(initialSession: GatewaySession): WorkspaceP
 								? "Setup identity verified. Message delivery has not been verified."
 								: "Setup is pending or unavailable. Creator authority is required.",
 						lastHealth: channel.lastHealth === null || channel.lastHealth === undefined ? null : parseHealth(channel.lastHealth),
-						failure: outcome.kind === "failed" ? oneOf(outcome.reason, FAILURES) : null,
-						awaiting: outcome.kind === "awaiting_creator" ? oneOf(outcome.step, AWAITING) : null,
+						failure: outcome.kind === "failed" ? oneOf(outcome.reason, CHANNEL_FAILURES) : null,
+						awaiting: outcome.kind === "awaiting_creator" ? oneOf(outcome.step, CHANNEL_STEPS) : null,
 					};
 				}),
 			} satisfies WorkspaceDetails;
@@ -462,11 +478,6 @@ function boolean(value: unknown): boolean {
 	return value;
 }
 
-const FAILURES = ["authorization", "credentials", "transport", "provider", "identity"] as const;
-const AWAITING = ["grant", "manager-bootstrap", "telegram-confirmation"] as const;
-const APPROVERS = ["local-creator", "host-administrator", "developer-local"] as const;
-const RUN_STATUSES = ["ready", "running", "waiting", "paused", "blocked", "completed", "stopped"] as const;
-
 function parseUsage(value: unknown): WorkspaceUsage {
 	const usage = object(value);
 	const cost = object(usage.cost);
@@ -528,7 +539,7 @@ function historyId(value: unknown): number {
 function parseMission(value: unknown): WorkspaceDetails["mission"] {
 	const mission = object(value);
 	const formation = object(mission.formation);
-	const authority = oneOf(mission.authority, AUTHORITIES);
+	const authority = oneOf(mission.authority, MISSION_AUTHORITIES);
 	const current = formation.agreement ?? formation.draft;
 	const terms = current === null ? {} : object(object(current).terms);
 	const draft = formation.draft === null ? null : parseDraft(formation.draft);
@@ -581,7 +592,7 @@ function parseAgreement(value: unknown): MissionAgreementView {
 		approvalBoundary: list(terms.approvalBoundary, 32, text),
 		reviewEveryMs: number(terms.reviewEveryMs),
 		approvedAt: number(approval.approvedAt),
-		approvedBy: oneOf(object(approval.approvedBy).kind, APPROVERS),
+		approvedBy: oneOf(object(approval.approvedBy).kind, APPROVER_KINDS),
 		...(policy.allowedTools === undefined ? {} : { allowedTools: list(policy.allowedTools, 128, text) }),
 		limits: {
 			maxCycles: number(policy.maxCycles),
@@ -597,7 +608,7 @@ function parseAgreement(value: unknown): MissionAgreementView {
 function parseRun(value: unknown): MissionRunView {
 	const run = object(value);
 	return {
-		status: oneOf(run.status, RUN_STATUSES),
+		status: oneOf(run.status, RUN_STATES),
 		blocker: run.blocker === null ? null : text(run.blocker),
 		nextWakeAt: run.nextWakeAt === null ? null : number(run.nextWakeAt),
 		cycles: number(run.cycles),
@@ -633,50 +644,31 @@ function parseMemoryStats(stats: JsonObject): MemoryStatsView {
 	};
 }
 
-const GRAPH_NODES = 300;
-const GRAPH_EDGES = 1000;
-const GRAPH_CONTENT = 280;
-const MEMORY_KINDS = ["fact", "preference", "decision", "observation"] as const;
-const MEMORY_TIERS = ["working", "episodic"] as const;
-const MEMORY_ORIGINS = ["user", "agent", "tool"] as const;
-const MEMORY_RELATIONS = ["relates", "supports", "contradicts", "updates"] as const;
-const MEMORY_DERIVATIONS = ["explicit", "consolidation"] as const;
-
 /** Validates a memory graph reply; rejects oversize lists, unknown values, self relations and edges to absent nodes. */
 export function parseMemoryGraph(value: unknown): MemoryGraphView {
 	const graph = object(value);
 	if (graph.operation !== "graph") throw new Error("Invalid memory response.");
-	const ids = new Set<string>();
-	const nodes = list(graph.nodes, GRAPH_NODES, (item) => {
+	const nodes = list(graph.nodes, MEMORY_GRAPH_LIMITS.nodes, (item): MemoryGraphView["nodes"][number] => {
 		const node = object(item);
 		const id = text(node.id);
-		const content = text(node.content);
-		if (id.length === 0 || id.length > 1000 || ids.has(id)) throw new Error("Invalid memory id.");
-		if (content.length === 0 || Array.from(content).length > GRAPH_CONTENT) throw new Error("Invalid memory content.");
-		const importance = number(node.importance);
-		if (importance > 1) throw new Error("Invalid memory importance.");
-		const conversation = text(node.conversation);
-		if (!/^[a-f0-9]{12}$/.test(conversation)) throw new Error("Invalid memory conversation.");
-		ids.add(id);
+		if (id.length > MEMORY_GRAPH_LIMITS.idText) throw new Error("Invalid memory id.");
 		return {
 			id,
-			content,
+			content: text(node.content),
 			truncated: boolean(node.truncated),
 			kind: oneOf(node.kind, MEMORY_KINDS),
 			tier: oneOf(node.tier, MEMORY_TIERS),
 			origin: oneOf(node.origin, MEMORY_ORIGINS),
-			importance,
+			importance: number(node.importance),
 			createdAt: number(node.createdAt),
-			conversation,
+			conversation: text(node.conversation),
 		};
 	});
-	const edges = list(graph.edges, GRAPH_EDGES, (item): MemoryGraphEdgeView => {
+	const edges = list(graph.edges, MEMORY_GRAPH_LIMITS.edges, (item): MemoryGraphEdgeView => {
 		const edge = object(item);
 		const from = text(edge.from);
 		const to = text(edge.to);
-		if (!ids.has(from) || !ids.has(to)) throw new Error("Invalid memory edge.");
 		if (edge.kind === "summary") return { from, to, kind: "summary" };
-		if (from === to) throw new Error("Invalid memory edge.");
 		return {
 			from,
 			to,
@@ -685,19 +677,16 @@ export function parseMemoryGraph(value: unknown): MemoryGraphView {
 		};
 	});
 	const total = number(graph.total);
-	if (!Number.isSafeInteger(total) || total < nodes.length || boolean(graph.limited) !== nodes.length < total)
-		throw new Error("Invalid memory total.");
-	return { nodes, edges, total, limited: nodes.length < total };
+	const limited = boolean(graph.limited);
+	const problem = Number.isSafeInteger(total) ? memoryGraphProblem({ nodes, edges, total, limited }) : "Invalid memory total.";
+	if (problem !== null) throw new Error(problem);
+	return { nodes, edges, total, limited };
 }
 
 function parseHealth(value: unknown): { observedAt: number; healthy: boolean } {
 	const health = object(value);
 	return { observedAt: number(health.observedAt), healthy: boolean(health.healthy) };
 }
-
-const AUTHORITIES = ["managed-administrator", "developer-local", "unconfigured", "invalid"] as const;
-const CREATOR_KINDS = ["human", "elder", "organization"] as const;
-const DRAFT_STATUSES = ["editing", "proposed"] as const;
 
 function parseCreator(value: unknown): NonNullable<WorkspaceDetails["mission"]["creator"]> {
 	const creator = object(value);

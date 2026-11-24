@@ -5,6 +5,34 @@ import { parsePlanView, type PlanView } from "../missions/plan-wire.ts";
 import type { MissionRefusalCode } from "../missions/refusal.ts";
 import type { ServiceRequest } from "../service.ts";
 import { type ChatHistoryPage, parseChatHistoryPage } from "../service-view.ts";
+import {
+	APPROVER_KINDS,
+	type ApproverKind,
+	CHANNEL_FAILURES,
+	CHANNEL_OUTCOMES,
+	CHANNEL_STEPS,
+	type ChannelFailure,
+	type ChannelStep,
+	CREATOR_KINDS,
+	type CreatorKind,
+	DRAFT_STATUSES,
+	MEMORY_DERIVATIONS,
+	MEMORY_GRAPH_LIMITS,
+	MEMORY_KINDS,
+	MEMORY_ORIGINS,
+	MEMORY_RELATIONS,
+	MEMORY_TIERS,
+	type MemoryDerivation,
+	type MemoryKind,
+	type MemoryOrigin,
+	type MemoryRelation,
+	type MemoryTier,
+	type MissionAuthority,
+	memoryGraphProblem,
+	MISSION_AUTHORITIES,
+	RUN_STATES,
+	type RunState,
+} from "./payload.ts";
 
 type PostResponse =
 	| { type: "error"; message: "Owner rejected the operation." }
@@ -50,8 +78,8 @@ export type WebPlanReview = {
 type MissionStatus = {
 	stage: "awaiting_creator" | "drafting" | "awaiting_approval" | "agreed";
 	formation: { agreement: Agreement | null; draft: MissionDraft | null };
-	creator: { kind: "human" | "elder" | "organization"; id: string } | null;
-	authority: "managed-administrator" | "developer-local" | "unconfigured" | "invalid";
+	creator: { kind: CreatorKind; id: string } | null;
+	authority: MissionAuthority;
 	authorityError: "invalid-authority" | null;
 	canAgree: boolean;
 	previousReceipt?: string | null;
@@ -87,11 +115,10 @@ type Agreement = {
 	};
 	approval: {
 		approvedAt: number;
-		approvedBy: { kind: "local-creator" | "host-administrator" | "developer-local" };
+		approvedBy: { kind: ApproverKind };
 	};
 };
 
-type RunState = "ready" | "running" | "waiting" | "paused" | "blocked" | "completed" | "stopped";
 type Run = {
 	status: RunState;
 	blocker: string | null;
@@ -121,11 +148,11 @@ type ChannelStatus = {
 };
 
 type ChannelOutcome =
-	| { kind: "awaiting_creator"; step: "grant" | "manager-bootstrap" | "telegram-confirmation" }
-	| { kind: "failed"; reason: "authorization" | "credentials" | "transport" | "provider" | "identity" }
+	| { kind: "awaiting_creator"; step: ChannelStep }
+	| { kind: "failed"; reason: ChannelFailure }
 	| { kind: "configured" | "ready" | "unknown" | "disabled" };
 
-type MemoryRecord = { id: string; content: string; origin: "user" | "agent" | "tool"; tier: "working" | "episodic" };
+type MemoryRecord = { id: string; content: string; origin: MemoryOrigin; tier: MemoryTier };
 
 type MemoryResult =
 	| {
@@ -145,19 +172,14 @@ type MemoryGraph = {
 	operation: "graph";
 	nodes: (MemoryRecord & {
 		truncated: boolean;
-		kind: "fact" | "preference" | "decision" | "observation";
+		kind: MemoryKind;
 		importance: number;
 		createdAt: number;
 		conversation: string;
 	})[];
 	edges: (
 		| { from: string; to: string; kind: "summary" }
-		| {
-				from: string;
-				to: string;
-				kind: "relates" | "supports" | "contradicts" | "updates";
-				derivation: "explicit" | "consolidation";
-		  }
+		| { from: string; to: string; kind: MemoryRelation; derivation: MemoryDerivation }
 	)[];
 	total: number;
 	limited: boolean;
@@ -238,8 +260,6 @@ function status(response: Record<string, unknown>): StatusResponse {
 	};
 }
 
-const RUN_STATES = ["ready", "running", "waiting", "paused", "blocked", "completed", "stopped"] as const;
-
 function mission(
 	result: Record<string, unknown>,
 	managed?: { review?: ManagedMissionReview },
@@ -247,7 +267,7 @@ function mission(
 ): MissionStatus {
 	const formation = object(result.formation);
 	const creator = result.creator === null ? null : object(result.creator);
-	const reported = oneOf(result.authority, ["managed-administrator", "developer-local", "unconfigured", "invalid"]);
+	const reported = oneOf(result.authority, MISSION_AUTHORITIES);
 	const authority = managed !== undefined && reported === "developer-local" ? "invalid" : reported;
 	const currentDraft = formation.draft === null ? null : draft(object(formation.draft));
 	const proposal = managed?.review?.proposal;
@@ -281,7 +301,7 @@ function mission(
 		creator:
 			creator === null
 				? null
-				: { kind: oneOf(creator.kind, ["human", "elder", "organization"]), id: text(creator.id, 200) },
+				: { kind: oneOf(creator.kind, CREATOR_KINDS), id: text(creator.id, 200) },
 		authority,
 		authorityError: authority === "invalid" ? "invalid-authority" : null,
 		// The gateway refuses every browser Agree on a managed host, so only developer-local can offer it.
@@ -326,7 +346,7 @@ function agreement(value: Record<string, unknown>, verifiedApproval?: MissionApp
 		approval: {
 			approvedAt: number(approval.approvedAt),
 			approvedBy: {
-				kind: oneOf(object(approval.approvedBy).kind, ["local-creator", "host-administrator", "developer-local"]),
+				kind: oneOf(object(approval.approvedBy).kind, APPROVER_KINDS),
 			},
 		},
 	};
@@ -334,7 +354,7 @@ function agreement(value: Record<string, unknown>, verifiedApproval?: MissionApp
 
 function draft(value: Record<string, unknown>): MissionDraft {
 	const digest = value.digest === null ? null : text(value.digest, 64);
-	const status = oneOf(value.status, ["editing", "proposed"]);
+	const status = oneOf(value.status, DRAFT_STATUSES);
 	if (status === "proposed" ? digest === null || !/^[a-f0-9]{64}$/.test(digest) : digest !== null) return invalid();
 	return {
 		missionId: text(value.missionId, 200),
@@ -392,19 +412,12 @@ function channels(result: Record<string, unknown>): ChannelStatus {
 	};
 }
 
-const CHANNEL_OUTCOMES = ["awaiting_creator", "configured", "ready", "failed", "unknown", "disabled"] as const;
-const CHANNEL_STEPS = ["grant", "manager-bootstrap", "telegram-confirmation"] as const;
-const CHANNEL_FAILURES = ["authorization", "credentials", "transport", "provider", "identity"] as const;
-
 function channelOutcome(value: Record<string, unknown>): ChannelOutcome {
 	const kind = oneOf(value.kind, CHANNEL_OUTCOMES);
 	if (kind === "awaiting_creator") return { kind, step: oneOf(value.step, CHANNEL_STEPS) };
 	if (kind === "failed") return { kind, reason: oneOf(value.reason, CHANNEL_FAILURES) };
 	return { kind };
 }
-
-const ORIGINS = ["user", "agent", "tool"] as const;
-const TIERS = ["working", "episodic"] as const;
 
 function memory(result: Record<string, unknown>): MemoryResult {
 	switch (result.operation) {
@@ -426,8 +439,8 @@ function memory(result: Record<string, unknown>): MemoryResult {
 					return {
 						id: text(record.id, 1000),
 						content: text(record.content, 2000),
-						origin: oneOf(record.origin, ORIGINS),
-						tier: oneOf(record.tier, TIERS),
+						origin: oneOf(record.origin, MEMORY_ORIGINS),
+						tier: oneOf(record.tier, MEMORY_TIERS),
 					};
 				}),
 			};
@@ -440,53 +453,37 @@ function memory(result: Record<string, unknown>): MemoryResult {
 	}
 }
 
-const MEMORY_KINDS = ["fact", "preference", "decision", "observation"] as const;
-const RELATION_KINDS = ["relates", "supports", "contradicts", "updates"] as const;
-const RELATION_DERIVATIONS = ["explicit", "consolidation"] as const;
-
 function graph(result: Record<string, unknown>): MemoryGraph {
-	const ids = new Set<string>();
-	const nodes = rows(result.nodes, 300, (item) => {
+	const nodes = rows(result.nodes, MEMORY_GRAPH_LIMITS.nodes, (item): MemoryGraph["nodes"][number] => {
 		const node = object(item);
-		const id = text(node.id, 1000);
-		const content = text(node.content, 560);
-		const importance = number(node.importance);
-		const conversation = text(node.conversation, 12);
-		if (!id.trim() || ids.has(id) || content.length === 0 || importance > 1 || !/^[a-f0-9]{12}$/.test(conversation))
-			return invalid();
-		let points = 0;
-		for (const _ of content) if (++points > 280) return invalid();
-		ids.add(id);
 		return {
-			id,
-			content,
-			importance,
-			conversation,
+			id: text(node.id, MEMORY_GRAPH_LIMITS.idText),
+			// A code point is at most two UTF-16 units; the exact code-point rule runs in `memoryGraphProblem`.
+			content: text(node.content, MEMORY_GRAPH_LIMITS.contentPoints * 2),
+			importance: number(node.importance),
+			conversation: text(node.conversation, 12),
 			truncated: flag(node.truncated),
 			kind: oneOf(node.kind, MEMORY_KINDS),
-			tier: oneOf(node.tier, TIERS),
-			origin: oneOf(node.origin, ORIGINS),
+			tier: oneOf(node.tier, MEMORY_TIERS),
+			origin: oneOf(node.origin, MEMORY_ORIGINS),
 			createdAt: number(node.createdAt),
 		};
 	});
-	const edges = rows<MemoryGraph["edges"][number]>(result.edges, 1000, (item) => {
+	const edges = rows<MemoryGraph["edges"][number]>(result.edges, MEMORY_GRAPH_LIMITS.edges, (item) => {
 		const edge = object(item);
-		const from = text(edge.from, 1000);
-		const to = text(edge.to, 1000);
-		if (!ids.has(from) || !ids.has(to)) return invalid();
+		const from = text(edge.from, MEMORY_GRAPH_LIMITS.idText);
+		const to = text(edge.to, MEMORY_GRAPH_LIMITS.idText);
 		if (edge.kind === "summary") return { from, to, kind: "summary" };
-		if (from === to) return invalid();
 		return {
 			from,
 			to,
-			kind: oneOf(edge.kind, RELATION_KINDS),
-			derivation: oneOf(edge.derivation, RELATION_DERIVATIONS),
+			kind: oneOf(edge.kind, MEMORY_RELATIONS),
+			derivation: oneOf(edge.derivation, MEMORY_DERIVATIONS),
 		};
 	});
 	const total = count(result.total);
 	const limited = flag(result.limited);
-	const expectedLimited = nodes.length < total;
-	if (total < nodes.length || limited !== expectedLimited) return invalid();
+	if (memoryGraphProblem({ nodes, edges, total, limited }) !== null) return invalid();
 	return { operation: "graph", nodes, edges, total, limited };
 }
 

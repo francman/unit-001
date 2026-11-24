@@ -1,4 +1,5 @@
 // Closed browser projection for Missions v2; no protected authority records or write requests.
+import type { PLAN_PROJECTION_LIMITS } from "../src/missions/plan-limits.ts";
 
 type Priority = "high" | "normal" | "low";
 
@@ -125,7 +126,7 @@ export interface PlanView {
 		missing: readonly string[];
 	} | null;
 	gate: { state: "not-adopted" | "open" | "closed"; reason: "receipt" | "binding" | "reopen-needed" | "head-missing" | null };
-	runs: { used: number; limit: 32 };
+	runs: { used: number; limit: (typeof PLAN_PROJECTION_LIMITS)["runs"] };
 	allowance: ReviewAllowanceView | null;
 	turns: readonly ReviewTurnView[];
 	blocker: ReviewTurnView | null;

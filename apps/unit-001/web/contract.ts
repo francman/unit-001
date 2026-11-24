@@ -1,5 +1,18 @@
 // Defines the browser workspace projection independently of private owner storage.
 import type { MissionRefusalCode } from "../src/missions/refusal.ts";
+import type {
+	ApproverKind,
+	ChannelFailure,
+	ChannelStep,
+	CreatorKind,
+	MemoryDerivation,
+	MemoryKind,
+	MemoryOrigin,
+	MemoryRelation,
+	MemoryTier,
+	MissionAuthority,
+	RunState,
+} from "../src/web/payload.ts";
 import type { PlanTerms, PlanView } from "./mission-plan-contract.ts";
 
 export type Connection = "connected" | "connecting" | "offline" | "workspace-changed";
@@ -41,7 +54,7 @@ export interface MissionAgreementView {
 	approvalBoundary: readonly string[];
 	reviewEveryMs: number;
 	approvedAt: number;
-	approvedBy: "local-creator" | "host-administrator" | "developer-local";
+	approvedBy: ApproverKind;
 	allowedTools?: readonly string[];
 	limits: {
 		maxCycles: number;
@@ -118,7 +131,7 @@ export type MissionPlanMutationOutcome = MissionMutationOutcome | { state: "issu
 
 /** The one bounded work run the owner reports; it is not the purpose and not a planner. */
 export interface MissionRunView {
-	status: "ready" | "running" | "waiting" | "paused" | "blocked" | "completed" | "stopped";
+	status: RunState;
 	blocker: string | null;
 	/** A retry or maintenance wake only; there is no planner observation time yet. */
 	nextWakeAt: number | null;
@@ -145,7 +158,7 @@ export interface MemoryStatsView {
 }
 
 /** How two memories relate: `relates` is symmetric; the others read "from supports/contradicts/updates to". */
-export type MemoryRelationKind = "relates" | "supports" | "contradicts" | "updates";
+export type MemoryRelationKind = MemoryRelation;
 
 /**
  * A summary link (from = episodic summary, to = working source), or a live relation between two memories
@@ -154,7 +167,7 @@ export type MemoryRelationKind = "relates" | "supports" | "contradicts" | "updat
  */
 export type MemoryGraphEdgeView =
 	| { from: string; to: string; kind: "summary" }
-	| { from: string; to: string; kind: MemoryRelationKind; derivation: "explicit" | "consolidation" };
+	| { from: string; to: string; kind: MemoryRelationKind; derivation: MemoryDerivation };
 
 /** Read-only snapshot of live memories, their summary links and their relations; bounded, newest first. */
 export interface MemoryGraphView {
@@ -163,9 +176,9 @@ export interface MemoryGraphView {
 		/** Truncated server-side to 280 code points. */
 		content: string;
 		truncated: boolean;
-		kind: "fact" | "preference" | "decision" | "observation";
-		tier: "working" | "episodic";
-		origin: "user" | "agent" | "tool";
+		kind: MemoryKind;
+		tier: MemoryTier;
+		origin: MemoryOrigin;
 		/** 0..1 as stored. */
 		importance: number;
 		/** Epoch ms. */
@@ -193,8 +206,8 @@ export interface WorkspaceDetails {
 		tools: readonly string[];
 		agreement: MissionAgreementView | null;
 		run: MissionRunView | null;
-		creator: { kind: "human" | "elder" | "organization"; id: string } | null;
-		authority: "managed-administrator" | "developer-local" | "unconfigured" | "invalid";
+		creator: { kind: CreatorKind; id: string } | null;
+		authority: MissionAuthority;
 		agreementValid: boolean;
 		authorityError: string | null;
 		/** False when the projected review does not bind the shown draft; the page then offers no formation action. */
@@ -224,8 +237,8 @@ export interface WorkspaceDetails {
 		detail: string;
 		/** When the owner last checked identity, and what it found; null when never checked. */
 		lastHealth: { observedAt: number; healthy: boolean } | null;
-		failure: "authorization" | "credentials" | "transport" | "provider" | "identity" | null;
-		awaiting: "grant" | "manager-bootstrap" | "telegram-confirmation" | null;
+		failure: ChannelFailure | null;
+		awaiting: ChannelStep | null;
 	}[];
 }
 

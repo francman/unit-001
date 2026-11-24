@@ -1,13 +1,10 @@
 // Parses the mission plan projection at the owner wire; imports no owner runtime, so privileged clients can use it.
 import { missionNumber, missionObject, missionText, missionTextList } from "./contract.ts";
+import { MAX_DUE_TRIGGERS, MAX_REVIEW_TURNS, PLAN_PROJECTION_LIMITS as LIMITS } from "./plan-limits.ts";
 import type { ReviewFacts, ReviewItem, ReviewNote, ReviewTrigger } from "./plan-review.ts";
 import { type PlanTerms, parsePlanTerms } from "./plan-terms.ts";
 
-/** Most review turns the owner retains and status lists; an unresolved turn is never dropped. */
-export const MAX_REVIEW_TURNS = 16;
-
-/** Most due review triggers status lists; the producer keeps the most urgent ones, so a valid status always parses. */
-export const MAX_DUE_TRIGGERS = 16;
+export { MAX_DUE_TRIGGERS, MAX_REVIEW_TURNS };
 
 /** One agreed plan revision as status shows it. */
 export type PlanRevisionView = {
@@ -97,7 +94,7 @@ export function parsePlanView(value: unknown): PlanView {
 		head: input.head === null ? null : parseRevision(input.head),
 		headValid: input.headValid,
 		previous: input.previous === null ? null : parseRevision(input.previous),
-		history: list(input.history, 32).map((item) => {
+		history: list(input.history, LIMITS.history).map((item) => {
 			const entry = missionObject(item);
 			return { revision: count(entry.revision), digest: hex(entry.digest), agreedAt: count(entry.agreedAt) };
 		}),
@@ -106,7 +103,7 @@ export function parsePlanView(value: unknown): PlanView {
 		runs: { used: count(runs.used), limit: count(runs.limit) },
 		due: list(input.due, MAX_DUE_TRIGGERS).map(parseTrigger),
 		preview: input.preview === null ? null : parseReviewNote(input.preview),
-		reviews: list(input.reviews, 12).map(parseReviewNote),
+		reviews: list(input.reviews, LIMITS.reviews).map(parseReviewNote),
 		allowance: input.allowance === null ? null : parseAllowanceView(input.allowance),
 		turns: list(input.turns, MAX_REVIEW_TURNS).map(parseTurnView),
 		blocker: input.blocker === null ? null : parseTurnView(input.blocker),
@@ -137,7 +134,7 @@ function parseDraft(value: unknown): NonNullable<PlanView["draft"]> {
 		digest: input.digest === null ? null : hex(input.digest),
 		savedBy: input.savedBy,
 		fromReview: input.fromReview === null ? null : missionText(input.fromReview),
-		missing: missionTextList(input.missing, 64, 200),
+		missing: missionTextList(input.missing, LIMITS.missing, LIMITS.missingText),
 	};
 }
 
@@ -149,8 +146,8 @@ function parseTrigger(value: unknown): ReviewTrigger {
 	const input = closed(value, ["kind", "key", "subject"]);
 	return {
 		kind: member(input.kind, TRIGGER_KINDS) as ReviewTrigger["kind"],
-		key: missionText(input.key, 400),
-		subject: input.subject === null ? null : missionText(input.subject, 400),
+		key: missionText(input.key, LIMITS.keyText),
+		subject: input.subject === null ? null : missionText(input.subject, LIMITS.keyText),
 	};
 }
 
@@ -173,16 +170,16 @@ export function parseReviewNote(value: unknown): ReviewNote {
 	const window = closed(input.window, ["from", "to"]);
 	return {
 		reviewId: missionText(input.reviewId),
-		key: missionText(input.key, 400),
+		key: missionText(input.key, LIMITS.keyText),
 		trigger: parseTrigger(input.trigger),
 		planRevision: count(input.planRevision),
 		planDigest: hex(input.planDigest),
 		window: { from: count(window.from), to: count(window.to) },
 		createdAt: count(input.createdAt),
 		outcome: member(input.outcome, ["no-change", "attention"]) as ReviewNote["outcome"],
-		items: list(input.items, 16).map(parseItem),
+		items: list(input.items, LIMITS.noteItems).map(parseItem),
 		facts: parseFacts(input.facts),
-		uncertainty: missionTextList(input.uncertainty, 64, 400),
+		uncertainty: missionTextList(input.uncertainty, LIMITS.uncertainty, LIMITS.uncertaintyText),
 		disposition: input.disposition === null ? null : parseDisposition(input.disposition),
 	};
 }
@@ -200,13 +197,13 @@ function parseItem(value: unknown): ReviewItem {
 		"deadlineAt",
 	]);
 	return {
-		id: missionText(input.id, 64),
+		id: missionText(input.id, LIMITS.itemIdText),
 		level: member(input.level, ITEM_LEVELS) as ReviewItem["level"],
 		status: member(input.status, ITEM_STATUSES) as ReviewItem["status"],
 		verifiedWorks: count(input.verifiedWorks),
 		listedWorks: count(input.listedWorks),
-		runIds: missionTextList(input.runIds, 32, 400),
-		blockReasons: missionTextList(input.blockReasons, 32, 200),
+		runIds: missionTextList(input.runIds, LIMITS.itemRunIds, LIMITS.keyText),
+		blockReasons: missionTextList(input.blockReasons, LIMITS.itemBlockReasons, LIMITS.blockReasonText),
 		unsettled: count(input.unsettled),
 		deadlineAt: input.deadlineAt === null ? null : count(input.deadlineAt),
 	};
@@ -287,7 +284,7 @@ function parseTurnView(value: unknown): ReviewTurnView {
 		"at",
 	]);
 	return {
-		key: missionText(input.key, 400),
+		key: missionText(input.key, LIMITS.keyText),
 		planRevision: count(input.planRevision),
 		trigger: parseTrigger(input.trigger),
 		state: member(input.state, TURN_STATES) as ReviewTurnView["state"],

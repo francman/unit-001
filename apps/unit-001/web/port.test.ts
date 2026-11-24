@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MissionPlanMutation } from "./contract.ts";
 import type { PlanTerms, PlanView, ReviewNote } from "./mission-plan-contract.ts";
+import { memoryGraphCases } from "../test/fixtures/memory-graph-cases.ts";
 import { browserWorkspacePort, parseMemoryGraph, parseWorkspaceView } from "./port.ts";
 
 const csrfToken = "b".repeat(64);
@@ -1151,5 +1152,11 @@ describe("browser memory graph", () => {
 		["missing edges", { edges: undefined }],
 	])("rejects %s", (_name, patch) => {
 		expect(() => parseMemoryGraph({ ...graph, ...patch })).toThrow();
+	});
+
+	// The gateway side runs the same cases in test/web-payload.test.ts, so the two readers cannot drift apart.
+	it.each(memoryGraphCases)("page agrees with the gateway on %s", (_name, result, accepted) => {
+		if (accepted) expect(() => parseMemoryGraph(result)).not.toThrow();
+		else expect(() => parseMemoryGraph(result)).toThrow();
 	});
 });
