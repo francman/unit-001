@@ -22,6 +22,7 @@ import {
 	parseMissionDraftTerms,
 } from "./contract.ts";
 import { parseOperationAcknowledgment, parseOperationIntent, parsePurposeCeiling } from "./purpose-authority.ts";
+import { creatorApproved, receiptBinds } from "./receipt.ts";
 
 export type MissionLocation =
 	| { kind: "managed"; installationId: string; session: string }
@@ -492,7 +493,10 @@ export function missionDigest(
 		.digest("hex");
 }
 
-/** Checks exact receipt binding; neither an approval-looking wire frame nor an owner document can grant authority. */
+/**
+ * Checks exact receipt binding; neither an approval-looking wire frame nor an owner document can grant authority.
+ * Unlike purpose and plan receipts, a managed one-shot receipt may also be the host administrator's own approval.
+ */
 export function matchingApproval(
 	authority: MissionAuthority,
 	receiptId: string,
@@ -500,21 +504,13 @@ export function matchingApproval(
 	revision: number,
 	terms: MissionTerms,
 ): MissionApproval | undefined {
-	// Issuing an amendment closes the previous authority immediately, including across an owner crash or stale draft.
-	if (authority.approvals.at(-1)?.receiptId !== receiptId) return undefined;
+	// Only the newest receipt counts: issuing an amendment closes the previous authority immediately, including across
+	// an owner crash or stale draft.
+	const receipt = authority.approvals.at(-1);
 	const digest = missionDigest(terms, missionId, revision, authority);
-	return authority.approvals.find(
-		(receipt) =>
-			receipt.receiptId === receiptId &&
-			receipt.installationId === authority.installationId &&
-			receipt.session === authority.session &&
-			receipt.missionId === missionId &&
-			receipt.revision === revision &&
-			receipt.authorityRevision === authority.revision &&
-			receipt.digest === digest &&
-			receipt.provenance === (authority.installationId === null ? "developer-local" : "managed-administrator") &&
-			JSON.stringify(receipt.creator) === JSON.stringify(authority.creator),
-	);
+	if (!receipt || !receiptBinds(authority, receipt, { receiptId, missionId, revision, digest })) return undefined;
+	const administrator = authority.installationId !== null && receipt.approvedBy.kind === "host-administrator";
+	return administrator || creatorApproved(authority, receipt) ? receipt : undefined;
 }
 
 /** Validates complete terms received across a protocol boundary before a host approves them. */

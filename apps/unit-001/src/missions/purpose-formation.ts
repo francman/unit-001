@@ -8,6 +8,7 @@ import type { MissionApproval, MissionAuthority, MissionRequest } from "./contra
 import { MissionPurposeDoc, readMissionPurpose } from "./purpose.ts";
 import { matchingPurposeApproval, purposeDigest, validatePurposeTerms } from "./purpose-authority.ts";
 import { type LoopState, recordPurposeAgreement } from "./purpose-loop.ts";
+import { developerReceipt } from "./receipt.ts";
 import { MissionDoc } from "./state.ts";
 
 type Propose = Extract<MissionRequest, { operation: "purpose-propose" }>;
@@ -81,20 +82,11 @@ export class PurposeFormation {
 		const terms = validatePurposeTerms(draft.terms, authority, this.#now());
 		if (purposeDigest(terms, loop.missionId!, draft.revision, authority) !== draft.digest)
 			throw new Error("Creator authority changed; propose the purpose again.");
-		const receipt: MissionApproval = {
-			receiptId: randomUUID(),
-			requestId: request.requestId,
-			installationId: null,
-			session: "default",
-			missionId: loop.missionId!,
-			revision: draft.revision,
-			digest: draft.digest,
-			creator: authority.creator,
-			authorityRevision: authority.revision,
-			approvedAt: this.#now(),
-			provenance: "developer-local",
-			approvedBy: { kind: "developer-local", uid: process.getuid?.() ?? null },
-		};
+		const receipt = developerReceipt(
+			authority,
+			{ requestId: request.requestId, missionId: loop.missionId!, revision: draft.revision, digest: draft.digest },
+			this.#now(),
+		);
 		await writeMissionAuthority(this.#location, withPurposeReceipt(authority, loop, receipt));
 		await this.reconcile(receipt.receiptId, context);
 	}

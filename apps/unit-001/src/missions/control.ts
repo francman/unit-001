@@ -13,7 +13,6 @@ import {
 } from "./authority.ts";
 import {
 	initialFormation,
-	type MissionApproval,
 	type MissionAuthority,
 	type MissionDraft,
 	type MissionDraftTerms,
@@ -26,6 +25,7 @@ import {
 import { MissionExecutionDoc } from "./execution-state.ts";
 import { readMissionPlan } from "./plan-state.ts";
 import { importLegacyAgreements, readMissionPurpose, recordLegacyAgreement } from "./purpose.ts";
+import { developerReceipt } from "./receipt.ts";
 import { MissionRefusal } from "./refusal.ts";
 import { MissionDoc } from "./state.ts";
 
@@ -334,20 +334,11 @@ export class MissionControl {
 		if (digest !== request.digest)
 			throw new MissionRefusal("stale-digest", "Mission authority changed; propose the draft again.");
 		await this.#requirePurpose(context);
-		const receipt: MissionApproval = {
-			receiptId: randomUUID(),
-			requestId: request.requestId,
-			installationId: null,
-			session: "default",
-			missionId: draft.missionId,
-			revision: draft.revision,
-			digest,
-			creator: authority.creator,
-			authorityRevision: authority.revision,
-			approvedAt: this.#now(),
-			provenance: "developer-local",
-			approvedBy: { kind: "developer-local", uid: process.getuid?.() ?? null },
-		};
+		const receipt = developerReceipt(
+			authority,
+			{ requestId: request.requestId, missionId: draft.missionId, revision: draft.revision, digest },
+			this.#now(),
+		);
 		const currentReceipt = authority.approvals.find((item) => item.receiptId === formation?.agreement?.approval.receiptId);
 		await writeMissionAuthority(this.#location, {
 			...authority,

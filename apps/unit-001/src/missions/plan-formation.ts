@@ -20,6 +20,7 @@ import {
 import { missingPlanTerms, parsePlanTerms, planTermsDenial, reviewAllowanceDenial } from "./plan-terms.ts";
 import type { LoopState } from "./purpose-loop.ts";
 import { readMissionPurpose, storedLoop } from "./purpose.ts";
+import { developerReceipt } from "./receipt.ts";
 import { MissionRefusal } from "./refusal.ts";
 import { purposeUnsettled, REVIEW_PROVIDER_PREFIX, storedReviewState, unresolvedTurn } from "./review-turn-state.ts";
 import { MissionDoc } from "./state.ts";
@@ -213,20 +214,11 @@ export class PlanFormation {
 			throw new MissionRefusal("stale-digest", "The protected plan changed; inspect the plan again.");
 		const loop = (await readMissionPurpose(this.#harness, context))?.loop;
 		const proposal = eligibleProposal(plan, authority, loop, request.revision, request.digest);
-		const receipt: MissionApproval = {
-			receiptId: randomUUID(),
-			requestId: request.requestId,
-			installationId: null,
-			session: "default",
-			missionId: plan.missionId!,
-			revision: proposal.revision,
-			digest: proposal.digest,
-			creator: authority.creator,
-			authorityRevision: authority.revision,
-			approvedAt: this.#now(),
-			provenance: "developer-local",
-			approvedBy: { kind: "developer-local", uid: process.getuid?.() ?? null },
-		};
+		const receipt = developerReceipt(
+			authority,
+			{ requestId: request.requestId, missionId: plan.missionId!, revision: proposal.revision, digest: proposal.digest },
+			this.#now(),
+		);
 		await writeMissionAuthority(this.#location, withPlanReceipt(authority, newest, receipt));
 		return this.#recordIssued(receipt.receiptId, context);
 	}

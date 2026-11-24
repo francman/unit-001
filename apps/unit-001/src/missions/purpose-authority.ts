@@ -15,6 +15,7 @@ import {
 	type PurposeTerms,
 	type WorkTerms,
 } from "./contract.ts";
+import { creatorApproved, receiptBinds } from "./receipt.ts";
 
 /** Most work items one purpose revision may list; bounds the stored runs and proposals. */
 export const MAX_PURPOSE_WORKS = 32;
@@ -167,20 +168,10 @@ export function matchingPurposeApproval(
 ): MissionApproval | undefined {
 	const receipt = authority.purposeApprovals?.at(-1);
 	if (!receipt || receipt.receiptId !== receiptId) return undefined;
-	const managed = authority.installationId !== null;
-	if (
-		receipt.installationId !== authority.installationId ||
-		receipt.session !== authority.session ||
-		receipt.missionId !== missionId ||
-		receipt.revision !== revision ||
-		receipt.authorityRevision !== authority.revision ||
-		receipt.digest !== purposeDigest(terms, missionId, revision, authority) ||
-		receipt.provenance !== (managed ? "managed-administrator" : "developer-local") ||
-		(managed && (receipt.approvedBy.kind !== "local-creator" || receipt.approvedBy.uid !== authority.creator.uid)) ||
-		JSON.stringify(receipt.creator) !== JSON.stringify(authority.creator)
-	)
-		return undefined;
-	return receipt;
+	const digest = purposeDigest(terms, missionId, revision, authority);
+	return receiptBinds(authority, receipt, { receiptId, missionId, revision, digest }) && creatorApproved(authority, receipt)
+		? receipt
+		: undefined;
 }
 
 /** Validates the latest protected operation intent from the authority file. */

@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import type { MissionApproval, MissionAuthority } from "./contract.ts";
 import type { PlanTerms } from "./plan-terms.ts";
+import { creatorApproved, receiptBinds } from "./receipt.ts";
 
 /** Hashes exact plan terms bound to mission, revision, predecessor, installation, session, authority revision and creator. */
 export function planDigest(
@@ -43,22 +44,13 @@ export function matchingPlanApproval(
 ): MissionApproval | undefined {
 	const receipt = authority.planApprovals?.at(-1);
 	if (!receipt || receipt.receiptId !== receiptId || !planReceiptsRecorded(authority)) return undefined;
-	const managed = authority.installationId !== null;
+	const digest = planDigest(terms, missionId, revision, previousDigest, authority);
 	if (
-		receipt.installationId !== authority.installationId ||
-		receipt.session !== authority.session ||
-		receipt.missionId !== missionId ||
-		receipt.revision !== revision ||
+		!receiptBinds(authority, receipt, { receiptId, missionId, revision, digest }) ||
+		!creatorApproved(authority, receipt) ||
+		// Plan-only: the receipt names its predecessor, and a managed creator is never root.
 		previousDigest !== (authority.planRequests?.at(-2)?.digest ?? null) ||
-		receipt.authorityRevision !== authority.revision ||
-		receipt.digest !== planDigest(terms, missionId, revision, previousDigest, authority) ||
-		receipt.provenance !== (managed ? "managed-administrator" : "developer-local") ||
-		receipt.approvedBy.kind !== (managed ? "local-creator" : "developer-local") ||
-		receipt.approvedBy.uid !== authority.creator.uid ||
-		(managed && (authority.creator.uid === null || authority.creator.uid === 0)) ||
-		receipt.creator.kind !== authority.creator.kind ||
-		receipt.creator.id !== authority.creator.id ||
-		receipt.creator.uid !== authority.creator.uid
+		(authority.installationId !== null && (authority.creator.uid === null || authority.creator.uid === 0))
 	)
 		return undefined;
 	return receipt;

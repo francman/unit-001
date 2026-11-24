@@ -23,6 +23,7 @@ import type {
 import { ProviderDoc } from "@earendil-works/pi-durable";
 import { MaintenanceDoc } from "../maintenance.ts";
 import { releaseAttempt, reserveAttempt, settleAttempt } from "./allowance.ts";
+import { exceedsCap, releaseSpend, reserveSpend, settleSpend } from "./attempt-ledger.ts";
 import { type MissionLocation, matchingApproval, readMissionAuthority } from "./authority.ts";
 import type { MissionAuthority } from "./contract.ts";
 import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts";
@@ -517,17 +518,12 @@ export class MissionAdmission {
 				if (current.unknownRequests !== 0) throw new Error("An interrupted mission request needs reconciliation.");
 				if (current.pendingTools.length !== 0) throw new Error("An interrupted mission tool needs reconciliation.");
 				const amount = requestCostCeiling(model);
-				if (
-					policy.maxEstimatedCost !== undefined &&
-					(amount === null || current.estimatedCost + current.reservedCost + amount > policy.maxEstimatedCost)
-				) {
+				if (policy.maxEstimatedCost !== undefined && exceedsCap(current, policy.maxEstimatedCost, amount)) {
 					current.state = { status: "blocked", reason: "estimated_spend_limit" };
 					current.revision++;
 					return null;
 				}
-				current.requests++;
-				current.unknownRequests++;
-				current.reservedCost += amount ?? 0;
+				reserveSpend(current, amount ?? 0);
 				current.revision++;
 				return {
 					kind: "legacy",
@@ -596,15 +592,7 @@ export class MissionAdmission {
 				if (received.stopReason === "pending") return;
 				const current = (await tx.doc(MissionExecutionDoc)).current;
 				if (!current || current.controller !== reserved.controller) return;
-				if (unpriced) {
-					current.unknownRequests--;
-					current.unpricedResponses++;
-					current.revision++;
-					return;
-				}
-				current.estimatedCost += cost;
-				current.reservedCost = Math.max(0, current.reservedCost - reserved.amount);
-				current.unknownRequests--;
+				settleSpend(current, reserved.amount, unpriced ? null : cost);
 				current.revision++;
 			}, BACKGROUND_CONTEXT);
 			if (terminal !== undefined) stream.push({ type: "done", reason: terminal, message });
@@ -629,8 +617,7 @@ export class MissionAdmission {
 						}
 						const current = (await tx.doc(MissionExecutionDoc)).current;
 						if (!current || current.controller !== reserved.controller) return;
-						current.unknownRequests--;
-						current.reservedCost = Math.max(0, current.reservedCost - reserved.amount);
+						releaseSpend(current, reserved.amount);
 						current.revision++;
 					}, BACKGROUND_CONTEXT)
 					.catch(() => {});

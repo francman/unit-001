@@ -232,12 +232,7 @@ export function nextOperationAuthority(
 	request: Operate,
 	now: number,
 ): MissionAuthority {
-	// A request ID names one command: reused across kinds, reconciliation could not tell which one it applies.
-	const otherKind =
-		request.action === "acknowledge"
-			? authority.operationIntent?.requestId === request.requestId
-			: authority.operationAcknowledgments?.some((item) => item.requestId === request.requestId);
-	if (otherKind) throw new Error("Conflicting operation request ID.");
+	refuseOtherCommandRequest(authority, request.action, request.requestId);
 	if (request.action === "acknowledge") {
 		const previous = authority.operationAcknowledgments?.find((item) => item.requestId === request.requestId);
 		if (previous) {
@@ -299,6 +294,23 @@ export function nextOperationAuthority(
 			...(head ? { planDigest: head.digest } : {}),
 		},
 	};
+}
+
+/**
+ * Refuses a request ID that already names the other kind of operation command, an intent or an acknowledgment. The
+ * owner reconciles an acknowledgment before an intent, so one ID naming both would report one command's result as the
+ * other's.
+ */
+export function refuseOtherCommandRequest(
+	authority: Pick<MissionAuthority, "operationIntent" | "operationAcknowledgments">,
+	action: Operate["action"],
+	requestId: string,
+): void {
+	const otherKind =
+		action === "acknowledge"
+			? authority.operationIntent?.requestId === requestId
+			: authority.operationAcknowledgments?.some((item) => item.requestId === requestId);
+	if (otherKind) throw new Error("Conflicting operation request ID.");
 }
 
 // The agreed plan head an open must be issued under, if a plan is adopted or its first receipt is published. An

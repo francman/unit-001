@@ -1,6 +1,7 @@
 // Stores continuous operation of an approved purpose: agreements, operation, proposals, runs and the lifetime ledger.
 import { isDeepStrictEqual } from "node:util";
 import type { ConversationId, EntryId, TaskId } from "@earendil-works/pi-durable";
+import { type AttemptLedger, countAttempt, emptyAttemptLedger, type ProviderAttempt } from "./attempt-ledger.ts";
 import { parseMissionApproval } from "./authority.ts";
 import { type MissionApproval, missionObject, type PurposeTerms, type WorkTerms } from "./contract.ts";
 import type { MissionEvidence } from "./execution-state.ts";
@@ -28,14 +29,6 @@ export type LoopProposal = {
 
 export type WaitReason = "next_observation" | "maintenance" | "retry" | "all_listed_work_done";
 
-/** One reserved provider attempt; its receipt settles this record once, by ID, never by run or totals. */
-export type LoopAttempt = {
-	attemptId: string;
-	ceiling: number | null;
-	status: "reserved" | "priced" | "unpriced" | "released";
-	cost?: number;
-};
-
 /** One execution of one listed work item: identities, counters, uncertain effects, evidence and outcome. */
 export type LoopRun = {
 	runId: string;
@@ -48,7 +41,7 @@ export type LoopRun = {
 	cycles: number;
 	retries: number;
 	noProgress: number;
-	attempts: LoopAttempt[];
+	attempts: ProviderAttempt[];
 	pendingTools: TaskId[];
 	evidence: MissionEvidence[];
 	lastAnswer: EntryId | null;
@@ -82,16 +75,7 @@ export type LoopOperation = {
 };
 
 /** Cumulative consumption per mission; restarts, reopen and amendments never reset it, and nothing refunds it. */
-export type LoopLedger = {
-	workItems: number;
-	cycles: number;
-	requests: number;
-	estimatedCost: number;
-	reservedCost: number;
-	unknownRequests: number;
-	unpricedResponses: number;
-	unboundedAttempts: number;
-};
+export type LoopLedger = AttemptLedger & { workItems: number; cycles: number };
 
 export type LoopState = {
 	missionId: string | null;
@@ -128,16 +112,7 @@ export function initialLoop(): LoopState {
 		observations: 0,
 		proposals: [],
 		runs: [],
-		ledger: {
-			workItems: 0,
-			cycles: 0,
-			requests: 0,
-			estimatedCost: 0,
-			reservedCost: 0,
-			unknownRequests: 0,
-			unpricedResponses: 0,
-			unboundedAttempts: 0,
-		},
+		ledger: { workItems: 0, cycles: 0, ...emptyAttemptLedger() },
 	};
 }
 
@@ -222,7 +197,8 @@ export function checkLoopState(value: unknown): LoopState {
 			throw new Error("Invalid stored purpose agreement order.");
 		previous = exact.revision;
 	}
-	const totals = { cycles: 0, requests: 0, estimatedCost: 0, reservedCost: 0, unknown: 0, unpriced: 0, unbounded: 0 };
+	let cycles = 0;
+	const totals = emptyAttemptLedger();
 	for (const run of loop.runs) {
 		const agreement = loopAgreement(loop, run.purposeRevision);
 		const work = agreement && listedWork(agreement, run.workId);
@@ -239,18 +215,8 @@ export function checkLoopState(value: unknown): LoopState {
 		const maxCycles = work.kind === "artifact-digest" ? work.maxCycles : 0;
 		if (run.cycles > maxCycles || run.attempts.length > work.maxRequests)
 			throw new Error("Stored run exceeds its approved work.");
-		totals.cycles += run.cycles;
-		for (const attempt of run.attempts) {
-			checkAttempt(attempt);
-			totals.requests++;
-			// Provably never sent: a charged request with zero cost, neither unknown nor unbounded spend.
-			if (attempt.status === "released") continue;
-			if (attempt.ceiling === null) totals.unbounded++;
-			if (attempt.status === "reserved") totals.unknown++;
-			if (attempt.status === "unpriced") totals.unpriced++;
-			if (attempt.status === "priced") totals.estimatedCost += attempt.cost!;
-			else totals.reservedCost += attempt.ceiling ?? 0;
-		}
+		cycles += run.cycles;
+		for (const attempt of run.attempts) countAttempt(totals, attempt);
 	}
 	const ledger = loop.ledger;
 	// Spend checks add and compare these totals against the cap; NaN or a missing total compares false and admits, so
@@ -265,11 +231,11 @@ export function checkLoopState(value: unknown): LoopState {
 		throw new Error("Stored purpose ledger does not match its runs.");
 	if (
 		ledger.workItems !== loop.runs.length ||
-		ledger.cycles !== totals.cycles ||
+		ledger.cycles !== cycles ||
 		ledger.requests !== totals.requests ||
-		ledger.unknownRequests !== totals.unknown ||
-		ledger.unpricedResponses !== totals.unpriced ||
-		ledger.unboundedAttempts !== totals.unbounded ||
+		ledger.unknownRequests !== totals.unknownRequests ||
+		ledger.unpricedResponses !== totals.unpricedResponses ||
+		ledger.unboundedAttempts !== totals.unboundedAttempts ||
 		Math.abs(ledger.estimatedCost - totals.estimatedCost) > 1e-9 ||
 		Math.abs(ledger.reservedCost - totals.reservedCost) > 1e-9
 	)
@@ -296,22 +262,6 @@ export function validLoop(value: unknown): LoopState | undefined {
 
 function storedCount(value: unknown): boolean {
 	return Number.isSafeInteger(value) && (value as number) >= 0;
-}
-
-const ATTEMPT_STATUSES: readonly unknown[] = ["reserved", "priced", "unpriced", "released"];
-
-// An attempt's ceiling and cost are what the ledger totals recompute from, so each must be a real amount; a priced
-// attempt without its cost would count as free.
-function checkAttempt(attempt: LoopAttempt): void {
-	const input = missionObject(attempt);
-	const amount = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0;
-	if (
-		typeof input.attemptId !== "string" ||
-		!ATTEMPT_STATUSES.includes(input.status) ||
-		(input.ceiling !== null && !amount(input.ceiling)) ||
-		(input.status === "priced" ? !amount(input.cost) : input.cost !== undefined)
-	)
-		throw new Error("Invalid stored purpose attempt.");
 }
 
 function parseReceiptAgreement(value: unknown): PurposeReceiptAgreement {
