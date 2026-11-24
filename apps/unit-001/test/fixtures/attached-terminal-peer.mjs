@@ -67,6 +67,9 @@ const server = createServer((socket) => {
 			socket.end(
 				`${JSON.stringify({ type: "error", message: "Mission formation is unavailable in this fixture" })}\n`,
 			);
+		} else if (request.type === "admission") {
+			// The fixture records no receipts, so every lookup is an unknown request, as in the real owner.
+			socket.end(`${JSON.stringify({ type: "admission", admission: { status: "not-found" } })}\n`);
 		} else if (request.type === "cancel") {
 			view = { ...view, busy: false, text: "" };
 			publish();
