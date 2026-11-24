@@ -1,5 +1,6 @@
 // Holds session ownership through a separate SQLite transaction released automatically on process death.
-import { mkdir, open } from "node:fs/promises";
+import { closeSync, openSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { ConfigurationError } from "./errors.ts";
@@ -7,8 +8,15 @@ import { ConfigurationError } from "./errors.ts";
 /** Takes exclusive session ownership until release or process death, without deleting a competing owner's lock. */
 export async function acquireSessionLock(path: string): Promise<() => Promise<void>> {
 	await mkdir(dirname(path), { recursive: true });
-	const file = await open(path, "a", 0o600);
-	await file.close();
+	// Closing a second descriptor for an existing inode can drop this process's SQLite locks.
+	// If we create the file, close it before another acquisition on this event loop can run.
+	let fd: number | undefined;
+	try {
+		fd = openSync(path, "wx", 0o600);
+	} catch (error) {
+		if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+	}
+	if (fd !== undefined) closeSync(fd);
 	const database = new DatabaseSync(path, { timeout: 0 });
 	try {
 		// Keeping this transaction open holds an OS-backed lock; the lock file itself is never removed.

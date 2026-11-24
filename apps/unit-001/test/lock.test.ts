@@ -51,11 +51,17 @@ function contender() {
 }
 
 describe("acquireSessionLock", () => {
-	it("refuses a second holder and can be taken after idempotent release", async () => {
+	it("keeps the owner exclusive across successive failed acquisitions until release", async () => {
 		const release = await acquireSessionLock(path);
-		await expect(acquireSessionLock(path)).rejects.toThrow(ConfigurationError);
-		await expect(acquireSessionLock(path)).rejects.toThrow(/already running/);
-		await release();
+		try {
+			await expect(acquireSessionLock(path)).rejects.toThrow(ConfigurationError);
+			await expect(acquireSessionLock(path)).rejects.toThrow(/already running/);
+			const { child, outcome } = contender();
+			child.stdin.write("go\n");
+			await expect(outcome).resolves.toBe("BUSY");
+		} finally {
+			await release();
+		}
 		await release();
 		await (await acquireSessionLock(path))();
 	});
