@@ -5,8 +5,10 @@ import {
 	type MissionDraft,
 	type MissionRequest,
 	type MissionView,
-	missionNumber,
+	missionDigestText,
+	missionInteger,
 	missionObject,
+	missionRequestId,
 	missionText,
 	missionTextList,
 	parseMissionCreator,
@@ -26,9 +28,7 @@ export function parseMissionRequest(value: unknown): MissionRequest {
 	if (input.operation === "reconcile-execution") {
 		if (Object.keys(input).some((key) => key !== "operation" && key !== "requestId"))
 			throw new Error("Unknown mission command field.");
-		const requestId = missionText(input.requestId);
-		if (!requestId.trim()) throw new Error("Mission changes need a request ID.");
-		return { operation: "reconcile-execution", requestId };
+		return { operation: "reconcile-execution", requestId: missionRequestId(input.requestId) };
 	}
 	if (input.operation === "control-local") {
 		if (
@@ -37,13 +37,11 @@ export function parseMissionRequest(value: unknown): MissionRequest {
 			throw new Error("Unknown mission command field.");
 		if (input.action !== "start" && input.action !== "pause" && input.action !== "resume" && input.action !== "stop")
 			throw new Error("Unknown mission lifecycle action.");
-		const requestId = missionText(input.requestId);
-		if (!requestId.trim()) throw new Error("Mission changes need a request ID.");
 		return {
 			operation: "control-local",
 			action: input.action,
 			expectedPolicyRevision: revision(input.expectedPolicyRevision, 0),
-			requestId,
+			requestId: missionRequestId(input.requestId),
 		};
 	}
 	const fields =
@@ -63,9 +61,12 @@ export function parseMissionRequest(value: unknown): MissionRequest {
 	if (Object.keys(input).some((key) => !fields.includes(key))) throw new Error("Unknown mission command field.");
 	if (input.operation === "status") return { operation: "status" };
 	if (input.operation === "agree") {
-		const requestId = missionText(input.requestId);
-		if (!requestId.trim()) throw new Error("Mission changes need a request ID.");
-		return { operation: "agree", revision: revision(input.revision, 1), digest: digest(input.digest), requestId };
+		return {
+			operation: "agree",
+			revision: revision(input.revision, 1),
+			digest: digest(input.digest),
+			requestId: missionRequestId(input.requestId),
+		};
 	}
 	if (input.operation === "reconcile") return { operation: "reconcile", receiptId: missionText(input.receiptId) };
 	if (input.operation === "configure-local")
@@ -78,8 +79,7 @@ export function parseMissionRequest(value: unknown): MissionRequest {
 	if (input.operation !== "draft" && input.operation !== "propose" && input.operation !== "approve-local")
 		throw new Error("Unknown mission operation.");
 	const expectedRevision = revision(input.expectedRevision, 0);
-	const requestId = missionText(input.requestId);
-	if (!requestId.trim()) throw new Error("Mission changes need a request ID.");
+	const requestId = missionRequestId(input.requestId);
 	if (input.operation === "draft")
 		return { operation: "draft", expectedRevision, requestId, terms: parseMissionDraftTerms(input.terms) };
 	if (input.operation === "approve-local")
@@ -184,11 +184,7 @@ function parsePurposeRequest(input: Record<string, unknown>): MissionRequest | u
 		if (Object.keys(input).some((key) => key !== "operation" && !fields.includes(key)))
 			throw new Error("Unknown mission command field.");
 	};
-	const requestId = () => {
-		const id = missionText(input.requestId);
-		if (!id.trim()) throw new Error("Mission changes need a request ID.");
-		return id;
-	};
+	const requestId = () => missionRequestId(input.requestId);
 	switch (input.operation) {
 		case "purpose-propose":
 			only("expectedRevision", "requestId", "terms");
@@ -298,13 +294,9 @@ function parseAgreement(value: unknown): MissionAgreement {
 }
 
 function revision(value: unknown, minimum: number): number {
-	const result = missionNumber(value);
-	if (!Number.isSafeInteger(result) || result < minimum) throw new Error("Invalid mission revision.");
-	return result;
+	return missionInteger(value, minimum, "Invalid mission revision.");
 }
 
 function digest(value: unknown): string {
-	const result = missionText(value, 64);
-	if (!/^[0-9a-f]{64}$/.test(result)) throw new Error("Invalid mission digest.");
-	return result;
+	return missionDigestText(value, "Invalid mission digest.");
 }

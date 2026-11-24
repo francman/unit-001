@@ -30,7 +30,11 @@ afterEach(async () => {
 
 function setup() {
 	const mission = new MissionControl(harness, { kind: "developer-local", directory, session: "default" }, ["read"], () => 1000);
-	const tool = missionDraftTool((request, ctx) => mission.handle(request, ctx));
+	const tool = missionDraftTool((request, ctx) => {
+		// The tool sends only formation drafts; formation takes nothing else.
+		if (request.operation !== "draft") throw new Error(`Unexpected ${request.operation} from the draft tool.`);
+		return mission.handle(request, ctx);
+	});
 	// The tool reads only the call identity from its API.
 	const call = (callId: string, args: Parameters<typeof tool.execute>[0]) =>
 		tool.execute(args, { taskId: "task-1", callId } as unknown as ToolExecutionApi, context);

@@ -1,6 +1,6 @@
 // Parses and bounds research work terms and the administrator's research ceiling; terms grant nothing by themselves.
 import {
-	missionNumber,
+	missionInteger,
 	missionObject,
 	missionText,
 	type PurposeCeiling,
@@ -92,7 +92,5 @@ export function canonicalResearchWork(work: ResearchWorkTerms): ResearchWorkTerm
 }
 
 function count(value: unknown, minimum: number): number {
-	const number = missionNumber(value);
-	if (!Number.isSafeInteger(number) || number < minimum) throw new Error(`Research limits are integers from ${minimum}.`);
-	return number;
+	return missionInteger(value, minimum, `Research limits are integers from ${minimum}.`);
 }

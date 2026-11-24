@@ -1,7 +1,7 @@
 // Shares mission command parsing and presentation across terminal and headless clients.
 import { randomUUID } from "node:crypto";
 import { sanitizeTerminalText } from "../render.ts";
-import type { MissionView } from "./contract.ts";
+import { type MissionView, missionDigestText, missionRequestId } from "./contract.ts";
 import type { MissionPurposeView } from "./purpose-view.ts";
 
 export type MissionCommand =
@@ -81,9 +81,7 @@ export function parseMissionCommand(args: readonly string[]): {
 			throw new Error("Mission policy revision must be a nonnegative integer.");
 		if (values.has("--request-id") && policyRevision === undefined)
 			throw new Error("An explicit lifecycle request ID requires --policy-revision N for safe retries.");
-		const requestId = values.get("--request-id") ?? randomUUID();
-		if (!requestId.trim() || Buffer.byteLength(requestId) > 200)
-			throw new Error("Mission request ID must fit 200 bytes.");
+		const requestId = missionRequestId(values.get("--request-id") ?? randomUUID());
 		return {
 			command: { action, ...(policyRevision === undefined ? {} : { policyRevision }), requestId, json },
 			...location,
@@ -100,9 +98,7 @@ export function parseMissionCommand(args: readonly string[]): {
 			throw new Error("An explicit operation request ID requires --operation-revision N for safe retries.");
 		if ((operate === "acknowledge") !== values.has("--run"))
 			throw new Error("Acknowledge needs exactly one --run ID; other operation actions take none.");
-		const requestId = values.get("--request-id") ?? randomUUID();
-		if (!requestId.trim() || Buffer.byteLength(requestId) > 200)
-			throw new Error("Mission request ID must fit 200 bytes.");
+		const requestId = missionRequestId(values.get("--request-id") ?? randomUUID());
 		return {
 			command: {
 				action: "operate",
@@ -151,19 +147,15 @@ export function parseMissionCommand(args: readonly string[]): {
 	const revision = Number(values.get("--revision"));
 	if (!values.has("--revision") || !Number.isSafeInteger(revision) || revision < 0)
 		throw new Error("Mission change requires --revision N (0 for the first draft).");
-	const requestId = values.get("--request-id") ?? randomUUID();
-	if (!requestId.trim() || Buffer.byteLength(requestId) > 200)
-		throw new Error("Mission request ID must contain 1–200 characters.");
+	const requestId = missionRequestId(values.get("--request-id") ?? randomUUID());
 	if (action === "draft" || action === "purpose") {
 		const file = values.get("--file");
 		if (!file) throw new Error(`Mission ${action} requires --file FILE.`);
 		return { command: { action, file, revision, requestId, json }, ...location };
 	}
 	if (action === "approve" || action === "approve-purpose" || action === "plan-approve") {
-		const digest = values.get("--digest");
 		if (action === "plan-approve" && revision === 0) throw new Error("Plan approval requires a positive revision.");
-		if (!digest || !/^[0-9a-f]{64}$/.test(digest))
-			throw new Error("Mission approval requires the exact --digest SHA256.");
+		const digest = missionDigestText(values.get("--digest"), "Mission approval requires the exact --digest SHA256.");
 		return { command: { action, revision, digest, requestId, json }, ...location };
 	}
 	return { command: { action, revision, requestId, json }, ...location };

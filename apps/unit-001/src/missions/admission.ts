@@ -27,7 +27,7 @@ import { exceedsCap, releaseSpend, reserveSpend, settleSpend } from "./attempt-l
 import { type MissionLocation, matchingApproval, readMissionAuthority } from "./authority.ts";
 import type { MissionAuthority } from "./contract.ts";
 import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts";
-import { operationDenial } from "./loop.ts";
+import { operationDenial, runWork } from "./loop.ts";
 import { planHeadValid } from "./plan-gate.ts";
 import { storedPlan } from "./plan-state.ts";
 import { MissionPurposeDoc, storedLoop } from "./purpose.ts";
@@ -155,10 +155,9 @@ export class MissionAdmission {
 	async beforeTool(call: ToolHookCall, api: HookApi, context: Context): Promise<{ block: string } | undefined> {
 		if (this.#loopConversations.has(api.conversationId)) {
 			const denial = await this.#harness!.commit(async (tx) => {
-				const loop = await storedLoop(tx);
-				const denial = await this.#loopDenial(tx, loop, api, call.name);
-				if (denial !== undefined) return denial;
-				const run = (await loopRunFor(tx, loop!, api.conversationId))!.run;
+				const decision = await this.#loopDecision(tx, await storedLoop(tx), api, call.name);
+				if ("denial" in decision) return decision.denial;
+				const run = decision.run;
 				if (run.pendingTools.includes(api.taskId)) return "An interrupted mission tool needs reconciliation.";
 				run.pendingTools.push(api.taskId);
 				this.#admitted.set(api.taskId, "fresh");
@@ -224,7 +223,10 @@ export class MissionAdmission {
 		api: ToolExecutionApi,
 		context: Context,
 	): Promise<ToolExecutionResult> {
-		const decide = async (tx: Tx) => this.#loopDenial(tx, await storedLoop(tx), api, tool.name, { pending: true });
+		const decide = async (tx: Tx) => {
+			const decision = await this.#loopDecision(tx, await storedLoop(tx), api, tool.name, { pending: true });
+			return "denial" in decision ? decision.denial : undefined;
+		};
 		if (this.#admitted.get(api.taskId) !== "fresh") {
 			// A read-only transaction: nothing commits, the decision is read on the Session line like an effect's.
 			const denial = await api.commit(decide, context);
@@ -256,27 +258,27 @@ export class MissionAdmission {
 	 * The decision for one purpose-run action, read inside the caller's transaction: the run is admitted and executing,
 	 * the action is the run's work tool, no hold, no unresolved sibling, and protected authority (read now) still opens
 	 * this operation. With `pending`, the call's own intent must also still be pending. A stored loop that failed
-	 * validation (`undefined`) admits nothing.
+	 * validation (`undefined`) admits nothing. An admitted call gets the run it belongs to, read in the same transaction.
 	 */
-	async #loopDenial(
+	async #loopDecision(
 		tx: Tx,
 		loop: LoopState | undefined,
 		call: Pick<HookApi, "conversationId" | "taskId">,
 		name: string,
 		options: { pending?: true } = {},
-	): Promise<string | undefined> {
-		if (!loop) return "Mission purpose records are invalid.";
+	): Promise<{ denial: string } | { run: LoopRun }> {
+		if (!loop) return { denial: "Mission purpose records are invalid." };
 		const found = await loopRunFor(tx, loop, call.conversationId);
 		const run = found?.run;
 		if (!found || !run || run.state.status !== "running" || run.state.phase !== "execution")
-			return "Mission admission is closed.";
-		if (!found.tools.includes(name)) return "Tool is outside the approved purpose capability.";
-		if ((await tx.doc(MaintenanceDoc)).current.state === "held") return "Maintenance holds mission tools.";
-		if (options.pending && !run.pendingTools.includes(call.taskId)) return "Mission admission is closed.";
+			return { denial: "Mission admission is closed." };
+		if (!found.tools.includes(name)) return { denial: "Tool is outside the approved purpose capability." };
+		if ((await tx.doc(MaintenanceDoc)).current.state === "held") return { denial: "Maintenance holds mission tools." };
+		if (options.pending && !run.pendingTools.includes(call.taskId)) return { denial: "Mission admission is closed." };
 		if (run.pendingTools.some((id) => id !== call.taskId && !this.#admitted.has(id)))
-			return "An interrupted mission tool needs reconciliation.";
+			return { denial: "An interrupted mission tool needs reconciliation." };
 		const denial = operationDenial(await this.readAuthority(), loop, await storedPlan(tx), run.sequence, this.#now());
-		return denial === undefined ? undefined : `Mission authority is closed: ${denial}.`;
+		return denial === undefined ? { run } : { denial: `Mission authority is closed: ${denial}.` };
 	}
 
 	/** The tool's api with `commit` fenced: the effect commits only if its decision still holds inside that commit. */
@@ -440,14 +442,8 @@ export class MissionAdmission {
 		const denial = operationDenial(await this.readAuthority(), loop, await storedPlan(tx), run.sequence, this.#now());
 		if (denial !== undefined) throw new Error(`Mission authority is closed: ${denial}.`);
 		if ((await tx.doc(MaintenanceDoc)).current.state === "held") throw new Error("Maintenance holds mission requests.");
-		const agreement = loopAgreement(loop, run.purposeRevision)!;
-		const reserved = reserveAttempt(
-			loop,
-			run,
-			listedWork(agreement, run.workId)!,
-			agreement.terms.lifetime,
-			requestCostCeiling(model),
-		);
+		const { agreement, work: listed } = runWork(loop, run);
+		const reserved = reserveAttempt(loop, run, listed, agreement.terms.lifetime, requestCostCeiling(model));
 		if ("denial" in reserved) throw new Error(reserved.denial);
 		return {
 			kind: "loop",

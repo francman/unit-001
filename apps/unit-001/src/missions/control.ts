@@ -12,11 +12,11 @@ import {
 	writeMissionAuthority,
 } from "./authority.ts";
 import {
+	type FormationRequest,
 	initialFormation,
 	type MissionAuthority,
 	type MissionDraft,
 	type MissionDraftTerms,
-	type MissionRequest,
 	type MissionTerms,
 	type MissionView,
 	missingMissionTerms,
@@ -143,24 +143,7 @@ export class MissionControl {
 	}
 
 	/** Commits one revision-checked draft operation or an approval already issued by its authenticated authority. */
-	async handle(request: MissionRequest, context: Context): Promise<MissionView> {
-		if (
-			request.operation === "control-local" ||
-			request.operation === "reconcile-execution" ||
-			request.operation === "purpose-propose" ||
-			request.operation === "purpose-approve-local" ||
-			request.operation === "reconcile-purpose" ||
-			request.operation === "operate-local" ||
-			request.operation === "reconcile-operation" ||
-			request.operation === "plan-draft" ||
-			request.operation === "plan-propose" ||
-			request.operation === "plan-agree" ||
-			request.operation === "reconcile-plan" ||
-			request.operation === "prepare-plan" ||
-			request.operation === "review-now" ||
-			request.operation === "review-dismiss"
-		)
-			throw new Error("Mission execution, purpose and plan changes belong to its runtime owner.");
+	async handle(request: FormationRequest, context: Context): Promise<MissionView> {
 		if (this.#location.session !== "default")
 			throw new Error("Mission formation belongs to the default owner session.");
 		if (request.operation === "status") return this.inspect(context);
@@ -303,7 +286,7 @@ export class MissionControl {
 
 	// Every refusal comes before the receipt is published; once it is, a failure is reported as pending, never a refusal.
 	async #approveLocal(
-		request: Extract<MissionRequest, { operation: "approve-local" }>,
+		request: Extract<FormationRequest, { operation: "approve-local" }>,
 		authority: MissionAuthority | null,
 		context: Context,
 	): Promise<MissionView> {

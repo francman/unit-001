@@ -1,13 +1,10 @@
 // Runs explicit, finite mission cycles with durable submissions and host-verified completion.
-import { randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord/context";
 import {
-	AgentDoc,
 	defineExtension,
 	defineTask,
 	type Harness,
 	hook,
-	ProviderDoc,
 	type Registry,
 	type TaskId,
 	type ToolRegistration,
@@ -19,6 +16,7 @@ import { MaintenanceDoc } from "../maintenance.ts";
 import type { ModelChoice } from "../provider.ts";
 import { MISSION_PROVIDER_PREFIX, type MissionAdmission } from "./admission.ts";
 import { MANAGED_MISSION_ACTIONS, type MissionExecutionIntent } from "./contract.ts";
+import { createMissionConversation } from "./conversation.ts";
 import { type MissionExecution, MissionExecutionDoc } from "./execution-state.ts";
 import { missionLoop } from "./loop.ts";
 import { NO_RESEARCH_SOURCES, type ResearchSources } from "./research-sources.ts";
@@ -337,15 +335,16 @@ async function createExecutionScope(
 		{ missionId, revision },
 		{ conversationId: control.id, ownership: { kind: "conversation" }, background: true },
 	);
-	const conversation = await tx.createConversation({ ownership: { kind: "task", taskId: controller } });
+	// The one-shot engine never set `modelTools`: every enabled tool that is not deferred is offered, as before.
+	const conversation = await createMissionConversation(tx, controller, {
+		model,
+		tools,
+		modelTools: null,
+		maxTurns: 1,
+		prefix: MISSION_PROVIDER_PREFIX,
+	});
 	admission.trackConversation(conversation.id);
-	const agent = await tx.doc(AgentDoc, conversation.id);
-	agent.model = model;
-	agent.tools = tools;
-	agent.maxTurns = 1;
-	const providerSession = `${MISSION_PROVIDER_PREFIX}${randomUUID()}`;
-	(await tx.doc(ProviderDoc, conversation.id)).sessionId = providerSession;
-	return { controller, conversation: conversation.id, providerSession };
+	return { controller, conversation: conversation.id, providerSession: conversation.providerSession };
 }
 
 function active(execution: MissionExecution): boolean {

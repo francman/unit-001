@@ -1,5 +1,12 @@
 // Parses the mission plan projection at the owner wire; imports no owner runtime, so privileged clients can use it.
-import { missionNumber, missionObject, missionText, missionTextList } from "./contract.ts";
+import {
+	missionDigestText,
+	missionInteger,
+	missionNumber,
+	missionObject,
+	missionText,
+	missionTextList,
+} from "./contract.ts";
 import { MAX_DUE_TRIGGERS, MAX_REVIEW_TURNS, PLAN_PROJECTION_LIMITS as LIMITS } from "./plan-limits.ts";
 import type { ReviewFacts, ReviewItem, ReviewNote, ReviewTrigger } from "./plan-review.ts";
 import { type PlanTerms, parsePlanTerms } from "./plan-terms.ts";
@@ -54,13 +61,16 @@ export type ReviewAllowanceView = {
 	reservedCost: number;
 };
 
+const TURN_STATES = ["running", "done", "skipped", "blocked"] as const;
+const TURN_REASONS = [null, "budget", "hold", "unsettled", "unknown_request_outcome", "turn_failed", "authority"] as const;
+
 /** One model review turn as status shows it; separate from saved notes and drafts. */
 export type ReviewTurnView = {
 	key: string;
 	planRevision: number;
 	trigger: ReviewTrigger;
-	state: "running" | "done" | "skipped" | "blocked";
-	reason: null | "budget" | "hold" | "unsettled" | "unknown_request_outcome" | "turn_failed" | "authority";
+	state: (typeof TURN_STATES)[number];
+	reason: (typeof TURN_REASONS)[number];
 	reviewId: string | null;
 	draftRevision: number | null;
 	requests: number;
@@ -138,14 +148,28 @@ function parseDraft(value: unknown): NonNullable<PlanView["draft"]> {
 	};
 }
 
-const TRIGGER_KINDS: readonly unknown[] = ["cadence", "completed", "blocked", "runs-low", "deadline-near", "owner"];
-const ITEM_LEVELS: readonly unknown[] = ["strategic", "tactical", "legacy"];
-const ITEM_STATUSES: readonly unknown[] = ["on-track", "at-risk", "blocked", "done", "planned", "parked"];
+const TRIGGER_KINDS = [
+	"cadence",
+	"completed",
+	"blocked",
+	"runs-low",
+	"deadline-near",
+	"owner",
+] as const satisfies readonly ReviewTrigger["kind"][];
+const ITEM_LEVELS = ["strategic", "tactical", "legacy"] as const satisfies readonly ReviewItem["level"][];
+const ITEM_STATUSES = [
+	"on-track",
+	"at-risk",
+	"blocked",
+	"done",
+	"planned",
+	"parked",
+] as const satisfies readonly ReviewItem["status"][];
 
 function parseTrigger(value: unknown): ReviewTrigger {
 	const input = closed(value, ["kind", "key", "subject"]);
 	return {
-		kind: member(input.kind, TRIGGER_KINDS) as ReviewTrigger["kind"],
+		kind: member(input.kind, TRIGGER_KINDS),
 		key: missionText(input.key, LIMITS.keyText),
 		subject: input.subject === null ? null : missionText(input.subject, LIMITS.keyText),
 	};
@@ -176,7 +200,7 @@ export function parseReviewNote(value: unknown): ReviewNote {
 		planDigest: hex(input.planDigest),
 		window: { from: count(window.from), to: count(window.to) },
 		createdAt: count(input.createdAt),
-		outcome: member(input.outcome, ["no-change", "attention"]) as ReviewNote["outcome"],
+		outcome: member(input.outcome, ["no-change", "attention"] as const),
 		items: list(input.items, LIMITS.noteItems).map(parseItem),
 		facts: parseFacts(input.facts),
 		uncertainty: missionTextList(input.uncertainty, LIMITS.uncertainty, LIMITS.uncertaintyText),
@@ -198,8 +222,8 @@ function parseItem(value: unknown): ReviewItem {
 	]);
 	return {
 		id: missionText(input.id, LIMITS.itemIdText),
-		level: member(input.level, ITEM_LEVELS) as ReviewItem["level"],
-		status: member(input.status, ITEM_STATUSES) as ReviewItem["status"],
+		level: member(input.level, ITEM_LEVELS),
+		status: member(input.status, ITEM_STATUSES),
 		verifiedWorks: count(input.verifiedWorks),
 		listedWorks: count(input.listedWorks),
 		runIds: missionTextList(input.runIds, LIMITS.itemRunIds, LIMITS.keyText),
@@ -235,7 +259,7 @@ function parseFacts(value: unknown): ReviewFacts {
 function parseDisposition(value: unknown): NonNullable<ReviewNote["disposition"]> {
 	const input = closed(value, ["kind", "at", "draftRevision"]);
 	return {
-		kind: member(input.kind, ["dismissed", "drafted"]) as "dismissed" | "drafted",
+		kind: member(input.kind, ["dismissed", "drafted"] as const),
 		at: count(input.at),
 		draftRevision: input.draftRevision === null ? null : count(input.draftRevision),
 	};
@@ -260,17 +284,6 @@ function parseAllowanceView(value: unknown): ReviewAllowanceView {
 	};
 }
 
-const TURN_STATES: readonly unknown[] = ["running", "done", "skipped", "blocked"];
-const TURN_REASONS: readonly unknown[] = [
-	null,
-	"budget",
-	"hold",
-	"unsettled",
-	"unknown_request_outcome",
-	"turn_failed",
-	"authority",
-];
-
 function parseTurnView(value: unknown): ReviewTurnView {
 	const input = closed(value, [
 		"key",
@@ -287,8 +300,8 @@ function parseTurnView(value: unknown): ReviewTurnView {
 		key: missionText(input.key, LIMITS.keyText),
 		planRevision: count(input.planRevision),
 		trigger: parseTrigger(input.trigger),
-		state: member(input.state, TURN_STATES) as ReviewTurnView["state"],
-		reason: member(input.reason, TURN_REASONS) as ReviewTurnView["reason"],
+		state: member(input.state, TURN_STATES),
+		reason: member(input.reason, TURN_REASONS),
 		reviewId: input.reviewId === null ? null : missionText(input.reviewId),
 		draftRevision: input.draftRevision === null ? null : count(input.draftRevision),
 		requests: count(input.requests),
@@ -304,9 +317,11 @@ function closed(value: unknown, fields: string[]): Record<string, unknown> {
 	return input;
 }
 
-function member(value: unknown, allowed: readonly unknown[]): unknown {
-	if (!allowed.includes(value)) throw new Error("Invalid plan projection value.");
-	return value;
+// Returns the allowed entry itself, so the result is typed by the list without a cast; no list holds `undefined`.
+function member<T>(value: unknown, allowed: readonly T[]): T {
+	const found = allowed.find((item) => item === value);
+	if (found === undefined) throw new Error("Invalid plan projection value.");
+	return found;
 }
 
 function amount(value: unknown): number {
@@ -321,13 +336,9 @@ function list(value: unknown, maximum: number): unknown[] {
 }
 
 function count(value: unknown): number {
-	const number = missionNumber(value);
-	if (!Number.isSafeInteger(number) || number < 0) throw new Error("Invalid plan projection number.");
-	return number;
+	return missionInteger(value, 0, "Invalid plan projection number.");
 }
 
 function hex(value: unknown): string {
-	const digest = missionText(value, 64);
-	if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("Invalid plan digest.");
-	return digest;
+	return missionDigestText(value, "Invalid plan digest.");
 }

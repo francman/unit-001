@@ -3,8 +3,11 @@ import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { canonicalResearchWork, parseResearchCeiling, parseResearchWork, researchWorkDenial } from "./research-terms.ts";
 import {
+	isMissionDigest,
 	type MissionApproval,
 	type MissionAuthority,
+	missionDigestText,
+	missionInteger,
 	missionNumber,
 	missionObject,
 	missionText,
@@ -182,9 +185,9 @@ export function parseOperationIntent(value: unknown): OperationIntent {
 	const requestId = missionText(input.requestId);
 	const purposeDigest = missionText(input.purposeDigest, 64);
 	const planDigest = input.planDigest === undefined ? undefined : missionText(input.planDigest, 64);
-	if (planDigest !== undefined && (input.action !== "open" || !/^[0-9a-f]{64}$/.test(planDigest)))
+	if (planDigest !== undefined && (input.action !== "open" || !isMissionDigest(planDigest)))
 		throw new Error("Invalid plan-bound open intent.");
-	if (!requestId.trim() || !/^[0-9a-f]{64}$/.test(purposeDigest)) throw new Error("Invalid operation intent binding.");
+	if (!requestId.trim() || !isMissionDigest(purposeDigest)) throw new Error("Invalid operation intent binding.");
 	return {
 		requestId,
 		sequence: count(input.sequence, 1),
@@ -229,8 +232,7 @@ function parseWorkTerms(value: unknown): WorkTerms {
 	];
 	if (Object.keys(input).some((key) => !fields.includes(key))) throw new Error("Unknown purpose work term.");
 	if (input.kind !== "artifact-digest") throw new Error("Purpose work supports only the artifact-digest kind.");
-	const sha256 = missionText(input.sha256, 64);
-	if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error("Work needs an exact lowercase SHA-256.");
+	const sha256 = missionDigestText(input.sha256, "Work needs an exact lowercase SHA-256.");
 	return {
 		kind: "artifact-digest",
 		path: workPath(missionText(input.path, 512), false),
@@ -289,10 +291,7 @@ function canonicalTerms(terms: PurposeTerms): PurposeTerms {
 }
 
 function count(value: unknown, minimum: number, maximum = Number.MAX_SAFE_INTEGER): number {
-	const number = missionNumber(value);
-	if (!Number.isSafeInteger(number) || number < minimum || number > maximum)
-		throw new Error(`Purpose limits need integers from ${minimum} to ${maximum}.`);
-	return number;
+	return missionInteger(value, minimum, `Purpose limits need integers from ${minimum} to ${maximum}.`, maximum);
 }
 
 function positive(value: unknown): number {

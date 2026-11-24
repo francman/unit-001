@@ -402,7 +402,7 @@ describe("the plan gate on a running purpose", () => {
 	});
 });
 
-describe("codex gate review holds", () => {
+describe("plan receipts across prepare, publish, creator rotation and open", () => {
 	it("records the exact prepared revision R when the owner moved on to R+1 before the terminal published", async () => {
 		const host = await launch();
 		const binding = await withPurpose(host, ["alpha"]);
@@ -657,7 +657,7 @@ describe("codex gate review holds", () => {
 	});
 });
 
-describe("codex gate review holds, second round", () => {
+describe("plan request bindings and review drafts of an older head", () => {
 	it("refuses mint and replay when an old revision's protected request binding was dropped", async () => {
 		const host = await launch();
 		const binding = await withPurpose(host, ["alpha"]);

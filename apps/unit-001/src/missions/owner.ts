@@ -231,22 +231,49 @@ export class MissionOwner {
 				const view = await this.inspect(context);
 				return { ...view, plan: view.plan && { ...view.plan, draft: proposalDraftView(proposal) } };
 			}
-			if (request.operation === "control-local" || request.operation === "reconcile-execution") {
-				if (request.operation === "control-local") await this.issueLocal(request, context);
-				await this.reconcile(request.requestId, context, this.#scheduling);
-			} else if (request.operation === "purpose-propose") await this.#purpose.propose(request, context);
-			else if (request.operation === "purpose-approve-local") await this.#purpose.approveLocal(request, context);
-			else if (request.operation === "reconcile-purpose") await this.#purpose.reconcile(request.receiptId, context);
-			else if (request.operation === "plan-draft") await this.#plan.draft(request, context);
-			else if (request.operation === "plan-propose") await this.#plan.propose(request, context);
-			else if (request.operation === "plan-agree") await this.#plan.agreeLocal(request, context);
-			else if (request.operation === "reconcile-plan") await this.#plan.reconcile(request.receiptId, context);
-			else if (request.operation === "review-now") await this.#plan.review(request.requestId, context);
-			else if (request.operation === "review-dismiss") await this.#plan.dismiss(request.reviewId, context);
-			else if (request.operation === "operate-local" || request.operation === "reconcile-operation") {
-				if (request.operation === "operate-local") await this.#operation.issueLocal(request, context);
-				await this.#operation.reconcile(request.requestId, context, this.#scheduling);
-			} else await this.#formation.handle(request, context);
+			// One case per runtime operation; `default` passes only `FormationRequest`, so an unrouted runtime operation
+			// does not compile.
+			switch (request.operation) {
+				case "control-local":
+				case "reconcile-execution":
+					if (request.operation === "control-local") await this.issueLocal(request, context);
+					await this.reconcile(request.requestId, context, this.#scheduling);
+					break;
+				case "purpose-propose":
+					await this.#purpose.propose(request, context);
+					break;
+				case "purpose-approve-local":
+					await this.#purpose.approveLocal(request, context);
+					break;
+				case "reconcile-purpose":
+					await this.#purpose.reconcile(request.receiptId, context);
+					break;
+				case "plan-draft":
+					await this.#plan.draft(request, context);
+					break;
+				case "plan-propose":
+					await this.#plan.propose(request, context);
+					break;
+				case "plan-agree":
+					await this.#plan.agreeLocal(request, context);
+					break;
+				case "reconcile-plan":
+					await this.#plan.reconcile(request.receiptId, context);
+					break;
+				case "review-now":
+					await this.#plan.review(request.requestId, context);
+					break;
+				case "review-dismiss":
+					await this.#plan.dismiss(request.reviewId, context);
+					break;
+				case "operate-local":
+				case "reconcile-operation":
+					if (request.operation === "operate-local") await this.#operation.issueLocal(request, context);
+					await this.#operation.reconcile(request.requestId, context, this.#scheduling);
+					break;
+				default:
+					await this.#formation.handle(request, context);
+			}
 			// A newly recorded plan may grant a review allowance; arming is idempotent and a no-op without one.
 			if (request.operation === "plan-agree" || request.operation === "reconcile-plan")
 				await this.#armReview(context).catch(() => {});

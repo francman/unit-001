@@ -266,11 +266,22 @@ export type MissionExecutionIntent = {
 	issuedAt: number;
 };
 
-export type MissionRequest =
+/** Every owner-wire mission command; the owner routes each to formation or to its runtime part. */
+export type MissionRequest = FormationRequest | RuntimeRequest;
+
+/** Commands `MissionControl` handles: status and the formation draft, proposal, approval and creator setup. */
+export type FormationRequest =
 	| { operation: "status" }
 	| { operation: "draft"; expectedRevision: number; requestId: string; terms: MissionDraftTerms }
 	| { operation: "propose"; expectedRevision: number; requestId: string }
 	| { operation: "reconcile"; receiptId: string }
+	| { operation: "configure-local"; creator: MissionCreator; ceiling: MissionCeiling; purposeCeiling?: PurposeCeiling }
+	| { operation: "approve-local"; expectedRevision: number; digest: string; requestId: string }
+	/** The creator's one explicit browser agreement to an exact proposed revision; the owner mints it only on developer-local. */
+	| { operation: "agree"; revision: number; digest: string; requestId: string };
+
+/** Commands only the runtime owner handles: execution lifecycle, purpose, operation, plan and review. */
+export type RuntimeRequest =
 	| { operation: "reconcile-execution"; requestId: string }
 	| {
 			operation: "control-local";
@@ -278,10 +289,6 @@ export type MissionRequest =
 			expectedPolicyRevision: number;
 			requestId: string;
 	  }
-	| { operation: "configure-local"; creator: MissionCreator; ceiling: MissionCeiling; purposeCeiling?: PurposeCeiling }
-	| { operation: "approve-local"; expectedRevision: number; digest: string; requestId: string }
-	/** The creator's one explicit browser agreement to an exact proposed revision; the owner mints it only on developer-local. */
-	| { operation: "agree"; revision: number; digest: string; requestId: string }
 	| { operation: "purpose-propose"; expectedRevision: number; requestId: string; terms: PurposeTerms }
 	| { operation: "purpose-approve-local"; revision: number; digest: string; requestId: string }
 	| { operation: "reconcile-purpose"; receiptId: string }
@@ -421,6 +428,36 @@ export function missionText(value: unknown, maximum = 200): string {
 /** Reads finite numeric wire values; semantic limits are checked before proposing or approving. */
 export function missionNumber(value: unknown): number {
 	if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("Mission numbers must be finite.");
+	return value;
+}
+
+/** Reads a safe integer within bounds; `message` names the field in the caller's terms. */
+export function missionInteger(
+	value: unknown,
+	minimum: number,
+	message: string,
+	maximum = Number.MAX_SAFE_INTEGER,
+): number {
+	const number = missionNumber(value);
+	if (!Number.isSafeInteger(number) || number < minimum || number > maximum) throw new Error(message);
+	return number;
+}
+
+/** Reads a nonblank request ID of at most 200 bytes, the one request ID form every mission change carries. */
+export function missionRequestId(value: unknown): string {
+	if (typeof value !== "string" || !value.trim() || Buffer.byteLength(value) > 200)
+		throw new Error("Mission changes need a request ID of 1-200 bytes.");
+	return value;
+}
+
+/** Whether a value is a lowercase hex SHA-256, the one digest form missions bind to. */
+export function isMissionDigest(value: unknown): value is string {
+	return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+/** Reads a lowercase hex SHA-256; `message` names the digest in the caller's terms. */
+export function missionDigestText(value: unknown, message: string): string {
+	if (!isMissionDigest(value)) throw new Error(message);
 	return value;
 }
 

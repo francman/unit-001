@@ -94,7 +94,8 @@ describe("verification step", () => {
 	});
 });
 
-describe("codex #27 HOLD", () => {
+// #27
+describe("research record binding and synthesis input", () => {
 	const work = {
 		kind: "research" as const,
 		question: "q",
@@ -109,7 +110,7 @@ describe("codex #27 HOLD", () => {
 		maxToolRoundsPerChild: 3,
 	};
 
-	it("item 3: stored research binds to exactly its run's work digest, question and identities", () => {
+	it("stored research binds to exactly its run's work digest, question and identities", () => {
 		const stored = run({ workDigest: workDigest(work) });
 		const loopRun = { runId: "r1", workDigest: workDigest(work), conversation: 1, providerSession: "s1" } as LoopRun;
 		expect(researchBound(stored, loopRun, work)).toBe(true);
@@ -119,7 +120,7 @@ describe("codex #27 HOLD", () => {
 		expect(researchBound(stored, loopRun, { ...work, maxFetches: 3 })).toBe(false);
 	});
 
-	it("item 7: synthesis receives the whole bounded verified candidate as data", () => {
+	it("synthesis receives the whole bounded verified candidate as data", () => {
 		const candidate = parseCandidate({
 			title: "t",
 			summary: "the summary",

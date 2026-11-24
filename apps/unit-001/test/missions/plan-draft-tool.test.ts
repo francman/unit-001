@@ -51,10 +51,8 @@ describe("unit_plan_draft", () => {
 		await expect(call("c1", { expectedRevision: 0, terms })).rejects.toThrow("slugs");
 		expect(requests).toEqual([]);
 	});
-});
 
-describe("codex 1b HOLD item 8", () => {
-	it("lets Bob send the plan's review allowance, so a draft keeps the agreed value", () => {
+	it("offers the review allowance in its schema, so a draft Bob writes keeps the agreed value", () => {
 		const tool = planDraftTool(async () => ({}) as MissionView);
 		const overall = (tool.parameters as { properties: { terms: { properties: { overall: { properties: object } } } } })
 			.properties.terms.properties.overall.properties;

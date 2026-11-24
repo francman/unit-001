@@ -112,8 +112,8 @@ describe("retained turns", () => {
 	});
 });
 
-describe("codex 1b HOLD items", () => {
-	it("item 3: an earlier request without a ceiling blocks capped spend, even after it settles unpriced", () => {
+describe("review spend, attempt and purpose-effect checks", () => {
+	it("an earlier request without a ceiling blocks capped spend, even after it settles unpriced", () => {
 		const state = empty();
 		const a = turn("1:cadence:w1");
 		recordTurn(state, a);
@@ -125,7 +125,7 @@ describe("codex 1b HOLD items", () => {
 		expect(reviewRequestDenial(state, b, allowance, 0.1)).toBeUndefined();
 	});
 
-	it("item 4: refuses duplicate attempt IDs and retained spend above the ledger", () => {
+	it("refuses duplicate attempt IDs and retained spend above the ledger", () => {
 		const state = empty();
 		const a = turn("1:cadence:w1");
 		recordTurn(state, a);

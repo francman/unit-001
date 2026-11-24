@@ -1,9 +1,9 @@
 // Runs Bob's bounded model review of the agreed plan: at a due trigger, one budget-counted turn that may save a draft.
-import { randomUUID } from "node:crypto";
-import { AgentDoc, defineTask, ProviderDoc, type TaskId, type Tx } from "@earendil-works/pi-durable";
+import { defineTask, type TaskId, type Tx } from "@earendil-works/pi-durable";
 import { MaintenanceDoc } from "../maintenance.ts";
 import type { ModelChoice } from "../provider.ts";
 import type { MissionAdmission } from "./admission.ts";
+import { createMissionConversation } from "./conversation.ts";
 import { planHeadValid } from "./plan-gate.ts";
 import { dueTriggers, type ReviewNote, type ReviewTrigger, reviewNote } from "./plan-review.ts";
 import { type PlanAgreement, type PlanState, saveReview, storedPlan } from "./plan-state.ts";
@@ -167,20 +167,19 @@ async function admit(
 	trigger: ReviewTrigger,
 	now: number,
 ): Promise<ReviewNote> {
-	const conversation = await tx.createConversation({ ownership: { kind: "task", taskId } });
-	const agent = await tx.doc(AgentDoc, conversation.id);
-	agent.model = model;
-	agent.tools = [...REVIEW_TOOLS];
-	agent.modelTools = [...REVIEW_TOOLS];
-	agent.maxTurns = head.terms.overall.reviewAllowance!.maxRequestsPerReview;
-	const providerSession = `${REVIEW_PROVIDER_PREFIX}${randomUUID()}`;
-	(await tx.doc(ProviderDoc, conversation.id)).sessionId = providerSession;
+	const conversation = await createMissionConversation(tx, taskId, {
+		model,
+		tools: REVIEW_TOOLS,
+		modelTools: REVIEW_TOOLS,
+		maxTurns: head.terms.overall.reviewAllowance!.maxRequestsPerReview,
+		prefix: REVIEW_PROVIDER_PREFIX,
+	});
 	const note = reviewNote(plan, head, loop, trigger, now);
 	saveReview(plan, note, null);
 	upsert(reviews, trigger, head, now, { status: "running" }, {
 		reviewId: note.reviewId,
 		conversation: conversation.id,
-		providerSession,
+		providerSession: conversation.providerSession,
 	});
 	return note;
 }

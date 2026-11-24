@@ -1,5 +1,13 @@
 // Defines the mission plan's terms (overall purpose, strategics, tacticals) and checks them; terms grant nothing.
-import { type MissionAuthority, missionNumber, missionObject, missionText, missionTextList } from "./contract.ts";
+import {
+	type MissionAuthority,
+	missionDigestText,
+	missionInteger,
+	missionNumber,
+	missionObject,
+	missionText,
+	missionTextList,
+} from "./contract.ts";
 import { type LoopState, loopAgreement } from "./purpose-loop.ts";
 
 export type PlanPriority = "high" | "normal" | "low";
@@ -180,8 +188,7 @@ function parseTactical(value: unknown): PlanTactical {
 
 function parseBinding(value: unknown): PlanBinding {
 	const input = closed(value, ["missionId", "purposeRevision", "purposeDigest"], "binding");
-	const purposeDigest = missionText(input.purposeDigest, 64);
-	if (!/^[0-9a-f]{64}$/.test(purposeDigest)) throw new Error("A binding needs an exact purpose digest.");
+	const purposeDigest = missionDigestText(input.purposeDigest, "A binding needs an exact purpose digest.");
 	return { missionId: missionText(input.missionId), purposeRevision: whole(input.purposeRevision, 1), purposeDigest };
 }
 
@@ -207,7 +214,5 @@ function priority(value: unknown): PlanPriority {
 }
 
 function whole(value: unknown, minimum: number): number {
-	const number = missionNumber(value);
-	if (!Number.isSafeInteger(number) || number < minimum) throw new Error(`Plan numbers are integers from ${minimum}.`);
-	return number;
+	return missionInteger(value, minimum, `Plan numbers are integers from ${minimum}.`);
 }

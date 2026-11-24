@@ -5,6 +5,7 @@ import { lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/prom
 import { dirname, join } from "node:path";
 import {
 	type BrowserAgreementGrant,
+	isMissionDigest,
 	type IssuedAgreement,
 	type MissionApproval,
 	type MissionAuthority,
@@ -14,6 +15,8 @@ import {
 	type MissionTerms,
 	type PlanRequestBinding,
 	missingMissionTerms,
+	missionDigestText,
+	missionInteger,
 	missionNumber,
 	missionObject,
 	missionText,
@@ -187,7 +190,7 @@ export function parseMissionApproval(value: unknown): MissionApproval {
 		revision < 1 ||
 		!Number.isSafeInteger(authorityRevision) ||
 		authorityRevision < 1 ||
-		!/^[0-9a-f]{64}$/.test(digest)
+		!isMissionDigest(digest)
 	)
 		throw new Error("Invalid mission approval revision or digest.");
 	const actor = missionObject(input.approvedBy);
@@ -324,7 +327,7 @@ function parsePlanRequest(value: unknown): PlanRequestBinding {
 	const receiptId = missionText(input.receiptId);
 	const missionId = missionText(input.missionId);
 	const digest = missionText(input.digest, 64);
-	if (!requestId.trim() || !receiptId.trim() || !missionId.trim() || !/^[0-9a-f]{64}$/.test(digest))
+	if (!requestId.trim() || !receiptId.trim() || !missionId.trim() || !isMissionDigest(digest))
 		throw new Error("Invalid plan request binding.");
 	return {
 		requestId,
@@ -367,8 +370,7 @@ function parseIssuedAgreement(value: unknown): IssuedAgreement {
 	const input = missionObject(value);
 	const fields = ["requestId", "receiptId", "missionId", "revision", "digest", "authorityRevision", "previousReceipt", "issuedAt"];
 	if (Object.keys(input).some((key) => !fields.includes(key))) throw new Error("Unknown issued agreement field.");
-	const digest = missionText(input.digest, 64);
-	if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("Invalid issued agreement digest.");
+	const digest = missionDigestText(input.digest, "Invalid issued agreement digest.");
 	return {
 		requestId: missionText(input.requestId, 64),
 		receiptId: missionText(input.receiptId),
@@ -382,9 +384,7 @@ function parseIssuedAgreement(value: unknown): IssuedAgreement {
 }
 
 function counter(value: unknown, minimum: number): number {
-	const number = missionNumber(value);
-	if (!Number.isSafeInteger(number) || number < minimum) throw new Error("Invalid protected authority counter.");
-	return number;
+	return missionInteger(value, minimum, "Invalid protected authority counter.");
 }
 
 function boundedList(value: unknown, maximum: number): unknown[] {

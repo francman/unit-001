@@ -89,14 +89,15 @@ describe("fixture sources", () => {
 	});
 });
 
-describe("codex #27 HOLD", () => {
-	it("item 1: a quote that is empty once whitespace is normalised never passes", () => {
+// #27
+describe("quote, cited source and stored selection checks", () => {
+	it("a quote that is empty once whitespace is normalised never passes", () => {
 		expect(() => candidate("   ")).toThrow("Quotes");
 		const blank = { ...candidate("undici"), claims: [{ text: "x", citations: [{ artifact: source.sha256, quote: " \n " }] }] };
 		expect(verifyCandidate(run(), blank, sources, 1).reasons).toEqual(["claim 1: quote not found verbatim"]);
 	});
 
-	it("item 5: the cited source must match the fetched size and content type, not only its digest", () => {
+	it("the cited source must match the fetched size and content type, not only its digest", () => {
 		const fetchedAsPlain = { ...run(), artifacts: [{ ...run().artifacts[0]!, contentType: "text/plain" }] };
 		expect(verifyCandidate(fetchedAsPlain, candidate("undici"), sources, 1).reasons).toEqual([
 			"claim 1: artifact does not match what was fetched",
@@ -107,7 +108,7 @@ describe("codex #27 HOLD", () => {
 		]);
 	});
 
-	it("item 2: a stored selection holds only when it rebuilds exactly and the candidate still verifies", () => {
+	it("a stored selection holds only when it rebuilds exactly and the candidate still verifies", () => {
 		const accepted = { ...run(), candidate: candidate("undici"), decision: { accepted: true, reasons: [], decidedAt: 1 } };
 		const chosen = selectAndDraft("m", accepted, "why", { title: "T", body: "B" }, 9);
 		const settled = { ...accepted, ...chosen };
@@ -120,7 +121,8 @@ describe("codex #27 HOLD", () => {
 	});
 });
 
-describe("codex #27 re-review A", () => {
+// #27
+describe("receipt and candidate rebuilt, never trusted", () => {
 	const accepted = () => ({ ...run(), candidate: candidate("undici"), decision: { accepted: true, reasons: [], decidedAt: 1 } });
 
 	it("breaks the receipt when the draft's title or body is edited behind an unchanged marker", () => {

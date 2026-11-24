@@ -372,8 +372,9 @@ describe("contract", () => {
 	});
 });
 
-describe("codex #27 HOLD regressions", () => {
-	it("item 4: unreadable research records block admission without charging a work slot", async () => {
+// #27
+describe("research admission with unreadable records, refused candidates, hold and close", () => {
+	it("unreadable research records block admission without charging a work slot", async () => {
 		const host = await launch();
 		await host.harness.commit(async (tx) => {
 			(await tx.doc(MissionResearchDoc)).runs = "corrupt" as never;
@@ -385,7 +386,7 @@ describe("codex #27 HOLD regressions", () => {
 		expect(loop.ledger.workItems).toBe(0);
 	});
 
-	it("item 6: an out-of-bounds candidate is a no-effect refusal that strands no tool intent", async () => {
+	it("an out-of-bounds candidate is a no-effect refusal that strands no tool intent", async () => {
 		let host: Host;
 		const tooMany = tool("research_submit_candidate", {
 			title: "t",
@@ -412,7 +413,7 @@ describe("codex #27 HOLD regressions", () => {
 		expect((await readResearch(host.harness, context))!.runs[0]!.outcome).toBe("selected");
 	});
 
-	it("item 8: a hold mid-research sleeps before the next input, and the run resumes after release and reopen", async () => {
+	it("a hold mid-research sleeps before the next input, and the run resumes after release and reopen", async () => {
 		let host: Host;
 		const holdThenSay: Response = async () => {
 			await host.harness.commit(async (tx) => {
@@ -436,7 +437,7 @@ describe("codex #27 HOLD regressions", () => {
 		expect(host.faux.state.callCount).toBe(5);
 	});
 
-	it("item 8: close mid-research stops it at the next request", async () => {
+	it("close mid-research stops it at the next request", async () => {
 		const started = latch();
 		const host = await launch([plan(), hanging(started.open), fetch()]);
 		await start(host);
@@ -477,7 +478,8 @@ describe("rollback inspection", () => {
 	});
 });
 
-describe("codex #27 re-review B", () => {
+// #27
+describe("research request charging by the awaited conversation", () => {
 	it("charges nothing for a coordinator request while the run awaits its child", async () => {
 		const started = latch();
 		const host = await launch([plan(), say("Planned."), hanging(started.open), say("Should never be sent.")]);

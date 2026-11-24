@@ -978,7 +978,7 @@ describe("stored loop is a trust boundary", () => {
 	});
 });
 
-describe("code check fixes", () => {
+describe("decisions read inside a queued commit, ledger bounds and abort finalization", () => {
 	/** Publishes `change` inside the next commit, just before its callback runs: the commit was queued before it. */
 	function duringNextCommit(host: Host, change: () => Promise<void>) {
 		const real = host.harness.commit.bind(host.harness);

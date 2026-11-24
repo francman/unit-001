@@ -366,7 +366,7 @@ describe("skips", () => {
 	});
 });
 
-describe("draft guard for review conversations (codex 1b HOLD)", () => {
+describe("draft guard for review conversations", () => {
 	type TurnSetup = {
 		attempts?: number;
 		estimatedCost?: number;
@@ -493,8 +493,8 @@ describe("draft guard for review conversations (codex 1b HOLD)", () => {
 	});
 });
 
-describe("codex 1b HOLD owner items", () => {
-	it("item 1: a draft from a review turn is refused once protected authority no longer agrees the head", async () => {
+describe("review drafts and turns after authority changes, restart and inhibition", () => {
+	it("a draft from a review turn is refused once protected authority no longer agrees the head", async () => {
 		const host = await launch();
 		const binding = await adopt(host, allowance({ maxEstimatedCost: 1 }));
 		const noted = await host.request({ operation: "review-now", requestId: "note" });
@@ -531,7 +531,7 @@ describe("codex 1b HOLD owner items", () => {
 		).rejects.toMatchObject({ code: "stale-revision" });
 	});
 
-	it("item 5: a running turn whose task ended is reconciled on start, so its unknown request shows as the blocker", async () => {
+	it("a running turn whose task ended is reconciled on start, so its unknown request shows as the blocker", async () => {
 		let host = await launch();
 		await adopt(host, allowance());
 		await host.owner.endParkedReview(context);
@@ -558,7 +558,7 @@ describe("codex 1b HOLD owner items", () => {
 		expect(view.plan!.blocker).toMatchObject({ key: "1:cadence:w1", state: "blocked", reason: "unknown_request_outcome" });
 	});
 
-	it("item 6: ending a parked review task while inhibited never runs the scheduler", async () => {
+	it("ending a parked review task while inhibited never runs the scheduler", async () => {
 		const host = await launch();
 		await adopt(host, allowance());
 		await host.owner.initialize(context, "inhibited");
@@ -569,7 +569,7 @@ describe("codex 1b HOLD owner items", () => {
 		expect(wait).not.toHaveBeenCalled();
 	});
 
-	it("item 7: a plan without a review allowance never creates a review document", async () => {
+	it("a plan without a review allowance never creates a review document", async () => {
 		const host = await launch();
 		await adopt(host, null);
 		await host.request({ operation: "status" });
@@ -577,8 +577,8 @@ describe("codex 1b HOLD owner items", () => {
 	});
 });
 
-describe("codex 1b re-review edges", () => {
-	it("edge 1: a review draft whose write is queued after a hold commits is refused as held", async () => {
+describe("review drafts and turns under a hold, a missing task and unbounded spend", () => {
+	it("a review draft whose write is queued after a hold commits is refused as held", async () => {
 		const host = await launch();
 		const binding = await adopt(host, allowance());
 		const noted = await host.request({ operation: "review-now", requestId: "note" });
@@ -617,7 +617,7 @@ describe("codex 1b re-review edges", () => {
 		expect((await readMissionPlan(host.harness, context))!.draft).toBeNull();
 	});
 
-	it("edge 2: a pointer to a task that no longer exists neither hides a running turn nor blocks rearming", async () => {
+	it("a pointer to a task that no longer exists neither hides a running turn nor blocks rearming", async () => {
 		let host = await launch();
 		await adopt(host, allowance());
 		await host.owner.endParkedReview(context);
@@ -647,7 +647,7 @@ describe("codex 1b re-review edges", () => {
 		expect((await host.request({ operation: "status" })).plan!.blocker).toMatchObject({ key: "1:cadence:w1" });
 	});
 
-	it("edge 3: an earlier unbounded request skips a capped review as budget before its key is consumed", async () => {
+	it("an earlier unbounded request skips a capped review as budget before its key is consumed", async () => {
 		let host = await launch();
 		await adopt(host, allowance({ maxEstimatedCost: 1 }));
 		await host.harness.commit(async (tx) => {
