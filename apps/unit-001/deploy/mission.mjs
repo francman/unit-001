@@ -19,8 +19,10 @@ import { missingPlanTerms, reviewAllowanceDenial } from "../app/dist/missions/pl
 import { parsePurposeCeiling, parsePurposeTerms, purposeDigest, validatePurposeTerms } from "../app/dist/missions/purpose-authority.js";
 import { parseMissionView } from "../app/dist/missions/wire.js";
 import { installationPaths, readInstallation, withManagementLock } from "./installation.mjs";
+import { assertSelectedIssuer } from "./issuer-release.mjs";
 import { readUpdateJournal } from "./update-activation.mjs";
 
+const executingPath = import.meta.filename;
 if (process.platform !== "linux" || process.geteuid() !== 0)
 	throw new Error("Managed mission authority requires the host administrator.");
 const { values, positionals } = parseArgs({
@@ -65,6 +67,7 @@ await withManagementLock(async () => {
 	const journal = readUpdateJournal(record.id);
 	if (journal && journal.phase !== "complete")
 		throw new Error("Recover the incomplete update before changing mission authority.");
+	assertSelectedIssuer(current, executingPath);
 	const previous = await readMissionAuthority(location);
 	if (planApproval) return approvePlan(previous);
 	const view = await owner({ operation: "status" });

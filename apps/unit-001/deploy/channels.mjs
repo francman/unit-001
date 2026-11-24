@@ -15,6 +15,7 @@ import {
 import { channelInteger, channelObject, channelText, parseChannelRequest } from "../app/dist/channels/contract.js";
 import { ChannelCredentials } from "../app/dist/channels/credentials.js";
 import { installationPaths, readInstallation, withManagementLock } from "./installation.mjs";
+import { assertSelectedIssuer } from "./issuer-release.mjs";
 import { readUpdateJournal } from "./update-activation.mjs";
 
 try {
@@ -85,6 +86,7 @@ try {
 			const journal = readUpdateJournal(record.id);
 			if (journal && journal.phase !== "complete")
 				throw new Error("Recover the incomplete update before changing channel authority.");
+			assertSelectedIssuer(current, import.meta.filename);
 			const authority = await readChannelAuthority(location);
 			if (!authority) throw new Error("Configure the protected creator before channel setup.");
 			const action = positionals[0];

@@ -123,6 +123,8 @@ A failed first installation retains a stopped record so retrying the verified in
 
 The management lock now lives under protected `/run/unit-001`. Older releases use a different lock path. Complete upgrades of all named installations before running their administrative commands concurrently; an old helper cannot coordinate with the new lock.
 
+Before activating away from a release without the issuer release check, let any running `sudo NAME channels` or `sudo NAME mission` command finish. Wait for activation to finish before issuing another. A command already dispatched from the older release can acquire the management lock after activation and still run the old issuer. This also applies when upgrading again after a rollback to a release without the check. To control the cutover when the six-hour automatic update timer is enabled, run `sudo NAME update disable` and apply the guarded release manually with `sudo NAME update apply`, then restore the timer with `sudo NAME update enable`.
+
 Before upgrading, stop the agent and back up its state directory while SQLite is closed. Verify and install the bundle under the same name, preserving identity. Keep a compatible previous release and state backup until verified. A running-service upgrade checks expected identity, version, and systemd PID within 30 seconds; failed readiness stops the candidate before restoring the previous release.
 
 Rollback requires code that understands the stored documents and task checkpoints. Otherwise restore a matching closed-state backup. Never copy live SQLite without a SQLite-aware backup method or run two owners against one session.

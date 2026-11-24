@@ -298,6 +298,8 @@ function managedPlan() {
 			parseArgs: (options) => parseArgs({ ...options, args: [...args, "--id", record.id] }),
 			readInstallation: () => record,
 			readUpdateJournal: () => null,
+			executingPath: "/fixture/deploy/mission.mjs",
+			assertSelectedIssuer: () => assert.equal(state.locked, true),
 			execFileSync: (command, [, account]) => {
 				assert.equal(command, "getent");
 				return account === record.account ? `${account}:x:${state.serviceUid}:` : `creator:x:${account}:`;
