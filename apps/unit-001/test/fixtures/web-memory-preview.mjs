@@ -22,8 +22,17 @@ const graph = (rows) => ({
 	total: rows.length,
 	limited: false,
 });
-const unmount = mountWorkspace(document.querySelector("#app"), {
-	watch: () => () => undefined,
+const view = {
+	name: "Bob", version: "0.0.0-test", installationId: "memory-preview", busy: false, model: null,
+	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { kind: "estimate", usd: 0 } },
+	entries: [], text: "", textTruncated: false, historyTruncated: false, tools: [],
+};
+const unmount =mountWorkspace(document.querySelector("#app"), {
+	// Reads, Search and Forget wait for the first view, which marks the connection as up (5321c51ee).
+	watch: (listener) => {
+		listener({ type: "view", view });
+		return () => undefined;
+	},
 	details: () => defer("details"),
 	memoryGraph: () => defer("graph"),
 	recall: (query) => defer("recall", query),

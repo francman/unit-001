@@ -893,7 +893,9 @@ test(
 				await evaluate(`document.querySelector('[data-key="nav-status"]').click()`);
 				const mission = await missionPage();
 				assert.equal(mission.title, "Mission");
-				const order = ["Purpose", "Current work", "Evidence", "History", "From a terminal"];
+				// The plan block comes first and carries its own History (the page shows the legacy History only without a plan view),
+				// then the agreed purpose, the run, its evidence and the terminal commands.
+				const order = ["History", "Purpose", "Current work", "Evidence", "From a terminal"];
 				const seen = mission.headings.filter((name) => order.includes(name));
 				assert.deepEqual(seen, order.filter((name) => seen.includes(name)), `${width}: Mission headings are in order`);
 				assert.equal(seen.includes("Purpose") && seen.includes("History") && seen.includes("From a terminal"), true, `${width}: Purpose, History and terminal sections exist`);

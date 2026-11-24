@@ -25,7 +25,9 @@ function exercise(width) {
 		input.dispatchEvent(new Event("input", { bubbles: true }));
 	};
 	const mount = (root) => { document.body.replaceChildren(root); return root; };
-	const fit = (root) => check(innerWidth === width && root.scrollWidth <= width && document.documentElement.scrollWidth === width, `draft fits ${width}px`);
+	// clientWidth excludes a classic vertical scrollbar, so equal scroll and client widths mean no horizontal overflow.
+	const fit = (root) => check(innerWidth === width && root.scrollWidth <= document.documentElement.clientWidth &&
+		document.documentElement.scrollWidth === document.documentElement.clientWidth, `draft fits ${width}px`);
 	const terms = {
 		overall: { purpose: '<img src=x onerror="window.ran=true">\r\n\u202E a\u00A0b \\u000A', scope: "This workspace only", askFirst: ["publish\nexternally", ""], reviewEveryMs: 604800001,
 			reviewAllowance: { maxRequests: 7, maxRequestsPerReview: 3, maxEstimatedCost: 0.0125 } },

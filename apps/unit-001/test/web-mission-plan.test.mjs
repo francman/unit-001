@@ -101,7 +101,8 @@ function exercise(width) {
 	for (const details of root.querySelectorAll("details")) details.open = true;
 	check(innerWidth === width && getComputedStyle(overall.querySelector("dl")).gridTemplateColumns.split(" ").length === (width === 320 ? 1 : 2),
 		`facts use the expected column count at ${width}px`);
-	check(document.documentElement.scrollWidth === width, `expanded exact terms and commands fit ${width}px`);
+	// clientWidth excludes a classic vertical scrollbar, so equal scroll and client widths mean no horizontal overflow.
+	check(document.documentElement.scrollWidth === document.documentElement.clientWidth, `expanded exact terms and commands fit ${width}px`);
 
 	const called = [];
 	const copy = async (line) => { called.push(line); return false; };
@@ -155,7 +156,7 @@ function exercise(width) {
 	check(fact(rows[1].parentElement, "Draft revision").textContent === "8" && fact(rows[1].parentElement, "Review ID").textContent === '"done-note"',
 		"the done turn identifies its exact review and generated draft");
 	for (const details of root.querySelectorAll("details")) details.open = true;
-	check(document.documentElement.scrollWidth === width, `expanded turn history fits ${width}px`);
+	check(document.documentElement.scrollWidth === document.documentElement.clientWidth, `expanded turn history fits ${width}px`);
 	root = mount({ plan: { ...modelPlan, allowance: null, turns: [...modelPlan.turns, blocker] } });
 	check(actionable(root).includes("unknown_request_outcome") && !section(root, "Reviews").textContent.includes("unknown_request_outcome"),
 		"the blocker is shown once and survives removal of the active allowance");
