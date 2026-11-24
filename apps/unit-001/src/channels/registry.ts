@@ -2,9 +2,30 @@
 import { createHash } from "node:crypto";
 import { defineDoc } from "@earendil-works/pi-durable";
 import type { MissionAuthority } from "../missions/contract.ts";
-import type { ChannelAdapter, ChannelRequest, ChannelSetupInput, ChannelState } from "./contract.ts";
+import type {
+	ChannelAdapter,
+	ChannelOutcome,
+	ChannelRecord,
+	ChannelRequest,
+	ChannelSetupInput,
+	ChannelState,
+} from "./contract.ts";
 
-export const ChannelDoc = defineDoc<ChannelState>({
+// Retired unknown attempts stay on their bounded proposal receipts, outside the live channel projection.
+type ChannelRegistryState = Omit<ChannelState, "receipts"> & {
+	receipts: Record<
+		string,
+		ChannelState["receipts"][string] & {
+			retiredSetup?: {
+				request: ChannelRequest;
+				attempt: NonNullable<ChannelRecord["attempt"]>;
+				outcome: Extract<ChannelOutcome, { kind: "unknown" }>;
+			};
+		}
+	>;
+};
+
+export const ChannelDoc = defineDoc<ChannelRegistryState>({
 	kind: "unit.channels",
 	version: 1,
 	scope: "session",
@@ -14,7 +35,7 @@ export const ChannelDoc = defineDoc<ChannelState>({
 
 /** Records an exact setup proposal without granting permission or performing external work. */
 export function requestChannelSetup(
-	state: ChannelState,
+	state: ChannelRegistryState,
 	input: ChannelSetupInput,
 	authority: MissionAuthority,
 	adapters: readonly ChannelAdapter[],
@@ -37,7 +58,21 @@ export function requestChannelSetup(
 	if ((previous?.request.revision ?? 0) !== input.expectedRevision) throw new Error("Stale channel revision.");
 	if (Object.keys(state.receipts).length >= 1024 || (!previous && Object.keys(state.channels).length >= 16))
 		throw new Error("Channel registry capacity reached; administrator review required.");
-	if (previous?.attempt) throw new Error("Reconcile the active channel setup before changing its request.");
+	if (previous?.attempt) {
+		const old = previous.request;
+		const supersededCreator =
+			old.installationId === authority.installationId &&
+			old.session === authority.session &&
+			old.authorityRevision < authority.revision;
+		if (old.expiresAt > now && !supersededCreator)
+			throw new Error("Reconcile the active channel setup before changing its request.");
+		// Legacy grant-denied setup could overwrite the displayed outcome, but its attempt still means unknown.
+		state.receipts[old.requestId].retiredSetup = {
+			request: old,
+			attempt: previous.attempt,
+			outcome: { kind: "unknown", attemptId: previous.attempt.id },
+		};
+	}
 	const request: ChannelRequest = {
 		requestId: input.requestId,
 		channelId: input.channelId,

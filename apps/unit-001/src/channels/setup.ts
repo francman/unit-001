@@ -20,6 +20,10 @@ export type ChannelAuthorityReader = () => Promise<{
 	channels: ChannelAuthority | null;
 } | null>;
 
+type SetupAdmission =
+	| { kind: "observed"; outcome: ChannelOutcome }
+	| { kind: "admitted"; attemptId: string; grantId: string; adapter: ChannelSetupAdapter };
+
 /** Runs one journaled attempt; a restart preserves unknown outcomes until an explicit reconciliation. */
 export async function runChannelSetup(
 	channelId: string,
@@ -34,33 +38,35 @@ export async function runChannelSetup(
 	const request = record.request;
 	const authority = await readAuthority();
 	if (authority?.channels?.disabled.includes(channelId)) return { kind: "disabled" };
-	const grant = authority && matchingChannelGrant(request, authority, now());
-	if (!grant)
-		return store.commit((state) => {
-			const current = state.channels[channelId];
-			if (current.request.digest !== request.digest) throw new Error("Channel request changed.");
-			current.outcome = { kind: "awaiting_creator", step: "grant" };
-			state.revision++;
-			return current.outcome;
-		});
+	// Missing permission is a current observation, not a new result of the journaled attempt.
+	if (!authority || !matchingChannelGrant(request, authority, now())) return { kind: "awaiting_creator", step: "grant" };
 	if (record.outcome.kind === "disabled") return record.outcome;
 	if (record.outcome.kind === "ready" && !record.attempt) return record.outcome;
 	if (record.attempt && !options.reconcile) return { kind: "unknown", attemptId: record.attempt.id };
-	const adapter = adapters.find((value) => value.id === request.adapter);
-	if (!adapter) throw new Error("Channel setup adapter is unavailable.");
-	const attemptId = randomUUID();
-	await store.commit((state) => {
+	const admission = await store.commit((state): SetupAdmission => {
 		const current = state.channels[channelId];
-		if (current.request.digest !== request.digest || current.attempt?.id !== record.attempt?.id)
-			throw new Error("Channel setup changed.");
-		current.attempt = { id: attemptId, grantId: grant.id, startedAt: now() };
+		if (current?.request.digest !== request.digest) throw new Error("Channel setup changed.");
+		const startedAt = now();
+		const grant = matchingChannelGrant(current.request, authority, startedAt);
+		if (!grant) return { kind: "observed", outcome: { kind: "awaiting_creator", step: "grant" } };
+		// A competing caller can finish and clear its attempt after our snapshot.
+		if (current.outcome.kind === "disabled" || (current.outcome.kind === "ready" && !current.attempt))
+			return { kind: "observed", outcome: { ...current.outcome } };
+		if (current.attempt?.id !== record.attempt?.id) throw new Error("Channel setup changed.");
+		const adapter = adapters.find((value) => value.id === request.adapter);
+		if (!adapter) throw new Error("Channel setup adapter is unavailable.");
+		const attemptId = randomUUID();
+		current.attempt = { id: attemptId, grantId: grant.id, startedAt };
 		current.outcome = { kind: "unknown", attemptId };
 		state.revision++;
+		return { kind: "admitted", attemptId, grantId: grant.id, adapter };
 	});
+	if (admission.kind === "observed") return admission.outcome;
+	const { adapter, attemptId, grantId } = admission;
 	const authorized = async () => {
 		options.signal?.throwIfAborted();
 		const fresh = await readAuthority();
-		if (!fresh || matchingChannelGrant(request, fresh, now())?.id !== grant.id)
+		if (!fresh || matchingChannelGrant(request, fresh, now())?.id !== grantId)
 			throw new Error("Channel permission changed.");
 		const current = (await store.read())?.channels[channelId];
 		if (current?.request.digest !== request.digest || current.attempt?.id !== attemptId)
@@ -77,7 +83,8 @@ export async function runChannelSetup(
 	}
 	return store.commit((state) => {
 		const current = state.channels[channelId];
-		if (current.attempt?.id !== attemptId) throw new Error("Channel setup superseded.");
+		if (current?.request.digest !== request.digest || current.attempt?.id !== attemptId)
+			throw new Error("Channel setup superseded.");
 		current.outcome = outcome;
 		if (outcome.kind !== "unknown") current.attempt = null;
 		if (outcome.kind === "ready") current.lastHealth = { observedAt: outcome.observedAt, healthy: true };
