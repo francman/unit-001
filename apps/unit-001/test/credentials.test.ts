@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
-import fs, { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { syncBuiltinESMExports } from "node:module";
+import { fork, spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +11,6 @@ const fixture = fileURLToPath(new URL("./fixtures/increment.ts", import.meta.url
 let directory: string;
 let file: string;
 let store: FileCredentialStore;
-const platform = process.platform;
 
 beforeEach(async () => {
 	directory = await mkdtemp(join(tmpdir(), "unit-001-credentials-"));
@@ -20,8 +19,6 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	vi.restoreAllMocks();
-	syncBuiltinESMExports();
-	Object.defineProperty(process, "platform", { value: platform });
 	await rm(directory, { recursive: true, force: true });
 });
 
@@ -64,16 +61,18 @@ describe("FileCredentialStore", () => {
 		await expect(stat(file)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
-	it.skipIf(process.platform === "win32")("creates the file readable only by its owner", async () => {
+	it.skipIf(process.platform === "win32")("keeps the credentials file and lock path private", async () => {
 		await store.modify("anthropic", async () => oauth("a"));
 		expect((await stat(file)).mode & 0o777).toBe(0o600);
 		expect((await stat(join(directory, "nested"))).mode & 0o777).toBe(0o700);
+		expect((await stat(`${file}.lock.d`)).mode & 0o777).toBe(0o700);
 	});
 
-	it("leaves no temporary or lock files behind", async () => {
+	it("keeps the persistent lock but leaves no temporary files after a write", async () => {
 		await store.modify("anthropic", async () => oauth("a"));
 		await store.delete("anthropic");
-		expect(await readdir(join(directory, "nested"))).toEqual(["auth.json"]);
+		expect((await readdir(join(directory, "nested"))).sort()).toEqual(["auth.json", "auth.json.lock.d"]);
+		expect(await readdir(`${file}.lock.d`)).toEqual(["owner.sqlite"]);
 	});
 
 	it("refuses a corrupt file and never overwrites it", async () => {
@@ -120,10 +119,11 @@ describe("FileCredentialStore", () => {
 		expect(await store.read("anthropic")).toBeUndefined();
 	});
 
-	it("serializes concurrent writes in one process", async () => {
+	it("serializes concurrent writes through different store instances in one process", async () => {
+		const secondStore = new FileCredentialStore(file);
 		await Promise.all(
-			Array.from({ length: 20 }, () =>
-				store.modify("counter", async (current) =>
+			Array.from({ length: 20 }, (_, index) =>
+				(index % 2 === 0 ? store : secondStore).modify("counter", async (current) =>
 					key(String(Number(current?.type === "api_key" ? current.key : 0) + 1)),
 				),
 			),
@@ -141,15 +141,48 @@ describe("FileCredentialStore", () => {
 		expect(await store.read("anthropic")).toEqual(oauth("a"));
 	});
 
-	it("takes over a lock left by a process that died", async () => {
+	it("refuses an old legacy marker until the operator removes it", async () => {
 		await store.modify("anthropic", async () => oauth("a"));
-		const lock = `${file}.lock`;
-		await writeFile(lock, "");
+		const original = await readFile(file, "utf8");
+		const legacy = `${file}.lock`;
+		await writeFile(legacy, "");
 		const old = new Date(Date.now() - 10 * 60_000);
-		await utimes(lock, old, old);
-		await store.modify("openai", async () => key("k"));
-		expect(await store.read("openai")).toEqual(key("k"));
+		await utimes(legacy, old, old);
+		const mutate = vi.fn(async () => key("k"));
+		await expect(store.modify("openai", mutate)).rejects.toThrow(/Stop all older unit-001 processes/);
+		expect(mutate).not.toHaveBeenCalled();
+		expect(await readFile(legacy, "utf8")).toBe("");
+		expect(await readFile(file, "utf8")).toBe(original);
+		await rm(legacy);
+		await expect(store.modify("openai", mutate)).resolves.toEqual(key("k"));
 	});
+
+	it("bounds contention, honors cancellation, and recovers when the owning process dies", async () => {
+		await store.modify("counter", async () => key("1"));
+		const original = await readFile(file, "utf8");
+		const child = fork(fixture, [file, "hold"], { execArgv: [], stdio: ["ignore", "ignore", "inherit", "ipc"] });
+		const exited = once(child, "exit");
+		try {
+			const [message] = await Promise.race([once(child, "message"), exited]);
+			expect(message).toBe("LOCKED");
+
+			const mutate = vi.fn(async () => key("2"));
+			await expect(store.modify("counter", mutate, { signal: AbortSignal.timeout(100) })).rejects.toThrow(
+				/aborted|timeout/i,
+			);
+			await expect(store.modify("counter", mutate)).rejects.toThrow(/Timed out waiting for the credentials lock/);
+			expect(mutate).not.toHaveBeenCalled();
+			expect(await readFile(file, "utf8")).toBe(original);
+
+			expect(child.kill("SIGKILL")).toBe(true);
+			await exited;
+			expect(await readFile(file, "utf8")).toBe(original);
+			await expect(store.modify("counter", mutate)).resolves.toEqual(key("2"));
+		} finally {
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			await exited;
+		}
+	}, 45_000);
 
 	it("serializes writes across processes", async () => {
 		const processes = 4;
@@ -175,90 +208,4 @@ describe("FileCredentialStore", () => {
 		// A lost update would leave the total below 60.
 		expect(await store.read("counter")).toEqual(key(String(processes * each)));
 	}, 60_000);
-
-	// Regression observed in PR #38's Windows cross-process credentials gate.
-	it.each(["EPERM", "EBUSY"])(
-		"retries transient Windows lock creation %s without entering early",
-		async (errorCode) => {
-			Object.defineProperty(process, "platform", { value: "win32" });
-			const original = fs.open;
-			let attempts = 0;
-			let entered = false;
-			vi.spyOn(fs, "open").mockImplementation(async (...args) => {
-				if (args[0] === `${file}.lock` && ++attempts <= 2) {
-					expect(entered).toBe(false);
-					throw Object.assign(new Error("lock temporarily unavailable"), { code: errorCode });
-				}
-				return original(...args);
-			});
-			syncBuiltinESMExports();
-			await store.modify("counter", async () => {
-				entered = true;
-				return key("1");
-			});
-			expect(attempts).toBe(3);
-			expect(await store.read("counter")).toEqual(key("1"));
-		},
-	);
-
-	it("bounds Windows permission retries and preserves the first denial", async () => {
-		Object.defineProperty(process, "platform", { value: "win32" });
-		const denied = Object.assign(new Error("permanent permission denial"), { code: "EPERM" });
-		const opened = vi
-			.spyOn(fs, "open")
-			.mockRejectedValueOnce(denied)
-			.mockRejectedValue(Object.assign(new Error("later denial"), { code: "EPERM" }));
-		const unlink = vi.spyOn(fs, "unlink");
-		syncBuiltinESMExports();
-		const mutate = vi.fn(async () => key("1"));
-		await expect(store.modify("counter", mutate)).rejects.toBe(denied);
-		expect(opened).toHaveBeenCalledTimes(6);
-		expect(mutate).not.toHaveBeenCalled();
-		expect(unlink).not.toHaveBeenCalled();
-	});
-
-	it("retains the lock deadline during Windows create retries", async () => {
-		Object.defineProperty(process, "platform", { value: "win32" });
-		vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(30_000);
-		const denied = Object.assign(new Error("permission denied at deadline"), { code: "EPERM" });
-		const opened = vi.spyOn(fs, "open").mockRejectedValue(denied);
-		syncBuiltinESMExports();
-		await expect(store.modify("counter", async () => key("1"))).rejects.toBe(denied);
-		expect(opened).toHaveBeenCalledTimes(1);
-	});
-
-	it("does not retry unrelated Windows access errors", async () => {
-		Object.defineProperty(process, "platform", { value: "win32" });
-		const denied = Object.assign(new Error("access denied"), { code: "EACCES" });
-		const opened = vi.spyOn(fs, "open").mockRejectedValue(denied);
-		syncBuiltinESMExports();
-		await expect(store.modify("counter", async () => key("1"))).rejects.toBe(denied);
-		expect(opened).toHaveBeenCalledTimes(1);
-	});
-
-	it("does not retry POSIX permission denial", async () => {
-		Object.defineProperty(process, "platform", { value: "linux" });
-		const denied = Object.assign(new Error("permission denied"), { code: "EPERM" });
-		const opened = vi.spyOn(fs, "open").mockRejectedValue(denied);
-		syncBuiltinESMExports();
-		await expect(store.modify("counter", async () => key("1"))).rejects.toBe(denied);
-		expect(opened).toHaveBeenCalledTimes(1);
-	});
-
-	it("aborts a Windows lock retry without admitting the mutation", async () => {
-		Object.defineProperty(process, "platform", { value: "win32" });
-		const controller = new AbortController();
-		const aborted = new Error("cancel lock wait");
-		const opened = vi.spyOn(fs, "open").mockImplementation(async () => {
-			controller.abort(aborted);
-			throw Object.assign(new Error("pending deletion"), { code: "EPERM" });
-		});
-		syncBuiltinESMExports();
-		const mutate = vi.fn(async () => key("1"));
-		await expect(store.modify("counter", mutate, { signal: controller.signal })).rejects.toThrow(
-			/cancel lock wait|aborted/,
-		);
-		expect(opened).toHaveBeenCalledTimes(1);
-		expect(mutate).not.toHaveBeenCalled();
-	});
 });

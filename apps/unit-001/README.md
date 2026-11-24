@@ -55,6 +55,10 @@ In release `0.0.4` and later, `sudo agent setup` guides provider selection, subs
 
 Sign-ins are stored in `auth.json` in the data directory, readable only by the agent account (mode 0600 on macOS and Linux; on Windows it inherits your profile directory's access rules). A stored sign-in wins over an API key for the same provider.
 
+The credential-lock change requires old and new versions not to write the same `auth.json` concurrently. On a managed installation the automatic updater stops the owner before switching versions, but it does not wait for `login` or `logout`. For a controlled cutover, run `sudo agent update disable`, finish any running `login` or `logout` commands, then run `sudo agent update apply`. Do not start another credential command during the cutover. Restore previously enabled automatic updates with `sudo agent update enable` after the switch. For a source upgrade, stop the owner and all credential commands sharing the data directory before starting the new version.
+
+If the error starts with `Legacy credentials lock at` (it may appear as the cause of a credential refresh error), the managed marker is `/var/lib/unit-001/agents/<id>/auth.json.lock`; for source use it is `auth.json.lock` in the configured data directory. On a managed host, inspect `sudo pgrep -u <agent-account> -af .` and verify no older owner or credential command for that installation is still running. Only then remove that one legacy marker. Do not remove `auth.json.lock.d`, which contains the current lock.
+
 Whether a provider lets third-party tools use a subscription is that provider's policy and has changed before; check the current terms of your plan before relying on it.
 
 ## Configuration

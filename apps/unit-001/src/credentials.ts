@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import { lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { AuthOperationOptions, Credential, CredentialInfo, CredentialStore } from "@earendil-works/pi-ai";
 
@@ -9,10 +10,7 @@ type Entries = Record<string, Credential>;
 const LOCK_POLL_MS = 25;
 /** Longer than a token refresh (15 s), which runs while the lock is held. */
 const LOCK_WAIT_MS = 30_000;
-/** A lock this old belongs to a process that died. */
-const LOCK_STALE_MS = 60_000;
 const RENAME_RETRIES = 5;
-const LOCK_CREATE_RETRIES = 5;
 
 function code(error: unknown): string | undefined {
 	return error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
@@ -35,11 +33,10 @@ function isEntries(value: unknown): value is Entries {
 export class FileCredentialStore implements CredentialStore {
 	readonly #path: string;
 	readonly #lockPath: string;
-	#queue: Promise<unknown> = Promise.resolve();
 
 	constructor(path: string) {
 		this.#path = path;
-		this.#lockPath = `${path}.lock`;
+		this.#lockPath = join(`${path}.lock.d`, "owner.sqlite");
 	}
 
 	async read(providerId: string, options?: AuthOperationOptions): Promise<Credential | undefined> {
@@ -124,60 +121,49 @@ export class FileCredentialStore implements CredentialStore {
 		}
 	}
 
-	/** One writer at a time: queued in this process, then locked against other processes. */
-	#exclusive<T>(task: () => Promise<T>, options?: AuthOperationOptions): Promise<T> {
-		const run = async (): Promise<T> => {
-			options?.signal?.throwIfAborted();
-			const release = await this.#lock(options?.signal);
-			try {
-				return await task();
-			} finally {
-				await release();
-			}
-		};
-		const result = this.#queue.then(run, run);
-		this.#queue = result.catch(() => {});
-		return result;
-	}
-
-	async #lock(signal: AbortSignal | undefined): Promise<() => Promise<void>> {
-		await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
-		const deadline = Date.now() + LOCK_WAIT_MS;
-		let transientAttempts = 0;
-		let transientFailure: unknown;
-		for (;;) {
-			signal?.throwIfAborted();
-			try {
-				const handle = await open(this.#lockPath, "wx", 0o600);
-				await handle.close();
-				return () => unlink(this.#lockPath).catch(() => {});
-			} catch (error) {
-				if (code(error) === "EEXIST") {
-					transientAttempts = 0;
-					transientFailure = undefined;
-				} else if (process.platform === "win32" && ["EPERM", "EBUSY"].includes(code(error) ?? "")) {
-					// Windows may deny exclusive creation while a previous lock is pending deletion.
-					// Never infer ownership or remove a lock from this error; permanent denial stays visible.
-					transientFailure ??= error;
-					if (transientAttempts >= LOCK_CREATE_RETRIES || Date.now() >= deadline) throw transientFailure;
-					transientAttempts++;
-					await sleep(LOCK_POLL_MS, undefined, { signal });
-					continue;
-				} else {
-					throw error;
+	/** Hold a process-owned lock across the entire read-modify-write; never unlink its inode. */
+	async #exclusive<T>(task: () => Promise<T>, options?: AuthOperationOptions): Promise<T> {
+		const signal = options?.signal;
+		signal?.throwIfAborted();
+		const deadline = performance.now() + LOCK_WAIT_MS;
+		// The private directory lets SQLite create and open the inode itself: closing a separate
+		// file descriptor could release this process's existing lock on POSIX.
+		await mkdir(dirname(this.#lockPath), { recursive: true, mode: 0o700 });
+		signal?.throwIfAborted();
+		const database = new DatabaseSync(this.#lockPath, { timeout: 0 });
+		try {
+			for (;;) {
+				signal?.throwIfAborted();
+				if (performance.now() >= deadline) {
+					throw new Error(`Timed out waiting for the credentials lock at ${this.#lockPath}.`);
+				}
+				try {
+					// No data is written to SQLite; closing the connection or process releases ownership.
+					database.exec("BEGIN EXCLUSIVE");
+					break;
+				} catch (error) {
+					if (!(error instanceof Error && "errcode" in error && typeof error.errcode === "number")) throw error;
+					const primary = error.errcode & 0xff;
+					if (primary !== 5 && primary !== 6) throw error; // SQLITE_BUSY or SQLITE_LOCKED
+					await sleep(Math.min(LOCK_POLL_MS, deadline - performance.now()), undefined, { signal });
 				}
 			}
-			const age = await stat(this.#lockPath).then(
-				(info) => Date.now() - info.mtimeMs,
-				() => 0,
-			);
-			if (age > LOCK_STALE_MS) {
-				await unlink(this.#lockPath).catch(() => {});
-				continue;
+
+			// Empty legacy markers carry no ownership information. Never reclaim them; upgrading
+			// requires stopping old writers even when no marker is present.
+			const legacy = `${this.#path}.lock`;
+			const marker = await lstat(legacy).catch((error: unknown) => {
+				if (code(error) !== "ENOENT") throw error;
+			});
+			if (marker !== undefined) {
+				throw new Error(
+					`Legacy credentials lock at ${legacy}. Stop all older unit-001 processes using this store before removing it.`,
+				);
 			}
-			if (Date.now() > deadline) throw new Error(`Timed out waiting for the credentials lock at ${this.#lockPath}.`);
 			signal?.throwIfAborted();
-			await sleep(LOCK_POLL_MS, undefined, { signal });
+			return await task();
+		} finally {
+			database.close();
 		}
 	}
 }
