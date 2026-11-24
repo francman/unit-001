@@ -1426,8 +1426,8 @@ function journalMayNeedRelease(record, paths, version, root) {
 	}
 	if (record.releaseVersion !== previousVersion && record.releaseVersion !== journal.candidateVersion) return true;
 	if (previousVersion === version || journal.candidateVersion === version) return true;
-	// A holding attempt or a restored live deferral can make the displaced rollback receipt current again.
-	if (journal.phase !== "holding" && !(journal.phase === "restored" && journal.liveDeferred)) return false;
+	// Any precommit attempt can make the displaced rollback receipt current again.
+	if (journal.phase === "committed") return false;
 	if (!protectedWebPath(paths.priorJournal, root)) return false;
 	// Match completeDeferral's bound: a journal plus room for its operation ID and envelope.
 	if (trustedFile(paths.priorJournal, root).size > 65536 + 1024) return true;

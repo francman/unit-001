@@ -1078,6 +1078,11 @@ async function releaseGate(record, journal, context) {
 	const current = readInstallation(record.id, context.root);
 	if (current.desiredState !== "running") return;
 	const status = await waitForStatus(current, context);
+	if (journal.phase === "restored") {
+		assertRestoredOwner(current, journal, status);
+		// The previous owner may have reopened before the displaced journal was put back.
+		if (status.maintenance.state === "open" && status.inhibited === false) return;
+	}
 	if (status.maintenance?.state === "open" && !status.inhibited && journal.phase === "committed") return;
 	if (status.maintenance?.state === "open")
 		await context.control(current, ["maintenance-enter", "--operation-id", journal.operationId, "--timeout-ms", "0"]);
@@ -1259,7 +1264,7 @@ async function activateVerifiedUpdate(record, candidate, features, previousJourn
 			version: candidate.version,
 		};
 	if (previousCore) selectLink(paths.recoveryCore, previousCore);
-	// Kept for a deferral, which must leave the committed update's journal current for rollback and migration.
+	// A precommit failure must leave the last committed journal available for rollback and unit migration.
 	atomicJson(paths.priorJournal, { operationId, journal: previousJournal });
 	saveJournal(record, context, journal, "holding");
 	try {
@@ -1449,10 +1454,9 @@ function appliedRestriction(authority, purpose, allowParkedReview) {
 }
 
 /**
- * Ends an attempt that changed nothing: it deferred under the hold, or was interrupted at "holding", before any backup
- * or publication. The journal it displaced becomes current again:
- * a completed attempt journal would name the unchanged release as the update's result, and rollback would refuse every
- * retry. A journal from a core without the prior record completes as before.
+ * Ends a precommit attempt once the previous owner can admit work again.
+ * The displaced journal describes the release that is still current and makes its rollback available.
+ * A journal from a core without the prior record completes as before.
  */
 function completeDeferral(record, journal, context) {
 	const paths = updatePaths(record.id, context.root);
@@ -1484,9 +1488,7 @@ async function prepareRecovery(record, journal, context) {
 		if (!["inactive", "failed"].includes(state.trim()))
 			throw new Error("Boot recovery requires a closed application owner.");
 	} else await context.run("systemctl", ["stop", paths.unit]);
-	// "holding" precedes the backup and every publication, so the attempt changed nothing even when power failed or the
-	// owner was stopped: like a deferral, it puts back the journal it displaced. Finalizing it as an update instead would
-	// name the unchanged release as the result, and rollback would refuse every retry.
+	// "holding" precedes the backup and every publication, so there is no snapshot to restore.
 	if (journal.phase === "holding") journal.liveDeferred = true;
 	else {
 		const backup = join(updatePaths(record.id, context.root).configDirectory, "backup");
@@ -1513,11 +1515,7 @@ async function prepareRecovery(record, journal, context) {
 		}
 	}
 	const current = readInstallation(record.id, context.root);
-	publishApplication(
-		{ ...journal.previousRecord, desiredState: current.desiredState },
-		journal.previousRecord.releaseVersion,
-		context,
-	);
+	publishApplication(current, journal.previousRecord.releaseVersion, context);
 	const core = updatePaths(record.id, context.root);
 	if (journal.previousCore) selectLink(core.currentCore, journal.previousCore);
 	// A retry after "restored" skips this preparation, so systemd must drop the candidate's cached unit first.
@@ -1529,6 +1527,8 @@ async function prepareRecovery(record, journal, context) {
 
 async function finalizeRecovery(record, journal, context) {
 	if (journal.phase === "complete") return { status: "recovered" };
+	if (journal.phase !== "committed" && journal.phase !== "restored")
+		throw new Error("Prepare update recovery before finalizing it.");
 	if (readInstallation(record.id, context.root).desiredState !== "running")
 		return { status: "deferred", reason: "Operator intent is stopped." };
 	if (journal.phase === "committed") {
@@ -1539,14 +1539,27 @@ async function finalizeRecovery(record, journal, context) {
 	if (journal.liveDeferred) {
 		const current = readInstallation(record.id, context.root);
 		const status = await waitForStatus(current, context);
+		assertRestoredOwner(current, journal, status);
 		if (status.inhibited) await releaseGate(record, journal, context);
 		else if (status.maintenance?.state === "held")
 			await context.control(current, ["maintenance-release", "--operation-id", journal.operationId]);
 	} else await releaseGate(record, journal, context);
-	if (journal.liveDeferred) completeDeferral(record, journal, context);
-	else saveJournal(record, context, journal, "complete");
+	if (journal.phase === "committed") saveJournal(record, context, journal, "complete");
+	else completeDeferral(record, journal, context);
 	const warnings = pruneCores(record, context);
 	return { status: "recovered", ...(warnings.length ? { warnings } : {}) };
+}
+
+function assertRestoredOwner(record, journal, status) {
+	if (
+		record.releaseVersion !== journal.previousRecord.releaseVersion ||
+		status.installationId !== record.id ||
+		status.version !== record.releaseVersion ||
+		status.maintenance?.protocol !== 1 ||
+		!["open", "held"].includes(status.maintenance.state) ||
+		typeof status.inhibited !== "boolean"
+	)
+		throw new Error("Cannot reconcile an unexpected restored owner.");
 }
 
 /** Repairs files before boot startup, then verifies/releases after startup without dependency cycles. */
@@ -1554,10 +1567,12 @@ export async function recoverUpdate(record, context, options = { phase: "all" })
 	const phase = options.phase ?? "all";
 	if (options.start === true && phase !== "all")
 		throw new Error("Explicit recovery start cannot run as a boot phase.");
-	const journal = readUpdateJournal(record.id, context.root);
-	if (!journal || journal.phase === "complete") return { status: "idle" };
 	try {
 		return await withManagementLock(async () => {
+			record = readInstallation(record.id, context.root);
+			const journal = readUpdateJournal(record.id, context.root);
+			if (!journal || journal.phase === "complete") return { status: "idle" };
+			if (record.desiredState === "uninstalled") throw new Error("This agent is uninstalled.");
 			if (phase !== "finalize")
 				await prepareRecovery(record, journal, { ...context, bootPrepare: phase === "prepare" });
 			if (options.start === true)

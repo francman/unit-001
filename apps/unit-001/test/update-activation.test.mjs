@@ -1,6 +1,6 @@
 // #18: Update fault recovery keeps a two-way door until commit and never restores state after release.
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
@@ -18,13 +18,21 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { installationPaths, readInstallation, writeAgentCommand, writeInstallation } from "../deploy/installation.mjs";
+import {
+	installationPaths,
+	readInstallation,
+	removeUnusedRelease,
+	withManagementLock,
+	writeAgentCommand,
+	writeInstallation,
+} from "../deploy/installation.mjs";
 import { runUpdate } from "../deploy/update.mjs";
 import {
 	activateUpdate,
@@ -239,6 +247,8 @@ for (const phase of ["service-unit", "candidate"])
 		assert.equal(readInstallation(id, fixture.root).releaseVersion, phase === "candidate" ? "0.0.6" : "0.0.7");
 		delete fixture.context.fault;
 		fixture.context.run = run;
+		// Older cores did not save a prior journal.
+		rmSync(updatePaths(id, fixture.root).priorJournal);
 		await recoverUpdate(fixture.record, fixture.context);
 		assert.equal(readFileSync(fixture.paths.unitFile, "utf8"), previous);
 		assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.7");
@@ -346,9 +356,8 @@ for (const phase of ["holding", "backed-up", "candidate"])
 		assert.equal(readFileSync(join(fixture.paths.state, "marker"), "utf8"), "old state");
 		await fixture.context.run("systemctl", ["start", fixture.paths.unit]);
 		await recoverUpdate(fixture.record, fixture.context, { phase: "finalize" });
-		// "holding" changed nothing, so it puts back the journal it displaced; this first attempt displaced none.
-		if (phase === "holding") assert.equal(readUpdateJournal(id, fixture.root), null);
-		else assert.equal(readUpdateJournal(id, fixture.root).phase, "complete");
+		// The first attempt had no completed journal to restore.
+		assert.equal(readUpdateJournal(id, fixture.root), null);
 	});
 
 // Codex wiring re-check: boot preparation saw "holding", skipped the live-owner branch that restores the prior journal,
@@ -391,6 +400,107 @@ test("#18 committed recovery preserves new state and never restores the closed b
 	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.3");
 });
 
+test("#18 a restored owner already open after lost finalization keeps new work without another hold", async () => {
+	const fixture = setup();
+	const { context, paths, root } = fixture;
+	assert.equal((await activateUpdate(fixture.record, fixture.candidate, context)).status, "updated");
+	const journal = updatePaths(id, root).journal;
+	const previousJournal = readFileSync(journal);
+	const selected = readInstallation(id, root);
+	const marker = join(paths.state, "marker");
+	const candidate = { releasePath: release(root, "0.0.4"), version: "0.0.4", compatibility };
+	const control = context.control;
+	context.fault = (phase) => {
+		if (phase === "candidate") throw new Error("failed candidate");
+	};
+	context.control = async (current, args) => {
+		const result = await control(current, args);
+		if (args[0] === "maintenance-release") {
+			writeFileSync(marker, "work admitted after restoration");
+			throw new Error("lost finalization after release");
+		}
+		return result;
+	};
+	await assert.rejects(activateUpdate(selected, candidate, context), /lost finalization after release/);
+	delete context.fault;
+	context.control = async (current, args) => {
+		const result = await control(current, args);
+		return args[0] === "service-status" ? { ...result, version: "0.0.4" } : result;
+	};
+	assert.equal(readUpdateJournal(id, root).phase, "restored");
+	assert.deepEqual(await control(selected, ["service-status"]), {
+		type: "status", installationId: id, version: "0.0.3", pid: 1,
+		inhibited: false, maintenance: { protocol: 1, state: "open", operationId: null },
+	});
+	fixture.calls.length = 0;
+	await assert.rejects(recoverUpdate(selected, context, { phase: "finalize" }), /unexpected restored owner/);
+	assert.deepEqual(fixture.calls, [["control", "service-status"]]);
+	assert.equal(readUpdateJournal(id, root).phase, "restored");
+
+	context.control = control;
+	fixture.calls.length = 0;
+	assert.equal((await recoverUpdate(selected, context, { phase: "finalize" })).status, "recovered");
+	assert.deepEqual(fixture.calls, [["control", "service-status"]]);
+	assert.equal(readFileSync(marker, "utf8"), "work admitted after restoration");
+	assert.deepEqual(readFileSync(journal), previousJournal);
+	assert.equal((await rollbackUpdate(selected, context)).status, "updated");
+	assert.equal(readInstallation(id, root).releaseVersion, "0.0.2");
+	assert.equal(readFileSync(marker, "utf8"), "work admitted after restoration");
+});
+
+test("recovery sees an update that finishes at management lock acquisition", async (t) => {
+	const { calls, candidate, context, paths, record, root } = setup();
+	const { journal } = updatePaths(id, root);
+	const marker = join(paths.state, "marker");
+	let pending;
+	context.fault = (phase) => {
+		if (phase === "candidate") pending = readFileSync(journal);
+	};
+	assert.equal((await activateUpdate(record, candidate, context)).status, "updated");
+	const complete = readFileSync(journal);
+	delete context.fault;
+	calls.length = 0;
+	writeFileSync(journal, pending);
+
+	// Publish the bytes from the completed activation just before the real lock command runs.
+	const [method, command] = process.platform === "linux" ? ["execFileSync", "flock"] : ["spawn", "lockf"];
+	const acquire = childProcess[method];
+	const mock = t.mock.method(childProcess, method, (program, ...args) => {
+		if (program === command) {
+			writeFileSync(journal, complete);
+			writeFileSync(marker, "work admitted after commit");
+		}
+		return acquire(program, ...args);
+	});
+	syncBuiltinESMExports();
+	try {
+		assert.deepEqual(await runUpdate(["recover", "--id", id], context), { status: "idle" });
+	} finally {
+		mock.mock.restore();
+		syncBuiltinESMExports();
+	}
+	assert.equal(mock.mock.callCount(), 1);
+	assert.deepEqual(calls, []);
+	assert.deepEqual(readFileSync(journal), complete);
+	assert.equal(readFileSync(marker, "utf8"), "work admitted after commit");
+	assert.equal(readInstallation(id, root).releaseVersion, candidate.version);
+	assert.equal(readlinkSync(paths.current), `../../releases/${candidate.version}`);
+});
+
+test("boot recovery delegates management lock contention to the orchestrator", async () => {
+	const { candidate, context, record, root } = setup();
+	context.fault = (phase) => {
+		if (phase === "holding") throw new Error("power loss");
+	};
+	await assert.rejects(activateUpdate(record, candidate, context), /power loss/);
+	await withManagementLock(async () => {
+		for (const phase of ["prepare", "finalize"])
+			assert.deepEqual(await recoverUpdate(record, context, { phase }), { status: "orchestrated" });
+		await assert.rejects(recoverUpdate(record, context), /Another install, update, or lifecycle operation/);
+	}, root);
+	assert.equal(readUpdateJournal(id, root).phase, "holding");
+});
+
 test("#18 explicit rollback performs another drain and keeps current state", async () => {
 	const fixture = setup();
 	await activateUpdate(fixture.record, fixture.candidate, fixture.context);
@@ -418,6 +528,56 @@ test("#18 stopped recovery remains stopped until an explicit recovery start", as
 	);
 	assert.equal((await recoverUpdate(fixture.record, fixture.context, { start: true })).status, "recovered");
 	assert.equal(readInstallation(id, fixture.root).desiredState, "running");
+});
+
+test("stopped candidate recovery retains the last completed rollback until it can resume", async () => {
+	const { calls, candidate, context, paths, record, root } = setup();
+	assert.equal((await activateUpdate(record, candidate, context)).status, "updated");
+	const update = updatePaths(id, root);
+	const complete = readFileSync(update.journal);
+	const marker = join(paths.state, "marker");
+	writeFileSync(marker, "work before the failed update");
+	const next = { releasePath: release(root, "0.0.4"), version: "0.0.4", compatibility };
+	const run = context.run;
+	let crashed = false;
+	context.fault = (phase) => {
+		if (phase === "candidate") {
+			writeFileSync(marker, "uncommitted candidate work");
+			crashed = true;
+			throw new Error("power loss");
+		}
+	};
+	context.run = async (...args) => {
+		if (crashed) throw new Error("power loss");
+		return run(...args);
+	};
+	await assert.rejects(activateUpdate(record, next, context), /power loss/);
+	assert.equal(readUpdateJournal(id, root).phase, "candidate");
+	delete context.fault;
+	context.run = run;
+	writeInstallation({ ...readInstallation(id, root), name: "renamed", desiredState: "stopped" }, root);
+	calls.length = 0;
+
+	assert.equal((await recoverUpdate(record, context)).status, "deferred");
+	assert.equal(readUpdateJournal(id, root).phase, "restored");
+	assert.equal(readFileSync(marker, "utf8"), "work before the failed update");
+	assert.deepEqual(readInstallation(id, root), {
+		...record,
+		name: "renamed",
+		releaseVersion: candidate.version,
+		desiredState: "stopped",
+	});
+	assert.ok(!calls.some((call) => call[0] === "systemctl" && call[1] === "start"));
+
+	assert.equal((await recoverUpdate(record, context, { start: true })).status, "recovered");
+	assert.deepEqual(readFileSync(update.journal), complete);
+	assert.equal(existsSync(update.priorJournal), false);
+	writeFileSync(marker, "work after recovery resumed");
+	calls.length = 0;
+	assert.equal((await rollbackUpdate(record, context)).status, "updated");
+	assert.deepEqual(readInstallation(id, root), { ...record, name: "renamed" });
+	assert.equal(readFileSync(marker, "utf8"), "work after recovery resumed");
+	assert.ok(calls.some((call) => call[1] === "maintenance-enter" && call[5] === "30000"));
 });
 
 test("#18 a live unreachable service and another session both defer without stopping work", async () => {
@@ -1127,6 +1287,60 @@ test("#18 failed recovery preparation preserves stopped operator intent", async 
 	assert.equal(readInstallation(id, fixture.root).desiredState, "stopped");
 });
 
+test("#18 finalization cannot clear a journal whose precommit restoration was never prepared", async () => {
+	const fixture = setup();
+	fixture.context.fault = (phase) => {
+		if (phase === "holding") throw new Error("crash");
+	};
+	await assert.rejects(activateUpdate(fixture.record, fixture.candidate, fixture.context), /crash/);
+	delete fixture.context.fault;
+	const paths = updatePaths(id, fixture.root);
+	const journal = readFileSync(paths.journal);
+	const prior = readFileSync(paths.priorJournal);
+	fixture.calls.length = 0;
+	await assert.rejects(recoverUpdate(fixture.record, fixture.context, { phase: "finalize" }), /Prepare update recovery/);
+	assert.deepEqual(fixture.calls, []);
+	assert.deepEqual(readFileSync(paths.journal), journal);
+	assert.deepEqual(readFileSync(paths.priorJournal), prior);
+});
+
+test("#18 uninstall retains an archive referenced by a displaced rollback journal until commit", async () => {
+	const { root, record } = setup();
+	const archive = release(root, "0.0.1");
+	const ignored = {
+		...record,
+		id: "22222222-2222-4222-8222-222222222222",
+		account: "ua-222222222222422282222222",
+		name: "other",
+		releaseVersion: "0.0.1",
+	};
+	const paths = updatePaths(id, root);
+	const previous = {
+		schemaVersion: 1,
+		id,
+		operationId: "33333333-3333-4333-8333-333333333333",
+		previousRecord: { ...record, releaseVersion: "0.0.1" },
+		candidateVersion: record.releaseVersion,
+		phase: "complete",
+	};
+	const journal = {
+		...previous,
+		operationId: "44444444-4444-4444-8444-444444444444",
+		previousRecord: record,
+		candidateVersion: "0.0.3",
+	};
+	writeFileSync(paths.priorJournal, JSON.stringify({ operationId: journal.operationId, journal: previous }));
+	for (const phase of ["holding", "backed-up", "candidate", "restored"]) {
+		writeFileSync(paths.journal, JSON.stringify({ ...journal, phase }));
+		assert.equal(removeUnusedRelease(ignored, root), false, phase);
+		assert.ok(existsSync(archive));
+	}
+	writeInstallation({ ...record, releaseVersion: journal.candidateVersion }, root);
+	writeFileSync(paths.journal, JSON.stringify({ ...journal, phase: "committed" }));
+	assert.equal(removeUnusedRelease(ignored, root), true);
+	assert.equal(existsSync(archive), false);
+});
+
 // Leaves the files a busy deferral had written when power failed right after it saved "restored".
 async function deferredThenPowerLoss(fixture) {
 	const paths = updatePaths(id, fixture.root);
@@ -1364,20 +1578,24 @@ test("#18 cold recover --start starts an unloaded inactive unit without reset-fa
 	assert.ok(!fixture.calls.slice(begin).some((call) => call[0] === "systemctl" && call[1] === "reset-failed"));
 	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.2");
 	assert.equal(readInstallation(id, fixture.root).desiredState, "running");
-	assert.equal(readUpdateJournal(id, fixture.root).phase, "complete");
+	assert.equal(readUpdateJournal(id, fixture.root), null);
 });
 
 // #18: A working retained core must not entrust recovery to the broken selected updater.
-test("#18 retained executing core owns recovery across failed repair and successful rollback", async () => {
+test("#18 retained executing core preserves the completed rollback across a failed repair", async () => {
 	const fixture = setup();
 	await activateUpdate(fixture.record, fixture.candidate, fixture.context);
 	const paths = updatePaths(id, fixture.root);
+	const complete = readFileSync(paths.journal);
+	const marker = join(fixture.paths.state, "marker");
+	writeFileSync(marker, "work before repair");
 	fixture.context.executingModule = join(paths.cores, "0.0.2/lib/update-activation.mjs");
 	const ready = fixture.context.ready;
 	let fail = true;
 	fixture.context.ready = async (...args) => {
 		if (fail) {
 			fail = false;
+			writeFileSync(marker, "uncommitted repair work");
 			throw new Error("repair health failure");
 		}
 		return ready.apply(fixture.context, args);
@@ -1390,16 +1608,12 @@ test("#18 retained executing core owns recovery across failed repair and success
 	assert.equal(readlinkSync(paths.currentCore), "cores/0.0.2");
 	assert.equal(readlinkSync(paths.recoveryCore), "cores/0.0.2");
 	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.3");
-	assert.equal(
-		(
-			await activateUpdate(
-				readInstallation(id, fixture.root),
-				{ releasePath: join(fixture.root, "opt/unit-001/releases/0.0.2"), version: "0.0.2", compatibility },
-				fixture.context,
-			)
-		).status,
-		"updated",
-	);
+	assert.equal(readFileSync(marker, "utf8"), "work before repair");
+	assert.deepEqual(readFileSync(paths.journal), complete);
+	assert.equal(existsSync(paths.priorJournal), false);
+	writeFileSync(marker, "work after repair recovery");
+	assert.equal((await rollbackUpdate(readInstallation(id, fixture.root), fixture.context)).status, "updated");
+	assert.equal(readFileSync(marker, "utf8"), "work after repair recovery");
 	assert.equal(readlinkSync(paths.currentCore), "cores/0.0.2");
 	assert.equal(readlinkSync(paths.recoveryCore), "cores/0.0.2");
 	assert.deepEqual(readdirSync(paths.cores), ["0.0.2"]);
@@ -1544,7 +1758,7 @@ for (const phase of ["service-unit", "candidate"])
 		await recoverUpdate(fixture.record, fixture.context);
 		assert.equal(readFileSync(fixture.paths.unitFile, "utf8"), fixture.previousUnit);
 		assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.2");
-		assert.equal(readUpdateJournal(id, fixture.root).phase, "complete");
+		assert.equal(readUpdateJournal(id, fixture.root), null);
 	});
 
 test("#18 failed candidate health restores the previous service unit before the old owner restarts", async () => {
@@ -1561,7 +1775,7 @@ test("#18 failed candidate health restores the previous service unit before the 
 	await assert.rejects(activateUpdate(fixture.record, fixture.candidate, fixture.context), /candidate health failure/);
 	assert.equal(readFileSync(fixture.paths.unitFile, "utf8"), fixture.previousUnit);
 	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.2");
-	assert.equal(readUpdateJournal(id, fixture.root).phase, "complete");
+	assert.equal(readUpdateJournal(id, fixture.root), null);
 });
 
 test("#18 committed recovery keeps the applied service unit", async () => {
@@ -1725,7 +1939,7 @@ test("#18 systemd loading other policy after reload restores the previous unit a
 	);
 	assert.equal(readFileSync(fixture.paths.unitFile, "utf8"), fixture.previousUnit);
 	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.2");
-	assert.equal(readUpdateJournal(id, fixture.root).phase, "complete");
+	assert.equal(readUpdateJournal(id, fixture.root), null);
 });
 
 // Review of #18: escape-heavy units that fit their own bound must not produce a journal recovery cannot read.
