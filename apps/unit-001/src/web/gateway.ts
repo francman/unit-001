@@ -20,6 +20,7 @@ export type WebGatewayOptions = {
 	origin: string;
 	assets: ReadonlyMap<string, { contentType: string; body: Uint8Array }>;
 	managed?: boolean;
+	inheritedUnixListener?: true;
 	managedReview?: (view: MissionView) => Promise<ManagedMissionReview | undefined>;
 	planReview?: (view: MissionView) => Promise<WebPlanReview | undefined>;
 };
@@ -77,11 +78,11 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 		if (req.rawHeaders.length > 32 * 2) return json(res, 431, { error: "Too many headers." });
 		// Verify the actual listening transport and accepted peer independently of HTTP headers.
 		const listener = server.address();
+		// Node supplies no pathname for a listener adopted by descriptor. The launcher checks its exact binding first.
+		const namedUnixListener = typeof listener === "string" && listener.length > 0 && !listener.startsWith("\0");
 		const allowedPeer = managed
 			? process.platform !== "win32" &&
-				typeof listener === "string" &&
-				listener.length > 0 &&
-				!listener.startsWith("\0") &&
+				(namedUnixListener || (listener === null && options.inheritedUnixListener === true)) &&
 				req.socket.localAddress === undefined &&
 				req.socket.remoteAddress === undefined
 			: listener !== null &&

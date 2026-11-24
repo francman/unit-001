@@ -21,6 +21,16 @@ Use the exact `Browser workspace` URL printed by the command. Direct browser nav
 
 Ctrl+C or disconnecting the SSH terminal stops the browser gateway. Keep operator-owned socket paths in place while the launcher is running or shutting down. Owner work continues, including when you close a tab. After restarting the gateway, the browser reconnects without a code. Each deliberate action uses the new gateway’s request metadata.
 
+### Persistent workspace on managed Linux
+
+Persistent web is off by default. Before enabling it on a host, verify the exact Linux x64 package, the installed update and recovery core selections, and signed rollback. Measure headroom during installation and while the owner is serving requests with a browser tab open. Keep using the foreground workflow and its existing SSH forward until the host and forward have passed their acceptance checks.
+
+After qualifying the installed release and its selected update and recovery cores, a host administrator can run `sudo bob web enable ubuntu` to select one existing operator on that installation. Run the command with the installed name and operator account. Forward local `127.0.0.1:4317` to `/run/unit-001-web/<installation-id>.sock` in the trusted workstation’s SSH profile. Once the owner is running, `ssh unit-001` and the browser are enough. The first browser connection starts the gateway on demand. A browser connection leaves a stopped owner stopped.
+
+Socket-only startup assumes the shipped systemd units and their installed dependencies. The host administrator controls root-owned overrides and can change that startup behavior. If an administrator dependency starts the gateway eagerly, remove the dependency before relying on socket-only startup. Disable can still stop an owned serving pair after a dependency-only override and leaves the administrator’s configuration in place.
+
+Keep the foreground flow above when the selected updater or recovery core is older. Installing newer application files can leave those core selections in place. Use `sudo bob web disable` to end active browser connections and remove the persistent socket and service. Disable persistent web before selecting an older release that lacks socket activation, including before using its installer directly. Restore the foreground SSH forward for that release.
+
 ## Authority and access
 
 The gateway runs in a separate process as the operator. Managed installations reject owner/root web launches; the launcher resolves only the installation's existing operator socket. It never opens SQLite or private credentials. Creator approval, connection grants, security changes, updates and lifecycle administration have no browser endpoints. Source-checkout launches use the developer's existing owner socket and authority.

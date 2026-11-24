@@ -11,7 +11,7 @@ const activation = fileURLToPath(new URL("../deploy/activate.sh", import.meta.ur
 const id = "11111111-1111-4111-8111-111111111111";
 const unit = `unit-001@${id}.service`;
 
-for (const mode of ["failed", "inactive", "reset-failure", "stopped"]) {
+for (const mode of ["failed", "inactive", "reset-failure", "stopped", "web-quiesce", "web-quiesce-failure"]) {
 	// #23: Upgrade recovery must clear failure limits without racing cold-unit garbage collection.
 	test(`#16 activation handles ${mode} service state`, { skip: process.platform === "win32" }, async () => {
 		const root = await mkdtemp(join(tmpdir(), "unit-activation-"));
@@ -31,7 +31,14 @@ for (const mode of ["failed", "inactive", "reset-failure", "stopped"]) {
 				[join(plan, "record.json")]: "new record",
 				[join(plan, "command")]: "new command",
 				[join(plan, "unit")]: "new unit",
-				[join(release, "runtime/bin/node")]: "#!/bin/sh\nprintf 'ready\\n' >> \"$ACTIVATION_LOG\"\n",
+				[join(release, "runtime/bin/node")]: `#!/bin/sh
+if [ "$2" = web-quiesce ]; then
+  printf 'web-quiesce %s\\n' "$(readlink "$ACTIVATION_CURRENT")" >> "$ACTIVATION_LOG"
+  [ "$ACTIVATION_MODE" != web-quiesce-failure ] || exit 51
+else
+  printf 'ready\\n' >> "$ACTIVATION_LOG"
+fi
+`,
 				[join(commands, "systemctl")]: `#!/bin/sh
 printf '%s\\n' "$*" >> "$ACTIVATION_LOG"
 case "$1" in
@@ -46,6 +53,7 @@ case "$1" in
 esac
 `,
 			};
+			if (mode.startsWith("web-quiesce")) files[join(config, "web-activation.json")] = "{}";
 			for (const module of ["installation.mjs", "agent-command.mjs", "lifecycle.mjs", "update-activation.mjs"])
 				files[join(release, "deploy", module)] = `new ${module}`;
 			for (const [path, text] of Object.entries(files)) {
@@ -78,12 +86,17 @@ esac
 						ACTIVATION_LOG: log,
 						ACTIVATION_MODE: mode,
 						ACTIVATION_RESET: join(root, "reset"),
+						ACTIVATION_CURRENT: join(prefix, "current"),
 					},
 				},
 			);
 			const calls = (await readFile(log, "utf8")).trim().split("\n");
-			assert.equal(result.status, mode === "reset-failure" ? 42 : 0, result.stderr);
-			if (mode === "reset-failure") {
+			assert.equal(result.status, mode === "web-quiesce-failure" ? 51 : mode === "reset-failure" ? 42 : 0, result.stderr);
+			if (mode.startsWith("web-quiesce")) {
+				assert.ok(calls.includes("web-quiesce ../../releases/0.0.1"));
+				assert.ok(calls.indexOf(`stop ${unit}`) < calls.indexOf("web-quiesce ../../releases/0.0.1"));
+			}
+			if (mode === "reset-failure" || mode === "web-quiesce-failure") {
 				assert.equal(await readlink(join(prefix, "current")), "../../releases/0.0.1");
 				assert.equal(await readFile(join(config, "installation.json"), "utf8"), "old record");
 				assert.equal(await readFile(join(management, "lifecycle.mjs"), "utf8"), "old helper");
@@ -91,7 +104,7 @@ esac
 				assert.ok(!calls.includes("ready"));
 			} else {
 				assert.equal(await readlink(join(prefix, "current")), "../../releases/0.0.2");
-				assert.equal(calls.includes(`reset-failed ${unit}`), mode === "failed");
+				assert.equal(calls.includes(`reset-failed ${unit}`), ["failed", "web-quiesce"].includes(mode));
 				assert.equal(calls.includes(`start ${unit}`), mode !== "stopped");
 				assert.equal(calls.includes("ready"), mode !== "stopped");
 				if (mode === "stopped") assert.ok(!calls.some((call) => call.startsWith("show ")));

@@ -9,6 +9,7 @@ import {
 	ownedServiceUnit,
 	removeOwnedAgentCommand,
 	removeUnusedRelease,
+	removeWebActivation,
 	validateRelease,
 	writeAgentCommand,
 	writeInstallation,
@@ -131,6 +132,7 @@ export async function lifecycle(record, action, context, newName) {
 	// Complete ownership checks before removing any path used to retry this command.
 	assertUpdateCoreOwned(record, root);
 	assertUpdateSchedulingOwned(record, root);
+	await removeWebActivation(record, context);
 	await removeOwnedAgentCommand(record, root);
 	if (link !== undefined) await rm(paths.current);
 	if (text !== undefined) await rm(paths.unitFile);

@@ -1,6 +1,7 @@
 // Runs the installation owner or its normal-user operator client with a fixed identity.
 import { dirname } from "node:path";
 import { main, processRuntime } from "./cli.ts";
+import { runActivatedWebWorkspace } from "./web/launcher.ts";
 
 const [id, name, state, ...args] = process.argv.slice(2);
 if (
@@ -13,6 +14,16 @@ if (
 ) {
 	process.stderr.write("Invalid named agent identity or account; use the installed agent command.\n");
 	process.exitCode = 1;
+} else if (args[0] === "--web-service") {
+	const controller = new AbortController();
+	for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => controller.abort());
+	try {
+		if (args.length !== 1) throw new Error("Invalid activated web arguments.");
+		process.exitCode = await runActivatedWebWorkspace(id, controller.signal);
+	} catch (error) {
+		process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+		process.exitCode = 1;
+	}
 } else {
 	const operator = args[0] === "--operator";
 	if (operator) args.shift();

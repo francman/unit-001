@@ -28,12 +28,20 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import {
 	assertSafePath,
+	assertWebApplicationUsable,
+	assertWebCoreMatchesRelease,
+	assertWebCoreUsable,
+	assertWebSelectedRuntime,
 	installationPaths,
 	ownedServiceUnit,
 	readInstallation,
+	readWebActivation,
+	smokeWebApplication,
+	smokeWebCore,
 	trustedFile,
 	trustedParents,
 	validateRelease,
+	webActivationReleaseSupported,
 	withManagementLock,
 	writeInstallation,
 } from "./installation.mjs";
@@ -247,7 +255,8 @@ function coreFiles(directory, prefix = "") {
 		});
 }
 
-function recoveryUnit(record, phase) {
+/** Renders the exact managed boot recovery service for the requested phase. */
+export function recoveryUnit(record, phase) {
 	const prefix = `/usr/lib/unit-001/updaters/${record.id}/recovery`;
 	const ordering = phase === "prepare" ? "Before" : "After";
 	return `[Unit]\nDescription=unit-001 update ${phase} ${record.id}\n${ordering}=${installationPaths(record.id).unit}\n[Service]\nType=oneshot\nExecStart=${prefix}/runtime/bin/node ${prefix}/lib/update.mjs recover --id ${record.id} --phase ${phase}\n`;
@@ -340,18 +349,7 @@ export function installUpdateCore(record, releasePath, context) {
 	if (!existsSync(core)) {
 		const stage = mkdtempSync(join(paths.cores, ".stage-"));
 		try {
-			cpSync(join(releasePath, "updater"), stage, { recursive: true });
-			normalizeTree(stage);
-			chmodSync(join(stage, "runtime/bin/node"), 0o755);
-			const manifest = Object.fromEntries(
-				coreFiles(stage).map((file) => [
-					file,
-					createHash("sha256")
-						.update(readFileSync(join(stage, file)))
-						.digest("hex"),
-				]),
-			);
-			writeFileSync(join(stage, "CORE-SHA256SUMS.json"), JSON.stringify(manifest), { mode: 0o644 });
+			copyCore(releasePath, stage);
 			syncTree(stage);
 			renameSync(stage, core);
 			syncDirectory(paths.cores);
@@ -404,6 +402,38 @@ export function installUpdateCore(record, releasePath, context) {
 	syncDirectory(dropin);
 	syncDirectory(dirname(launcher));
 	return true;
+}
+
+function copyCore(release, stage) {
+	cpSync(join(release, "updater"), stage, { recursive: true });
+	normalizeTree(stage);
+	chmodSync(join(stage, "runtime/bin/node"), 0o755);
+	const manifest = Object.fromEntries(
+		coreFiles(stage).map((file) => [file, createHash("sha256").update(readFileSync(join(stage, file))).digest("hex")]),
+	);
+	writeFileSync(join(stage, "CORE-SHA256SUMS.json"), JSON.stringify(manifest), { mode: 0o644 });
+}
+
+/** Checks a retained core in place or a verified temporary copy with the installed core's mode. */
+export async function smokeCandidateWebCore(record, version, release, context) {
+	const { root } = context;
+	const { cores } = updatePaths(record.id, root);
+	const core = join(cores, version);
+	assertSafePath(core, root);
+	if (existsSync(core)) {
+		assertWebCoreMatchesRelease(core, release, root);
+		await smokeWebCore(record, core, context);
+		return;
+	}
+	trustedParents(core, root);
+	const stage = mkdtempSync(join(cores, ".smoke-"));
+	try {
+		copyCore(release, stage);
+		assertWebCoreMatchesRelease(stage, release, root);
+		await smokeWebCore(record, stage, context);
+	} finally {
+		rmSync(stage, { recursive: true, force: true });
+	}
 }
 
 /** Supplies bounded host commands and local controls without opening a second application storage owner. */
@@ -573,31 +603,33 @@ function executingCore(paths, context) {
 	return existsSync(paths.currentCore) ? readlinkSync(paths.currentCore) : null;
 }
 
-function stageRelease(candidate, context) {
+async function stageRelease(candidate, context, qualify) {
 	const destination = join(resolve(context.root), "opt/unit-001/releases", candidate.version);
 	assertSafePath(destination, context.root);
-	if (validateRelease(candidate.releasePath, context.root).version !== candidate.version)
-		throw new Error("Verified candidate version does not match its payload.");
+	const manifest = readFileSync(join(candidate.releasePath, "SHA256SUMS"), "utf8");
+	const verify = (release) => {
+		if (readFileSync(join(release, "SHA256SUMS"), "utf8") !== manifest)
+			throw new Error("A different release already uses this version.");
+		validateRelease(release, context.root, { protectedContents: qualify !== undefined });
+	};
 	if (!existsSync(destination)) {
 		const stage = mkdtempSync(join(dirname(destination), ".update-"));
 		try {
 			cpSync(candidate.releasePath, stage, { recursive: true });
 			normalizeTree(stage);
 			for (const file of ["runtime/bin/node", "bin/agent", "install.sh"]) chmodSync(join(stage, file), 0o755);
-			validateRelease(stage, context.root);
+			verify(stage);
+			await qualify?.(stage);
 			syncTree(stage);
 			renameSync(stage, destination);
 			syncDirectory(dirname(destination));
 		} finally {
 			rmSync(stage, { recursive: true, force: true });
 		}
+		return destination;
 	}
-	if (
-		readFileSync(join(destination, "SHA256SUMS"), "utf8") !==
-		readFileSync(join(candidate.releasePath, "SHA256SUMS"), "utf8")
-	)
-		throw new Error("A different release already uses this version.");
-	validateRelease(destination, context.root);
+	verify(destination);
+	await qualify?.(destination);
 	return destination;
 }
 
@@ -1060,200 +1092,251 @@ export async function activateUpdate(record, candidate, context) {
 		const admission = await context.admit?.(record, candidate);
 		if (admission) return admission;
 		if (record.desiredState !== "running") return { status: "deferred", reason: "Operator intent is stopped." };
-		const legacyRollback = record.releaseVersion === "0.0.7" && candidate.version === "0.0.6";
-		if (legacyRollback) ownedServiceUnit(record, context.root);
-		const sessions = join(installationPaths(record.id, context.root).state, "sessions");
-		assertSafePath(sessions, context.root);
-		if (existsSync(sessions) && !lstatSync(sessions).isDirectory())
-			throw new Error("Session storage must be a real directory.");
-		if (
-			existsSync(sessions) &&
-			readdirSync(sessions).some((file) => file.endsWith(".sqlite") && file !== "default.sqlite")
-		)
-			return { status: "deferred", reason: "Automatic updates require only the default managed session." };
-		if (
-			candidate.compatibility?.stateVersion !== 1 ||
-			candidate.compatibility.minReaderVersion !== 1 ||
-			candidate.compatibility.maintenanceProtocol !== 1
-		)
-			return { status: "incompatible", reason: "Unsupported state or maintenance compatibility." };
+		const metadata = verifyUpdateRelease(candidate.releasePath, candidate.version, context.root);
+		const features = releaseFeatures(metadata);
+		const web = readWebActivation(record, context.root);
+		const refusal = releaseSwitchRefusal(record, candidate, features, web, context);
+		if (refusal) return refusal;
 		const previousJournal = readUpdateJournal(record.id, context.root);
-		if (previousJournal && previousJournal.phase !== "complete")
-			return { status: "deferred", reason: "An update requires recovery." };
-		let status;
-		let closedRepair = false;
-		try {
-			status = await context.control(record, ["service-status"]);
-		} catch {
-			const state = await context.run(
-				"systemctl",
-				["show", "--property=ActiveState", "--value", installationPaths(record.id, context.root).unit],
-				true,
-			);
-			if (!["failed", "inactive"].includes(state.trim()))
-				return { status: "deferred", reason: "A live service is unreachable; refusing to bypass drain." };
-			const metadata = JSON.parse(
-				readFileSync(
-					join(resolve(context.root), "opt/unit-001/releases", record.releaseVersion, "release.json"),
-					"utf8",
-				),
-			);
-			if (metadata.compatibility?.maintenanceProtocol !== 1)
-				return { status: "incompatible", reason: "Closed-owner repair requires the maintenance-capable baseline." };
-			closedRepair = true;
-		}
-		if (!closedRepair && status.maintenance?.protocol !== 1)
-			return { status: "incompatible", reason: "Install the maintenance-capable baseline manually." };
-		const paths = updatePaths(record.id, context.root);
-		const state = installationPaths(record.id, context.root).state;
-		let bytes;
-		try {
-			bytes = stateBytes(state);
-		} catch (error) {
-			return { status: "deferred", reason: error.message };
-		}
-		const required = 2 * bytes + 16 * 1024 * 1024;
-		for (const directory of [paths.configDirectory, dirname(state)]) {
-			const filesystem = statfsSync(directory);
-			const available = context.availableBytes?.(directory) ?? Number(filesystem.bavail) * Number(filesystem.bsize);
-			if (available < required)
-				return { status: "deferred", reason: "Insufficient free space for backup and staged state recovery." };
-		}
-		const destination = stageRelease(candidate, context);
-		// The signed descriptor's features decide the guard below, so the verified payload must declare the same ones.
-		const features = releaseFeatures(candidate.version, context.root);
-		if (!sameFeatures(features, candidate.compatibility.features))
-			return {
-				status: "incompatible",
-				reason: "The release's features differ from its signed descriptor.",
-				version: candidate.version,
-			};
-		// A loop-capable predecessor can replay Open while ignoring its plan binding.
-		const currentFeatures = releaseFeatures(record.releaseVersion, context.root);
-		const dropsPlan = currentFeatures.includes("mission-plan-gate") && !features.includes("mission-plan-gate");
-		const dropsLoop = currentFeatures.includes("mission-loop") && !features.includes("mission-loop");
-		const dropsReview = currentFeatures.includes("mission-review-turn") && !features.includes("mission-review-turn");
-		const dropsResearch = currentFeatures.includes("mission-research") && !features.includes("mission-research");
-		const guarded = dropsPlan || dropsLoop || dropsReview || dropsResearch;
-		const boundHold = dropsPlan || dropsReview || dropsResearch;
-		if (guarded && closedRepair)
-			return {
-				status: "incompatible",
-				reason: boundHold
-					? "The running owner must confirm settled mission work before dropping a mission capability."
-					: `The target release cannot run a mission loop. Start ${record.name}, run sudo ${record.name} mission operate close until mission status shows no live loop, then retry.`,
-			};
-		if (boundHold && (status.installationId !== record.id || status.version !== record.releaseVersion))
-			return { status: "deferred", reason: "Cannot verify the current installation owner for mission downgrade." };
-		// Asked before the journal, so the common refusal never holds admissions or touches the journal.
-		const guard = { dropsPlan, dropsReview, dropsResearch, dropsLoop };
-		const refusal = await missionDowngradeRefusal(guard, record, context, "before-hold");
-		if (refusal) return { status: "deferred", reason: refusal };
-		const unitPlan = legacyRollback
-			? { action: "keep" }
-			: serviceUnitPlan(record, candidate, destination, previousJournal, context);
-		if (unitPlan.action === "refuse") return { ...unitPlan.result, version: candidate.version };
-		const previousCore = executingCore(paths, context);
-		const operationId = randomUUID();
-		const journal = {
-			schemaVersion: 1,
-			id: record.id,
-			operationId,
-			previousRecord: record,
-			candidateVersion: candidate.version,
-			compatibility: candidate.compatibility,
-			phase: "holding",
-			previousCore,
-			...(unitPlan.action === "replace" ? { serviceUnit: unitPlan.serviceUnit } : {}),
+		return activateVerifiedUpdate(record, candidate, features, previousJournal, context, web);
+	}, context.root);
+}
+
+function verifyUpdateRelease(release, version, root) {
+	if (validateRelease(release, root).version !== version)
+		throw new Error("Verified candidate version does not match its payload.");
+	return readReleaseMetadata(release, root);
+}
+
+function readReleaseMetadata(release, root) {
+	const metadata = join(release, "release.json");
+	trustedFile(metadata, root);
+	return JSON.parse(readFileSync(metadata, "utf8"));
+}
+
+function releaseSwitchRefusal(record, candidate, features, web, context, releaseRoot) {
+	const { root } = context;
+	if (!sameFeatures(features, candidate.compatibility?.features))
+		return {
+			status: "incompatible",
+			reason: "The release's features differ from its signed descriptor.",
+			version: candidate.version,
 		};
-		// JSON escaping can double unit bytes; every phase must stay readable by the retained recovery core.
-		if (Buffer.byteLength(`${JSON.stringify(journal)}\n`) + JOURNAL_HEADROOM_BYTES > MAX_JOURNAL_BYTES)
-			return {
-				status: "incompatible",
-				reason: "The update journal would exceed its size limit; the service unit is too large.",
-				version: candidate.version,
-			};
-		if (previousCore) selectLink(paths.recoveryCore, previousCore);
-		// Kept for a deferral, which must leave the committed update's journal current for rollback and migration.
-		atomicJson(paths.priorJournal, { operationId, journal: previousJournal });
-		saveJournal(record, context, journal, "holding");
+	if (web === null) return null;
+	if (!features.includes("web-socket-activation") || !webActivationReleaseSupported(candidate.releasePath, releaseRoot))
+		return {
+			status: "deferred",
+			reason: `Disable persistent web with sudo ${record.name} web disable before selecting this release.`,
+		};
+	const destination = join(resolve(root), "opt/unit-001/releases", candidate.version);
+	assertSafePath(destination, root);
+	// A retained release skips the mode normalization used for freshly staged archives.
+	if (existsSync(destination)) assertWebApplicationUsable(destination, root);
+	const paths = updatePaths(record.id, root);
+	const core = join(paths.cores, candidate.version);
+	assertSafePath(core, root);
+	// The candidate inventory also authenticates any core that already uses this version.
+	if (existsSync(core)) assertWebCoreMatchesRelease(core, candidate.releasePath, root, releaseRoot ?? null);
+	assertWebSelectedRuntime(record, root);
+	const recovery = executingCore(paths, context);
+	if (recovery) assertWebCoreUsable(join(paths.updaterRoot, recovery), root);
+	return null;
+}
+
+async function stageWebRelease(record, candidate, web, context) {
+	return stageRelease(candidate, context, async (release) => {
+		await smokeWebApplication(record, web.uid, release, context);
+		await smokeCandidateWebCore(record, candidate.version, release, context);
+	});
+}
+
+async function activateVerifiedUpdate(record, candidate, features, previousJournal, context, web, qualifiedDestination) {
+	const legacyRollback = record.releaseVersion === "0.0.7" && candidate.version === "0.0.6";
+	if (legacyRollback) ownedServiceUnit(record, context.root);
+	const sessions = join(installationPaths(record.id, context.root).state, "sessions");
+	assertSafePath(sessions, context.root);
+	if (existsSync(sessions) && !lstatSync(sessions).isDirectory())
+		throw new Error("Session storage must be a real directory.");
+	if (
+		existsSync(sessions) &&
+		readdirSync(sessions).some((file) => file.endsWith(".sqlite") && file !== "default.sqlite")
+	)
+		return { status: "deferred", reason: "Automatic updates require only the default managed session." };
+	if (
+		candidate.compatibility?.stateVersion !== 1 ||
+		candidate.compatibility.minReaderVersion !== 1 ||
+		candidate.compatibility.maintenanceProtocol !== 1
+	)
+		return { status: "incompatible", reason: "Unsupported state or maintenance compatibility." };
+	if (previousJournal && previousJournal.phase !== "complete")
+		return { status: "deferred", reason: "An update requires recovery." };
+	let status;
+	let closedRepair = false;
+	try {
+		status = await context.control(record, ["service-status"]);
+	} catch {
+		const state = await context.run(
+			"systemctl",
+			["show", "--property=ActiveState", "--value", installationPaths(record.id, context.root).unit],
+			true,
+		);
+		if (!["failed", "inactive"].includes(state.trim()))
+			return { status: "deferred", reason: "A live service is unreachable; refusing to bypass drain." };
+		const metadata = JSON.parse(
+			readFileSync(
+				join(resolve(context.root), "opt/unit-001/releases", record.releaseVersion, "release.json"),
+				"utf8",
+			),
+		);
+		if (metadata.compatibility?.maintenanceProtocol !== 1)
+			return { status: "incompatible", reason: "Closed-owner repair requires the maintenance-capable baseline." };
+		closedRepair = true;
+	}
+	if (!closedRepair && status.maintenance?.protocol !== 1)
+		return { status: "incompatible", reason: "Install the maintenance-capable baseline manually." };
+	const paths = updatePaths(record.id, context.root);
+	const state = installationPaths(record.id, context.root).state;
+	let bytes;
+	try {
+		bytes = stateBytes(state);
+	} catch (error) {
+		return { status: "deferred", reason: error.message };
+	}
+	const required = 2 * bytes + 16 * 1024 * 1024;
+	for (const directory of [paths.configDirectory, dirname(state)]) {
+		const filesystem = statfsSync(directory);
+		const available = context.availableBytes?.(directory) ?? Number(filesystem.bavail) * Number(filesystem.bsize);
+		if (available < required)
+			return { status: "deferred", reason: "Insufficient free space for backup and staged state recovery." };
+	}
+	const destination = qualifiedDestination ?? (web
+		? await stageWebRelease(record, candidate, web, context)
+		: await stageRelease(candidate, context));
+	// A loop-capable predecessor can replay Open while ignoring its plan binding.
+	const currentRelease = join(resolve(context.root), "opt/unit-001/releases", record.releaseVersion);
+	const currentFeatures = releaseFeatures(readReleaseMetadata(currentRelease, context.root));
+	const dropsPlan = currentFeatures.includes("mission-plan-gate") && !features.includes("mission-plan-gate");
+	const dropsLoop = currentFeatures.includes("mission-loop") && !features.includes("mission-loop");
+	const dropsReview = currentFeatures.includes("mission-review-turn") && !features.includes("mission-review-turn");
+	const dropsResearch = currentFeatures.includes("mission-research") && !features.includes("mission-research");
+	const guarded = dropsPlan || dropsLoop || dropsReview || dropsResearch;
+	const boundHold = dropsPlan || dropsReview || dropsResearch;
+	if (guarded && closedRepair)
+		return {
+			status: "incompatible",
+			reason: boundHold
+				? "The running owner must confirm settled mission work before dropping a mission capability."
+				: `The target release cannot run a mission loop. Start ${record.name}, run sudo ${record.name} mission operate close until mission status shows no live loop, then retry.`,
+		};
+	if (boundHold && (status.installationId !== record.id || status.version !== record.releaseVersion))
+		return { status: "deferred", reason: "Cannot verify the current installation owner for mission downgrade." };
+	// Asked before the journal, so the common refusal never holds admissions or touches the journal.
+	const guard = { dropsPlan, dropsReview, dropsResearch, dropsLoop };
+	const refusal = await missionDowngradeRefusal(guard, record, context, "before-hold");
+	if (refusal) return { status: "deferred", reason: refusal };
+	const unitPlan = legacyRollback
+		? { action: "keep" }
+		: serviceUnitPlan(record, candidate, destination, previousJournal, context);
+	if (unitPlan.action === "refuse") return { ...unitPlan.result, version: candidate.version };
+	const previousCore = executingCore(paths, context);
+	const operationId = randomUUID();
+	const journal = {
+		schemaVersion: 1,
+		id: record.id,
+		operationId,
+		previousRecord: record,
+		candidateVersion: candidate.version,
+		compatibility: candidate.compatibility,
+		phase: "holding",
+		previousCore,
+		...(unitPlan.action === "replace" ? { serviceUnit: unitPlan.serviceUnit } : {}),
+	};
+	// JSON escaping can double unit bytes; every phase must stay readable by the retained recovery core.
+	if (Buffer.byteLength(`${JSON.stringify(journal)}\n`) + JOURNAL_HEADROOM_BYTES > MAX_JOURNAL_BYTES)
+		return {
+			status: "incompatible",
+			reason: "The update journal would exceed its size limit; the service unit is too large.",
+			version: candidate.version,
+		};
+	if (previousCore) selectLink(paths.recoveryCore, previousCore);
+	// Kept for a deferral, which must leave the committed update's journal current for rollback and migration.
+	atomicJson(paths.priorJournal, { operationId, journal: previousJournal });
+	saveJournal(record, context, journal, "holding");
+	try {
+		const hold = closedRepair
+			? { result: "drained" }
+			: await context.control(record, [
+					"maintenance-enter",
+					"--operation-id",
+					operationId,
+					"--timeout-ms",
+					"30000",
+				]);
+		// Asked again under the hold, where no operation can open a loop before the stop: this closes the race with
+		// an open issued after the first answer.
+		const held = !boundHold || (hold.protocol === 1 && hold.state === "held" && hold.operationId === operationId);
+		const reason =
+			hold.result === "drained" && held
+				? await missionDowngradeRefusal(guard, record, context, "held")
+				: "Active work did not drain.";
+		if (reason) {
+			journal.liveDeferred = true;
+			saveJournal(record, context, journal, "restored");
+			await context.control(record, ["maintenance-release", "--operation-id", operationId]);
+			completeDeferral(record, journal, context);
+			return { status: "deferred", reason };
+		}
+		await context.run("systemctl", ["stop", installationPaths(record.id, context.root).unit]);
+		const locks = sessionLocks(record, context);
 		try {
-			const hold = closedRepair
-				? { result: "drained" }
-				: await context.control(record, [
-						"maintenance-enter",
-						"--operation-id",
-						operationId,
-						"--timeout-ms",
-						"30000",
-					]);
-			// Asked again under the hold, where no operation can open a loop before the stop: this closes the race with
-			// an open issued after the first answer.
-			const held = !boundHold || (hold.protocol === 1 && hold.state === "held" && hold.operationId === operationId);
-			const reason =
-				hold.result === "drained" && held
-					? await missionDowngradeRefusal(guard, record, context, "held")
-					: "Active work did not drain.";
-			if (reason) {
-				journal.liveDeferred = true;
-				saveJournal(record, context, journal, "restored");
-				await context.control(record, ["maintenance-release", "--operation-id", operationId]);
-				completeDeferral(record, journal, context);
-				return { status: "deferred", reason };
-			}
-			await context.run("systemctl", ["stop", installationPaths(record.id, context.root).unit]);
-			const locks = sessionLocks(record, context);
-			try {
-				const backup = join(paths.configDirectory, "backup");
-				rmSync(backup, { recursive: true, force: true });
-				const state = installationPaths(record.id, context.root).state;
-				cpSync(state, backup, {
-					recursive: true,
-					verbatimSymlinks: true,
-					filter: (source) => relative(state, source).split("/")[0] !== "control",
-				});
-				chmodSync(backup, 0o700);
-				syncTree(backup);
-				syncDirectory(dirname(backup));
-				saveJournal(record, context, journal, "backed-up");
-				installUpdateCore({ ...record, releaseVersion: candidate.version }, destination, context);
+			const backup = join(paths.configDirectory, "backup");
+			rmSync(backup, { recursive: true, force: true });
+			const state = installationPaths(record.id, context.root).state;
+			cpSync(state, backup, {
+				recursive: true,
+				verbatimSymlinks: true,
+				filter: (source) => relative(state, source).split("/")[0] !== "control",
+			});
+			chmodSync(backup, 0o700);
+			syncTree(backup);
+			syncDirectory(dirname(backup));
+			saveJournal(record, context, journal, "backed-up");
+			installUpdateCore({ ...record, releaseVersion: candidate.version }, destination, context);
+			if (!web)
 				await context.run(join(paths.cores, candidate.version, "runtime/bin/node"), [
 					join(paths.cores, candidate.version, "lib/update.mjs"),
 					"--help",
 				]);
-				publishApplication(record, candidate.version, context);
-				saveJournal(record, context, journal, "candidate");
-			} finally {
-				for (const lock of locks) lock.close();
-			}
-			const updated = readInstallation(record.id, context.root);
-			await context.run("systemctl", ["daemon-reload"]);
-			if (journal.serviceUnit) await assertLoadedUnit(record, context);
-			await startApplication(record, context);
-			await context.ready(updated, operationId);
-			// After this publication no recovery path may restore historical state.
-			saveJournal(record, context, journal, "committed");
-			if (journal.previousCore) selectLink(paths.previousCore, journal.previousCore);
-			selectLink(paths.currentCore, `cores/${candidate.version}`);
-			await releaseGate(updated, journal, context);
-			saveJournal(record, context, journal, "complete");
-			const warnings = pruneCores(record, context);
-			return { status: "updated", version: candidate.version, ...(warnings.length ? { warnings } : {}) };
-		} catch (error) {
-			if (journal.phase === "committed") throw error;
-			await prepareRecovery(record, journal, context);
-			await startApplication(record, context);
-			await finalizeRecovery(record, journal, context);
-			throw error;
+			publishApplication(record, candidate.version, context);
+			saveJournal(record, context, journal, "candidate");
+		} finally {
+			for (const lock of locks) lock.close();
 		}
-	}, context.root);
+		const updated = readInstallation(record.id, context.root);
+		await context.run("systemctl", ["daemon-reload"]);
+		if (journal.serviceUnit) await assertLoadedUnit(record, context);
+		await startApplication(record, context);
+		await context.ready(updated, operationId);
+		// After this publication no recovery path may restore historical state.
+		saveJournal(record, context, journal, "committed");
+		if (journal.previousCore) selectLink(paths.previousCore, journal.previousCore);
+		selectLink(paths.currentCore, `cores/${candidate.version}`);
+		await releaseGate(updated, journal, context);
+		saveJournal(record, context, journal, "complete");
+		const warnings = pruneCores(record, context);
+		return { status: "updated", version: candidate.version, ...(warnings.length ? { warnings } : {}) };
+	} catch (error) {
+		if (journal.phase === "committed") throw error;
+		await prepareRecovery(record, journal, context);
+		await startApplication(record, context);
+		await finalizeRecovery(record, journal, context);
+		throw error;
+	}
 }
 
 // Releases before feature flags declare none: they cannot have written a mission loop.
-function releaseFeatures(version, root) {
-	const metadata = join(resolve(root), "opt/unit-001/releases", version, "release.json");
-	trustedFile(metadata, root);
-	const features = JSON.parse(readFileSync(metadata, "utf8")).compatibility?.features;
+function releaseFeatures(metadata) {
+	const features = metadata.compatibility?.features;
 	return Array.isArray(features) ? features : [];
 }
 
@@ -1494,28 +1577,33 @@ export async function recoverUpdate(record, context, options = { phase: "all" })
 	}
 }
 
-/** Rolls code back only after a new drain, preserving state written after the prior committed update. */
-export async function rollbackUpdate(record, context) {
-	const journal = readUpdateJournal(record.id, context.root);
-	if (!journal || journal.phase !== "complete" || !journal.previousRecord)
-		return { status: "incompatible", reason: "No completed update is available for rollback." };
-	if (
-		journal.candidateVersion !== record.releaseVersion ||
-		journal.previousRecord.releaseVersion === record.releaseVersion
-	)
-		return { status: "incompatible", reason: "The prior update did not commit a different current release." };
-	const releasePath = join(resolve(context.root), "opt/unit-001/releases", journal.previousRecord.releaseVersion);
-	validateRelease(releasePath, context.root);
-	const metadata = JSON.parse(readFileSync(join(releasePath, "release.json"), "utf8"));
-	return activateUpdate(
-		record,
-		{
-			releasePath,
-			version: journal.previousRecord.releaseVersion,
-			compatibility: metadata.compatibility,
-			// Only this operation may lower the service template version, and only to the journal's exact unit.
-			operation: "rollback",
-		},
-		context,
-	);
+/** Selects, admits and activates a rollback under one management lock, preserving state written after commit. */
+export async function rollbackUpdate(record, context, admitRollback) {
+	const root = context.root;
+	return withManagementLock(async () => {
+		record = readInstallation(record.id, root);
+		if (record.desiredState === "uninstalled") throw new Error("This agent is uninstalled.");
+		const journal = readUpdateJournal(record.id, root);
+		const version = journal?.previousRecord?.releaseVersion;
+		if (journal?.phase !== "complete" || !/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(version ?? ""))
+			return { status: "incompatible", reason: "No completed update is available for rollback." };
+		if (journal.candidateVersion !== record.releaseVersion || version === record.releaseVersion)
+			return { status: "incompatible", reason: "The prior update did not commit a different current release." };
+		const releasePath = join(resolve(root), "opt/unit-001/releases", version);
+		const metadata = verifyUpdateRelease(releasePath, version, root);
+		const candidate = { releasePath, version, compatibility: metadata.compatibility, operation: "rollback" };
+		const features = releaseFeatures(metadata);
+		const web = readWebActivation(record, root);
+		const refusal = releaseSwitchRefusal(record, candidate, features, web, context, root);
+		if (refusal) return refusal;
+		// runUpdate's admission persists the rollback pin, so verify the retained payload first.
+		const qualifiedDestination = web ? await stageWebRelease(record, candidate, web, context) : undefined;
+		const admission = await admitRollback?.(record, candidate);
+		if (admission) return admission;
+		if (context.rollback) return context.rollback(record, context);
+		const activated = await context.admit?.(record, candidate);
+		if (activated) return activated;
+		if (record.desiredState !== "running") return { status: "deferred", reason: "Operator intent is stopped." };
+		return activateVerifiedUpdate(record, candidate, features, journal, context, web, qualifiedDestination);
+	}, root);
 }

@@ -184,47 +184,15 @@ export async function runUpdate(args, context = createUpdateContext()) {
 			}
 			return { status: "configured", enabled: config.enabled, pin: config.pin };
 		}, root);
-	let rollbackPin;
-	if (command === "rollback") {
-		rollbackPin = await withManagementLock(async () => {
-			const journal = readUpdateJournal(record.id, root);
-			const current = readInstallation(record.id, root);
-			if (current.desiredState === "uninstalled") throw new Error("This agent is uninstalled.");
-			if (!journal || journal.phase !== "complete" || !VERSION.test(journal.previousRecord?.releaseVersion ?? ""))
-				throw new Error("No completed update is available for rollback.");
-			const version = journal.previousRecord.releaseVersion;
-			const release = join(resolve(root), "opt/unit-001/releases", version);
-			if (validateRelease(release, root).version !== version) throw new Error("Rollback release metadata mismatch.");
-			const policy = readConfig(record.id, root);
-			atomicWrite(paths.config, `${JSON.stringify({ ...policy, pin: version })}\n`, root);
-			return version;
-		}, root);
-	}
+	if (command === "rollback") return runRollback(record, paths, context, root);
 	const policy = readConfig(record.id, root);
 	if (command === "auto" && !policy.enabled) return { status: "disabled" };
 	if (command !== "check" && record.desiredState !== "running")
 		return { status: "deferred", reason: "Operator intent is stopped." };
-	if (command !== "rollback") requireConfigured(paths, root, policy);
-	protectedDirectory(paths.cache, root);
-	const lockPath = join(paths.cache, "updater.lock");
-	assertSafePath(lockPath, root);
-	if (existsSync(lockPath)) trustedFile(lockPath, root);
-	const lock = new DatabaseSync(lockPath, { timeout: 0 });
+	requireConfigured(paths, root, policy);
+	const lock = tryCacheLock(paths, root);
+	if (!lock) return { status: "deferred", reason: "Another update check is running." };
 	try {
-		try {
-			lock.exec("BEGIN EXCLUSIVE");
-		} catch {
-			return {
-				status: "deferred",
-				reason: "Another update check is running.",
-				...(rollbackPin === undefined ? {} : { pin: rollbackPin }),
-			};
-		}
-		if (command === "rollback") {
-			const result = { ...(await (context.rollback ?? rollbackUpdate)(record, context)), pin: rollbackPin };
-			recordCheck(paths, result, root);
-			return result;
-		}
 		let result = { status: "current", version: record.releaseVersion };
 		const candidate = await (context.fetchCandidate ?? fetchUpdate)(
 			{
@@ -292,18 +260,54 @@ export async function runUpdate(args, context = createUpdateContext()) {
 		recordCheck(paths, result, root);
 		return result;
 	} catch (error) {
-		const failure =
-			rollbackPin === undefined
-				? error
-				: new Error(`Rollback failed; version ${rollbackPin} remains pinned. ${error.message}`, { cause: error });
-		atomicWrite(
-			join(paths.configDirectory, "last-check.json"),
-			`${JSON.stringify({ at: new Date().toISOString(), status: "failed", reason: failure.message.slice(0, 2000) })}\n`,
-			root,
-		);
-		throw failure;
+		recordCheck(paths, { status: "failed", reason: error.message.slice(0, 2000) }, root);
+		throw error;
 	} finally {
 		lock.close();
+	}
+}
+
+async function runRollback(record, paths, context, root) {
+	let pin;
+	let lock;
+	try {
+		const result = await rollbackUpdate(record, context, (current, candidate) => {
+			if (!VERSION.test(candidate.version)) throw new Error("Rollback pin requires an exact stable version.");
+			const policy = readConfig(record.id, root);
+			atomicWrite(paths.config, `${JSON.stringify({ ...policy, pin: candidate.version })}\n`, root);
+			pin = candidate.version;
+			if (current.desiredState !== "running")
+				return { status: "deferred", reason: "Operator intent is stopped." };
+			// Never wait for the cache lock while holding management: an in-flight check may need management to finish.
+			lock = tryCacheLock(paths, root);
+			return lock ? null : { status: "deferred", reason: "Another update check is running.", pin };
+		});
+		if (!lock) return result;
+		const pinned = { ...result, pin };
+		recordCheck(paths, pinned, root);
+		return pinned;
+	} catch (error) {
+		if (!pin) throw error;
+		const failure = new Error(`Rollback failed; version ${pin} remains pinned. ${error.message}`, { cause: error });
+		recordCheck(paths, { status: "failed", reason: failure.message.slice(0, 2000) }, root);
+		throw failure;
+	} finally {
+		lock?.close();
+	}
+}
+
+function tryCacheLock(paths, root) {
+	protectedDirectory(paths.cache, root);
+	const lockPath = join(paths.cache, "updater.lock");
+	assertSafePath(lockPath, root);
+	if (existsSync(lockPath)) trustedFile(lockPath, root);
+	const lock = new DatabaseSync(lockPath, { timeout: 0 });
+	try {
+		lock.exec("BEGIN EXCLUSIVE");
+		return lock;
+	} catch {
+		lock.close();
+		return null;
 	}
 }
 

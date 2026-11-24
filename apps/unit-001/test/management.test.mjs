@@ -4,22 +4,23 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, test } from "node:test";
-import { configuredEnvironment, confirmAction, dispatchAgent } from "../deploy/agent-command.mjs";
+import { configuredEnvironment, confirmAction, dispatchAgent, run } from "../deploy/agent-command.mjs";
 import {
 	bootstrapReleaseUpdates,
 	installationPaths,
 	readInstallation,
+	removeUnusedRelease,
 	withManagementLock,
 	writeAgentCommand,
 	writeInstallation,
 } from "../deploy/installation.mjs";
 import { lifecycle, recoverRename } from "../deploy/lifecycle.mjs";
-import { updatePaths, updateScheduling } from "../deploy/update-activation.mjs";
+import { installUpdateCore, updatePaths, updateScheduling } from "../deploy/update-activation.mjs";
 import { writeReleaseChecksums, writeUpdateBootstrap } from "../scripts/build-release.mjs";
 import { generateRepositoryKeys } from "../scripts/update-repository.mjs";
 
@@ -74,6 +75,11 @@ async function setup() {
 	};
 	return { root, record, paths, calls, context };
 }
+
+test("management capture waits for the output pipe after the child exits", async () => {
+	const output = await run("/bin/sh", ["-c", "(sleep 0.1; printf 'LoadState=loaded\\n') &"], true);
+	assert.equal(output, "LoadState=loaded\n");
+});
 
 test("#23 management lock uses a protected directory instead of an attacker-precreated /run/lock file", async () => {
 	const { root, paths } = await setup();
@@ -480,6 +486,22 @@ test("#32 setup rejects an incomplete update before launching any configuration 
 	}
 });
 
+test("persistent web provisioning requires root and refuses an incomplete update before touching units", async () => {
+	const { context, root, calls, paths } = await setup();
+	await assert.rejects(
+		dispatchAgent(id, "agent", ["web", "enable", "ubuntu"], { ...context, uid: 1001 }),
+		/provisioning requires root/,
+	);
+	const update = updatePaths(id, root);
+	await mkdir(update.configDirectory, { recursive: true });
+	await writeFile(update.journal, JSON.stringify({ schemaVersion: 1, id, operationId: "pending-update", phase: "candidate" }), {
+		mode: 0o600,
+	});
+	await assert.rejects(dispatchAgent(id, "agent", ["web", "enable", "ubuntu"], context), /Recover the incomplete update/);
+	assert.deepEqual(calls, []);
+	await assert.rejects(stat(join(paths.config, "web-activation.json")), { code: "ENOENT" });
+});
+
 test("#32 an active administrative operation blocks setup before authentication begins", async () => {
 	const { context, root, calls } = await setup();
 	await withManagementLock(async () => {
@@ -675,6 +697,225 @@ test("#20 uninstall preserves a release referenced by another stopped installati
 	await writeInstallation(second, root);
 	await lifecycle(record, "uninstall", context);
 	assert.equal(await readFile(join(release, "VERSION"), "utf8"), "0.0.1\n");
+});
+
+test("unit-gp1.11 uninstall retains the inventory for another installation's selected updater core", async (t) => {
+	for (const [selection, desiredState] of [
+		["currentCore", "running"],
+		["recoveryCore", "stopped"],
+	]) {
+		await t.test(`${selection} on a ${desiredState} installation with a newer application`, async () => {
+			const { record, root, paths, context } = await setup();
+			const release = await software(record, root, paths);
+			const other = {
+				...record,
+				id: otherId,
+				name: "bob",
+				account: "ua-222222222222422282222222",
+				releaseVersion: "0.0.2",
+				desiredState,
+			};
+			await writeInstallation(other, root);
+			const otherPaths = installationPaths(otherId, root);
+			const newer = await software(other, root, otherPaths);
+			for (const [archive, version] of [
+				[release, record.releaseVersion],
+				[newer, other.releaseVersion],
+			]) {
+				await mkdir(join(archive, "updater/runtime/bin"), { recursive: true });
+				await mkdir(join(archive, "updater/lib"), { recursive: true });
+				await writeFile(join(archive, "updater/runtime/bin/node"), `runtime ${version}`);
+				await writeFile(join(archive, "updater/lib/update.mjs"), `// updater ${version}\n`);
+				writeReleaseChecksums(archive);
+				assert.equal(installUpdateCore({ ...other, releaseVersion: version }, archive, context), true);
+			}
+			const update = updatePaths(otherId, root);
+			const oldTarget = `cores/${record.releaseVersion}`;
+			const newTarget = `cores/${other.releaseVersion}`;
+			const otherSelector = selection === "currentCore" ? update.recoveryCore : update.currentCore;
+			await rm(otherSelector);
+			await symlink(newTarget, otherSelector);
+			const inventory = await readFile(join(release, "SHA256SUMS"));
+
+			await lifecycle(record, "uninstall", context);
+			assert.equal(readInstallation(id, root).desiredState, "uninstalled");
+			assert.equal(await readlink(otherPaths.current), `../../releases/${other.releaseVersion}`);
+			assert.equal(await readlink(update[selection]), oldTarget);
+			assert.deepEqual(await readFile(join(release, "SHA256SUMS")), inventory);
+			assert.deepEqual(
+				await readFile(join(release, "updater/runtime/bin/node")),
+				await readFile(join(update[selection], "runtime/bin/node")),
+			);
+
+			await symlink(oldTarget, update.previousCore);
+			await rm(update[selection]);
+			await symlink(newTarget, update[selection]);
+			assert.equal(removeUnusedRelease(record, root), true);
+			await assert.rejects(stat(release), { code: "ENOENT" });
+			assert.equal(await readlink(update.previousCore), oldTarget);
+			assert.equal(
+				await readFile(join(update.previousCore, "runtime/bin/node"), "utf8"),
+				`runtime ${record.releaseVersion}`,
+			);
+			assert.equal(await readFile(join(newer, "VERSION"), "utf8"), `${other.releaseVersion}\n`);
+		});
+	}
+
+	for (const [condition, pathKey, createEntry] of [
+		["absent selector directory", null],
+		["malformed selector", "recoveryCore", (path) => writeFile(path, "unexpected")],
+		["foreign selector", "recoveryCore", (path, release) => symlink(release, path)],
+		["dangling selector", "recoveryCore", (path) => symlink("cores/0.0.9", path)],
+		["writable selector directory", "updaterRoot", (path) => chmod(path, 0o777)],
+	]) {
+		await t.test(`uninstall handles ${condition}`, async () => {
+			const { record, root, paths, context } = await setup();
+			const release = await software(record, root, paths);
+			await writeInstallation(
+				{
+					...record,
+					id: otherId,
+					name: "bob",
+					account: "ua-222222222222422282222222",
+					releaseVersion: "0.0.2",
+				},
+				root,
+			);
+			const update = updatePaths(otherId, root);
+			const entry = pathKey && update[pathKey];
+			let original;
+			if (entry) {
+				await mkdir(update.updaterRoot, { recursive: true });
+				await createEntry(entry, release);
+				original = await lstat(entry);
+			}
+
+			await lifecycle(record, "uninstall", context);
+			assert.equal(readInstallation(id, root).desiredState, "uninstalled");
+			await assert.rejects(stat(paths.wrapper(record.name)), { code: "ENOENT" });
+			if (entry) {
+				assert.equal((await lstat(entry)).ino, original.ino);
+				assert.equal(await readFile(join(release, "VERSION"), "utf8"), `${record.releaseVersion}\n`);
+			} else {
+				await assert.rejects(stat(release), { code: "ENOENT" });
+			}
+		});
+	}
+});
+
+test("unit-gp1.14 uninstall retains another installation's journal-reachable release", async (t) => {
+	for (const phase of ["backed-up", "candidate", "committed", "complete", "holding", "restored"]) {
+		await t.test(phase, async () => {
+			const { record, root, paths, context } = await setup();
+			const release = await software(record, root, paths);
+			const other = {
+				...record,
+				id: otherId,
+				name: "bob",
+				account: "ua-222222222222422282222222",
+				releaseVersion: "0.0.3",
+				desiredState: "stopped",
+			};
+			const otherPaths = installationPaths(otherId, root);
+			await writeInstallation(other, root);
+			await software(other, root, otherPaths);
+			const update = updatePaths(otherId, root);
+			const core = "cores/0.0.0";
+			await mkdir(join(update.updaterRoot, core), { recursive: true });
+			for (const selector of [update.currentCore, update.recoveryCore]) await symlink(core, selector);
+			await mkdir(update.configDirectory);
+
+			const previous = {
+				schemaVersion: 1,
+				id: otherId,
+				operationId: "33333333-3333-4333-8333-333333333333",
+				previousRecord: { ...other, releaseVersion: record.releaseVersion, desiredState: "running" },
+				candidateVersion: other.releaseVersion,
+				phase: "complete",
+			};
+			const canRestoreReceipt = phase === "holding" || phase === "restored";
+			const journal =
+				canRestoreReceipt
+					? {
+							...previous,
+							operationId: "44444444-4444-4444-8444-444444444444",
+							previousRecord: { ...other, desiredState: "running" },
+							candidateVersion: "0.0.4",
+							phase,
+							...(phase === "restored" ? { liveDeferred: true } : {}),
+						}
+					: { ...previous, phase };
+			const receipt = JSON.stringify({ operationId: journal.operationId, journal: previous });
+			if (canRestoreReceipt) await writeFile(update.priorJournal, receipt);
+			const journalBytes = JSON.stringify(journal);
+			await writeFile(update.journal, journalBytes);
+			const inventory = await readFile(join(release, "SHA256SUMS"));
+
+			await lifecycle(record, "uninstall", context);
+			assert.equal(readInstallation(id, root).desiredState, "uninstalled");
+			assert.equal(await readlink(otherPaths.current), `../../releases/${other.releaseVersion}`);
+			assert.equal(await readlink(update.currentCore), core);
+			assert.equal(await readlink(update.recoveryCore), core);
+			assert.equal(await readFile(update.journal, "utf8"), journalBytes);
+			if (canRestoreReceipt) assert.equal(await readFile(update.priorJournal, "utf8"), receipt);
+			assert.deepEqual(await readFile(join(release, "SHA256SUMS")), inventory);
+
+			await writeFile(
+				update.journal,
+				JSON.stringify({ ...previous, previousRecord: { ...previous.previousRecord, releaseVersion: "0.0.2" } }),
+			);
+			assert.equal(removeUnusedRelease(record, root), true);
+			await assert.rejects(stat(release), { code: "ENOENT" });
+		});
+	}
+});
+
+test("unit-gp1.14 uninstall finishes when another installation's recovery metadata is ambiguous", async (t) => {
+	for (const condition of [
+		"null marker",
+		"untrusted journal",
+		"unknown phase",
+		"foreign record",
+		"invalid release",
+		"invalid receipt",
+	]) {
+		await t.test(condition, async () => {
+			const { record, root, paths, context } = await setup();
+			const release = await software(record, root, paths);
+			const other = {
+				...record,
+				id: otherId,
+				name: "bob",
+				account: "ua-222222222222422282222222",
+				releaseVersion: "0.0.3",
+			};
+			await writeInstallation(other, root);
+			const update = updatePaths(otherId, root);
+			await mkdir(update.configDirectory);
+			const journal = {
+				schemaVersion: 1,
+				id: otherId,
+				operationId: "33333333-3333-4333-8333-333333333333",
+				previousRecord: other,
+				candidateVersion: "0.0.4",
+				phase: "holding",
+			};
+			if (condition === "unknown phase") journal.phase = "unknown";
+			if (condition === "foreign record") journal.previousRecord = record;
+			if (condition === "invalid release") journal.candidateVersion = "../0.0.4";
+			if (condition === "invalid receipt")
+				await writeFile(update.priorJournal, JSON.stringify({ operationId: journal.operationId }));
+			const journalBytes = JSON.stringify(condition === "null marker" ? null : journal);
+			await writeFile(update.journal, journalBytes);
+			if (condition === "untrusted journal") await chmod(update.journal, 0o666);
+
+			await lifecycle(record, "uninstall", context);
+			assert.equal(readInstallation(id, root).desiredState, "uninstalled");
+			await assert.rejects(stat(paths.wrapper(record.name)), { code: "ENOENT" });
+			assert.equal(await readFile(update.journal, "utf8"), journalBytes);
+			assert.equal(await readFile(join(release, "VERSION"), "utf8"), `${record.releaseVersion}\n`);
+		});
+	}
 });
 
 test("#19 service launches as its recorded UID with process replacement and rejects root", async () => {

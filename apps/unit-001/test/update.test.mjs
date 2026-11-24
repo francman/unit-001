@@ -3,10 +3,13 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
 	chmodSync,
+	cpSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
+	readlinkSync,
 	realpathSync,
 	rmSync,
 	statSync,
@@ -18,14 +21,16 @@ import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { gzipSync } from "node:zlib";
-import { accountFor, withManagementLock, writeInstallation } from "../deploy/installation.mjs";
+import { accountFor, installationPaths, withManagementLock, writeInstallation } from "../deploy/installation.mjs";
 import { extractUpdateArchive, runUpdate } from "../deploy/update.mjs";
 import { updatePaths } from "../deploy/update-activation.mjs";
 import { writeReleaseArchive, writeReleaseChecksums } from "../scripts/build-release.mjs";
 import { generateRepositoryKeys } from "../scripts/update-repository.mjs";
+import { webApplicationFiles, webUpdaterPackages } from "./fixtures/web-release-artifacts.mjs";
 
 const ID = "11111111-1111-4111-8111-111111111111";
 const compatibility = { stateVersion: 1, minReaderVersion: 1, maintenanceProtocol: 1 };
+const webCompatibility = { ...compatibility, features: ["web-socket-activation"] };
 
 function fixture(t) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "unit-update-")));
@@ -61,11 +66,12 @@ function fixture(t) {
 	return { root, record, paths, keys, token, calls, context, run, configure };
 }
 
-function bundle(f, version = "0.0.2", format) {
+function bundle(f, version = "0.0.2", format, { web = false, omit } = {}) {
 	const name = `unit-001-${version}-linux-x64`;
 	const source = join(f.root, `source-${version}-${format ?? "default"}`);
 	const directory = join(source, name);
 	mkdirSync(directory, { recursive: true });
+	const releaseCompatibility = web ? webCompatibility : compatibility;
 	writeFileSync(join(directory, "VERSION"), `${version}\n`);
 	writeFileSync(
 		join(directory, "release.json"),
@@ -73,10 +79,40 @@ function bundle(f, version = "0.0.2", format) {
 			version,
 			platform: "linux-x64",
 			source: { commit: "a".repeat(40), dirty: false },
-			compatibility,
+			compatibility: releaseCompatibility,
 		}),
 	);
 	writeFileSync(join(directory, "empty"), "");
+	for (const file of ["runtime/bin/node", "bin/agent", "install.sh"]) {
+		mkdirSync(dirname(join(directory, file)), { recursive: true });
+		writeFileSync(join(directory, file), "fixture executable");
+	}
+	chmodSync(join(directory, "install.sh"), 0o755);
+	if (web) {
+		const marker = JSON.stringify({ features: webCompatibility.features });
+		for (const [file, contents] of Object.entries({
+			"deploy/release-compatibility.json": marker,
+			"deploy/installation.mjs": "fixture installer",
+			"deploy/agent-command.mjs": "fixture named command",
+			"deploy/lifecycle.mjs": "fixture lifecycle",
+			"deploy/update-activation.mjs": "fixture management activation",
+			"updater/lib/release-compatibility.json": marker,
+			"updater/lib/update-activation.mjs": "fixture activation",
+			"updater/lib/installation.mjs": "fixture installation",
+			"updater/lib/update.mjs": "fixture updater",
+			"updater/lib/release-version.mjs": "fixture version parser",
+			"updater/lib/update-trust.mjs": "fixture archive trust",
+			"updater/lib/control.mjs": "fixture owner control",
+			"updater/runtime/bin/node": "fixture independent runtime",
+			...webApplicationFiles,
+			...Object.fromEntries(Object.entries(webUpdaterPackages).map(([name, bytes]) => [`updater/${name}`, bytes])),
+		})) {
+			if (file === omit) continue;
+			const path = join(directory, file);
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, contents);
+		}
+	}
 	const longPath = join(directory, "long".repeat(28), "unicode-λ.txt");
 	mkdirSync(dirname(longPath), { recursive: true });
 	writeFileSync(longPath, "long path evidence");
@@ -87,7 +123,7 @@ function bundle(f, version = "0.0.2", format) {
 			env: { ...process.env, COPYFILE_DISABLE: "1" },
 		});
 	else writeReleaseArchive(source, name, archive);
-	return { version, archivePath: archive, sourceCommit: "a".repeat(40), compatibility };
+	return { version, archivePath: archive, sourceCommit: "a".repeat(40), compatibility: releaseCompatibility };
 }
 
 function supplied(candidate, onFetch) {
@@ -282,6 +318,65 @@ test("policy changed during download blocks activation under its final admission
 	assert.equal((await f.run(["apply"], { fetchCandidate: supplied(candidate), activate })).status, "deferred");
 });
 
+for (const [name, options, retainedPath, retainedMode, message] of [
+	["missing capability", {}],
+	["missing browser asset", { web: true, omit: "app/web-dist/style.css" }],
+	["missing updater runtime", { web: true, omit: "updater/runtime/bin/node" }],
+	["missing updater local import", { web: true, omit: "updater/lib/release-version.mjs" }],
+	["missing packaged updater dependency", { web: true, omit: "updater/node_modules/tuf-js/dist/index.js" }],
+	["non-executable retained application runtime", { web: true }, "runtime/bin/node", 0o644, /executable mode 0755/],
+	["root-only retained application runtime", { web: true }, "runtime/bin/node", 0o744, /executable mode 0755/],
+	["unsearchable retained application runtime", { web: true }, "runtime", 0o700, /searchable by non-root accounts/],
+	["unreadable retained browser asset", { web: true }, "app/web-dist/style.css", 0o600, /readable by non-root accounts/],
+])
+	test(`persistent web apply refuses ${name} before durable release staging`, async (t) => {
+		const f = fixture(t);
+		await f.configure();
+		const paths = installationPaths(ID, f.root);
+		const releases = join(f.root, "opt/unit-001/releases");
+		mkdirSync(paths.state, { recursive: true });
+		mkdirSync(paths.agentRoot, { recursive: true });
+		symlinkSync(`../../releases/${f.record.releaseVersion}`, paths.current);
+		const marker = join(paths.state, "marker");
+		const webConfig = join(paths.config, "web-activation.json");
+		writeFileSync(marker, "state before apply", { mode: 0o600 });
+		writeFileSync(
+			webConfig,
+			JSON.stringify({ schemaVersion: 1, id: ID, operator: "ubuntu", uid: 1001, state: "configured" }),
+		);
+		const candidate = bundle(f, "0.0.2", undefined, options);
+		const retained = join(releases, candidate.version);
+		if (retainedPath !== undefined) {
+			cpSync(join(f.root, "source-0.0.2-default/unit-001-0.0.2-linux-x64"), retained, { recursive: true });
+			chmodSync(join(retained, "runtime/bin/node"), 0o755);
+			chmodSync(join(retained, retainedPath), retainedMode);
+		}
+		const protectedFiles = [f.paths.config, webConfig, paths.record, marker];
+		const before = protectedFiles.map((file) => readFileSync(file));
+		const versions = readdirSync(releases);
+		f.calls.length = 0;
+		const apply = () => f.run(["apply"], {
+			fetchCandidate: supplied(candidate),
+			control: async () => assert.fail("Persistent web refusal must precede owner control."),
+		});
+		if (retainedPath === undefined) {
+			const result = await apply();
+			assert.equal(result.status, "deferred");
+			assert.match(result.reason, /web disable/);
+		} else {
+			await assert.rejects(apply(), message);
+			assert.equal(statSync(join(retained, retainedPath)).mode & 0o777, retainedMode);
+		}
+		assert.deepEqual(readdirSync(releases), versions);
+		assert.ok(!readdirSync(f.paths.cache).some((entry) => entry.startsWith(".extract-")));
+		assert.equal(existsSync(f.paths.journal), false);
+		assert.equal(existsSync(f.paths.priorJournal), false);
+		assert.equal(existsSync(f.paths.updaterRoot), false);
+		assert.equal(readlinkSync(paths.current), `../../releases/${f.record.releaseVersion}`);
+		assert.deepEqual(protectedFiles.map((file) => readFileSync(file)), before);
+		assert.deepEqual(f.calls, []);
+	});
+
 test("recover --start is explicit and independent of update credentials", async (t) => {
 	const f = fixture(t);
 	let requested;
@@ -348,6 +443,7 @@ test("actual archive writer and PAX/GNU long paths extract including empty files
 		const destination = mkdtempSync(join(f.root, "extract-"));
 		const directory = await extractUpdateArchive(candidate.archivePath, destination, candidate.version);
 		assert.equal(readFileSync(join(directory, "empty")).length, 0);
+		assert.equal(statSync(join(directory, "install.sh")).mode & 0o777, 0o755);
 		assert.equal(readFileSync(join(directory, "long".repeat(28), "unicode-λ.txt"), "utf8"), "long path evidence");
 	}
 });
@@ -406,6 +502,7 @@ test("rollback pins before contended lock and prevents in-flight and later bad-s
 			id: ID,
 			operationId: "fixture",
 			phase: "complete",
+			candidateVersion: f.record.releaseVersion,
 			previousRecord: { ...f.record, releaseVersion: old.version },
 		}),
 	);
@@ -426,7 +523,13 @@ test("rollback pins before contended lock and prevents in-flight and later bad-s
 	});
 	assert.equal(result.status, "deferred");
 	assert.equal(rollbackRan, false);
-	const rollback = await f.run(["rollback"], { rollback: async () => ({ status: "updated", version: "0.0.0" }) });
+	const rollback = await f.run(["rollback"], {
+		async rollback() {
+			await assert.rejects(withManagementLock(() => {}, f.root), /Another install, update, or lifecycle/);
+			assert.equal(JSON.parse(readFileSync(f.paths.config)).pin, "0.0.0");
+			return { status: "updated", version: "0.0.0" };
+		},
+	});
 	assert.equal(rollback.pin, "0.0.0");
 	assert.equal((await f.run(["auto"], { fetchCandidate: supplied(candidate) })).status, "pinned");
 	await assert.rejects(

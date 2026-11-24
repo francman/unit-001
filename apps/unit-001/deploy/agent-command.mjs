@@ -9,8 +9,11 @@ import { parseEnv } from "node:util";
 import {
 	assertSafePath,
 	configureOperatorService,
+	configureWebActivation,
 	installationPaths,
 	readInstallation,
+	readWebActivation,
+	removeWebActivation,
 	withManagementLock,
 } from "./installation.mjs";
 import { lifecycle, recoverRename } from "./lifecycle.mjs";
@@ -25,6 +28,27 @@ export async function dispatchAgent(id, expectedName, args, context) {
 	if (!service && expectedName !== record.name)
 		throw new Error("This agent command was renamed; use its current name.");
 	const action = args[0];
+	if (!service && action === "web" && ["enable", "disable"].includes(args[1])) {
+		if (context.uid !== 0) throw new Error(`Run sudo ${record.name} web ${args[1]}; provisioning requires root.`);
+		if (args.length !== (args[1] === "enable" ? 3 : 2))
+			throw new Error("Usage: NAME web enable USER | NAME web disable");
+		return withManagementLock(async () => {
+			const current = readInstallation(id, context.root);
+			if (current.name !== expectedName || current.desiredState === "uninstalled")
+				throw new Error("The installation changed; retry its current command.");
+			if (args[1] === "enable") {
+				const journal = readUpdateJournal(id, context.root);
+				if (journal && journal.phase !== "complete")
+					throw new Error("Recover the incomplete update before enabling web activation.");
+				await configureWebActivation(current, args[2], context);
+				context.notice?.(`Persistent web configured for ${args[2]} at /run/unit-001-web/${id}.sock.\n`);
+			} else {
+				await removeWebActivation(current, context);
+				context.notice?.("Persistent web is disabled.\n");
+			}
+			return 0;
+		}, context.root);
+	}
 	if (!service && action === "channels" && ["policy", "approve", "revoke", "telegram-bootstrap"].includes(args[1])) {
 		if (context.uid !== 0)
 			throw new Error(
@@ -79,6 +103,8 @@ export async function dispatchAgent(id, expectedName, args, context) {
 				if (journal && journal.phase !== "complete")
 					throw new Error("Recover the incomplete update before changing operator access.");
 				servicePrepared = await configureOperatorService(current, context);
+			} else if (readWebActivation(current, context.root)?.operator === user) {
+				await removeWebActivation(current, context);
 			}
 			await context.run(
 				args[1] === "add" ? "usermod" : "gpasswd",
@@ -249,7 +275,8 @@ export function run(command, args, capture = false, applicationEnvironment = {},
 			cleanup();
 			reject(error);
 		});
-		child.once(options.forwardSignals ? "close" : "exit", (code, signal) => {
+		// A child can exit before its captured stdout has drained.
+		child.once(capture || options.forwardSignals ? "close" : "exit", (code, signal) => {
 			cleanup();
 			if (code === 0 && interrupted === undefined) resolve(capture ? output : 0);
 			else

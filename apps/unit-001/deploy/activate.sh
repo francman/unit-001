@@ -82,8 +82,17 @@ trap 'exit 143' TERM
 
 if [[ "$service_action" == manage ]] && systemctl is-active --quiet "$unit_name"; then was_running=true; fi
 if [[ "$service_action" == manage ]] && systemctl is-enabled --quiet "$unit_name"; then was_enabled=true; fi
-if [[ "$service_action" == manage && "$was_running" == true ]]; then systemctl stop "$unit_name"; fi
+web_configured=false
+if [[ "$service_action" == manage && ( -e "$config/web-activation.json" || -L "$config/web-activation.json" ) ]]; then
+  web_configured=true
+fi
+if [[ "$service_action" == manage && ( "$was_running" == true || "$web_configured" == true ) ]]; then
+  systemctl stop "$unit_name"
+fi
 activation_started=true
+if [[ "$web_configured" == true ]]; then
+  "$release/runtime/bin/node" "$release/deploy/installation.mjs" web-quiesce "$id"
+fi
 mkdir -p -- "$management"
 chmod 755 "$management"
 for module in installation.mjs agent-command.mjs lifecycle.mjs update-activation.mjs; do

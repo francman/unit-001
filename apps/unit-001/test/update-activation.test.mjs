@@ -11,6 +11,7 @@ import {
 	readdirSync,
 	readFileSync,
 	readlinkSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
@@ -22,8 +23,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
-import { fileURLToPath } from "node:url";
-import { installationPaths, readInstallation, writeInstallation } from "../deploy/installation.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { installationPaths, readInstallation, writeAgentCommand, writeInstallation } from "../deploy/installation.mjs";
+import { runUpdate } from "../deploy/update.mjs";
 import {
 	activateUpdate,
 	installUpdateCore,
@@ -35,6 +37,7 @@ import {
 	updatePaths,
 	updateScheduling,
 } from "../deploy/update-activation.mjs";
+import { webApplicationFiles, webUpdaterPackages } from "./fixtures/web-release-artifacts.mjs";
 
 const roots = [];
 afterEach(() => {
@@ -42,6 +45,7 @@ afterEach(() => {
 });
 const id = "11111111-1111-4111-8111-111111111111";
 const compatibility = { stateVersion: 1, minReaderVersion: 1, maintenanceProtocol: 1 };
+const webCompatibility = { ...compatibility, features: ["web-socket-activation"] };
 
 const template = readFileSync(fileURLToPath(new URL("../deploy/unit-001.service", import.meta.url)), "utf8");
 
@@ -66,10 +70,20 @@ function release(root, version, stateCompatibility = compatibility, serviceTempl
 		files[`deploy/${name}`] = readFileSync(fileURLToPath(new URL(`../deploy/${name}`, import.meta.url)), "utf8");
 	for (const name of ["installation.mjs", "update-activation.mjs"])
 		files[`updater/lib/${name}`] = files[`deploy/${name}`];
+	if (stateCompatibility.features?.includes("web-socket-activation")) {
+		const marker = JSON.stringify({ features: stateCompatibility.features });
+		files["deploy/release-compatibility.json"] = marker;
+		files["updater/lib/release-compatibility.json"] = marker;
+		Object.assign(files, webApplicationFiles);
+		for (const [name, contents] of Object.entries(webUpdaterPackages)) files[`updater/${name}`] = contents;
+		for (const name of ["update.mjs", "release-version.mjs", "update-trust.mjs", "control.mjs"])
+			files[`updater/lib/${name}`] = readFileSync(fileURLToPath(new URL(`../deploy/${name}`, import.meta.url)), "utf8");
+	}
 	for (const [path, text] of Object.entries(files)) {
 		mkdirSync(dirname(join(directory, path)), { recursive: true });
 		writeFileSync(join(directory, path), text);
 	}
+	chmodSync(join(directory, "runtime/bin/node"), 0o755);
 	writeFileSync(
 		join(directory, "SHA256SUMS"),
 		Object.entries(files)
@@ -79,8 +93,8 @@ function release(root, version, stateCompatibility = compatibility, serviceTempl
 	return directory;
 }
 
-function setup(mode = "healthy", versions = { baseline: "0.0.2", candidate: "0.0.3" }) {
-	const root = mkdtempSync(join(tmpdir(), "unit-update-"));
+function setup(mode = "healthy", versions = { baseline: "0.0.2", candidate: "0.0.3" }, baselineCompatibility = compatibility) {
+	const root = mkdtempSync(join(realpathSync(tmpdir()), "unit-update-"));
 	roots.push(root);
 	const record = {
 		schemaVersion: 1,
@@ -99,7 +113,11 @@ function setup(mode = "healthy", versions = { baseline: "0.0.2", candidate: "0.0
 	database.exec("CREATE TABLE proof(value TEXT)");
 	database.close();
 	writeFileSync(join(paths.state, "marker"), "old state");
-	const old = release(root, versions.baseline);
+	const old = release(root, versions.baseline, baselineCompatibility);
+	if (baselineCompatibility.features?.includes("web-socket-activation")) {
+		for (const name of ["installation.mjs", "lifecycle.mjs", "agent-command.mjs", "update-activation.mjs"])
+			copyFileSync(join(old, "deploy", name), join(paths.management, name));
+	}
 	const next = release(root, versions.candidate);
 	symlinkSync(`../../releases/${versions.baseline}`, paths.current);
 	mkdirSync(dirname(paths.unitFile), { recursive: true });
@@ -116,6 +134,8 @@ function setup(mode = "healthy", versions = { baseline: "0.0.2", candidate: "0.0
 	const context = {
 		root,
 		async run(command, args) {
+			if (command === "/usr/bin/env")
+				return execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 });
 			calls.push([command, ...args]);
 			if (command === "systemctl") {
 				// Systemd's loaded view: the managed unit file plus the updater's recovery drop-in.
@@ -561,6 +581,220 @@ test("#72 the archive and its signed descriptor must declare the same features",
 	}
 });
 
+test("the installed updater rejects rollback before changing the pin, journal, selectors or state", async () => {
+	const fixture = setup("healthy", undefined, webCompatibility);
+	const { root, paths, context, record } = fixture;
+	writeAgentCommand(record, root);
+	const candidate = { ...fixture.candidate, compatibility: webCompatibility };
+	release(root, candidate.version, candidate.compatibility);
+	assert.equal((await activateUpdate(record, candidate, context)).status, "updated");
+	const config = join(paths.config, "web-activation.json");
+	writeFileSync(
+		config,
+		JSON.stringify({ schemaVersion: 1, id, operator: "ubuntu", uid: 1001, state: "revoking" }),
+		{ mode: 0o644 },
+	);
+	const update = updatePaths(id, root);
+	writeFileSync(
+		update.config,
+		JSON.stringify({
+			schemaVersion: 1,
+			id,
+			enabled: true,
+			pin: "0.0.3",
+			repository: "francman/unit-001-releases",
+			channel: "stable",
+		}),
+		{ mode: 0o600 },
+	);
+	writeFileSync(join(paths.state, "marker"), "work since the update committed");
+	const files = [
+		update.config,
+		update.journal,
+		update.priorJournal,
+		paths.record,
+		join(paths.state, "marker"),
+		join(paths.state, "sessions/default.sqlite"),
+		join(update.configDirectory, "backup/marker"),
+	];
+	const selectors = [paths.current, update.currentCore, update.previousCore, update.recoveryCore];
+	const originalFiles = files.map((file) => readFileSync(file));
+	const originalSelectors = selectors.map((path) => readlinkSync(path));
+	const releaseNames = readdirSync(join(root, "opt/unit-001/releases"));
+	const entry = join(root, "rollback-fixture.mjs");
+	writeFileSync(entry, `
+import { execFileSync } from "node:child_process";
+import { runUpdate } from ${JSON.stringify(pathToFileURL(join(update.currentCore, "lib/update.mjs")).href)};
+const unexpected = () => { throw new Error("Rollback refusal must precede all service calls"); };
+try {
+	const result = await runUpdate(["rollback", "--id", ${JSON.stringify(id)}], {
+		root: ${JSON.stringify(root)},
+		run(command, args) {
+			if (command !== "/usr/bin/env" || !args.includes("--permission")) unexpected();
+			return execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 });
+		},
+		control: unexpected,
+	});
+	process.stdout.write(JSON.stringify(result));
+} catch (error) {
+	process.stdout.write(JSON.stringify({ error: error.message }));
+}
+`);
+	const installedRollback = () => JSON.parse(execFileSync(process.execPath, [entry], { encoding: "utf8" }));
+	const assertPreserved = () => {
+		assert.deepEqual(files.map((file) => readFileSync(file)), originalFiles);
+		assert.deepEqual(selectors.map((path) => readlinkSync(path)), originalSelectors);
+		assert.deepEqual(readdirSync(join(root, "opt/unit-001/releases")), releaseNames);
+	};
+	const previous = join(root, "opt/unit-001/releases/0.0.2");
+	const manifestPath = join(previous, "SHA256SUMS");
+	const manifest = readFileSync(manifestPath, "utf8");
+	for (const path of [
+		"app/web-dist/bootstrap.js",
+		"updater/runtime/bin/node",
+		"updater/lib/release-version.mjs",
+		"updater/node_modules/@tufjs/models/dist/index.js",
+	]) {
+		const file = join(previous, path);
+		const before = readFileSync(file);
+		rmSync(file);
+		writeFileSync(manifestPath, manifest.split("\n").filter((row) => !row.endsWith(`  ./${path}`)).join("\n"));
+		const result = installedRollback();
+		assert.equal(result.status, "deferred");
+		assert.match(result.reason, /web disable/);
+		assert.equal(Object.hasOwn(result, "pin"), false);
+		assertPreserved();
+		writeFileSync(file, before);
+		writeFileSync(manifestPath, manifest);
+	}
+	const dependency = "app/dist/service-client.js";
+	const dependencyPath = join(previous, dependency);
+	const dependencyBytes = readFileSync(dependencyPath);
+	rmSync(dependencyPath);
+	writeFileSync(manifestPath, manifest.split("\n").filter((row) => !row.endsWith(`  ./${dependency}`)).join("\n"));
+	assert.match(installedRollback().error, /package smoke failed.*named\.js/s);
+	assertPreserved();
+	writeFileSync(dependencyPath, dependencyBytes);
+	writeFileSync(manifestPath, manifest);
+	for (const runtime of [
+		join(previous, "runtime/bin/node"),
+		join(update.cores, "0.0.2/runtime/bin/node"),
+		join(update.cores, "0.0.3/runtime/bin/node"),
+	]) {
+		for (const mode of [0o644, 0o744]) {
+			chmodSync(runtime, mode);
+			assert.ok(installedRollback().error.includes(`executable mode 0755: ${runtime}`));
+			assert.equal(statSync(runtime).mode & 0o777, mode);
+			assertPreserved();
+		}
+		chmodSync(runtime, 0o755);
+	}
+	for (const [path, mode, error] of [
+		[join(previous, "runtime"), 0o700, "searchable by non-root accounts"],
+		[join(previous, "app/web-dist/bootstrap.js"), 0o600, "readable by non-root accounts"],
+		[join(update.cores, "0.0.2/lib/release-version.mjs"), 0o600, "readable by non-root accounts"],
+		[join(update.cores, "0.0.3/lib"), 0o700, "searchable by non-root accounts"],
+		[paths.agentRoot, 0o700, "searchable by non-root accounts"],
+	]) {
+		const originalMode = statSync(path).mode & 0o777;
+		chmodSync(path, mode);
+		assert.ok(installedRollback().error.includes(`${error}: ${path}`));
+		assert.equal(statSync(path).mode & 0o777, mode);
+		assertPreserved();
+		chmodSync(path, originalMode);
+	}
+
+	rmSync(config);
+	const control = context.control;
+	context.control = async (current, args) => {
+		const result = await control(current, args);
+		return args[0] === "maintenance-enter" && args[4] === "30000" ? { ...result, result: "deferred" } : result;
+	};
+	const rollback = () => runUpdate(["rollback", "--id", id], context);
+	assert.deepEqual(await rollback(), { status: "deferred", reason: "Active work did not drain.", pin: "0.0.2" });
+	assert.equal(JSON.parse(readFileSync(update.config)).pin, "0.0.2");
+	assert.deepEqual(readFileSync(update.journal), originalFiles[1]);
+	context.control = control;
+	assert.deepEqual(await rollback(), { status: "updated", version: "0.0.2", pin: "0.0.2" });
+	assert.equal(readInstallation(id, root).releaseVersion, "0.0.2");
+	assert.equal(readFileSync(join(paths.state, "marker"), "utf8"), "work since the update committed");
+});
+
+test("persistent web rejects a reused candidate core with a rewritten local manifest before staging", async () => {
+	const { root, paths, context, record, calls, candidate } = setup("healthy", undefined, webCompatibility);
+	writeAgentCommand(record, root);
+	const releasePath = join(root, "verified-candidate");
+	const destination = release(root, candidate.version, webCompatibility);
+	renameSync(destination, releasePath);
+	const next = { ...candidate, releasePath, compatibility: webCompatibility };
+	installUpdateCore({ ...record, releaseVersion: next.version }, releasePath, context);
+	writeFileSync(
+		join(paths.config, "web-activation.json"),
+		JSON.stringify({ schemaVersion: 1, id, operator: "ubuntu", uid: 1001, state: "configured" }),
+	);
+	const update = updatePaths(id, root);
+	const core = join(update.cores, next.version);
+	const file = "lib/update-activation.mjs";
+	const manifest = join(core, "CORE-SHA256SUMS.json");
+	const originalManifest = readFileSync(manifest, "utf8");
+	const originalGuard = readFileSync(join(core, file));
+	const changed = "// different core guard\n";
+	writeFileSync(join(core, file), changed);
+	writeFileSync(
+		manifest,
+		JSON.stringify({ ...JSON.parse(originalManifest), [file]: createHash("sha256").update(changed).digest("hex") }),
+	);
+	await assert.rejects(activateUpdate(record, next, context), /updater bytes differ from the retained release/);
+	assert.equal(existsSync(destination), false);
+	assert.equal(existsSync(update.journal), false);
+	assert.equal(readlinkSync(paths.current), "../../releases/0.0.2");
+	assert.equal(readlinkSync(update.currentCore), "cores/0.0.2");
+	assert.deepEqual(calls, []);
+
+	writeFileSync(join(core, file), originalGuard);
+	writeFileSync(manifest, originalManifest);
+	const runtime = join(core, "runtime/bin/node");
+	chmodSync(runtime, 0o744);
+	await assert.rejects(activateUpdate(record, next, context), /executable mode 0755/);
+	assert.equal(existsSync(destination), false);
+	assert.equal(existsSync(update.journal), false);
+	assert.deepEqual(calls, []);
+	chmodSync(runtime, 0o755);
+	chmodSync(join(releasePath, "runtime/bin/node"), 0o644);
+	chmodSync(join(releasePath, "app/web-dist"), 0o700);
+	chmodSync(join(releasePath, "app/web-dist/style.css"), 0o600);
+	assert.equal((await activateUpdate(record, next, context)).status, "updated");
+	assert.equal(statSync(join(destination, "runtime/bin/node")).mode & 0o777, 0o755);
+	assert.equal(statSync(join(destination, "app/web-dist")).mode & 0o777, 0o755);
+	assert.equal(statSync(join(destination, "app/web-dist/style.css")).mode & 0o777, 0o644);
+	assert.equal(readlinkSync(update.currentCore), "cores/0.0.3");
+});
+
+test("#80 apply rejects a verified candidate with an incomplete staged updater before publication or drain", async () => {
+	const { root, paths, context, record, candidate, calls } = setup("healthy", undefined, webCompatibility);
+	writeAgentCommand(record, root);
+	const destination = release(root, candidate.version, webCompatibility);
+	const releasePath = join(root, "verified-candidate");
+	renameSync(destination, releasePath);
+	const next = { ...candidate, releasePath, compatibility: webCompatibility };
+	const file = "updater/node_modules/@tufjs/models/dist/base.js";
+	const manifest = join(releasePath, "SHA256SUMS");
+	rmSync(join(releasePath, file));
+	writeFileSync(manifest, readFileSync(manifest, "utf8").split("\n").filter((row) => !row.endsWith(`  ./${file}`)).join("\n"));
+	writeFileSync(
+		join(paths.config, "web-activation.json"),
+		JSON.stringify({ schemaVersion: 1, id, operator: "ubuntu", uid: 1001, state: "configured" }),
+	);
+	const update = updatePaths(id, root);
+	await assert.rejects(activateUpdate(record, next, context), /package smoke failed.*update\.mjs/s);
+	assert.deepEqual(readdirSync(dirname(destination)), [record.releaseVersion]);
+	assert.deepEqual(readdirSync(update.cores), [record.releaseVersion]);
+	assert.equal(readUpdateJournal(id, root), null);
+	assert.equal(readlinkSync(paths.current), "../../releases/0.0.2");
+	assert.equal(readlinkSync(update.currentCore), "cores/0.0.2");
+	assert.deepEqual(calls, [["control", "service-status"]]);
+});
+
 test("#72 a descriptor claiming the loop cannot install an archive that drops it while a loop is live", async () => {
 	const fixture = await loopFixture(() => ({ loopRollback: "live-loop" }));
 	release(fixture.root, "0.0.4", compatibility);
@@ -604,11 +838,17 @@ test("#72 a closed owner cannot drop the mission loop, and refuses before any ho
 	assert.equal(readInstallation(id, fixture.root).releaseVersion, "0.0.3");
 });
 
-test("#72 the shipped release declares continuous operation, protected plan admission and review turns", () => {
+test("the shipped release declares its mission and managed web capabilities", () => {
 	const declared = JSON.parse(
 		readFileSync(fileURLToPath(new URL("../deploy/release-compatibility.json", import.meta.url)), "utf8"),
 	);
-	assert.deepEqual(declared.features, ["mission-loop", "mission-plan-gate", "mission-review-turn", "mission-research"]);
+	assert.deepEqual(declared.features, [
+		"mission-loop",
+		"mission-plan-gate",
+		"mission-review-turn",
+		"mission-research",
+		"web-socket-activation",
+	]);
 });
 
 const planCompatibility = { ...compatibility, features: ["mission-loop", "mission-plan-gate"] };
