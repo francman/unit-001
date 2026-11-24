@@ -33,7 +33,7 @@ import {
 	createServiceTerminalController,
 	createTerminalController,
 	type PendingSend,
-	type ReturnedSend,
+	type SendOutcome,
 	type TerminalController,
 	type TerminalState,
 } from "./terminal-controller.ts";
@@ -72,11 +72,27 @@ export interface RichAttachOptions {
 type Actions = Pick<TerminalController, "submit" | "cancel" | "detach"> &
 	Partial<Pick<TerminalController, "dismissSuggestions" | "admission">>;
 
+/**
+ * The one send whose outcome this view has not settled. The draft file keeps it beside the editor text until the owner
+ * settles it or another send replaces it: losing its ID would let a late admission under it be followed by the same
+ * text under a new ID. `below` means its text is shown under the transcript, because the editor holds newer typing.
+ */
+type OpenSend =
+	// Submitted from this view; its outcome is pending, or unknown after a lost reply.
+	| { readonly kind: "in-flight"; readonly send: UnconfirmedSend }
+	// Restored from an earlier client; the owner is asked about it once, on the first attached view.
+	| { readonly kind: "unchecked"; readonly send: UnconfirmedSend; readonly below: boolean }
+	// The owner has no record of its ID as of the last answer.
+	| { readonly kind: "replayable"; readonly send: UnconfirmedSend; readonly below: boolean }
+	// Its ID is settled, but the owner did not confirm this text; it stays below for the user to see.
+	| { readonly kind: "kept"; readonly send: UnconfirmedSend };
+
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
-const RESTORE_ENTER_GUARD_MS = 300;
 // Type-ahead is already buffered when the terminal starts reading, so it arrives within this window after a restore.
 const TYPE_AHEAD_MS = 200;
+// A stray Enter right after the type-ahead window must not send text the user has not looked at yet.
+const RESTORE_ENTER_GUARD_MS = 300;
 
 // Text, control keys, pastes and recognized key sequences; an unrecognized escape sequence is a terminal reply.
 function typedInput(data: string): boolean {
@@ -188,9 +204,7 @@ async function runRichConversation(
 	let result: number;
 	try {
 		tui.start();
-		// Type-ahead meant for the previous prompt must not reach the restored text. The view drops it; draining the
-		// terminal here would pop the keyboard protocol it just negotiated.
-		if (loaded?.status === "restored") view.armRestoreGuard();
+		view.refreshRestoreGuard();
 		result = await controller.closed;
 		if (result !== 0 && !signal.aborted) {
 			const closed = Promise.withResolvers<void>();
@@ -245,18 +259,10 @@ export class RichAttachView extends VStack {
 	#draft = "";
 	#restoringDraft = false;
 	readonly #drafts: DraftStore | undefined;
-	// Text just submitted stays on disk until the owner answers, because a client exit now loses its outcome.
-	#inFlight: UnconfirmedSend | undefined;
-	// An unconfirmed send from an earlier client, kept in the file beside the current draft until the user sends again.
-	#carried: UnconfirmedSend | undefined;
-	// A restored unconfirmed send the owner has not been asked about yet; asked once, on the first attached view.
-	#unchecked: UnconfirmedSend | undefined;
-	// A restored or refused send whose exact prompt, sent again, reuses its request ID so the owner admits it at most once.
-	#replayable: UnconfirmedSend | undefined;
+	#open: OpenSend | undefined;
 	// A send held because its ID could not be saved; sending the same text again is the user's consent to send it unsaved.
 	#held: PendingSend | undefined;
-	#enterBlockedUntil = 0;
-	#typeAheadUntil = 0;
+	#restoredAt = Number.NEGATIVE_INFINITY;
 	#paste: string | undefined;
 	#pasteBytes = 0;
 	#pasteBaseBytes = 0;
@@ -317,6 +323,7 @@ export class RichAttachView extends VStack {
 			else if (result.status === "submitted") {
 				this.clearInputNotice();
 				this.editor.addToHistory(text);
+				void result.outcome.then((outcome) => this.settleSend(result.requestId, outcome));
 			}
 			this.#tui.requestRender();
 		};
@@ -363,42 +370,55 @@ export class RichAttachView extends VStack {
 			state.evidence !== this.#state.evidence ||
 			state.connection !== this.#state.connection;
 		this.#state = state;
-		const sent = this.#inFlight;
-		if (sent !== undefined && !state.unresolvedRequestIds?.includes(sent.requestId)) {
-			this.#inFlight = undefined;
-			const returned = state.returnedSends?.find((send) => send.requestId === sent.requestId);
-			if (returned !== undefined) this.giveBack(sent, returned.reason);
-			else this.persistDraft();
-		}
 		if (state.connection === "failed" && state.view === undefined && this.#draft === "") this.#tui.setFocus(null);
 		if (changed || this.transcript.children.length === 0) this.updateTranscript(state.view);
-		if (state.connection === "attached" && this.#unchecked !== undefined) this.checkUnconfirmed(this.#unchecked);
+		const open = this.#open;
+		if (state.connection === "attached" && open?.kind === "unchecked") this.checkUnconfirmed(open.send, open.below);
 		this.#tui.requestRender();
 	}
 
-	/** Puts a draft saved by an earlier client into the editor with a notice; it is never submitted. */
+	/**
+	 * Puts a draft saved by an earlier client into the editor with a notice; it is never submitted. Call it just before
+	 * the terminal starts: type-ahead meant for the previous prompt is dropped for a short window after it, then Enter
+	 * is ignored briefly. The view drops it, because draining the terminal would pop the keyboard protocol it negotiates.
+	 */
 	restoreDraft(stored: StoredDraft): void {
 		const unconfirmed = stored.unconfirmed;
 		// With both stored, the editor gets the newer typing and the earlier send is shown beside it, unless they are equal.
 		this.putInEditor(stored.text !== "" ? stored.text : (unconfirmed?.text ?? ""));
-		this.#carried = stored.text !== "" && stored.text !== unconfirmed?.text ? unconfirmed : undefined;
-		this.#unchecked = unconfirmed;
-		this.#replayable = unconfirmed;
-		this.#enterBlockedUntil = Date.now() + RESTORE_ENTER_GUARD_MS;
+		const below = stored.text !== "" && stored.text !== unconfirmed?.text;
+		this.#open = unconfirmed === undefined ? undefined : { kind: "unchecked", send: unconfirmed, below };
+		this.#restoredAt = Date.now();
 		const id = unconfirmed === undefined ? "" : sanitizeTerminalText(unconfirmed.requestId);
 		this.#inputNotice =
 			unconfirmed === undefined
 				? "Restored unsent draft from an earlier session. Nothing was sent."
-				: this.#carried === undefined
+				: !below
 					? `Restored a draft whose send was unconfirmed (request ID ${id}).${blankHint(unconfirmed)} Checking whether the owner received it.`
 					: `Restored your latest draft. An earlier send (request ID ${id}) is unconfirmed and kept below.${blankHint(unconfirmed)} Checking whether the owner received it.`;
 		this.updateTranscript(this.#state.view);
 		this.#tui.requestRender();
 	}
 
+	/** Restarts the restore guard windows from now; call it right after the terminal starts, so a slow start cannot use them up. */
+	refreshRestoreGuard(): void {
+		if (this.#restoredAt !== Number.NEGATIVE_INFINITY) this.#restoredAt = Date.now();
+	}
+
+	// Only the send still in flight under the ID changes; a later send or a held retry has already replaced it.
+	private settleSend(requestId: string, outcome: SendOutcome): void {
+		const open = this.#open;
+		if (open?.kind !== "in-flight" || open.send.requestId !== requestId) return;
+		if (outcome.kind === "settled") {
+			this.#open = undefined;
+			this.persistDraft();
+		} else if (outcome.kind === "returned") this.giveBack(open.send, outcome.reason);
+		this.#tui.requestRender();
+	}
+
 	// Asked once per restore; the owner reads committed state only, so asking can never send the prompt.
-	private checkUnconfirmed(send: UnconfirmedSend): void {
-		this.#unchecked = undefined;
+	private checkUnconfirmed(send: UnconfirmedSend, below: boolean): void {
+		this.#open = { kind: "replayable", send, below };
 		const lookup = this.#actions.admission;
 		if (lookup === undefined) return;
 		// The first view can arrive while the controller is still being constructed; ask once that has returned.
@@ -422,21 +442,21 @@ export class RichAttachView extends VStack {
 			);
 			return;
 		}
+		// Any other answer settles the ID; unless the owner confirmed this exact text, text shown below stays there.
+		const open = this.#open;
+		const below = open?.send === send && shownBelow(open) !== undefined;
+		const exact = admission.status === "admitted" && admission.binding === "exact";
+		if (open?.send === send) this.#open = below && !exact ? { kind: "kept", send } : undefined;
 		if (admission.status === "rejected") {
-			if (this.#replayable === send) this.#replayable = undefined;
 			this.persistDraft();
 			this.showInputNotice(
 				`Request ${send.requestId} belongs to ${admission.reason === "different-prompt" ? "a different prompt" : "another operation"}, so this text was not sent under it. Sending it again uses a new request ID.`,
 			);
 			return;
 		}
-		if (this.#replayable === send) this.#replayable = undefined;
-		const exact = admission.binding === "exact";
 		let kept = "";
-		if (this.#carried === send) {
-			if (exact) this.#carried = undefined;
-			else kept = " Its text is kept below.";
-		} else if (this.#draft === send.text) {
+		if (below) kept = exact ? "" : " Its text is kept below.";
+		else if (this.#draft === send.text) {
 			if (exact) this.putInEditor("");
 			kept = exact ? " The editor was cleared." : " Its text stays in the editor; sending it again starts a new request.";
 		}
@@ -458,14 +478,16 @@ export class RichAttachView extends VStack {
 		this.showInputNotice(`Request ${send.requestId} was received ${outcome}.${binding}${kept}`);
 	}
 
-	// Sending an unconfirmed send's exact prompt again reuses its request ID instead of risking a second admission. The
-	// digest decides: saved text is sanitized and may differ from what was sent, and different text under the ID would be
-	// refused. A send without a digest is never replayed.
+	// Sending an unconfirmed send's exact prompt again reuses its request ID instead of risking a second admission: a
+	// restored send, one the owner has no record of, a held one, or one whose reply was lost. The digest decides: saved
+	// text is sanitized and may differ from what was sent, and different text under the ID would be refused. A send
+	// without a digest is never replayed.
 	private replayIdFor(text: string): string | undefined {
 		const digest = sendDigest(text.trim());
-		return [this.#replayable, this.#held, this.#state.sending ? undefined : this.#inFlight].find(
-			(send) => send?.digest === digest,
-		)?.requestId;
+		const open = this.#open;
+		const restored = open?.kind === "unchecked" || open?.kind === "replayable" ? open.send : undefined;
+		const lost = open?.kind === "in-flight" && !this.#state.sending ? open.send : undefined;
+		return [restored, this.#held, lost].find((send) => send?.digest === digest)?.requestId;
 	}
 
 	// Runs before the send leaves this client and waits for the file: after a deferred save, a crash in between would
@@ -476,10 +498,8 @@ export class RichAttachView extends VStack {
 	// it unsaved, unless that would take the file's place from an earlier send under another ID whose outcome is unknown.
 	// Refusing for good would leave a broken drafts directory with no way to send from this terminal at all.
 	private async recordSend(text: string, send: PendingSend): Promise<"dispatch" | "hold"> {
-		const earlier = { inFlight: this.#inFlight, carried: this.#carried, replayable: this.#replayable };
-		this.#inFlight = { text, ...send };
-		this.#carried = undefined;
-		this.#replayable = undefined;
+		const earlier = this.#open;
+		this.#open = { kind: "in-flight", send: { text, ...send } };
 		this.#draft = "";
 		this.persistDraft();
 		const saved = await this.#drafts?.flush();
@@ -488,7 +508,8 @@ export class RichAttachView extends VStack {
 			this.#held = undefined;
 			return "dispatch";
 		}
-		const kept = [earlier.inFlight, earlier.replayable].find((other) => other !== undefined && other.requestId !== id);
+		// Only a kept send's ID is settled; any other earlier send under another ID may still be admitted.
+		const kept = earlier !== undefined && earlier.kind !== "kept" && earlier.send.requestId !== id ? earlier.send : undefined;
 		if (this.#held?.requestId === id && kept === undefined) {
 			this.#held = undefined;
 			this.showInputNotice(
@@ -496,9 +517,7 @@ export class RichAttachView extends VStack {
 			);
 			return "dispatch";
 		}
-		this.#inFlight = earlier.inFlight;
-		this.#carried = earlier.carried;
-		this.#replayable = earlier.replayable;
+		this.#open = earlier;
 		this.#held = send;
 		// Typing that arrived while the file was written stays, after the held text.
 		const typed = this.editor.getExpandedText();
@@ -523,19 +542,14 @@ export class RichAttachView extends VStack {
 		this.showInputNotice(`Saved draft not restored: ${reason}`);
 	}
 
-	/** Drops typed input for a short window, then ignores Enter briefly; called once the terminal has started. */
-	armRestoreGuard(): void {
-		this.#typeAheadUntil = Date.now() + TYPE_AHEAD_MS;
-		this.#enterBlockedUntil = this.#typeAheadUntil + RESTORE_ENTER_GUARD_MS;
-	}
-
 	/** Handles configurable application actions before the focused editor consumes ordinary input. */
 	handleGlobalInput(data: string): TuiInputListenerResult {
 		if (isKeyRelease(data)) return { consume: true };
+		const sinceRestore = Date.now() - this.#restoredAt;
 		// Only keys and pastes are type-ahead; terminal replies to the renderer's own queries still pass.
-		if (Date.now() < this.#typeAheadUntil && typedInput(data)) return { consume: true };
-		// A stray Enter right after a restore must not send text the user has not looked at yet.
-		if (Date.now() < this.#enterBlockedUntil && this.#keys.matches(data, "tui.input.submit")) return { consume: true };
+		if (sinceRestore < TYPE_AHEAD_MS && typedInput(data)) return { consume: true };
+		if (sinceRestore < TYPE_AHEAD_MS + RESTORE_ENTER_GUARD_MS && this.#keys.matches(data, "tui.input.submit"))
+			return { consume: true };
 		const suggestions = this.#state.suggestions;
 		if ((suggestions?.length ?? 0) > 0 || this.#state.suggesting) {
 			if (this.#keys.matches(data, "unit.commands.dismiss")) {
@@ -626,11 +640,9 @@ export class RichAttachView extends VStack {
 		];
 	}
 
-	// The file holds the current text and, separately, the latest send whose outcome is not confirmed. A restored send
-	// stays there whatever the editor holds until the owner settles it or another send replaces it: losing its ID would
-	// let a late admission under it be followed by the same text under a new ID.
+	// The file holds the current text and, separately, the open send whatever the editor holds (see `OpenSend`).
 	private persistDraft(): void {
-		const unconfirmed = this.#inFlight ?? this.#carried ?? this.#replayable;
+		const unconfirmed = this.#open?.send;
 		this.#drafts?.save({ text: this.#draft, ...(unconfirmed === undefined ? {} : { unconfirmed }) });
 	}
 
@@ -646,19 +658,22 @@ export class RichAttachView extends VStack {
 
 	// A returned send's text goes back to an empty editor, otherwise it stays in the file. With no record under the ID
 	// the ID goes with it, so sending the same text again cannot be admitted twice; otherwise a resend gets a new ID.
-	private giveBack(sent: UnconfirmedSend, reason: ReturnedSend["reason"]): void {
-		if (reason === "not-found") this.#replayable = sent;
+	private giveBack(sent: UnconfirmedSend, reason: Extract<SendOutcome, { kind: "returned" }>["reason"]): void {
+		const below = this.#draft !== "";
+		this.#open =
+			reason === "not-found"
+				? { kind: "replayable", send: sent, below }
+				: below
+					? { kind: "kept", send: sent }
+					: undefined;
 		const why =
 			reason === "unverified"
 				? `The owner admitted request ${sent.requestId} but cannot confirm it was this text; sending it again starts a new request.`
 				: "The owner rejected the send.";
-		if (this.#draft === "") {
+		if (!below) {
 			this.putInEditor(sent.text);
 			this.#inputNotice = sanitizeTerminalText(`${why} Your text is back in the editor and still saved.`);
-		} else {
-			this.#carried = sent;
-			this.#inputNotice = sanitizeTerminalText(`${why} Its text is kept in the saved draft file.`);
-		}
+		} else this.#inputNotice = sanitizeTerminalText(`${why} Its text is kept in the saved draft file.`);
 		this.persistDraft();
 		this.updateTranscript(this.#state.view);
 	}
@@ -867,15 +882,16 @@ export class RichAttachView extends VStack {
 			);
 		}
 		if (this.#inputNotice !== "") this.transcript.addChild(new Text(this.#theme.warning(this.#inputNotice), 1, 0));
-		if (this.#carried !== undefined) {
+		const below = shownBelow(this.#open);
+		if (below !== undefined) {
 			this.transcript.addChild(
 				new Text(
-					this.#theme.muted(`Earlier send, unconfirmed (request ID ${sanitizeTerminalText(this.#carried.requestId)}):`),
+					this.#theme.muted(`Earlier send, unconfirmed (request ID ${sanitizeTerminalText(below.requestId)}):`),
 					1,
 					0,
 				),
 			);
-			this.transcript.addChild(new Text(sanitizeTerminalText(this.#carried.text), 2, 0));
+			this.transcript.addChild(new Text(sanitizeTerminalText(below.text), 2, 0));
 		}
 	}
 }
@@ -977,6 +993,12 @@ class ToolCard implements Component {
 		return lines;
 	}
 	invalidate(): void {}
+}
+
+// The open send whose text is shown under the transcript, beside newer typing in the editor.
+function shownBelow(open: OpenSend | undefined): UnconfirmedSend | undefined {
+	if (open === undefined || open.kind === "in-flight") return undefined;
+	return open.kind === "kept" || open.below ? open.send : undefined;
 }
 
 function replayHint(send: UnconfirmedSend): string {

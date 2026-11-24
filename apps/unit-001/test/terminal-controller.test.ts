@@ -314,9 +314,12 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 		owner.respond((_request, socket) => socket.destroy());
 		const { controller } = await connect(owner);
 		const result = controller.submit("try");
-		await expect.poll(() => controller.state.sending).toBe(false);
-		expect(controller.state.connection).toBe("attached");
 		if (result.status !== "submitted") throw new Error("Prompt was rejected");
+		// #26: a lost delivery stays unknown and is never resent by the client.
+		expect(await result.outcome).toEqual({ kind: "unknown" });
+		expect(controller.state.connection).toBe("attached");
+		expect(controller.state.unresolvedRequestIds).toEqual([result.requestId]);
+		expect(owner.requests.filter((request) => request.type === "send")).toHaveLength(1);
 		expect(controller.state.notices.map((notice) => notice.text).join(" ")).toContain(
 			`retry request ${result.requestId}`,
 		);
@@ -351,11 +354,10 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 		const { controller } = await connect(owner);
 		const result = controller.submit("not durable", { beforeDispatch: async () => "hold" });
 		if (result.status !== "submitted") throw new Error("expected a submitted send");
-		await expect.poll(() => controller.state.sending).toBe(false);
+		expect(await result.outcome).toEqual({ kind: "held" });
 		await new Promise((resolve) => setTimeout(resolve, 30));
 		expect(owner.requests).toEqual([{ type: "watch" }]);
 		expect(controller.state.unresolvedRequestIds).toEqual([]);
-		expect(controller.state.returnedSends).toBeUndefined();
 		expect(controller.state.notices.at(-1)?.text).toBe(`Request ${result.requestId} was not sent.`);
 	});
 
@@ -394,10 +396,9 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 			const { controller } = await connect(owner);
 			const result = controller.submit("big reply");
 			if (result.status !== "submitted") throw new Error("expected a submitted send");
-			await expect.poll(() => controller.state.sending).toBe(false);
+			expect(await result.outcome).toEqual({ kind: "settled" });
 			expect(owner.requests[2]).toEqual({ type: "admission", requestId: result.requestId, digest: result.digest });
 			expect(controller.state.unresolvedRequestIds).toEqual([]);
-			expect(controller.state.returnedSends).toBeUndefined();
 			expect(controller.state.notices.at(-1)?.text).toContain("admitted request");
 		});
 
@@ -410,8 +411,8 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 			const { controller } = await connect(owner);
 			const result = controller.submit("refused");
 			if (result.status !== "submitted") throw new Error("expected a submitted send");
-			await expect.poll(() => controller.state.sending).toBe(false);
-			expect(controller.state.returnedSends).toEqual([{ requestId: result.requestId, reason }]);
+			expect(await result.outcome).toEqual({ kind: "returned", reason });
+			expect(controller.state.unresolvedRequestIds).toEqual([]);
 			expect(controller.state.notices.at(-1)?.text).toContain("Not sent");
 		});
 
@@ -422,30 +423,28 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 			const { controller } = await connect(owner);
 			const result = controller.submit("evicted replay");
 			if (result.status !== "submitted") throw new Error("expected a submitted send");
-			await expect.poll(() => controller.state.sending).toBe(false);
+			expect(await result.outcome).toEqual({ kind: "returned", reason: "unverified" });
 			expect(controller.state.unresolvedRequestIds).toEqual([]);
-			expect(controller.state.returnedSends).toEqual([{ requestId: result.requestId, reason: "unverified" }]);
 			expect(controller.state.notices.at(-1)?.text).toContain("cannot confirm it was this text");
 		});
 
-		// #26 v2 review, blocker 2: the first attempt's refusal must not outlive a later success under the same ID.
-		it("drops an earlier refusal when a retry under the same ID is answered", async () => {
+		// #26: an explicit retry of a send the owner has no record of reuses its ID, and only the retry's answer counts.
+		it("reuses the request ID on an explicit retry after a refusal and settles it on the answer", async () => {
 			const owner = await server();
 			errorWithLookup(owner, { status: "not-found" });
 			const { controller } = await connect(owner);
 			const first = controller.submit("retried");
 			if (first.status !== "submitted") throw new Error("expected a submitted send");
-			await expect.poll(() => controller.state.sending).toBe(false);
-			expect(controller.state.returnedSends).toEqual([{ requestId: first.requestId, reason: "not-found" }]);
+			expect(await first.outcome).toEqual({ kind: "returned", reason: "not-found" });
 			owner.respond((_request, socket) =>
 				socket.end(`${JSON.stringify({ type: "reply", reply: { status: "answered", text: "ok" } })}\n`),
 			);
 			const retry = controller.submit("retried", { replayRequestId: first.requestId });
-			expect(retry).toMatchObject({ status: "submitted", requestId: first.requestId });
-			await expect.poll(() => controller.state.sending).toBe(false);
+			if (retry.status !== "submitted") throw new Error("expected a submitted retry");
+			expect(retry.requestId).toBe(first.requestId);
+			expect(await retry.outcome).toEqual({ kind: "settled" });
 			expect(owner.requests.at(-1)).toEqual({ type: "send", prompt: "retried", requestId: first.requestId });
 			expect(controller.state.unresolvedRequestIds).toEqual([]);
-			expect(controller.state.returnedSends).toEqual([]);
 		});
 
 		it("keeps the request ID unresolved when the lookup itself fails", async () => {
@@ -454,9 +453,8 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 			const { controller } = await connect(owner);
 			const result = controller.submit("unknown");
 			if (result.status !== "submitted") throw new Error("expected a submitted send");
-			await expect.poll(() => controller.state.sending).toBe(false);
+			expect(await result.outcome).toEqual({ kind: "unknown" });
 			expect(controller.state.unresolvedRequestIds).toEqual([result.requestId]);
-			expect(controller.state.returnedSends).toBeUndefined();
 		});
 	});
 
@@ -651,8 +649,7 @@ describe("foreground terminal controller", () => {
 		await agent.enterMaintenance("op-1", 0, BACKGROUND_CONTEXT);
 		const result = controller.submit("While held");
 		if (result.status !== "submitted") throw new Error("expected a submitted send");
-		await expect.poll(() => controller.state.sending).toBe(false);
-		expect(controller.state.returnedSends).toEqual([{ requestId: result.requestId, reason: "not-found" }]);
+		expect(await result.outcome).toEqual({ kind: "returned", reason: "not-found" });
 		expect(controller.state.notices.at(-1)?.text).toContain("held for maintenance");
 	});
 

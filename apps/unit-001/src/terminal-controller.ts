@@ -42,22 +42,10 @@ export interface TerminalState {
 	readonly notices: readonly TerminalNotice[];
 	readonly suggestions?: readonly CommandDefinition[];
 	readonly suggesting?: boolean;
+	/** IDs of sends and memory writes whose outcome this client has not seen; they are never resent automatically. */
 	readonly unresolvedRequestIds?: readonly string[];
-	/** Sends whose text goes back to the user (newest eight); each left `unresolvedRequestIds` on its latest attempt. */
-	readonly returnedSends?: readonly ReturnedSend[];
 	/** The latest explicitly requested tool evidence; it never arrives in watch frames. */
 	readonly evidence?: ToolEvidence;
-}
-
-/**
- * A send answered with an error whose text goes back to the user, and what the owner's record said about its ID:
- * `not-found`, no record, so the same text may go again under the ID and is still admitted at most once; `rejected`,
- * the ID belongs to another prompt or operation; `unverified`, the ID was admitted but the owner cannot show it was
- * this text. After `rejected` or `unverified` a resend needs a new ID.
- */
-export interface ReturnedSend {
-	readonly requestId: string;
-	readonly reason: "not-found" | "rejected" | "unverified";
 }
 
 /** One send as dispatched: its request ID and the digest of the exact prompt the owner receives. */
@@ -66,9 +54,23 @@ export interface PendingSend {
 	readonly digest: string;
 }
 
+/**
+ * How one send ended for this client. `settled`: the owner answered it, or admitted this exact text and then replied
+ * with an error. `returned`: the owner ended its handling with an error, and its record says `not-found` (no record,
+ * so the same text may go again under the ID and is still admitted at most once), `rejected` (the ID belongs to another
+ * prompt or operation) or `unverified` (the ID was admitted, but the owner cannot show it was this text); after
+ * `rejected` or `unverified` a resend needs a new ID. `unknown`: the reply or the lookup was lost, so the ID stays in
+ * `unresolvedRequestIds`. `held`: `beforeDispatch` held it, so it never left this client.
+ */
+export type SendOutcome =
+	| { readonly kind: "settled" }
+	| { readonly kind: "returned"; readonly reason: "not-found" | "rejected" | "unverified" }
+	| { readonly kind: "unknown" }
+	| { readonly kind: "held" };
+
 /** A rejected input must stay in the editor; commands and admitted sends may clear it. */
 export type TerminalInputResult =
-	| ({ readonly status: "submitted" } & PendingSend)
+	| ({ readonly status: "submitted"; readonly outcome: Promise<SendOutcome> } & PendingSend)
 	| { readonly status: "command" }
 	| { readonly status: "mission-setup" }
 	| { readonly status: "rejected" };
@@ -90,7 +92,7 @@ export interface SendOptions {
 export interface TerminalController {
 	readonly state: TerminalState;
 	readonly closed: Promise<number>;
-	/** Runs a command or sends a prompt; see `SendOptions` for replaying an unconfirmed send. */
+	/** Runs a command or sends a prompt; a send's `outcome` never rejects. See `SendOptions` for replaying a send. */
 	submit(text: string, options?: SendOptions): TerminalInputResult;
 	/** Cancels all work in the chat, including other clients' queued inputs; it is not scoped to one send. */
 	cancel(): void;
@@ -457,8 +459,7 @@ class OwnerTerminalController implements TerminalController {
 		};
 		this.#notice(`Submitting request ${requestId}; retry with this --request-id after a disconnect.`);
 		const send = { requestId, digest: sendDigest(text) };
-		void this.#send(text, send, earlier, options.beforeDispatch);
-		return { status: "submitted", ...send };
+		return { status: "submitted", ...send, outcome: this.#send(text, send, earlier, options.beforeDispatch) };
 	}
 
 	admission(requestId: string, digest: string | undefined): Promise<SendAdmission> {
@@ -569,28 +570,24 @@ class OwnerTerminalController implements TerminalController {
 		send: PendingSend,
 		earlier: "unresolved" | "settled",
 		beforeDispatch: SendOptions["beforeDispatch"],
-	): Promise<void> {
+	): Promise<SendOutcome> {
 		const { requestId } = send;
 		try {
 			if ((await beforeDispatch?.(send)) === "hold") {
-				if (earlier === "settled") this.#acknowledge(requestId);
+				if (earlier === "settled") this.#resolve(requestId);
 				if (!this.#finished) this.#notice(`Request ${requestId} was not sent.`);
-				return;
+				return { kind: "held" };
 			}
-			// A new attempt under the ID supersedes an earlier attempt's return: only the owner's latest answer counts.
-			this.#state = {
-				...this.#state,
-				returnedSends: this.#state.returnedSends?.filter((returned) => returned.requestId !== requestId),
-			};
 			const reply = await this.#transport.send(text, requestId, this.#local.signal);
-			this.#acknowledge(requestId);
-			if (this.#finished) return;
+			this.#resolve(requestId);
 			// The watch is authoritative for transcript output; never duplicate an answer from the send reply.
-			if (reply.status === "failed")
+			if (!this.#finished && reply.status === "failed")
 				this.#notice(`Unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}`, "error");
+			return { kind: "settled" };
 		} catch (error) {
-			if (error instanceof OwnerRequestError) await this.#settleRefusal(send, error);
-			else if (!this.#finished) this.#notice(`Send failed; retry request ${requestId}: ${describeError(error)}`, "error");
+			if (error instanceof OwnerRequestError) return await this.#settleRefusal(send, error);
+			if (!this.#finished) this.#notice(`Send failed; retry request ${requestId}: ${describeError(error)}`, "error");
+			return { kind: "unknown" };
 		} finally {
 			this.#cancelAfterAdmission = false;
 			if (!this.#finished) {
@@ -634,7 +631,7 @@ class OwnerTerminalController implements TerminalController {
 		}
 		try {
 			const result = await this.#transport.memory(request, this.#local.signal);
-			if (requestId !== undefined) this.#acknowledge(requestId);
+			if (requestId !== undefined) this.#resolve(requestId);
 			if (!this.#finished) {
 				if (result.operation === "recall") {
 					if (result.records.length === 0) this.#notice(describeMemory(result));
@@ -649,7 +646,7 @@ class OwnerTerminalController implements TerminalController {
 				} else this.#notice(describeMemory(result));
 			}
 		} catch (error) {
-			if (requestId !== undefined && error instanceof OwnerRequestError) this.#acknowledge(requestId);
+			if (requestId !== undefined && error instanceof OwnerRequestError) this.#resolve(requestId);
 			if (!this.#finished) this.#notice(`Memory: ${describeError(error)}`, "error");
 		}
 	}
@@ -658,7 +655,7 @@ class OwnerTerminalController implements TerminalController {
 	// is replaced by an error), so the owner's record decides; the error alone never discards the ID. With no record the
 	// ID stays reusable: an earlier client's request under it may still be in transit, and only the same ID keeps the
 	// owner from admitting the text twice. An admission settles the ID, but only an exact binding shows it was this text.
-	async #settleRefusal(send: PendingSend, error: OwnerRequestError): Promise<void> {
+	async #settleRefusal(send: PendingSend, error: OwnerRequestError): Promise<SendOutcome> {
 		let admission: SendAdmission;
 		try {
 			admission = await this.#transport.admission(send.requestId, send.digest, this.#local.signal);
@@ -668,33 +665,32 @@ class OwnerTerminalController implements TerminalController {
 					`Send failed: ${describeError(error)}. Request ${send.requestId} stays unconfirmed; asking the owner about it failed: ${describeError(lookup)}`,
 					"error",
 				);
-			return;
+			return { kind: "unknown" };
 		}
-		if (admission.status === "admitted" && admission.binding === "exact") {
-			this.#acknowledge(send.requestId);
-			if (!this.#finished)
-				this.#notice(`The owner admitted request ${send.requestId} but replied with an error: ${describeError(error)}`, "error");
-			return;
-		}
-		if (admission.status === "admitted") {
-			this.#acknowledge(send.requestId, { requestId: send.requestId, reason: "unverified" });
-			if (!this.#finished)
-				this.#notice(
-					`The owner admitted request ${send.requestId} but cannot confirm it was this text, and replied with an error: ${describeError(error)}`,
-					"error",
-				);
-			return;
-		}
-		this.#acknowledge(send.requestId, { requestId: send.requestId, reason: admission.status });
-		if (!this.#finished) this.#notice(`Not sent: ${describeError(error)}`, "error");
+		this.#resolve(send.requestId);
+		const outcome: SendOutcome =
+			admission.status !== "admitted"
+				? { kind: "returned", reason: admission.status }
+				: admission.binding === "exact"
+					? { kind: "settled" }
+					: { kind: "returned", reason: "unverified" };
+		if (!this.#finished)
+			this.#notice(
+				outcome.kind === "settled"
+					? `The owner admitted request ${send.requestId} but replied with an error: ${describeError(error)}`
+					: outcome.reason === "unverified"
+						? `The owner admitted request ${send.requestId} but cannot confirm it was this text, and replied with an error: ${describeError(error)}`
+						: `Not sent: ${describeError(error)}`,
+				"error",
+			);
+		return outcome;
 	}
 
-	// A returned send is recorded (newest eight) so a client can tell it from an answer and give the text back.
-	#acknowledge(requestId: string, returned?: ReturnedSend): void {
+	// Called once the owner's handling of a request is known to have ended, whatever its outcome.
+	#resolve(requestId: string): void {
 		this.#state = {
 			...this.#state,
 			unresolvedRequestIds: this.#state.unresolvedRequestIds?.filter((id) => id !== requestId),
-			...(returned === undefined ? {} : { returnedSends: [...(this.#state.returnedSends ?? []), returned].slice(-8) }),
 		};
 		this.#publish();
 	}

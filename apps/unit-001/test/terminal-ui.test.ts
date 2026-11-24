@@ -109,7 +109,7 @@ function launch(drafts?: DraftStore) {
 		submit: vi.fn((text: string, options?: SendOptions): TerminalInputResult => {
 			const send = { requestId: "r1", digest: sendDigest(text.trim()) };
 			void options?.beforeDispatch?.(send);
-			return { status: "submitted", ...send };
+			return { status: "submitted", ...send, outcome: new Promise(() => {}) };
 		}),
 		cancel: vi.fn(),
 		detach: vi.fn(),
@@ -1386,7 +1386,7 @@ describe("draft recovery across client exit", () => {
 	it("treats only keys and pastes as type-ahead, so replies to the renderer's queries still pass", () => {
 		const app = launch();
 		try {
-			app.view.armRestoreGuard();
+			app.view.restoreDraft({ text: "" });
 			for (const typed of ["x", "\r", "\x03", "\x1b[97u", "\x1b[13u", "\x1b[A", "\x1b[200~p\x1b[201~"])
 				expect(app.view.handleGlobalInput(typed), JSON.stringify(typed)).toEqual({ consume: true });
 			// Cell size and color replies answer the renderer's own queries; they are not keys.
@@ -1413,6 +1413,40 @@ describe("draft recovery across client exit", () => {
 			expect(request.mock.calls[0][0]).toMatchObject({ type: "send", prompt: "restored text" });
 			app.terminal.input("\x04");
 			await app.running;
+		});
+	});
+
+	// A slow terminal start must not use up the restore guard before the first buffered Enter arrives.
+	it("ignores a buffered Enter after a restore even when the terminal starts slowly", async () => {
+		await withDraftDirectory(async (directory) => {
+			const writer = storeFor(directory);
+			writer.save({ text: "restored text" });
+			await writer.flush();
+			let now = Date.now();
+			const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+			class SlowTerminal extends FakeTerminal {
+				override start(input: (data: string) => void, resize: () => void): void {
+					now += 600;
+					super.start(input, resize);
+				}
+			}
+			const terminal = new SlowTerminal();
+			const abort = new AbortController();
+			const request = answered();
+			const running = runRichServiceAttach(client(request), terminal, abort.signal, {
+				colorMode: "monochrome",
+				drafts: storeFor(directory),
+			});
+			try {
+				await expect.poll(() => shown(terminal)).toContain("restored text");
+				terminal.input("\r");
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				expect(request).not.toHaveBeenCalled();
+			} finally {
+				abort.abort();
+				await running;
+				clock.mockRestore();
+			}
 		});
 	});
 
@@ -1563,10 +1597,14 @@ describe("draft recovery across client exit", () => {
 				expect(app.screen().at(-2)).toContain("Draft saved; restored on next attach.");
 				expect(app.screen().every((line) => visibleWidth(line) <= columns)).toBe(true);
 				expect(app.actions.submit).not.toHaveBeenCalled();
+				// Past the type-ahead window that follows a restore, typing edits the restored text.
+				vi.useFakeTimers({ toFake: ["Date"] });
+				vi.setSystemTime(Date.now() + 250);
 				app.terminal.input("\x1b[D");
 				app.terminal.input("!");
 				expect(app.view.editor.getExpandedText()).toContain("!");
 			} finally {
+				vi.useRealTimers();
 				app.tui.stop();
 			}
 		});
