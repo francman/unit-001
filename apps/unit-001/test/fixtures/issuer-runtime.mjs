@@ -1,7 +1,9 @@
-// Runs the installed issuer with temporary installation paths and inert authority and owner endpoints.
+// Runs the installed issuer with temporary installation paths and file-backed authority and owner endpoints.
+// Durable state under the root: mission-authority.json (protected authority), mission-owner-view.json (the owner's
+// mission view), authority-events (one line per authority read or write) and owner-requests (one JSON line per frame).
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -91,11 +93,22 @@ export function createConnection() {
 	socket.setTimeout = () => {};
 	socket.destroy = () => {};
 	socket.write = (frame) => {
-		assert.deepEqual(JSON.parse(frame), { type: "mission", request: { operation: "status" } });
-		socket.emit("data", '{"type":"mission","result":{"formation":{}}}\n');
+		const { type, request } = JSON.parse(frame);
+		assert.equal(type, "mission");
+		appendFileSync(join(root, "owner-requests"), `${JSON.stringify(request)}\n`);
+		const view = ownerView();
+		if (request.operation === "status") socket.emit("data", `${JSON.stringify({ type: "mission", result: view })}\n`);
+		else if (request.operation === "reconcile-operation")
+			socket.emit("data", `${JSON.stringify({ type: "mission", result: { purpose: view.purpose } })}\n`);
+		else assert.fail(`The fixture owner does not serve ${request.operation}.`);
 	};
 	queueMicrotask(() => socket.emit("connect"));
 	return socket;
+}
+
+function ownerView() {
+	const file = join(root, "mission-owner-view.json");
+	return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : { formation: {} };
 }
 
 export function parseMissionView(view) {
@@ -104,7 +117,8 @@ export function parseMissionView(view) {
 
 export function readMissionAuthority() {
 	recordAuthority("read mission");
-	return null;
+	const file = join(root, "mission-authority.json");
+	return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : null;
 }
 
 export function readChannelAuthority() {
@@ -112,8 +126,9 @@ export function readChannelAuthority() {
 	return { channels: { disabled: [] } };
 }
 
-export function writeMissionAuthority() {
+export function writeMissionAuthority(_location, authority) {
 	recordAuthority("write mission");
+	writeFileSync(join(root, "mission-authority.json"), JSON.stringify(authority));
 }
 
 export function writeChannelAuthority() {

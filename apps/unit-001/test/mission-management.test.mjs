@@ -1,21 +1,24 @@
 // #14: Managed mission authority uses only the selected protected release, never a root Agent or caller-selected path.
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readFileSync, readSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, test } from "node:test";
-import { fileURLToPath } from "node:url";
-import { isDeepStrictEqual, parseArgs } from "node:util";
+import { isDeepStrictEqual, parseArgs, promisify } from "node:util";
 import { dispatchAgent } from "../deploy/agent-command.mjs";
 import { installationPaths, writeInstallation } from "../deploy/installation.mjs";
 import { parseMissionAuthority, parseMissionCeiling } from "../src/missions/authority.ts";
 import { MANAGED_MISSION_ACTIONS, missionObject, parseMissionCreator } from "../src/missions/contract.ts";
+import { refuseOtherCommandRequest } from "../src/missions/operation.ts";
 import { matchingPlanApproval, planDigest, planReceiptsRecorded } from "../src/missions/plan-authority.ts";
 import { missingPlanTerms, reviewAllowanceDenial } from "../src/missions/plan-terms.ts";
 import { parsePurposeCeiling, parsePurposeTerms, purposeDigest, validatePurposeTerms } from "../src/missions/purpose-authority.ts";
 import { MISSION, planTerms, PURPOSE_DIGEST } from "./missions/fixtures/plan.ts";
+
+const execFileAsync = promisify(execFile);
 
 const temporary = [];
 afterEach(async () => {
@@ -125,45 +128,6 @@ test("#72 purpose approval and operation execute only the selected-release missi
 		assert.equal(call[0], "/opt/verified-release/runtime/bin/node");
 		assert.deepEqual(call.slice(2), [false, { SUDO_UID: "2001", SUDO_USER: "creator" }]);
 	}
-});
-
-// #72: a run from an older purpose revision still blocks the loop, but the view's `works` lists only the current
-// revision, so the managed acknowledgment must accept any run in `unsettled`. mission.mjs runs as root on Linux at
-// import, so this pins the rule in its source; the native acceptance step 7 exercises it (docs/missions/verification.md).
-test("#72 managed acknowledgment accepts any unsettled run, from every purpose revision", () => {
-	const source = readFileSync(fileURLToPath(new URL("../deploy/mission.mjs", import.meta.url)), "utf8");
-	const acknowledge = source.slice(source.indexOf('if (operateAction === "acknowledge") {'));
-	const check = acknowledge.slice(0, acknowledge.indexOf("Only a run with unsettled effects can be acknowledged."));
-	assert.match(check, /!purpose\.unsettled\.some\(\(run\) => run\.runId === values\.run\)/);
-	assert.doesNotMatch(check, /purpose\.works/);
-});
-
-// #72: the owner reconciles an acknowledgment before an intent, so one request ID naming both would make close report
-// success without applying it. The guard is lifted from the source (mission.mjs cannot be imported here) and run.
-test("#72 managed operate refuses a request ID reused across acknowledgment and intent", () => {
-	const source = readFileSync(fileURLToPath(new URL("../deploy/mission.mjs", import.meta.url)), "utf8");
-	const start = source.indexOf("// A request ID names one command");
-	const end = source.indexOf('throw new Error("Conflicting operation request ID.");', start);
-	assert.ok(start > 0 && end > start, "The guard precedes both writers.");
-	assert.ok(end < source.indexOf('if (operateAction === "acknowledge") {', start));
-	const guard = new Function(
-		"operateAction",
-		"previous",
-		"requestId",
-		`${source.slice(start, end)}throw new Error("Conflicting operation request ID.");`,
-	);
-	const previous = {
-		operationIntent: { requestId: "intent-1", action: "open" },
-		operationAcknowledgments: [{ requestId: "ack-1", runId: "run-1" }],
-	};
-	for (const action of ["open", "suspend", "close"])
-		assert.throws(() => guard(action, previous, "ack-1"), /Conflicting operation request ID/);
-	assert.throws(() => guard("acknowledge", previous, "intent-1"), /Conflicting operation request ID/);
-	// Retries of the same command and fresh IDs pass to their own writer.
-	assert.doesNotThrow(() => guard("acknowledge", previous, "ack-1"));
-	assert.doesNotThrow(() => guard("close", previous, "intent-1"));
-	assert.doesNotThrow(() => guard("close", {}, "fresh"));
-	assert.doesNotThrow(() => guard("acknowledge", {}, "fresh"));
 });
 
 test("#14 rejects operator authority changes and installation identity overrides before execution", async () => {
@@ -315,6 +279,7 @@ function managedPlan() {
 			},
 			randomUUID,
 			planDigest,
+			refuseOtherCommandRequest,
 			matchingPlanApproval,
 			planReceiptsRecorded,
 			missingPlanTerms,
@@ -377,6 +342,165 @@ function managedPlan() {
 		await run(...Object.values(deps));
 	};
 	return state;
+}
+
+// #72: the shared rule behind the one-command-per-request-ID guard, for every action the entry accepts.
+test("#72 refuseOtherCommandRequest refuses an ID naming the other kind of operation command", () => {
+	const previous = {
+		operationIntent: { requestId: "intent-1", action: "open" },
+		operationAcknowledgments: [{ requestId: "ack-1", runId: "run-1" }],
+	};
+	for (const action of ["open", "suspend", "close"])
+		assert.throws(() => refuseOtherCommandRequest(previous, action, "ack-1"), /Conflicting operation request ID/);
+	assert.throws(() => refuseOtherCommandRequest(previous, "acknowledge", "intent-1"), /Conflicting operation request ID/);
+	// Retries of the same command and fresh IDs pass to their own writer.
+	assert.doesNotThrow(() => refuseOtherCommandRequest(previous, "acknowledge", "ack-1"));
+	assert.doesNotThrow(() => refuseOtherCommandRequest(previous, "close", "intent-1"));
+	assert.doesNotThrow(() => refuseOtherCommandRequest({}, "close", "fresh"));
+});
+
+// The installed mission.mjs runs as a real child through dispatchAgent and the selected-release check, under the real
+// management lock. Authority and owner I/O are file-backed by test/fixtures/issuer-runtime.mjs, so every assertion below
+// reads durable state: the authority file, its write log and the frames the owner received.
+async function operateChild() {
+	const { record, context } = await fixture();
+	const root = await realpath(context.root);
+	const release = join(root, "opt/unit-001/releases", record.releaseVersion);
+	await cp(new URL("../deploy/", import.meta.url), join(release, "deploy"), { recursive: true });
+	const { current } = installationPaths(record.id, root);
+	await mkdir(dirname(current), { recursive: true });
+	await symlink(`../../releases/${record.releaseVersion}`, current);
+	const authority = {
+		schemaVersion: 1,
+		installationId: record.id,
+		session: "default",
+		revision: 1,
+		creator: { id: "creator", kind: "human", uid: 2001 },
+		ceiling: {
+			allowedTools: [],
+			maxCycles: 1,
+			maxRequests: 1,
+			maxRetries: 0,
+			maxConsecutiveNoProgress: 1,
+			maxDurationMs: 1,
+		},
+		approvals: [],
+	};
+	const view = {
+		formation: {},
+		purpose: {
+			missionId: MISSION,
+			revision: 1,
+			digest: PURPOSE_DIGEST,
+			operation: "open",
+			operationRevision: 0,
+			appliedSequence: 0,
+			// A run from an older purpose revision blocks the loop but is absent from the current revision's works.
+			works: [],
+			unsettled: [{ runId: "run-old" }],
+		},
+	};
+	await writeFile(join(root, "mission-authority.json"), JSON.stringify(authority));
+	await writeFile(join(root, "mission-owner-view.json"), JSON.stringify(view));
+	const preload = new URL("./fixtures/issuer-runtime.mjs", import.meta.url).href;
+	const read = async (name) => readFile(join(root, name), "utf8").catch(() => "");
+	return {
+		run: (args) =>
+			dispatchAgent(record.id, record.name, ["mission", "operate", ...args], {
+				root,
+				uid: 0,
+				release: realpath,
+				run: (_runtime, childArgs) =>
+					execFileAsync(process.execPath, ["--conditions=source", `--import=${preload}`, ...childArgs], {
+						env: {
+							PATH: process.env.PATH,
+							SUDO_UID: String(process.getuid()),
+							SUDO_USER: "fixture",
+							UNIT_TEST_ISSUER_ROOT: root,
+						},
+						timeout: 10000,
+					}),
+			}),
+		authority: async () => JSON.parse(await read("mission-authority.json")),
+		writes: async () => (await read("authority-events")).split("\n").filter((line) => line === "write mission").length,
+		reconciles: async () =>
+			(await read("owner-requests"))
+				.split("\n")
+				.filter(Boolean)
+				.map((line) => JSON.parse(line))
+				.filter((request) => request.operation === "reconcile-operation"),
+	};
+}
+
+// #72: a run from an older purpose revision still blocks the loop, but the view's `works` lists only the current
+// revision, so the managed acknowledgment accepts any run in `unsettled` and refuses a run that is not.
+test("#72 real mission operate acknowledges an older unsettled run and refuses an unknown run", async () => {
+	const child = await operateChild();
+	await child.run(["acknowledge", "--run", "run-old", "--request-id", "ack-1", "--operation-revision", "0"]);
+	assert.deepEqual(
+		(await child.authority()).operationAcknowledgments.map(({ requestId, runId }) => ({ requestId, runId })),
+		[{ requestId: "ack-1", runId: "run-old" }],
+	);
+	assert.equal(await child.writes(), 1);
+	assert.deepEqual(await child.reconciles(), [{ operation: "reconcile-operation", requestId: "ack-1" }]);
+
+	const before = await child.authority();
+	await assert.rejects(
+		child.run(["acknowledge", "--run", "run-other", "--request-id", "ack-2", "--operation-revision", "0"]),
+		{ code: 1, stderr: /Only a run with unsettled effects can be acknowledged/ },
+	);
+	assert.deepEqual(await child.authority(), before);
+	assert.equal(await child.writes(), 1);
+	assert.equal((await child.reconciles()).length, 1);
+});
+
+// #72: the owner reconciles an acknowledgment before an intent, so one request ID naming both would make close report
+// success without applying it. Each direction refuses before any authority write or owner reconcile.
+for (const [first, second, firstArgs, secondArgs] of [
+	[
+		"acknowledgment",
+		"intent",
+		["acknowledge", "--run", "run-old", "--request-id", "shared", "--operation-revision", "0"],
+		["close", "--request-id", "shared", "--operation-revision", "0"],
+	],
+	[
+		"intent",
+		"acknowledgment",
+		["close", "--request-id", "shared", "--operation-revision", "0"],
+		["acknowledge", "--run", "run-old", "--request-id", "shared", "--operation-revision", "0"],
+	],
+]) {
+	test(`#72 real mission operate refuses an ${second} reusing an ${first} request ID`, async () => {
+		const child = await operateChild();
+		await child.run(firstArgs);
+		const saved = await child.authority();
+		assert.equal(await child.writes(), 1);
+		assert.equal((await child.reconciles()).length, 1);
+		await assert.rejects(child.run(secondArgs), { code: 1, stderr: /Conflicting operation request ID/ });
+		assert.deepEqual(await child.authority(), saved);
+		assert.equal(await child.writes(), 1);
+		assert.equal((await child.reconciles()).length, 1);
+	});
+}
+
+// #72: an exact retry of an accepted command reconciles again but never writes a second record.
+for (const [kind, args, field] of [
+	["acknowledgment", ["acknowledge", "--run", "run-old", "--request-id", "same", "--operation-revision", "0"], "operationAcknowledgments"],
+	["intent", ["close", "--request-id", "same", "--operation-revision", "0"], "operationIntent"],
+]) {
+	test(`#72 real mission operate accepts an exact ${kind} replay without another write`, async () => {
+		const child = await operateChild();
+		await child.run(args);
+		const saved = await child.authority();
+		assert.ok(saved[field]);
+		await child.run(args);
+		assert.deepEqual(await child.authority(), saved);
+		assert.equal(await child.writes(), 1);
+		assert.deepEqual(await child.reconciles(), [
+			{ operation: "reconcile-operation", requestId: "same" },
+			{ operation: "reconcile-operation", requestId: "same" },
+		]);
+	});
 }
 
 test("#27 managed purpose approval requires an exact fixture-only proposal and protected research grant", async () => {

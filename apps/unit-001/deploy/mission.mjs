@@ -14,6 +14,7 @@ import {
 	writeMissionAuthority,
 } from "../app/dist/missions/authority.js";
 import { MANAGED_MISSION_ACTIONS, missionObject, parseMissionCreator } from "../app/dist/missions/contract.js";
+import { refuseOtherCommandRequest } from "../app/dist/missions/operation.js";
 import { matchingPlanApproval, planDigest, planReceiptsRecorded } from "../app/dist/missions/plan-authority.js";
 import { missingPlanTerms, reviewAllowanceDenial } from "../app/dist/missions/plan-terms.js";
 import { parsePurposeCeiling, parsePurposeTerms, purposeDigest, validatePurposeTerms } from "../app/dist/missions/purpose-authority.js";
@@ -538,14 +539,7 @@ async function operatePurpose(view, previous) {
 		values["operation-revision"] === undefined ? purpose.operationRevision : Number(values["operation-revision"]);
 	if (!Number.isSafeInteger(expected) || expected < 0) throw new Error("Operation revision must be a nonnegative integer.");
 	let next;
-	// A request ID names one command: the owner reconciles an acknowledgment first, so a shared ID would report an
-	// intent applied that it never read.
-	if (
-		operateAction === "acknowledge"
-			? previous.operationIntent?.requestId === requestId
-			: previous.operationAcknowledgments?.some((item) => item.requestId === requestId)
-	)
-		throw new Error("Conflicting operation request ID.");
+	refuseOtherCommandRequest(previous, operateAction, requestId);
 	if (operateAction === "acknowledge") {
 		const known = previous.operationAcknowledgments?.find((item) => item.requestId === requestId);
 		if (known && known.runId !== values.run) throw new Error("Conflicting acknowledgment request ID.");
