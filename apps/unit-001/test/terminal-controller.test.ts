@@ -1,6 +1,6 @@
 // #21: Rich terminal controls use the service owner, never another storage writer.
 import { mkdtemp, rm } from "node:fs/promises";
-import { createServer, type Socket } from "node:net";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -9,7 +9,7 @@ import { fauxAssistantMessage, fauxProvider, fauxText } from "@earendil-works/pi
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "../src/agent.ts";
-import type { ServiceRequest, ServiceView } from "../src/service.ts";
+import type { ServiceView } from "../src/service.ts";
 import type { ServiceClient } from "../src/service-client.ts";
 import {
 	createForegroundTerminalController,
@@ -17,6 +17,7 @@ import {
 	createTerminalController,
 	type TerminalState,
 } from "../src/terminal-controller.ts";
+import { startFakeOwner } from "./fixtures/fake-owner.ts";
 
 let directory: string;
 const cleanup: (() => Promise<void>)[] = [];
@@ -43,66 +44,12 @@ const base: ServiceView = {
 };
 
 async function server(initial: ServiceView | null = base) {
-	const endpoint = join(directory, "default.sock");
-	const sockets = new Set<Socket>();
-	const watchers = new Set<Socket>();
-	const requests: (ServiceRequest | { type: "watch" })[] = [];
-	const missionRequests: ServiceRequest[] = [];
-	let respond = (_request: ServiceRequest, socket: Socket) => {
-		socket.end('{"type":"cancelled"}\n');
-	};
-	const listener = createServer((socket) => {
-		sockets.add(socket);
-		socket.on("error", () => {});
-		socket.once("close", () => {
-			sockets.delete(socket);
-			watchers.delete(socket);
-		});
-		socket.setEncoding("utf8");
-		let buffer = "";
-		socket.on("data", (chunk: string) => {
-			buffer += chunk;
-			const newline = buffer.indexOf("\n");
-			if (newline === -1) return;
-			const request = JSON.parse(buffer.slice(0, newline)) as ServiceRequest | { type: "watch" };
-			buffer = "";
-			if (request.type === "mission") {
-				missionRequests.push(request);
-				socket.end('{"type":"error","message":"Mission formation unavailable"}\n');
-				return;
-			}
-			requests.push(request);
-			if (request.type === "watch") {
-				watchers.add(socket);
-				if (initial !== null) socket.write(`${JSON.stringify({ type: "view", view: initial })}\n`);
-			} else respond(request, socket);
-		});
+	const owner = await startFakeOwner(join(directory, "default.sock"), {
+		initial,
+		missionError: "Mission formation unavailable",
 	});
-	await new Promise<void>((resolve, reject) => {
-		listener.once("error", reject);
-		listener.listen(endpoint, resolve);
-	});
-	cleanup.push(async () => {
-		for (const socket of sockets) socket.destroy();
-		await new Promise<void>((resolve, reject) => listener.close((error) => (error ? reject(error) : resolve())));
-	});
-	return {
-		endpoint,
-		requests,
-		missionRequests,
-		respond(fn: typeof respond) {
-			respond = fn;
-		},
-		view(view: ServiceView) {
-			for (const socket of watchers) socket.write(`${JSON.stringify({ type: "view", view })}\n`);
-		},
-		wire(wire: string) {
-			for (const socket of watchers) socket.write(wire);
-		},
-		disconnect() {
-			for (const socket of watchers) socket.destroy();
-		},
-	};
+	cleanup.push(owner.close);
+	return owner;
 }
 
 async function connect(owner: Awaited<ReturnType<typeof server>>) {

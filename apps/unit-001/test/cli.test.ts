@@ -121,6 +121,26 @@ describe("main", () => {
 			}
 		},
 	);
+	it.skipIf(process.platform === "win32")("sends inspect os to the running owner as one prompt", async () => {
+		const directory = join(home, "data");
+		await mkdir(join(directory, "control"), { recursive: true });
+		const requests: unknown[] = [];
+		const server = createServer((socket) =>
+			socket.once("data", (wire) => {
+				requests.push(JSON.parse(String(wire)));
+				socket.end(`${JSON.stringify({ type: "reply", reply: { status: "answered", text: "Linux 6.1" } })}\n`);
+			}),
+		);
+		await new Promise<void>((resolve) => server.listen(serviceEndpoint(directory, "default", process.platform), resolve));
+		try {
+			const run = runtime({});
+			expect(await main(["inspect", "os", "--request-id", "os-1"], run.runtime, signal)).toBe(0);
+			expect(requests).toEqual([{ type: "send", prompt: "inspect os", requestId: "os-1" }]);
+			expect(run.out()).toBe("Linux 6.1\n");
+		} finally {
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
+	});
 	it("rejects setup without a terminal before reading or writing agent files", async () => {
 		const run = runtime({});
 		expect(await main(["setup"], run.runtime, signal)).toBe(2);
@@ -327,6 +347,12 @@ describe("main", () => {
 		const run = runtime({});
 		expect(await main(["-p", "hi"], run.runtime, signal)).toBe(1);
 		expect(run.err()).toContain("No model provider is configured");
+	});
+
+	it("answers -p '/inspect os' from the host fact without a configured provider", async () => {
+		const run = runtime({});
+		expect(await main(["-p", "/inspect os"], run.runtime, signal)).toBe(0);
+		expect(run.out()).toContain(`Platform: ${process.platform}`);
 	});
 
 	it("lists how each provider is configured, without printing secrets", async () => {

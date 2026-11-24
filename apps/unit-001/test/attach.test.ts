@@ -1,14 +1,15 @@
 // #21: Attached terminals observe the owner and detach without cancelling durable work.
 import { mkdtemp, rm } from "node:fs/promises";
-import { createServer, type Socket } from "node:net";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runAttach, runServiceAttach } from "../src/attach.ts";
 import type { Terminal } from "../src/repl.ts";
-import type { ServiceRequest, ServiceView } from "../src/service.ts";
+import type { ServiceView } from "../src/service.ts";
 import type { ServiceClient } from "../src/service-client.ts";
+import { startFakeOwner } from "./fixtures/fake-owner.ts";
 
 let directory: string;
 const cleanups: (() => Promise<void>)[] = [];
@@ -56,59 +57,9 @@ function terminal() {
 }
 
 async function server(initial: ServiceView | null = base) {
-	const watchers = new Set<Socket>();
-	const sockets = new Set<Socket>();
-	const requests: (ServiceRequest | { type: "watch" })[] = [];
-	let respond = (_request: ServiceRequest, socket: Socket) => {
-		socket.end('{"type":"cancelled"}\n');
-	};
-	const endpoint = join(directory, "default.sock");
-	const listener = createServer((socket) => {
-		sockets.add(socket);
-		socket.on("error", () => {});
-		socket.once("close", () => {
-			sockets.delete(socket);
-			watchers.delete(socket);
-		});
-		socket.setEncoding("utf8");
-		let buffer = "";
-		socket.on("data", (chunk: string) => {
-			buffer += chunk;
-			const newline = buffer.indexOf("\n");
-			if (newline === -1) return;
-			const request = JSON.parse(buffer.slice(0, newline)) as ServiceRequest | { type: "watch" };
-			buffer = "";
-			requests.push(request);
-			if (request.type === "watch") {
-				watchers.add(socket);
-				if (initial !== null) socket.write(`${JSON.stringify({ type: "view", view: initial })}\n`);
-			} else respond(request, socket);
-		});
-	});
-	await new Promise<void>((resolve, reject) => {
-		listener.once("error", reject);
-		listener.listen(endpoint, resolve);
-	});
-	cleanups.push(async () => {
-		for (const socket of sockets) socket.destroy();
-		await new Promise<void>((resolve, reject) => listener.close((error) => (error ? reject(error) : resolve())));
-	});
-	return {
-		endpoint,
-		requests,
-		respond(fn: typeof respond) {
-			respond = fn;
-		},
-		view(view: ServiceView) {
-			for (const socket of watchers) socket.write(`${JSON.stringify({ type: "view", view })}\n`);
-		},
-		wire(wire: string) {
-			for (const socket of watchers) socket.write(wire);
-		},
-		disconnect() {
-			for (const socket of watchers) socket.destroy();
-		},
-	};
+	const owner = await startFakeOwner(join(directory, "default.sock"), { initial });
+	cleanups.push(owner.close);
+	return owner;
 }
 
 async function attach(service: Awaited<ReturnType<typeof server>>) {

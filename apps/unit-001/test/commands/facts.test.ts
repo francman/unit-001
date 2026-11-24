@@ -51,7 +51,20 @@ describe("deterministic host facts", () => {
 	it("recognizes known questions without swallowing ordinary discussion (#57, #59)", () => {
 		expect(isOperatingSystemQuestion("What operating system are you running?")).toBe(true);
 		expect(isOperatingSystemQuestion("inspect os")).toBe(true);
+		expect(isOperatingSystemQuestion("/inspect os")).toBe(true);
+		expect(isOperatingSystemQuestion("/inspect os?")).toBe(true);
 		expect(isOperatingSystemQuestion("Explain how operating systems work")).toBe(false);
+	});
+
+	it("answers the slash form from the host fact without a model call and keeps its retry text exact", async () => {
+		const { agent, calls } = await launch(true);
+		for (const text of ["/inspect os", "/inspect os?"]) {
+			const answer = await agent.ask(text, context, { requestId: `slash-${text}` });
+			expect(answer).toMatchObject({ status: "answered", text: expect.stringContaining(`Platform: ${process.platform}`) });
+			expect(await agent.ask(text, context, { requestId: `slash-${text}` })).toEqual(answer);
+		}
+		expect(calls()).toBe(0);
+		await expect(agent.ask("inspect os", context, { requestId: "slash-/inspect os" })).rejects.toThrow("conflicts");
 	});
 
 	it("answers without a provider and persists explicit host provenance across retry/restart (#57)", async () => {

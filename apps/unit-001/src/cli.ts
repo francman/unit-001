@@ -7,20 +7,20 @@ import type { Report } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { ProcessTerminal } from "@earendil-works/pi-tui";
 import { Agent } from "./agent.ts";
-import { type Command, parseArguments, USAGE } from "./args.ts";
+import { type Command, parseArguments, type ServiceOptions, USAGE } from "./args.ts";
 import { runAttach } from "./attach.ts";
 import { commandCatalog } from "./commands/catalog.ts";
-import { isOperatingSystemQuestion } from "./commands/facts.ts";
+import { isOperatingSystemQuestion, OS_INSPECTION_PROMPT } from "./commands/facts.ts";
 import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
 import { FileCredentialStore } from "./credentials.ts";
 import { createDraftStore, type DraftStore } from "./draft-store.ts";
-import { ConfigurationError, UsageError } from "./errors.ts";
+import { ConfigurationError, describeError, UsageError } from "./errors.ts";
 import { describeInspection } from "./introspection/command.ts";
 import { acquireSessionLock } from "./lock.ts";
 import { describeStatus, runLogin, runLogout, subscriptionFor } from "./login.ts";
 import { describeMemory, type MemoryRequest } from "./memory-control.ts";
 import { parseMissionCeiling } from "./missions/authority.ts";
-import { describeMission } from "./missions/command.ts";
+import { describeMission, type MissionCommand } from "./missions/command.ts";
 import { parsePurposeCeiling, parsePurposeTerms } from "./missions/purpose-authority.ts";
 import {
 	type MissionRequest,
@@ -299,229 +299,367 @@ async function run(
 	}
 }
 
-async function control(
-	command: Extract<
-		Command,
-		{
-			kind:
-				| "send"
-				| "service-status"
-				| "cancel"
-				| "attach"
-				| "maintenance-enter"
-				| "maintenance-release"
-				| "memory"
-				| "channels"
-				| "mission"
-				| "inspection";
-		}
-	>,
-	runtime: Runtime,
-	signal: AbortSignal,
-): Promise<number> {
+/** The commands that talk to a running owner through its socket. */
+type ControlCommand = Extract<
+	Command,
+	{
+		kind:
+			| "send"
+			| "inspect-os"
+			| "service-status"
+			| "cancel"
+			| "attach"
+			| "maintenance-enter"
+			| "maintenance-release"
+			| "memory"
+			| "channels"
+			| "mission"
+			| "inspection";
+	}
+>;
+
+const CONTROL_KINDS: ReadonlySet<string> = new Set<ControlCommand["kind"]>([
+	"send",
+	"inspect-os",
+	"service-status",
+	"cancel",
+	"attach",
+	"maintenance-enter",
+	"maintenance-release",
+	"memory",
+	"channels",
+	"mission",
+	"inspection",
+]);
+
+function isControlCommand(command: Command): command is ControlCommand {
+	return CONTROL_KINDS.has(command.kind);
+}
+
+/** The commands an operator client may run; everything else needs the administrator command. */
+type OperatorCommand = Extract<
+	Command,
+	{
+		kind:
+			| "attach"
+			| "send"
+			| "inspect-os"
+			| "cancel"
+			| "service-status"
+			| "memory"
+			| "channels"
+			| "mission"
+			| "inspection"
+			| "web";
+	}
+>;
+
+const OPERATOR_KINDS: ReadonlySet<string> = new Set<OperatorCommand["kind"]>([
+	"attach",
+	"send",
+	"inspect-os",
+	"cancel",
+	"service-status",
+	"memory",
+	"channels",
+	"mission",
+	"inspection",
+	"web",
+]);
+
+function isOperatorCommand(command: Command): command is OperatorCommand {
+	return OPERATOR_KINDS.has(command.kind);
+}
+
+/** Runs a command against the running owner and returns the exit code. */
+async function control(command: ControlCommand, runtime: Runtime, signal: AbortSignal): Promise<number> {
 	if (command.kind === "attach" && !runtime.interactive)
 		throw new UsageError(
 			`Interactive attach requires a terminal. Use ${runtime.managed?.name ?? "agent"} send for scripts and pipes.`,
 		);
-	const endpoint =
-		runtime.managed?.access === "operator"
-			? operatorEndpoint(runtime.managed.id, command.options.session)
-			: serviceEndpoint(resolveDirectory(command.options.dataDir, runtime), command.options.session, runtime.platform);
-	if (command.kind === "inspection") {
-		const response = await requestService(endpoint, { type: "inspection", query: command.query }, signal);
-		if (response.type === "error") throw new ConfigurationError(response.message);
-		if (response.type !== "inspection") throw new Error("Unexpected inspection response.");
-		runtime.stdout.write(
-			`${command.json ? JSON.stringify(response.report) : sanitizeTerminalText(describeInspection(response.report))}\n`,
-		);
-		return 0;
-	}
-	if (command.kind === "channels") {
-		const response = await requestService(endpoint, { type: "channels", request: { operation: "status" } }, signal);
-		if (response.type === "error") throw new ConfigurationError(response.message);
-		if (response.type !== "channels") throw new Error("Unexpected channel response.");
-		const result = response.result;
-		if (result.operation !== "status") throw new Error("Unexpected channel status operation.");
-		const lines = [
-			`Available adapters: ${result.view.available.map((adapter) => `${adapter.id} (${adapter.capabilities.join(", ")})`).join("; ") || "none"}`,
-			...result.view.channels.map(
-				(channel) =>
-					`${channel.request.channelId}: ${channel.outcome.kind}${channel.outcome.kind === "awaiting_creator" ? ` (${channel.outcome.step})` : ""}; ${channel.request.adapter} destination ${channel.request.destination}`,
-			),
-		];
-		if (!result.view.channels.length) lines.push("No channels configured.");
-		lines.push(`Observed: ${new Date(result.observedAt).toISOString()}`);
-		runtime.stdout.write(`${sanitizeTerminalText(lines.join("\n"))}\n`);
-		return 0;
-	}
-	if (command.kind === "mission") {
-		const request = async (request: MissionRequest): Promise<MissionView> => {
-			const response = await requestService(endpoint, { type: "mission", request }, signal);
-			if (response.type === "error") throw new ConfigurationError(response.message);
-			if (response.type === "mission-refused") throw new ConfigurationError(describeMissionRefusal(response.code));
-			if (request.operation === "plan-agree" && response.type === "mission-plan-issued")
-				throw new ConfigurationError(
-					`Plan agreement ${response.receiptId} was issued and is awaiting reconciliation. Retry with the same --request-id. Request ID: ${sanitizeTerminalText(request.requestId)}`,
-				);
-			if (response.type !== "mission") throw new Error("Unexpected mission response.");
-			return response.result;
-		};
-		const input = command.command;
-		if (input.action === "setup")
-			return runMissionSetup(
-				terminalFor(runtime),
-				runtime.managed?.name ?? "agent",
-				request,
+	const endpoint = ownerEndpoint(command.options, runtime);
+	switch (command.kind) {
+		case "inspection":
+			return controlInspection(command, endpoint, runtime, signal);
+		case "channels":
+			return controlChannels(endpoint, runtime, signal);
+		case "mission":
+			return controlMission(command, endpoint, runtime, signal);
+		case "attach":
+			return controlAttach(command, endpoint, runtime, signal);
+		case "memory":
+			return controlMemory(command, endpoint, runtime, signal);
+		case "inspect-os":
+			return controlService(
+				{
+					kind: "send",
+					options: command.options,
+					prompt: OS_INSPECTION_PROMPT,
+					...(command.requestId === undefined ? {} : { requestId: command.requestId }),
+				},
+				endpoint,
+				runtime,
 				signal,
-				runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb",
 			);
-		let operation: MissionRequest;
-		if (
-			input.action === "start" ||
-			input.action === "pause" ||
-			input.action === "resume" ||
-			input.action === "stop"
-		) {
+		default:
+			return controlService(command, endpoint, runtime, signal);
+	}
+}
+
+function ownerEndpoint(options: ServiceOptions, runtime: Runtime): string {
+	return runtime.managed?.access === "operator"
+		? operatorEndpoint(runtime.managed.id, options.session)
+		: serviceEndpoint(resolveDirectory(options.dataDir, runtime), options.session, runtime.platform);
+}
+
+async function controlInspection(
+	command: Extract<ControlCommand, { kind: "inspection" }>,
+	endpoint: string,
+	runtime: Runtime,
+	signal: AbortSignal,
+): Promise<number> {
+	const response = await requestService(endpoint, { type: "inspection", query: command.query }, signal);
+	if (response.type === "error") throw new ConfigurationError(response.message);
+	if (response.type !== "inspection") throw new Error("Unexpected inspection response.");
+	runtime.stdout.write(
+		`${command.json ? JSON.stringify(response.report) : sanitizeTerminalText(describeInspection(response.report))}\n`,
+	);
+	return 0;
+}
+
+async function controlChannels(endpoint: string, runtime: Runtime, signal: AbortSignal): Promise<number> {
+	const response = await requestService(endpoint, { type: "channels", request: { operation: "status" } }, signal);
+	if (response.type === "error") throw new ConfigurationError(response.message);
+	if (response.type !== "channels") throw new Error("Unexpected channel response.");
+	const result = response.result;
+	if (result.operation !== "status") throw new Error("Unexpected channel status operation.");
+	const lines = [
+		`Available adapters: ${result.view.available.map((adapter) => `${adapter.id} (${adapter.capabilities.join(", ")})`).join("; ") || "none"}`,
+		...result.view.channels.map(
+			(channel) =>
+				`${channel.request.channelId}: ${channel.outcome.kind}${channel.outcome.kind === "awaiting_creator" ? ` (${channel.outcome.step})` : ""}; ${channel.request.adapter} destination ${channel.request.destination}`,
+		),
+	];
+	if (!result.view.channels.length) lines.push("No channels configured.");
+	lines.push(`Observed: ${new Date(result.observedAt).toISOString()}`);
+	runtime.stdout.write(`${sanitizeTerminalText(lines.join("\n"))}\n`);
+	return 0;
+}
+
+/** Sends mission requests to the owner; an owner error or refusal becomes a configuration error with its text. */
+function missionRequester(
+	endpoint: string,
+	signal: AbortSignal,
+): (request: MissionRequest) => Promise<MissionView> {
+	return async (request) => {
+		const response = await requestService(endpoint, { type: "mission", request }, signal);
+		if (response.type === "error") throw new ConfigurationError(response.message);
+		if (response.type === "mission-refused") throw new ConfigurationError(describeMissionRefusal(response.code));
+		if (request.operation === "plan-agree" && response.type === "mission-plan-issued")
+			throw new ConfigurationError(
+				`Plan agreement ${response.receiptId} was issued and is awaiting reconciliation. Retry with the same --request-id. Request ID: ${sanitizeTerminalText(request.requestId)}`,
+			);
+		if (response.type !== "mission") throw new Error("Unexpected mission response.");
+		return response.result;
+	};
+}
+
+async function controlMission(
+	command: Extract<ControlCommand, { kind: "mission" }>,
+	endpoint: string,
+	runtime: Runtime,
+	signal: AbortSignal,
+): Promise<number> {
+	const request = missionRequester(endpoint, signal);
+	const input = command.command;
+	if (input.action === "setup") return runMissionSetup(...missionSetupArguments(runtime, request, signal));
+	const view = await request(await missionOperation(input, request, runtime));
+	runtime.stdout.write(`${input.json ? JSON.stringify(view) : describeMission(view)}\n`);
+	return 0;
+}
+
+/** The arguments `runMissionSetup` takes for this terminal, shared by the setup command and the attach flow. */
+function missionSetupArguments(
+	runtime: Runtime,
+	request: (request: MissionRequest) => Promise<MissionView>,
+	signal: AbortSignal,
+): Parameters<typeof runMissionSetup> {
+	return [
+		terminalFor(runtime),
+		runtime.managed?.name ?? "agent",
+		request,
+		signal,
+		runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb",
+	];
+}
+
+/** Builds the owner request for one non-setup mission action, reading the current revision or a file where needed. */
+async function missionOperation(
+	input: Exclude<MissionCommand, { action: "setup" }>,
+	request: (request: MissionRequest) => Promise<MissionView>,
+	runtime: Runtime,
+): Promise<MissionRequest> {
+	switch (input.action) {
+		case "start":
+		case "pause":
+		case "resume":
+		case "stop": {
 			const view = await request({ operation: "status" });
-			operation = {
+			return {
 				operation: "control-local",
 				action: input.action,
 				expectedPolicyRevision: input.policyRevision ?? view.policyRevision ?? view.runtime?.policyRevision ?? 0,
 				requestId: input.requestId,
 			};
-		} else if (input.action === "operate") {
+		}
+		case "operate": {
 			const view = await request({ operation: "status" });
-			operation = {
+			return {
 				operation: "operate-local",
 				action: input.operate,
 				expectedOperationRevision: input.operationRevision ?? view.purpose?.operationRevision ?? 0,
 				requestId: input.requestId,
 				...(input.runId === undefined ? {} : { runId: input.runId }),
 			};
-		} else if (input.action === "approve-purpose")
-			operation = {
+		}
+		case "approve-purpose":
+			return {
 				operation: "purpose-approve-local",
 				revision: input.revision,
 				digest: input.digest,
 				requestId: input.requestId,
 			};
-		else if (input.action === "draft" || input.action === "creator" || input.action === "purpose") {
-			const path = resolve(runtime.cwd, input.file);
-			const info = await lstat(path);
-			if (!info.isFile() || info.isSymbolicLink() || info.size > 65536)
-				throw new UsageError("Mission input must be a regular file of at most 64 KiB.");
-			const data: unknown = JSON.parse(await readFile(path, "utf8"));
+		case "draft":
+		case "creator":
+		case "purpose": {
+			const data = await readMissionFile(input.file, runtime);
 			if (input.action === "purpose")
-				operation = {
+				return {
 					operation: "purpose-propose",
 					expectedRevision: input.revision,
 					requestId: input.requestId,
 					terms: parsePurposeTerms(data),
 				};
-			else if (input.action === "draft")
-				operation = {
+			if (input.action === "draft")
+				return {
 					operation: "draft",
 					expectedRevision: input.revision,
 					requestId: input.requestId,
 					terms: parseMissionDraftTerms(data),
 				};
-			else {
-				const authority = missionObject(data);
-				operation = {
-					operation: "configure-local",
-					creator: parseMissionCreator(authority.creator),
-					ceiling: parseMissionCeiling(authority.ceiling),
-					...(authority.purposeCeiling === undefined
-						? {}
-						: { purposeCeiling: parsePurposeCeiling(authority.purposeCeiling) }),
-				};
-			}
-		} else if (input.action === "propose")
-			operation = { operation: "propose", expectedRevision: input.revision, requestId: input.requestId };
-		else if (input.action === "approve")
-			operation = {
+			const authority = missionObject(data);
+			return {
+				operation: "configure-local",
+				creator: parseMissionCreator(authority.creator),
+				ceiling: parseMissionCeiling(authority.ceiling),
+				...(authority.purposeCeiling === undefined
+					? {}
+					: { purposeCeiling: parsePurposeCeiling(authority.purposeCeiling) }),
+			};
+		}
+		case "propose":
+			return { operation: "propose", expectedRevision: input.revision, requestId: input.requestId };
+		case "approve":
+			return {
 				operation: "approve-local",
 				expectedRevision: input.revision,
 				requestId: input.requestId,
 				digest: input.digest,
 			};
-		else if (input.action === "plan-approve") {
+		case "plan-approve":
 			if (runtime.managed !== undefined)
 				throw new ConfigurationError(`Run sudo ${runtime.managed.name} mission plan approve as the configured creator.`);
-			operation = { operation: "plan-agree", revision: input.revision, digest: input.digest, requestId: input.requestId };
-		} else operation = { operation: "status" };
-		const view = await request(operation);
-		runtime.stdout.write(`${input.json ? JSON.stringify(view) : describeMission(view)}\n`);
-		return 0;
+			return { operation: "plan-agree", revision: input.revision, digest: input.digest, requestId: input.requestId };
+		default:
+			return { operation: "status" };
 	}
-	if (command.kind === "attach") {
-		const terminal = command.options.plain ? undefined : richTerminalFor(runtime);
-		if (terminal === undefined) return runAttach(endpoint, terminalFor(runtime), signal);
-		return runRichAttach(endpoint, terminal, signal, {
-			colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
-			drafts: draftsFor(
-				runtime,
-				runtime.managed?.id ?? `local:${resolveDirectory(command.options.dataDir, runtime)}`,
-				command.options.session,
-			),
-			missionSetup: (flowSignal) =>
-				runMissionSetup(
-					terminalFor(runtime),
-					runtime.managed?.name ?? "agent",
-					async (request) => {
-						const response = await requestService(endpoint, { type: "mission", request }, flowSignal);
-						if (response.type === "error") throw new ConfigurationError(response.message);
-						if (response.type === "mission-refused")
-							throw new ConfigurationError(describeMissionRefusal(response.code));
-						if (response.type !== "mission") throw new Error("Unexpected mission response.");
-						return response.result;
-					},
-					flowSignal,
-					runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb",
-				),
-			...(runtime.managed === undefined
-				? {}
-				: {
-						name: runtime.managed.name,
-						unavailableHint: `Configure: sudo ${runtime.managed.name} setup\nStart: sudo ${runtime.managed.name} start\nOpen: ${runtime.managed.access === "operator" ? "" : "sudo "}${runtime.managed.name}`,
-					}),
-		});
-	}
-	if (command.kind === "memory") {
-		let request: MemoryRequest;
-		if (command.request.operation === "confirm-forget") {
-			if (!command.yes) {
-				if (!runtime.interactive) throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
-				const readline = createInterface({ input: runtime.stdin, output: runtime.stdout });
-				try {
-					const answer = await readline.question(
-						`Forget ${sanitizeTerminalText(command.request.id)}? Conversation history remains. [y/N] `,
-						{ signal },
-					);
-					if (answer.trim().toLowerCase() !== "y" && answer.trim().toLowerCase() !== "yes") {
-						runtime.stdout.write("Forget cancelled.\n");
-						return 0;
-					}
-				} finally {
-					readline.close();
+}
+
+async function readMissionFile(file: string, runtime: Runtime): Promise<unknown> {
+	const path = resolve(runtime.cwd, file);
+	const info = await lstat(path);
+	if (!info.isFile() || info.isSymbolicLink() || info.size > 65536)
+		throw new UsageError("Mission input must be a regular file of at most 64 KiB.");
+	return JSON.parse(await readFile(path, "utf8"));
+}
+
+async function controlAttach(
+	command: Extract<ControlCommand, { kind: "attach" }>,
+	endpoint: string,
+	runtime: Runtime,
+	signal: AbortSignal,
+): Promise<number> {
+	const terminal = command.options.plain ? undefined : richTerminalFor(runtime);
+	if (terminal === undefined) return runAttach(endpoint, terminalFor(runtime), signal);
+	return runRichAttach(endpoint, terminal, signal, {
+		colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+		drafts: draftsFor(
+			runtime,
+			runtime.managed?.id ?? `local:${resolveDirectory(command.options.dataDir, runtime)}`,
+			command.options.session,
+		),
+		missionSetup: (flowSignal) =>
+			runMissionSetup(...missionSetupArguments(runtime, missionRequester(endpoint, flowSignal), flowSignal)),
+		...(runtime.managed === undefined
+			? {}
+			: {
+					name: runtime.managed.name,
+					unavailableHint: `Configure: sudo ${runtime.managed.name} setup\nStart: sudo ${runtime.managed.name} start\nOpen: ${runtime.managed.access === "operator" ? "" : "sudo "}${runtime.managed.name}`,
+				}),
+	});
+}
+
+async function controlMemory(
+	command: Extract<ControlCommand, { kind: "memory" }>,
+	endpoint: string,
+	runtime: Runtime,
+	signal: AbortSignal,
+): Promise<number> {
+	let request: MemoryRequest;
+	if (command.request.operation === "confirm-forget") {
+		if (!command.yes) {
+			if (!runtime.interactive) throw new UsageError("Memory forget requires an interactive confirmation or --yes.");
+			const readline = createInterface({ input: runtime.stdin, output: runtime.stdout });
+			try {
+				const answer = await readline.question(
+					`Forget ${sanitizeTerminalText(command.request.id)}? Conversation history remains. [y/N] `,
+					{ signal },
+				);
+				if (answer.trim().toLowerCase() !== "y" && answer.trim().toLowerCase() !== "yes") {
+					runtime.stdout.write("Forget cancelled.\n");
+					return 0;
 				}
+			} finally {
+				readline.close();
 			}
-			request = {
-				operation: "forget",
-				id: command.request.id,
-				requestId: command.request.requestId,
-				confirmed: true,
-			};
-		} else request = command.request;
-		const response = await requestService(endpoint, { type: "memory", request }, signal);
-		if (response.type === "error") {
-			runtime.stderr.write(`${response.message}\n`);
-			return 1;
 		}
-		if (response.type !== "memory") throw new Error("Unexpected memory response.");
-		runtime.stdout.write(`${describeMemory(response.result)}\n`);
-		return 0;
+		request = {
+			operation: "forget",
+			id: command.request.id,
+			requestId: command.request.requestId,
+			confirmed: true,
+		};
+	} else request = command.request;
+	const response = await requestService(endpoint, { type: "memory", request }, signal);
+	if (response.type === "error") {
+		runtime.stderr.write(`${response.message}\n`);
+		return 1;
 	}
+	if (response.type !== "memory") throw new Error("Unexpected memory response.");
+	runtime.stdout.write(`${describeMemory(response.result)}\n`);
+	return 0;
+}
+
+/** Sends one prompt, status, cancel or maintenance request and prints the owner's reply. */
+async function controlService(
+	command: Extract<
+		ControlCommand,
+		{ kind: "send" | "service-status" | "cancel" | "maintenance-enter" | "maintenance-release" }
+	>,
+	endpoint: string,
+	runtime: Runtime,
+	signal: AbortSignal,
+): Promise<number> {
 	const request: ServiceRequest | MaintenanceRequest =
 		command.kind === "maintenance-enter"
 			? { type: command.kind, operationId: command.operationId, timeoutMs: command.timeoutMs }
@@ -606,29 +744,11 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				if (command.dataDir !== undefined) throw new UsageError("Operator clients cannot change their data directory.");
 				return control({ kind: "service-status", options: { session: "default" } }, runtime, signal);
 			}
-			if (
-				command.kind !== "attach" &&
-				command.kind !== "send" &&
-				command.kind !== "cancel" &&
-				command.kind !== "service-status" &&
-				command.kind !== "memory" &&
-				command.kind !== "channels" &&
-				command.kind !== "mission" &&
-				command.kind !== "inspection" &&
-				command.kind !== "web" &&
-				!(command.kind === "run" && argv.length === 0 && runtime.interactive)
-			)
+			if (isOperatorCommand(command)) {
+				if (command.options.dataDir !== undefined)
+					throw new UsageError("Operator clients cannot change their data directory.");
+			} else if (!(command.kind === "run" && argv.length === 0 && runtime.interactive))
 				throw new ConfigurationError("This operation requires the administrator command.");
-			if (
-				command.kind === "mission" &&
-				// Mirrors the operator socket allowlist in service.ts: operators may only inspect, draft and propose.
-				!["status", "setup", "draft", "propose", "purpose"].includes(command.command.action)
-			)
-				throw new ConfigurationError(
-					"Mission purpose, creator, approval and operation changes require the administrator command.",
-				);
-			if (command.kind !== "run" && command.options.dataDir !== undefined)
-				throw new UsageError("Operator clients cannot change their data directory.");
 		}
 		let code: number;
 		if (command.kind === "web") {
@@ -665,19 +785,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				);
 			}
 		} else if (command.kind === "run" || command.kind === "serve") code = await run(command, runtime, signal);
-		else if (
-			command.kind === "send" ||
-			command.kind === "service-status" ||
-			command.kind === "cancel" ||
-			command.kind === "attach" ||
-			command.kind === "maintenance-enter" ||
-			command.kind === "maintenance-release" ||
-			command.kind === "memory" ||
-			command.kind === "channels" ||
-			command.kind === "mission" ||
-			command.kind === "inspection"
-		)
-			code = await control(command, runtime, signal);
+		else if (isControlCommand(command)) code = await control(command, runtime, signal);
 		else code = await account(command, runtime, signal);
 		return signal.aborted && !serving ? 130 : code;
 	} catch (error) {
@@ -715,7 +823,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 				runtime.stderr.write(`${sanitizeTerminalText(describeCommandSuggestions(suggestions, "cli"))}\n`);
 			return 2;
 		}
-		const message = error instanceof Error ? error.message : String(error);
+		const message = describeError(error);
 		runtime.stderr.write(
 			error instanceof ConfigurationError ? `${message}\n` : `${runtime.managed?.name ?? "agent"}: ${message}\n`,
 		);

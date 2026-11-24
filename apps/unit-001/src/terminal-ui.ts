@@ -22,7 +22,9 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { Agent } from "./agent.ts";
+import { MAX_PROMPT_LABEL } from "./commands/slash.ts";
 import { type DraftStore, MAX_DRAFT_BYTES, type StoredDraft, type UnconfirmedSend } from "./draft-store.ts";
+import { describeError } from "./errors.ts";
 import { cutText, sanitizeTerminalText } from "./render.ts";
 import { type SendAdmission, sendDigest } from "./send-receipt.ts";
 import type { ServiceView } from "./service.ts";
@@ -177,7 +179,7 @@ async function runRichConversation(
 					await missionSetup(AbortSignal.any([signal, flowAbort.signal]));
 				} catch (error) {
 					terminal.write(
-						`Mission setup: ${sanitizeTerminalText(error instanceof Error ? error.message : String(error))}\r\n`,
+						`Mission setup: ${sanitizeTerminalText(describeError(error))}\r\n`,
 					);
 				} finally {
 					missionFlow = undefined;
@@ -428,7 +430,7 @@ export class RichAttachView extends VStack {
 				(admission) => this.settleUnconfirmed(send, admission),
 				(error: unknown) =>
 					this.showInputNotice(
-						`Could not check request ${send.requestId}: ${error instanceof Error ? error.message : String(error)}. ${replayHint(send)}`,
+						`Could not check request ${send.requestId}: ${describeError(error)}. ${replayHint(send)}`,
 					),
 			);
 	}
@@ -679,7 +681,7 @@ export class RichAttachView extends VStack {
 	}
 
 	private rejectInput(): void {
-		this.#inputNotice = "Input exceeds 16 KiB; existing draft preserved.";
+		this.#inputNotice = `Input exceeds ${MAX_PROMPT_LABEL}; existing draft preserved.`;
 		this.updateTranscript(this.#state.view);
 		this.#tui.requestRender();
 	}

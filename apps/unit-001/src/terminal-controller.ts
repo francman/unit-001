@@ -13,9 +13,11 @@ import {
 	isEvidenceCallId,
 	MAX_INTERPRETED_INPUT,
 	MAX_PROMPT_BYTES,
+	MAX_PROMPT_LABEL,
 	parseMemorySlash,
 	unknownCommandNotice,
 } from "./commands/slash.ts";
+import { describeError } from "./errors.ts";
 import { describeInspection, inspectionText } from "./introspection/command.ts";
 import type { InspectionQuery, InspectionWireReport } from "./introspection/contract.ts";
 import { describeMemory, type MemoryRequest, type MemoryResult } from "./memory-control.ts";
@@ -439,7 +441,7 @@ class OwnerTerminalController implements TerminalController {
 			return { status: "rejected" };
 		}
 		if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) {
-			this.#notice("Prompt exceeds 16 KiB; it was not submitted.");
+			this.#notice(`Prompt exceeds ${MAX_PROMPT_LABEL}; it was not submitted.`);
 			return { status: "rejected" };
 		}
 		const requestId = options.replayRequestId ?? randomUUID();
@@ -803,8 +805,4 @@ async function withinFirstView<T extends { stop(): Promise<unknown> }>(opening: 
 	} finally {
 		clearTimeout(timer);
 	}
-}
-
-function describeError(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
 }

@@ -8,6 +8,9 @@ import { describeCommandSuggestions, resolveLocalCommand } from "./resolution.ts
 /** Largest prompt, in bytes, a terminal sends to the owner. */
 export const MAX_PROMPT_BYTES = 16_384;
 
+/** `MAX_PROMPT_BYTES` as the text every terminal shows in its limit messages. */
+export const MAX_PROMPT_LABEL = `${MAX_PROMPT_BYTES / 1024} KiB`;
+
 /** Longest unrecognized command text a terminal asks the owner to interpret; longer input is simply unknown. */
 export const MAX_INTERPRETED_INPUT = 256;
 
@@ -41,10 +44,14 @@ export function classifySlashInput(line: string): SlashInput {
 	if (text === "/mission" || text === "/mission status") return { kind: "mission", setup: false };
 	if (text === "/mission setup") return { kind: "mission", setup: true };
 	if (text === "/evidence" || text.startsWith("/evidence ")) return { kind: "evidence", argument: text.slice(9).trim() };
-	if ((text === "/inspect" || text.startsWith("/inspect ")) && !isOperatingSystemQuestion(text))
+	if (text === "/inspect" || text.startsWith("/inspect ")) {
+		// OS facts are not an inspection scope; the owner answers the original text from a host fact.
+		// Its retry receipt binds that exact text, so the prompt is never rewritten.
+		if (isOperatingSystemQuestion(text)) return { kind: "prompt", text };
 		return { kind: "inspect", text };
+	}
 	if (text === "/memory" || text.startsWith("/memory ")) return { kind: "memory", text };
-	if (text.startsWith("/") && !isOperatingSystemQuestion(text)) return { kind: "unknown" };
+	if (text.startsWith("/")) return { kind: "unknown" };
 	return text === "" ? { kind: "empty" } : { kind: "prompt", text };
 }
 

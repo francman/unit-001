@@ -11,9 +11,11 @@ import {
 	isEvidenceCallId,
 	MAX_INTERPRETED_INPUT,
 	MAX_PROMPT_BYTES,
+	MAX_PROMPT_LABEL,
 	parseMemorySlash,
 	unknownCommandNotice,
 } from "./commands/slash.ts";
+import { describeError } from "./errors.ts";
 import { describeInspection, inspectionText } from "./introspection/command.ts";
 import { describeMemory, type MemoryRequest } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
@@ -280,7 +282,7 @@ export async function runServiceAttach(
 				return;
 			}
 			if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) {
-				err("Prompt exceeds 16 KiB.\n");
+				err(`Prompt exceeds ${MAX_PROMPT_LABEL}.\n`);
 				return;
 			}
 			const requestId = randomUUID();
@@ -310,7 +312,9 @@ export async function runServiceAttach(
 		if (!local.signal.aborted) paint(() => {});
 	};
 	const oversizedInput = () => {
-		err("Input exceeds 16 KiB; detaching without cancelling service work.\n");
+		// Readline cannot drop a half-typed or half-piped line, so plain attach ends the session instead of rejecting it;
+		// the rich terminal rejects the input and keeps the draft.
+		err(`Input exceeds ${MAX_PROMPT_LABEL}; detaching without cancelling service work.\n`);
 		code = 2;
 		detach();
 	};
@@ -497,8 +501,4 @@ class AttachedOutput {
 		if (this.#lineOpen) this.#terminal.out("\n");
 		this.#lineOpen = false;
 	}
-}
-
-function describeError(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
 }

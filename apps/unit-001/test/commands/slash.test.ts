@@ -38,8 +38,12 @@ describe("slash input classification", () => {
 		expect(classifySlashInput(line)).toMatchObject(expected);
 	});
 
-	it("sends an operating-system question to the model even when it starts with a slash", () => {
+	it("sends an operating-system question to the owner even when it starts with a slash", () => {
+		// The owner binds retry receipts to the exact text, so the prompt is the original line (trimmed), never a rewrite.
 		expect(classifySlashInput("/inspect os")).toEqual({ kind: "prompt", text: "/inspect os" });
+		expect(classifySlashInput("/inspect os?")).toEqual({ kind: "prompt", text: "/inspect os?" });
+		expect(classifySlashInput("/inspect  OS ")).toEqual({ kind: "prompt", text: "/inspect  OS" });
+		expect(classifySlashInput("/inspect osx")).toEqual({ kind: "inspect", text: "/inspect osx" });
 		expect(classifySlashInput("what os are you running?")).toEqual({
 			kind: "prompt",
 			text: "what os are you running?",

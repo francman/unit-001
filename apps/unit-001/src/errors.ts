@@ -1,3 +1,8 @@
+/** The message of a thrown value, whether or not it is an `Error`. */
+export function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 /** A command line the user got wrong; the CLI prints the message and a usage hint, and exits with code 2. */
 export class UsageError extends Error {
 	constructor(message: string) {

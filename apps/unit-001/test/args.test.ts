@@ -24,6 +24,48 @@ describe("parseArguments", () => {
 		expect(parseArguments(["-p", "-"])).toEqual({ kind: "run", options: { print: "-", session: "default" } });
 	});
 
+	it("rejects -p and --print together as one repeated option", () => {
+		expect(() => parseArguments(["-p", "a", "--print=b"])).toThrow(/more than once/);
+	});
+
+	it("rejects a repeated or valueless flag the same way in every command", () => {
+		for (const argv of [
+			["login", "anthropic", "--data-dir", "/a", "--data-dir=/b"],
+			["send", "x", "--request-id", "a", "--request-id", "b"],
+			["memory", "stats", "--session", "a", "--session=b"],
+			["maintenance-enter", "--operation-id", "a", "--operation-id", "b"],
+		])
+			expect(() => parseArguments(argv)).toThrow(/Option --[a-z-]+ was given more than once\./);
+		for (const argv of [
+			["login", "anthropic", "--data-dir"],
+			["memory", "stats", "--request-id="],
+			["maintenance-release", "--operation-id"],
+		])
+			expect(() => parseArguments(argv)).toThrow(/Option --[a-z-]+ needs a value\./);
+	});
+
+	it("parses inspect os as its own command, keeping the retry ID", () => {
+		expect(parseArguments(["inspect", "os", "--request-id", "r1", "--session", "work"])).toEqual({
+			kind: "inspect-os",
+			requestId: "r1",
+			options: { session: "work" },
+		});
+		expect(parseArguments(["inspect", "os"])).toEqual({ kind: "inspect-os", options: { session: "default" } });
+	});
+
+	it("parses the web port in both forms and rejects a bad or repeated one", () => {
+		expect(parseArguments(["web", "--port", "5000", "--session=work"])).toEqual({
+			kind: "web",
+			port: 5000,
+			options: { session: "work" },
+		});
+		expect(parseArguments(["web", "--port=5001"])).toMatchObject({ port: 5001 });
+		expect(parseArguments(["web"])).toMatchObject({ port: 4317 });
+		for (const argv of [["web", "--port"], ["web", "--port=80"], ["web", "--port=x"]])
+			expect(() => parseArguments(argv)).toThrow("Web port must be 1024 to 65535.");
+		expect(() => parseArguments(["web", "--port=2000", "--port", "2001"])).toThrow("more than once");
+	});
+
 	it("returns help or version as soon as it sees them", () => {
 		expect(parseArguments(["-h"])).toEqual({ kind: "help" });
 		expect(parseArguments(["--session", "x", "--version"])).toEqual({ kind: "version" });

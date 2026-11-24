@@ -10,6 +10,9 @@ export const HostFactEntry = defineEntry<{
 	facts: OperatingSystemFacts | null;
 }>("unit.host.fact");
 
+/** The prompt `inspect os` and `/inspect os` send; the owner answers it from an observed host fact. */
+export const OS_INSPECTION_PROMPT = "inspect os";
+
 /** Matches only known OS questions; other conversation input follows the normal agent path. */
 export function isOperatingSystemQuestion(input: string): boolean {
 	const text = input
@@ -28,7 +31,7 @@ export function isOperatingSystemQuestion(input: string): boolean {
 		"what is your os",
 		"what os is this",
 		"what operating system is this",
-		"inspect os",
+		OS_INSPECTION_PROMPT,
 		"inspect operating system",
 		"/inspect os",
 	].includes(text);

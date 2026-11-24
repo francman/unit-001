@@ -10,6 +10,7 @@ import {
 	parseMemorySlash,
 	unknownCommandNotice,
 } from "./commands/slash.ts";
+import { describeError } from "./errors.ts";
 import { describeInspection, inspectionText } from "./introspection/command.ts";
 import { describeMemory, type MemoryRequest } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
@@ -152,7 +153,7 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 						);
 					else terminal.err("Forget cancelled.\n");
 				} catch (error) {
-					terminal.err(`Memory: ${error instanceof Error ? error.message : String(error)}\n`);
+					terminal.err(`Memory: ${describeError(error)}\n`);
 				}
 				if (interactive) readline.prompt();
 				continue;
@@ -182,7 +183,7 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 							`Close this foreground session, run ${agent.name} serve, then run ${agent.name} mission setup in another terminal.\n`,
 						);
 				} catch (error) {
-					terminal.err(`Mission: ${error instanceof Error ? error.message : String(error)}\n`);
+					terminal.err(`Mission: ${describeError(error)}\n`);
 				}
 			} else if (input.kind === "inspect") {
 				try {
@@ -190,7 +191,7 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 						`${sanitizeTerminalText(describeInspection(await agent.inspect(inspectionText(input.text), BACKGROUND_CONTEXT)))}\n`,
 					);
 				} catch (error) {
-					terminal.err(`Inspection: ${error instanceof Error ? error.message : String(error)}\n`);
+					terminal.err(`Inspection: ${describeError(error)}\n`);
 				}
 			} else if (input.kind === "memory") {
 				try {
@@ -205,7 +206,7 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 							`${describeMemory(await agent.memory(request satisfies MemoryRequest, BACKGROUND_CONTEXT))}\n`,
 						);
 				} catch (error) {
-					terminal.err(`Memory: ${error instanceof Error ? error.message : String(error)}\n`);
+					terminal.err(`Memory: ${describeError(error)}\n`);
 				}
 			} else if (input.kind === "unknown" || input.kind === "cancel" || input.kind === "evidence") {
 				// This loop reads no input while a turn runs (Ctrl+C cancels) and shows no tool cards,
@@ -216,7 +217,7 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 				try {
 					report(await turn(agent, input.text, terminal, current.signal), terminal);
 				} catch (error) {
-					terminal.err(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+					terminal.err(`error: ${describeError(error)}\n`);
 				} finally {
 					await stopping;
 					stopping = undefined;
