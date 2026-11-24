@@ -574,6 +574,10 @@ function stubOwner(replies: {
 						missing: [],
 						execution: "running",
 						tools: ["read"],
+						plan: null,
+						planError: null,
+						canAgreePlan: false,
+						runnablePurposeBinding: null,
 						...(replies.run === undefined ? {} : { runtime: replies.run }),
 						...replies.mission,
 					},
@@ -733,13 +737,14 @@ describe("browser operator details", () => {
 		expect(JSON.stringify(details)).not.toContain("secret.example");
 	});
 	it("keeps the creator, authority, agreement validity, and draft the page needs", async () => {
-		stubOwner({ draft: { revision: 4, status: "proposed", digest: "d".repeat(64), terms: {} } });
+		const draft = { missionId: "m", revision: 4, status: "proposed", digest: "d".repeat(64), terms: agreement.terms };
+		stubOwner({ draft });
 		const { mission } = await (await connectedPort()).details();
 		expect(mission.creator).toEqual({ kind: "human", id: "owner" });
 		expect(mission.authority).toBe("developer-local");
 		expect(mission.agreementValid).toBe(true);
 		expect(mission.authorityError).toBeNull();
-		expect(mission.draft).toEqual({ revision: 4, status: "proposed", digest: "d".repeat(64) });
+		expect(mission.draft).toEqual(draft);
 		stubOwner({ mission: { creator: null, authority: "invalid", authorityError: "invalid-authority" } });
 		expect((await (await connectedPort()).details()).mission).toMatchObject({
 			creator: null,
@@ -760,7 +765,7 @@ describe("browser operator details", () => {
 		stubOwner({ draft, mission: { authority: "managed-administrator", canAgree: true, previousReceipt: "receipt-4", review } });
 		await expect((await connectedPort()).mission()).resolves.toMatchObject({ review: null, canAgree: false, formationAvailable: false });
 		stubOwner({ draft });
-		await expect((await connectedPort()).mission()).resolves.toMatchObject({ draft, canAgree: false, formationAvailable: false });
+		await expect((await connectedPort()).mission()).resolves.toMatchObject({ draft, canAgree: false, formationAvailable: true });
 		stubOwner({ draft: { ...draft, digest: null }, mission: { authority: "managed-administrator", canAgree: false } });
 		await expect((await connectedPort()).mission()).resolves.toMatchObject({ draft: { digest: null, terms }, canAgree: false, formationAvailable: true });
 	});
@@ -784,6 +789,7 @@ describe("browser operator details", () => {
 						? { draft, agreement: null } : { draft: null, agreement: approved },
 					authority, canAgree, agreementValid: true, authorityError: null,
 					creator: null, missing: [], execution: "not-started", tools: [],
+					plan: null, planError: null, canAgreePlan: false, runnablePurposeBinding: null,
 				} });
 			}));
 			const port = await connectedPort();
@@ -897,12 +903,6 @@ describe("browser plan transport", () => {
 		expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)).operation).toEqual({
 			type: "mission", request: { operation: "status" },
 		});
-		fetch.mockImplementationOnce(async (_input, init) =>
-			completed(init, missionReply({ plan: undefined, planError: undefined, canAgreePlan: undefined, runnablePurposeBinding: undefined })),
-		);
-		const older = await (await connectedPort()).mission();
-		expect(older).not.toHaveProperty("plan");
-		expect(older).not.toHaveProperty("runnablePurposeBinding");
 		fetch.mockImplementationOnce(async (_input, init) =>
 			completed(init, missionReply({ plan: null, planError: "invalid-plan" })),
 		);

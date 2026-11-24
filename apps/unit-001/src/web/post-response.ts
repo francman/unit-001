@@ -31,7 +31,6 @@ type StatusResponse = {
 };
 
 export type ManagedMissionReview = {
-	armed: boolean;
 	proposal: AgreementReview | null;
 	verifiedApproval?: MissionApproval;
 };
@@ -285,7 +284,8 @@ function mission(
 				: { kind: oneOf(creator.kind, ["human", "elder", "organization"]), id: text(creator.id, 200) },
 		authority,
 		authorityError: authority === "invalid" ? "invalid-authority" : null,
-		canAgree: managed === undefined ? authority === "developer-local" : managed.review?.armed === true,
+		// The gateway refuses every browser Agree on a managed host, so only developer-local can offer it.
+		canAgree: managed === undefined && authority === "developer-local",
 		...(authority === "managed-administrator" && proposal != null
 			? { previousReceipt: proposal.previousReceipt, review: proposal }
 			: {}),

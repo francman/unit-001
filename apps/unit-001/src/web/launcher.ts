@@ -2,9 +2,9 @@
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { type BigIntStats, constants } from "node:fs";
-import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, rmdir, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile } from "node:fs/promises";
 import { userInfo } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { ConfigurationError } from "../errors.ts";
 import { matchingApproval, type MissionLocation, readMissionAuthority } from "../missions/authority.ts";
@@ -16,7 +16,7 @@ import { localServiceClient, type ServiceClient } from "../service-client.ts";
 import { createWebGateway, type WebGateway } from "./gateway.ts";
 import { readInheritedWebListener } from "./inherited-listener.ts";
 import { acquireListenerLock } from "./listener-lock.ts";
-import { forgetListener, type ListenerPaths, type PreservedPath, recordListener, recoverListener } from "./listener-residue.ts";
+import { clearListenerResidue } from "./listener-residue.ts";
 import type { ManagedMissionReview, WebPlanReview } from "./post-response.ts";
 
 type OwnerStatus = Extract<ServiceResponse, { type: "status" }>;
@@ -40,69 +40,38 @@ export async function runWebWorkspace(
 	const origin = `http://127.0.0.1:${port}`;
 	const gateway = await loadWorkspaceGateway(client, endpoint, origin, { installationId, developerDirectory });
 	let releaseLock: (() => Promise<void>) | undefined;
-	let recorded: ListenerPaths | undefined;
-	let preserved: readonly PreservedPath[] = [];
-	let staging: string | undefined;
-	let published: BigIntStats | undefined;
 	try {
 		if (managed === undefined) {
 			gateway.server.listen(port, "127.0.0.1");
 			await once(gateway.server, "listening");
 		} else {
 			const directory = await prepareManagedDirectory(managed.home, managed.uid);
-			// Held through shutdown and cleanup below, so no other launcher can take residue that is still in use.
+			// Held until the gateway has closed, so no other launcher can take the socket path while it is in use.
 			releaseLock = await acquireListenerLock(join(directory, `${managed.installationId}.lock`), managed.uid);
-			const paths: ListenerPaths = {
-				directory,
-				socket: managed.path,
-				record: join(directory, `${managed.installationId}.listener`),
-			};
-			preserved = await recoverListener(paths, managed.uid);
-			staging = await mkdtemp(join(directory, ".listener-"));
-			const bindPath = join(staging, "s");
-			// Node unlinks its bound path on close. Give it a separate name so cleanup cannot unlink a replacement at the public path.
+			await clearListenerResidue(directory, managed.path, managed.installationId, managed.uid);
 			const mask = process.umask();
 			process.umask(mask | 0o077);
 			try {
 				// A filesystem path is bound synchronously. Never hold a process-wide umask across an await.
-				gateway.server.listen({ path: bindPath, exclusive: true });
+				gateway.server.listen({ path: managed.path, exclusive: true });
 			} finally {
 				process.umask(mask);
 			}
 			await once(gateway.server, "listening");
-			await chmod(bindPath, 0o600);
-			const socket = await lstat(bindPath, { bigint: true });
-			await recordListener(paths, staging, socket, managed.uid);
-			recorded = paths;
-			await link(bindPath, managed.path).catch((error: NodeJS.ErrnoException) => {
-				if (error.code !== "EEXIST") throw error;
-				const reason = preserved.find((entry) => entry.path === managed.path)?.reason;
-				throw new ConfigurationError(
-					`Managed web socket path already exists: ${managed.path}${reason === undefined ? "" : ` (${reason})`}. Stop its launcher, or confirm the path is stale before removing it.`,
-				);
-			});
-			published = socket;
+			await chmod(managed.path, 0o600);
 		}
-		const notices = preserved.map(({ path, reason }) => `Preserved unrecognized path: ${path} (${reason}).\n`).join("");
 		write(
-			`${notices}Browser workspace: ${origin}\n${managed === undefined ? "" : `Managed socket: ${managed.path}\n`}Ctrl+C detaches the web workspace; agent work continues.\n`,
+			`Browser workspace: ${origin}\n${managed === undefined ? "" : `Managed socket: ${managed.path}\n`}Ctrl+C detaches the web workspace; agent work continues.\n`,
 		);
 		if (!signal.aborted)
 			await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
 		return 0;
 	} finally {
 		try {
-			// Keep the staging link until after this identity check so the inode cannot be reused.
-			if (managed !== undefined && published !== undefined) await removePublishedSocket(managed.path, published);
+			// Node unlinks the bound socket path when the server closes. A killed launcher leaves it for the next start.
+			await gateway.close();
 		} finally {
-			try {
-				await gateway.close();
-				if (staging !== undefined) await rmdir(staging);
-				// Forget the record only after every inode it names is gone; otherwise the next start finishes the cleanup.
-				if (recorded !== undefined) await forgetListener(recorded);
-			} finally {
-				await releaseLock?.();
-			}
+			await releaseLock?.();
 		}
 	}
 }
@@ -337,15 +306,6 @@ async function prepareManagedDirectory(home: string, uid: number): Promise<strin
 	return directory;
 }
 
-async function removePublishedSocket(path: string, published: BigIntStats): Promise<void> {
-	try {
-		const entry = await lstat(path, { bigint: true });
-		if (entry.isSocket() && entry.dev === published.dev && entry.ino === published.ino) await unlink(path);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-	}
-}
-
 async function reviewManagedMission(installationId: string, view: MissionView): Promise<ManagedMissionReview | undefined> {
 	const authority = await readMissionAuthority({ kind: "managed", installationId, session: "default" }).catch(() => null);
 	if (authority === null) return undefined;
@@ -354,7 +314,7 @@ async function reviewManagedMission(installationId: string, view: MissionView): 
 		active !== null && active.terms.policy.deadlineAt > Date.now()
 			? matchingApproval(authority, active.approval.receiptId, active.missionId, active.revision, active.terms)
 			: undefined;
-	return { armed: false, proposal: agreementReview(view.formation.draft, authority), verifiedApproval };
+	return { proposal: agreementReview(view.formation.draft, authority), verifiedApproval };
 }
 
 async function reviewPlan(location: MissionLocation, view: MissionView): Promise<WebPlanReview | undefined> {

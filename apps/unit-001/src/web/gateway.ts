@@ -173,11 +173,7 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 					const result = (async (): Promise<WebResult> => {
 						if (managed && parsed.operation.type === "mission" && parsed.operation.request.operation === "plan-agree")
 							return { requestId: parsed.requestId, state: "refused", code: "managed-requires-gateway" };
-						if (
-							parsed.operation.type === "mission" &&
-							parsed.operation.request.operation === "agree" &&
-							(managed || parsed.previousReceipt !== undefined)
-						)
+						if (managed && parsed.operation.type === "mission" && parsed.operation.request.operation === "agree")
 							return { requestId: parsed.requestId, state: "refused", code: "not-enabled" };
 						const response = await options.client.request(parsed.operation, signal);
 						if (
@@ -224,7 +220,7 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 							response: projectWebResponse(
 								parsed.operation,
 								response,
-								managed ? { review: review && { ...review, armed: false } } : undefined,
+								managed ? { review } : undefined,
 								planReview,
 							),
 						};

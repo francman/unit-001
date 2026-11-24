@@ -95,7 +95,7 @@ describe.skipIf(account.uid <= 0)("managed web listener", () => {
 		expect(await second.done).toBe(0);
 	});
 
-	it("preserves occupied paths, including live and stale sockets", async () => {
+	it("preserves an unrelated file and a live socket, and replaces a stale socket", async () => {
 		await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 });
 		const write = vi.fn();
 		const signal = new AbortController().signal;
@@ -117,24 +117,14 @@ describe.skipIf(account.uid <= 0)("managed web listener", () => {
 		);
 		expect(await lstat(socketPath)).toMatchObject({ uid: socket.uid, mode: socket.mode, ino: socket.ino });
 		expect(await get("http://127.0.0.1:4317", socketPath)).toEqual({ status: 200, body: "existing server" });
-		await new Promise<void>((resolve) => other.close(() => resolve()));
-		await expect(runWebWorkspace("fixture", 4317, write, signal, installationId)).rejects.toThrow(
-			"path already exists",
-		);
-		expect(await lstat(socketPath)).toMatchObject({ uid: socket.uid, mode: socket.mode, ino: socket.ino });
-		expect(await readdir(dirname(socketPath))).toEqual([`${installationId}.lock`, `${installationId}.sock`]);
 		expect(write).not.toHaveBeenCalled();
-	});
-
-	it("does not unlink a socket that replaced the published path", async () => {
-		const first = await start(4317);
-		await unlink(socketPath);
-		const replacement = createServer((_req, res) => res.end("replacement server"));
-		servers.push(replacement);
-		await once(replacement.listen(socketPath), "listening");
-		first.controller.abort();
-		expect(await first.done).toBe(0);
-		expect(await get("http://127.0.0.1:4317", socketPath)).toEqual({ status: 200, body: "replacement server" });
+		// Closing unlinks the server's own name and leaves a refusing socket at the managed path: a dead launcher's residue.
+		await new Promise<void>((resolve) => other.close(() => resolve()));
+		const next = await start(4317);
+		expect(await get("http://127.0.0.1:4317", socketPath)).toEqual({ status: 200, body: "workspace fixture" });
+		next.controller.abort();
+		expect(await next.done).toBe(0);
+		expect(await readdir(dirname(socketPath))).toEqual([`${installationId}.lock`]);
 	});
 
 	it("refuses writable ancestors, a linked account home, and an exposed private directory", async () => {

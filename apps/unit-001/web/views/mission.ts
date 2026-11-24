@@ -25,11 +25,10 @@ type PlanActions = Omit<MissionPlanOptions, "plan" | "planError" | "legacy"> & {
 	notice?: HTMLElement | null;
 };
 
-/** Shows the existing purpose and run, plus the plan only when the gateway projects it. */
+/** Shows the plan, the existing purpose and the run. */
 export function renderMission(ctx: Ctx, openDraft?: () => void, planActions?: PlanActions): HTMLElement {
 	const details = ctx.ui.details;
 	const mission = details?.mission;
-	const hasPlanStatus = mission?.plan !== undefined || mission?.planError != null;
 	const run = details?.mission.run ?? null;
 	const state = run ? runStates[run.status] : null;
 	const entry = details && openDraft
@@ -53,12 +52,13 @@ export function renderMission(ctx: Ctx, openDraft?: () => void, planActions?: Pl
 	const sections = [
 		...needsYou(ctx, details),
 		planActions?.notice,
-		hasPlanStatus ? renderMissionPlan({
+		renderMissionPlan({
 			...planActions,
-			plan: details.mission.plan ?? null,
-			planError: details.mission.planError != null,
-			legacy: mission?.agreement && mission.objective !== null ? { purpose: mission.objective, scope: mission.scope } : undefined,
-		}) : null,
+			plan: details.mission.plan,
+			planError: details.mission.planError !== null,
+			legacy: details.mission.agreement && details.mission.objective !== null
+				? { purpose: details.mission.objective, scope: details.mission.scope } : undefined,
+		}),
 		purposeSection(ctx, details, openDraft !== undefined),
 		currentWork(details, run),
 		evidenceSection(run),

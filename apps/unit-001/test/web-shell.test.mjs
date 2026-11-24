@@ -39,6 +39,7 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 		stage: "awaiting_approval", creator: { kind: "human", id: "fixture-creator" },
 		authority: "managed-administrator", canAgree: true, agreementValid: false, authorityError: null,
 		execution: "not-started", missing: [], tools: [], previousReceipt: null, review,
+		plan: null, planError: null, canAgreePlan: false, runnablePurposeBinding: null,
 		formation: { agreement: null, draft: { missionId: review.missionId, revision: review.revision, digest, status: "proposed", terms: {
 			objective: "Managed mission review sentinel", scope: "Local test", successCriteria: ["Inspect terms"], approvalBoundary: [],
 			reviewEveryMs: 60_000, policy: { allowedTools: [], maxCycles: 2, maxRequests: 3, maxRetries: 0, maxConsecutiveNoProgress: 1, deadlineAt: 1_893_456_000_000 },

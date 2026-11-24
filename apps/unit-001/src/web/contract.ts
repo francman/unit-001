@@ -19,13 +19,7 @@ export type WebOperation =
 				| { operation: "plan-agree"; revision: number; digest: string; confirmed: true }
 				| { operation: "review-now" }
 				| { operation: "review-dismiss"; reviewId: string }
-				| {
-						operation: "agree";
-						revision: number;
-						digest: string;
-						confirmed: true;
-						previousReceipt?: string | null;
-				  };
+				| { operation: "agree"; revision: number; digest: string; confirmed: true };
 	  }
 	| { type: "channels"; request: { operation: "status" } }
 	| {
@@ -41,11 +35,7 @@ export type WebRequest = { requestId: string; operation: WebOperation };
 export type WebSession = { csrfToken: string };
 
 /** Validates browser input and reconstructs owner requests without accepting authority claims. */
-export function parseWebRequest(value: unknown): {
-	requestId: string;
-	operation: ServiceRequest;
-	previousReceipt?: string | null;
-} {
+export function parseWebRequest(value: unknown): { requestId: string; operation: ServiceRequest } {
 	const envelope = object(value, ["requestId", "operation"]);
 	const requestId = text(envelope.requestId, 200);
 	const input = object(envelope.operation, ["type", "request", "prompt", "before"]);
@@ -65,25 +55,8 @@ export function parseWebRequest(value: unknown): {
 		return { requestId, operation: { type: "send", prompt: text(input.prompt, 32_768), requestId } };
 	}
 	object(input, ["type", "request"]);
-	if (input.type === "mission") {
-		const request = missionRequest(input.request, requestId);
-		const operation = { type: "mission", request } as const;
-		if (request.operation !== "agree") return { requestId, operation };
-		const previousReceipt = object(input.request, [
-			"operation",
-			"revision",
-			"digest",
-			"confirmed",
-			"previousReceipt",
-		]).previousReceipt;
-		if (previousReceipt === undefined) return { requestId, operation };
-		if (
-			previousReceipt !== null &&
-			(typeof previousReceipt !== "string" || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(previousReceipt))
-		)
-			throw new Error("Invalid protected receipt ID.");
-		return { requestId, operation, previousReceipt };
-	}
+	if (input.type === "mission")
+		return { requestId, operation: { type: "mission", request: missionRequest(input.request, requestId) } };
 	if (input.type === "channels") {
 		const request = object(input.request, ["operation"]);
 		if (request.operation !== "status") throw new Error("Only status is available on this surface.");
@@ -126,7 +99,6 @@ function missionRequest(value: unknown, requestId: string): MissionRequest {
 		"revision",
 		"digest",
 		"confirmed",
-		"previousReceipt",
 		"reviewId",
 	]);
 	if (request.operation === "status") {
@@ -151,8 +123,7 @@ function missionRequest(value: unknown, requestId: string): MissionRequest {
 	}
 	if (request.operation !== "agree" && request.operation !== "plan-agree")
 		throw new Error("Operation is unavailable on the browser surface.");
-	if (request.operation === "plan-agree") object(request, ["operation", "revision", "digest", "confirmed"]);
-	object(request, ["operation", "revision", "digest", "confirmed", "previousReceipt"]);
+	object(request, ["operation", "revision", "digest", "confirmed"]);
 	if (request.confirmed !== true) throw new Error("Agreeing to a mission requires explicit confirmation.");
 	return parseMissionRequest({ operation: request.operation, revision: request.revision, digest: request.digest, requestId });
 }

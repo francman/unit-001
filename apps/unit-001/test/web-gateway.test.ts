@@ -658,7 +658,7 @@ describe("web gateway", () => {
 			authorityRevision: 1,
 			previousReceipt: null,
 		};
-		const review = vi.fn(async () => ({ armed: true, proposal }));
+		const review = vi.fn(async () => ({ proposal }));
 		const f = await startGateway({ managed: true, managedReview: review }, "unix");
 		const session = await f.call("/api/v1/session");
 		expect(session.status).toBe(200);
@@ -680,18 +680,12 @@ describe("web gateway", () => {
 			{ "X-Forwarded-For": "127.0.0.1" },
 		] as const)
 			expect((await f.call("/api/v1/session", bad)).status).toBe(403);
-		for (const [id, extra] of [
-			["simple", {}],
-			["reviewed", { previousReceipt: null }],
-		] as const) {
-			const denied = await post(
-				id,
-				{ operation: "agree", revision: 2, digest: proposal.digest, confirmed: true, ...extra },
-				csrf,
-			);
-			expect(denied.status).toBe(200);
-			expect(JSON.parse(denied.body)).toEqual({ requestId: id, state: "refused", code: "not-enabled" });
-		}
+		const agree = { operation: "agree", revision: 2, digest: proposal.digest, confirmed: true };
+		const denied = await post("simple", agree, csrf);
+		expect(denied.status).toBe(200);
+		expect(JSON.parse(denied.body)).toEqual({ requestId: "simple", state: "refused", code: "not-enabled" });
+		// The browser never names a protected receipt; the field is rejected like any other unknown one.
+		expect((await post("reviewed", { ...agree, previousReceipt: null }, csrf)).status).toBe(400);
 		const planDenied = await post(
 			"managed-plan",
 			{ operation: "plan-agree", revision: 2, digest: proposal.digest, confirmed: true },

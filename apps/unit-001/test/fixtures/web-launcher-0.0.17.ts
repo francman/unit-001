@@ -1,4 +1,4 @@
-// Verbatim 0.0.17 managed web launcher (5321c51ee apps/unit-001/src/web/launcher.ts); only import paths are rewritten.
+// 0.0.17 managed web launcher (5321c51ee apps/unit-001/src/web/launcher.ts), verbatim except import paths and the later-removed `armed` review field.
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import type { BigIntStats } from "node:fs";
@@ -166,5 +166,5 @@ async function reviewManagedMission(installationId: string, view: MissionView): 
 		active !== null && active.terms.policy.deadlineAt > Date.now()
 			? matchingApproval(authority, active.approval.receiptId, active.missionId, active.revision, active.terms)
 			: undefined;
-	return { armed: false, proposal: agreementReview(view.formation.draft, authority), verifiedApproval };
+	return { proposal: agreementReview(view.formation.draft, authority), verifiedApproval };
 }

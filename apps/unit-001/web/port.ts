@@ -201,10 +201,10 @@ export function browserWorkspacePort(initialSession: GatewaySession): WorkspaceP
 			try {
 				if (change.operation === "agree") {
 					const connection = active;
-					if (!connection || "previousReceipt" in change) return { state: "rejected" };
+					if (!connection) return { state: "rejected" };
 					// Recheck authority at the click, not from prior UI state, and never carry the click across a reconnect.
 					const mission = await loadMission().catch(() => null);
-					if (active !== connection || !mission?.canAgree || !mission.formationAvailable) return { state: "rejected" };
+					if (active !== connection || !mission?.canAgree) return { state: "rejected" };
 					if (mission.draft?.status !== "proposed" || mission.draft.revision !== change.revision)
 						return { state: "refused", code: "stale-revision" };
 					if (mission.draft.digest !== change.digest) return { state: "refused", code: "stale-digest" };
@@ -540,9 +540,9 @@ function parseMission(value: unknown): WorkspaceDetails["mission"] {
 	const matchingReview = review === null ||
 		(draft?.status === "proposed" && review.missionId === draft.missionId && review.revision === draft.revision &&
 			review.digest === draft.digest && review.previousReceipt === (previousReceipt ?? null));
-	const plan = mission.plan == null ? mission.plan : parsePlanView(mission.plan);
-	const planError = mission.planError == null ? mission.planError : oneOf(mission.planError, ["invalid-plan"]);
-	if (planError === "invalid-plan" && plan != null) throw new Error("Invalid mission plan projection.");
+	const plan = mission.plan === null ? null : parsePlanView(mission.plan);
+	const planError = mission.planError === null ? null : oneOf(mission.planError, ["invalid-plan"]);
+	if (planError === "invalid-plan" && plan !== null) throw new Error("Invalid mission plan projection.");
 	const binding = mission.runnablePurposeBinding;
 	return {
 		stage: text(mission.stage),
@@ -557,19 +557,16 @@ function parseMission(value: unknown): WorkspaceDetails["mission"] {
 		authority,
 		agreementValid: boolean(mission.agreementValid),
 		authorityError: mission.authorityError === null ? null : oneOf(mission.authorityError, ["invalid-authority"]),
-		formationAvailable: typeof mission.canAgree === "boolean" && matchingReview && (draft === null || draft.terms !== undefined),
+		formationAvailable: matchingReview,
 		canAgree: authority === "developer-local" && mission.authorityError === null && mission.canAgree === true &&
 			previousReceipt === undefined && matchingReview,
 		previousReceipt,
 		draft,
 		review: matchingReview ? review : null,
-		...(plan === undefined ? {} : { plan }),
-		...(planError === undefined ? {} : { planError }),
-		...(mission.canAgreePlan === undefined ? {} : {
-			canAgreePlan: mission.canAgreePlan === true && authority === "developer-local" && plan !== undefined &&
-				planError !== "invalid-plan",
-		}),
-		...(binding === undefined ? {} : { runnablePurposeBinding: binding === null ? null : parseMissionPlanBinding(binding) }),
+		plan,
+		planError,
+		canAgreePlan: mission.canAgreePlan === true && authority === "developer-local" && planError !== "invalid-plan",
+		runnablePurposeBinding: binding === null ? null : parseMissionPlanBinding(binding),
 	};
 }
 
@@ -714,8 +711,6 @@ function parseDraft(value: unknown): NonNullable<WorkspaceDetails["mission"]["dr
 	const status = oneOf(draft.status, DRAFT_STATUSES);
 	const digest = draft.digest === null ? null : missionDigest(draft.digest);
 	if (status === "editing" && digest !== null) throw new Error("Invalid mission proposal.");
-	// Legacy projection still supports the existing terminal command, but cannot drive web formation.
-	if (draft.missionId === undefined) return { revision, status, digest };
 	return { revision, status, digest, missionId: missionIdentity(draft.missionId), terms: parseDraftTerms(draft.terms) };
 }
 

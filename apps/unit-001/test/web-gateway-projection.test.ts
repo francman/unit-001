@@ -190,7 +190,7 @@ describe("browser operation response projection", () => {
 			previousReceipt: null,
 		};
 		expect(
-			projectWebResponse(operation, { type: "mission", result: view }, { review: { armed: false, proposal } }),
+			projectWebResponse(operation, { type: "mission", result: view }, { review: { proposal } }),
 		).toMatchObject({
 			result: {
 				canAgree: false,

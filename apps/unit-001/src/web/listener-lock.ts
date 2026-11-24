@@ -1,7 +1,7 @@
 // Holds the managed web listener lock on a stable inode until release or process death.
 import { type ChildProcess, spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { type FileHandle, lstat, open } from "node:fs/promises";
+import { type FileHandle, open } from "node:fs/promises";
 import { ConfigurationError } from "../errors.ts";
 
 /**
@@ -14,17 +14,10 @@ export async function acquireListenerLock(path: string, uid: number): Promise<()
 		// Same pattern as the installation management lock: flock(1) locks the open file description this process keeps.
 		if (process.platform === "linux") {
 			await lockDescriptor(file, path);
-			await verifyLockedInode(file, path);
 			return () => file.close();
 		}
 		if (process.platform !== "darwin") throw new ConfigurationError("Managed web locking requires Linux.");
 		const holder = await holdDarwinLock(path);
-		try {
-			await verifyLockedInode(file, path);
-		} catch (error) {
-			await releaseDarwinLock(holder);
-			throw error;
-		}
 		return async () => {
 			try {
 				await releaseDarwinLock(holder);
@@ -39,10 +32,9 @@ export async function acquireListenerLock(path: string, uid: number): Promise<()
 }
 
 async function openLockFile(path: string, uid: number): Promise<FileHandle> {
-	// O_NONBLOCK: a FIFO planted at the lock name must fail the type check below, not block open.
-	const file = await open(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+	const file = await open(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
 	const entry = await file.stat();
-	if (!entry.isFile() || entry.uid !== uid || (entry.mode & 0o077) !== 0 || entry.nlink !== 1) {
+	if (!entry.isFile() || entry.uid !== uid || (entry.mode & 0o077) !== 0) {
 		await file.close();
 		throw new ConfigurationError(`The managed web lock must be an operator-owned 0600 file: ${path}.`);
 	}
@@ -61,13 +53,6 @@ async function lockDescriptor(file: FileHandle, path: string): Promise<void> {
 	});
 	if (status === 1) throw heldError(path);
 	if (status !== 0) throw new Error(`flock failed on ${path}: ${detail.trim() || `exit ${status}`}`);
-}
-
-// A lock taken by name must still be the inode this launcher opened without following links.
-async function verifyLockedInode(file: FileHandle, path: string): Promise<void> {
-	const [opened, named] = await Promise.all([file.stat({ bigint: true }), lstat(path, { bigint: true })]);
-	if (opened.dev !== named.dev || opened.ino !== named.ino)
-		throw new ConfigurationError(`The managed web lock changed while it was acquired: ${path}.`);
 }
 
 async function holdDarwinLock(path: string): Promise<ChildProcess> {

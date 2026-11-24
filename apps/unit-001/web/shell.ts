@@ -380,7 +380,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 	}
 
 	function planActions(mission: MissionSnapshot | undefined): Parameters<typeof renderMission>[2] {
-		if (!mission || (mission.plan === undefined && mission.planError == null && ui.planChange.kind === "idle")) return;
+		if (!mission) return;
 		const plan = mission.plan;
 		const access = planWritesAvailable(ui, mission);
 		const exact = planProposal(ui, mission);
@@ -1264,7 +1264,7 @@ function missionEntryAvailable(ui: Readonly<Ui>): boolean {
 }
 
 function hasPlanProtocol(mission: MissionSnapshot): boolean {
-	return mission.plan !== undefined && mission.planError == null;
+	return mission.planError === null;
 }
 
 function planWritesAvailable(ui: Readonly<Ui>, mission: MissionSnapshot): boolean {

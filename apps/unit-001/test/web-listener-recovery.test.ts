@@ -1,21 +1,18 @@
-// Verifies the managed web launcher recovers crash residue under its lock and preserves everything it cannot identify.
+// Verifies the managed web launcher clears a dead launcher's residue under its lock and refuses an occupied socket path.
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import { type BigIntStats, unlinkSync } from "node:fs";
-import { chmod, link, lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
+import { chmod, link, lstat, mkdir, mkdtemp, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { request } from "node:http";
 import { createServer, type Server } from "node:net";
 import { userInfo } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRuntimeFacts } from "../src/orientation.ts";
-import { runWebWorkspace } from "../src/web/launcher.ts";
-
-vi.mock("node:fs/promises", { spy: true });
-vi.mock("node:os", { spy: true });
 
 const installationId = "11111111-1111-4111-8111-111111111111";
+const otherInstallationId = "22222222-2222-4222-8222-222222222222";
 const account = userInfo();
 const child = fileURLToPath(new URL("./fixtures/web-launcher-child.ts", import.meta.url));
 const servers: Server[] = [];
@@ -25,7 +22,6 @@ let home: string;
 let web: string;
 let socketPath: string;
 let lockPath: string;
-let recordPath: string;
 let owner: string;
 
 describe.skipIf(account.uid <= 0)("managed web listener recovery", { timeout: 30_000 }, () => {
@@ -36,7 +32,6 @@ describe.skipIf(account.uid <= 0)("managed web listener recovery", { timeout: 30
 		web = join(home, ".unit-001", "web");
 		socketPath = join(web, `${installationId}.sock`);
 		lockPath = join(web, `${installationId}.lock`);
-		recordPath = join(web, `${installationId}.listener`);
 		owner = join(parent, "default.sock");
 		for (const key of ["SUDO_UID", "SUDO_USER", "SUDO_GID", "SUDO_COMMAND"]) vi.stubEnv(key, undefined);
 		servers.push(await listen(createOwner(), owner));
@@ -44,13 +39,12 @@ describe.skipIf(account.uid <= 0)("managed web listener recovery", { timeout: 30
 
 	afterEach(async () => {
 		vi.unstubAllEnvs();
-		vi.restoreAllMocks();
 		for (const process of processes.splice(0)) if (process.exitCode === null && process.signalCode === null) process.kill("SIGKILL");
 		await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
 		await rm(parent, { recursive: true, force: true });
 	});
 
-	describe("0.0.17 migration", () => {
+	describe("0.0.17 residue", () => {
 		it("preserves a live lockless 0.0.17 gateway", async () => {
 			const legacy = launch("legacy");
 			await legacy.ready;
@@ -69,31 +63,86 @@ describe.skipIf(account.uid <= 0)("managed web listener recovery", { timeout: 30
 		});
 
 		it("recovers the residue of a SIGKILLed 0.0.17 gateway on the next start", async () => {
-			const legacy = launch("legacy");
-			await legacy.ready;
-			const staging = await stagingPath();
-			await kill(legacy);
+			await legacyResidue();
 			expect((await lstat(socketPath)).nlink).toBe(2);
 			const current = launch("current");
-			expect(await current.ready).not.toContain("Preserved");
+			await current.ready;
 			expect(await get(socketPath)).toEqual({ status: 200, body: "workspace fixture" });
-			expect(await readdir(web)).not.toContain(staging.slice(web.length + 1));
+			expect((await readdir(web)).toSorted()).toEqual([`${installationId}.lock`, `${installationId}.sock`]);
+			await stop(current);
+			expect(await readdir(web)).toEqual([`${installationId}.lock`]);
+		});
+
+		it("unlinks only the recognized socket in its staging directory and keeps other entries", async () => {
+			await legacyResidue();
+			const staging = await stagingPath();
+			await writeFile(join(staging, "extra"), "not the launcher's", { mode: 0o600 });
+			const current = launch("current");
+			await current.ready;
+			expect(await readdir(staging)).toEqual(["extra"]);
+			await stop(current);
+		});
+
+		it("leaves a dead staging directory it cannot attribute to this installation", async () => {
+			await legacyResidue();
+			const staging = await stagingPath();
+			await unlink(socketPath);
+			const before = await snapshot(staging, join(staging, "s"));
+			const current = launch("current");
+			await current.ready;
+			await stop(current);
+			expect(await snapshot(staging, join(staging, "s"))).toEqual(before);
+		});
+
+		it("removes the listener record a SIGKILLed bc723f302 launcher kept beside the same layout", async () => {
+			await legacyResidue();
+			await writeFile(join(web, `${installationId}.listener`), "{}", { mode: 0o600 });
+			await writeFile(join(web, `${installationId}.listener.tmp`), "", { mode: 0o600 });
+			const current = launch("current");
+			await current.ready;
+			await stop(current);
+			expect(await readdir(web)).toEqual([`${installationId}.lock`]);
+		});
+
+		it("removes the staging a bc723f302 record names after its public link is gone", async () => {
+			await legacyResidue();
+			const staging = await stagingPath();
+			const { dev, ino } = await lstat(join(staging, "s"), { bigint: true });
+			await unlink(socketPath);
+			const record = { version: 1, staging: basename(staging), socketDev: String(dev), socketIno: String(ino) };
+			await writeFile(join(web, `${installationId}.listener`), JSON.stringify(record), { mode: 0o600 });
+			const current = launch("current");
+			await current.ready;
 			await stop(current);
 			expect(await readdir(web)).toEqual([`${installationId}.lock`]);
 		});
 	});
 
-	it("recovers the residue of a SIGKILLed current gateway on the next start", async () => {
+	// Codex HOLD on fix-gateway: installation B holds its own lock (or none on 0.0.17), so A's cleanup ran while B was
+	// between mkdtemp and bind and recursively removed B's staging directory.
+	it("leaves another installation's staging directory between mkdir and bind", async () => {
+		await mkdir(web, { recursive: true, mode: 0o700 });
+		const other = join(web, `${otherInstallationId}.sock`);
+		const staging = await mkdtemp(join(web, ".listener-"));
+		const current = launch("current");
+		await current.ready;
+		servers.push(await listen(createServer(), join(staging, "s")));
+		await link(join(staging, "s"), other);
+		expect((await lstat(other)).isSocket()).toBe(true);
+		await stop(current);
+		const expected = [`${installationId}.lock`, `${otherInstallationId}.sock`, basename(staging)];
+		expect((await readdir(web)).toSorted()).toEqual(expected.toSorted());
+	});
+
+	it("recovers the socket of a SIGKILLed current gateway on the next start", async () => {
 		const first = launch("current");
 		await first.ready;
-		const staging = await stagingPath();
-		expect(JSON.parse(await readFile(recordPath, "utf8"))).toMatchObject({ staging: staging.slice(web.length + 1) });
 		await kill(first);
 		await lockReleased();
+		expect((await lstat(socketPath)).isSocket()).toBe(true);
 		const next = launch("current");
-		expect(await next.ready).not.toContain("Preserved");
+		await next.ready;
 		expect(await get(socketPath)).toEqual({ status: 200, body: "workspace fixture" });
-		expect(await readdir(web)).not.toContain(staging.slice(web.length + 1));
 		await stop(next);
 		expect(await readdir(web)).toEqual([`${installationId}.lock`]);
 	});
@@ -113,169 +162,45 @@ describe.skipIf(account.uid <= 0)("managed web listener recovery", { timeout: 30
 		expect(output).toContain(`ERROR: Another bob web launcher holds this installation's web lock: ${lockPath}.`);
 		expect(output).not.toMatch(/\bpid\b|Browser workspace/i);
 		expect(await get(socketPath)).toEqual({ status: 200, body: "workspace fixture" });
-		expect((await readdir(web)).filter((name) => name.startsWith(".listener-"))).toHaveLength(1);
+		expect((await readdir(web)).toSorted()).toEqual([`${installationId}.lock`, `${installationId}.sock`]);
 	});
 
-	describe("preserved paths", () => {
-		it.each([
-			{
-				name: "an unrelated file at the socket path",
-				reason: "it is not a recognized listener socket",
-				arrange: async () => {
-					await mkdir(web, { recursive: true, mode: 0o700 });
-					await writeFile(socketPath, "unrelated file", { mode: 0o600 });
-					return [socketPath];
-				},
+	it.each([
+		{
+			name: "an unrelated file",
+			reason: "it is not a recognized listener socket",
+			arrange: async () => {
+				await writeFile(socketPath, "unrelated file", { mode: 0o600 });
+				return [socketPath];
 			},
-			{
-				name: "a symlink at the socket path to dead 0.0.17 residue",
-				reason: "it is not a recognized listener socket",
-				arrange: async () => {
-					const staging = await legacyResidue();
-					await rename(socketPath, join(parent, "moved.sock"));
-					await symlink(join(staging, "s"), socketPath);
-					return [socketPath, staging, join(staging, "s")];
-				},
+		},
+		{
+			name: "a symlink to a dead socket",
+			reason: "it is not a recognized listener socket",
+			arrange: async () => {
+				const dead = join(web, "dead.sock");
+				await deadSocket(dead);
+				await symlink(dead, socketPath);
+				return [socketPath, dead];
 			},
-			{
-				name: "a 0.0.17 staging directory substituted by a symlink",
-				reason: "it has no single matching staging link",
-				arrange: async () => {
-					const staging = await legacyResidue();
-					await rename(staging, join(parent, "moved"));
-					await symlink(join(parent, "moved"), staging);
-					return [socketPath, staging, join(parent, "moved", "s")];
-				},
+		},
+		{
+			name: "a socket whose connection probe is not refused",
+			reason: "its connection probe was not refused",
+			arrange: async () => {
+				// Without write permission, connect fails with EACCES before the kernel looks for a listener.
+				await deadSocket(socketPath);
+				await chmod(socketPath, 0o000);
+				return [socketPath];
 			},
-			{
-				name: "a third link to dead 0.0.17 residue",
-				reason: "it is not a recognized listener socket",
-				arrange: async () => {
-					const staging = await legacyResidue();
-					await link(socketPath, join(parent, "extra.sock"));
-					return [socketPath, staging, join(staging, "s")];
-				},
-			},
-			{
-				name: "an exposed 0.0.17 staging directory",
-				reason: "its staging directory is not operator-owned with mode 0700",
-				arrange: async () => {
-					const staging = await legacyResidue();
-					await chmod(staging, 0o750);
-					return [socketPath, staging, join(staging, "s")];
-				},
-			},
-			{
-				name: "a live socket substituted after a current crash",
-				reason: "it does not match the recorded listener",
-				arrange: async () => {
-					const crashed = launch("current");
-					await crashed.ready;
-					await kill(crashed);
-					await lockReleased();
-					await unlink(socketPath);
-					const other = join(parent, "other.sock");
-					servers.push(await listen(createServer((socket) => socket.end()), other));
-					await link(other, socketPath);
-					return [socketPath, other];
-				},
-			},
-			{
-				name: "a recorded public socket whose staging link is gone",
-				reason: "its recorded staging link no longer corroborates it",
-				arrange: async () => {
-					const staging = await currentResidue();
-					await unlink(join(staging, "s"));
-					// The empty recorded staging directory is still removed; only the public name is kept.
-					return [socketPath];
-				},
-			},
-			{
-				name: "a recorded public socket whose staging directory is gone",
-				reason: "its recorded staging link no longer corroborates it",
-				arrange: async () => {
-					const staging = await currentResidue();
-					await rm(staging, { recursive: true });
-					return [socketPath];
-				},
-			},
-		])("preserves $name", async ({ reason, arrange }) => {
-			const paths = await arrange();
-			const before = await snapshot(...paths);
-			const current = launch("current");
-			expect(await current.closed).toContain(`ERROR: Managed web socket path already exists: ${socketPath} (${reason}).`);
-			expect(await snapshot(...paths)).toEqual(before);
-		});
-
-		it.each([
-			{ name: "a FIFO at the record", path: () => recordPath, arrange: (path: string) => mkfifo(path) },
-			{ name: "a FIFO at the temporary record", path: () => `${recordPath}.tmp`, arrange: (path: string) => mkfifo(path) },
-			{
-				name: "a non-private temporary record",
-				path: () => `${recordPath}.tmp`,
-				arrange: (path: string) => writeFile(path, "leftover", { mode: 0o644 }),
-			},
-		])("refuses $name without blocking and keeps it", async ({ path, arrange }) => {
-			await mkdir(web, { recursive: true, mode: 0o700 });
-			await arrange(path());
-			const before = await snapshot(path());
-			const current = launch("current");
-			expect(await current.closed).toContain(`ERROR: The managed web listener record is not valid: ${path()}.`);
-			expect(await snapshot(path())).toEqual(before);
-			// Nothing was published, and the refused start left no staging directory behind.
-			expect((await readdir(web)).filter((name) => name.endsWith(".sock") || name.startsWith(".listener-"))).toEqual([]);
-		});
-
-		it("reports a recorded staging directory that holds files it did not create", async () => {
-			const crashed = launch("current");
-			await crashed.ready;
-			const staging = await stagingPath();
-			await kill(crashed);
-			await lockReleased();
-			await writeFile(join(staging, "note"), "operator file");
-			const next = launch("current");
-			expect(await next.ready).toContain(
-				`Preserved unrecognized path: ${staging} (it holds files this launcher did not create).\n`,
-			);
-			expect(await readdir(staging)).toEqual(["note"]);
-		});
-	});
-
-	describe("interrupted cleanup", () => {
-		it("starts after a cut between the public and staging unlinks of a current shutdown", async () => {
-			const crashed = launch("current");
-			await crashed.ready;
-			const staging = await stagingPath();
-			await kill(crashed);
-			await lockReleased();
-			// Shutdown unlinks the public path first; a kill right after it leaves only the staging link and the record.
-			await unlink(socketPath);
-			const next = launch("current");
-			expect(await next.ready).not.toContain("Preserved");
-			expect(await readdir(web)).not.toContain(staging.slice(web.length + 1));
-		});
-
-		it("starts after a cut between the unlinks of a 0.0.17 adoption", async () => {
-			const staging = await legacyResidue();
-			vi.mocked(userInfo).mockImplementation(() => ({ ...account, homedir: home }));
-			vi.mocked(readFile).mockResolvedValue(Buffer.from("workspace fixture"));
-			// Recovery unlinks the public path first; fail the staging unlink after it, as a kill at that point would.
-			vi.mocked(unlink).mockImplementation(async (path) => {
-				if (String(path).endsWith("/s")) throw Object.assign(new Error("cut between unlinks"), { code: "EIO" });
-				unlinkSync(path);
-			});
-			await expect(runWebWorkspace(owner, 4317, vi.fn(), new AbortController().signal, installationId)).rejects.toThrow(
-				"cut between unlinks",
-			);
-			vi.restoreAllMocks();
-			expect(await readdir(web)).toEqual(
-				expect.arrayContaining([`${installationId}.listener`, staging.slice(web.length + 1)]),
-			);
-			expect(await readdir(web)).not.toContain(`${installationId}.sock`);
-			const next = launch("current");
-			expect(await next.ready).not.toContain("Preserved");
-			expect(await readdir(web)).not.toContain(staging.slice(web.length + 1));
-		});
+		},
+	])("refuses $name at the socket path and keeps it", async ({ reason, arrange }) => {
+		await mkdir(web, { recursive: true, mode: 0o700 });
+		const paths = await arrange();
+		const before = await snapshot(...paths);
+		const current = launch("current");
+		expect(await current.closed).toContain(`ERROR: Managed web socket path already exists: ${socketPath} (${reason}).`);
+		expect(await snapshot(...paths)).toEqual(before);
 	});
 
 	// flock(1) locks the launcher's own open file description, so no helper process outlives it. Cannot run on macOS.
@@ -335,26 +260,18 @@ async function locker(args: string[]): Promise<number | null> {
 	return code;
 }
 
-async function legacyResidue(): Promise<string> {
+async function legacyResidue(): Promise<void> {
 	const legacy = launch("legacy");
 	await legacy.ready;
-	const staging = await stagingPath();
+	await stagingPath();
 	await kill(legacy);
-	return staging;
 }
 
-async function currentResidue(): Promise<string> {
-	const crashed = launch("current");
-	await crashed.ready;
-	const staging = await stagingPath();
-	await kill(crashed);
-	await lockReleased();
-	return staging;
-}
-
-async function mkfifo(path: string): Promise<void> {
-	const [code] = (await once(spawn("mkfifo", ["-m", "600", path], { stdio: "ignore" }), "exit")) as [number | null];
-	expect(code).toBe(0);
+// Node unlinks a server's bound path on close, so bind a second name and keep only the link at `path`.
+async function deadSocket(path: string): Promise<void> {
+	const server = await listen(createServer(), `${path}.bind`);
+	await link(`${path}.bind`, path);
+	await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
 async function stagingPath(): Promise<string> {

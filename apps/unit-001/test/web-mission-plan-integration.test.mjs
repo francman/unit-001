@@ -59,7 +59,8 @@ async function exercise(mountWorkspace, browserWorkspacePort, width) {
 	const legacy = {
 		stage: "agreed", missing: [], tools: [], execution: "not-started", runtime: null,
 		creator: { kind: "human", id: "operator" }, authority: "developer-local", agreementValid: true, authorityError: null,
-		canAgree: true, draft: null, review: null, formation: { draft: null, agreement: {
+		canAgree: true, draft: null, review: null, plan: null, planError: null, canAgreePlan: false, runnablePurposeBinding: null,
+		formation: { draft: null, agreement: {
 			revision: 17, terms: { objective: "Legacy dependency purpose", scope: "Old operations only", successCriteria: ["No drift"],
 				approvalBoundary: [], reviewEveryMs: cadence,
 				policy: { allowedTools: [], maxCycles: 8, maxRequests: 21, maxRetries: 0, maxConsecutiveNoProgress: 2, deadlineAt: 20 * cadence } },
@@ -155,7 +156,7 @@ async function exercise(mountWorkspace, browserWorkspacePort, width) {
 	const editingDraft = { revision: 3, baseRevision: 2, status: "editing", terms, digest: null, savedBy: "bob", fromReview: null, missing: [] };
 	try {
 		await wait(() => byKey("open-mission-draft"), "old Mission");
-		check(has("Legacy dependency purpose") && !planEntry(), "legacy status retains the fixed Mission without inventing plan support");
+		check(has("Legacy dependency purpose"), "a mission with no saved plan keeps the fixed purpose");
 		mission = { ...legacy, plan: { ...plan, headValid: false, gate: { state: "closed", reason: "receipt" } },
 			planError: null, canAgreePlan: false, runnablePurposeBinding: null };
 		go("mission");

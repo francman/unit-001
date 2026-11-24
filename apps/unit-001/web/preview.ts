@@ -125,6 +125,10 @@ const details: WorkspaceDetails = {
 		canAgree: true,
 		review: null,
 		draft: null,
+		plan: null,
+		planError: null,
+		canAgreePlan: true,
+		runnablePurposeBinding: null,
 		tools: ["read_file", "run_tests"],
 		agreement: {
 			revision: 2,
@@ -306,7 +310,7 @@ const port: WorkspacePort = {
 	},
 	async mutateMissionPlan(change, requestId) {
 		const mission = details.mission;
-		if (mission.plan === undefined || mission.planError !== null) return { state: "rejected" };
+		if (mission.planError !== null) return { state: "rejected" };
 		if (details.owner?.held) return { state: "refused", code: "held" };
 		const plan: PlanView = mission.plan ?? {
 			missionId: "sample-charter", adopted: false, head: null, headValid: false, previous: null, history: [], draft: null,

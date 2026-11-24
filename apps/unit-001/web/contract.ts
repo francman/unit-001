@@ -71,8 +71,13 @@ export interface MissionDraftTerms {
 	};
 }
 
-export type MissionDraftView = { revision: number; status: "editing" | "proposed"; digest: string | null } &
-	({ missionId: string; terms: MissionDraftTerms } | { missionId?: never; terms?: never });
+export type MissionDraftView = {
+	missionId: string;
+	revision: number;
+	status: "editing" | "proposed";
+	digest: string | null;
+	terms: MissionDraftTerms;
+};
 
 /** The gateway's exact review binding, not an authority claim from the draft. */
 export type MissionReviewView = {
@@ -192,7 +197,7 @@ export interface WorkspaceDetails {
 		authority: "managed-administrator" | "developer-local" | "unconfigured" | "invalid";
 		agreementValid: boolean;
 		authorityError: string | null;
-		/** True only when the gateway projects the formation protocol. */
+		/** False when the projected review does not bind the shown draft; the page then offers no formation action. */
 		formationAvailable: boolean;
 		/** Affirmative server capability for legacy developer-local browser approval only. */
 		canAgree: boolean;
@@ -200,12 +205,12 @@ export interface WorkspaceDetails {
 		previousReceipt?: string | null;
 		draft: MissionDraftView | null;
 		review: MissionReviewView | null;
-		/** Presence means the gateway projects the Missions v2 protocol; null can mean there is no saved plan. */
-		plan?: PlanView | null;
-		planError?: "invalid-plan" | null;
-		/** Affirmative developer-local browser capability; absent or false never authorizes Agree. */
-		canAgreePlan?: boolean;
-		runnablePurposeBinding?: MissionPlanBinding | null;
+		/** Null when there is no saved plan. */
+		plan: PlanView | null;
+		planError: "invalid-plan" | null;
+		/** Affirmative developer-local browser capability; false never authorizes Agree. */
+		canAgreePlan: boolean;
+		runnablePurposeBinding: MissionPlanBinding | null;
 	};
 	memory: {
 		count: number | null;
