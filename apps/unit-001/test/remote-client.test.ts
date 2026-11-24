@@ -40,7 +40,7 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 });
 
-async function owner() {
+async function owner(initialView: ServiceView | null = base) {
 	const directory = await mkdtemp(join(tmpdir(), "unit-remote-client-"));
 	const endpoint = join(directory, "default.sock");
 	const sockets = new Set<Socket>();
@@ -48,7 +48,8 @@ async function owner() {
 	const memorySockets = new Set<Socket>();
 	const sendSockets = new Set<Socket>();
 	const requests: { type: string; requestId?: string }[] = [];
-	let view = base;
+	const firstWatch = Promise.withResolvers<void>();
+	let view = initialView;
 	const server = createServer((socket) => {
 		sockets.add(socket);
 		socket.on("error", () => {});
@@ -63,21 +64,23 @@ async function owner() {
 			requests.push(request);
 			if (request.type === "watch") {
 				watchers.add(socket);
-				socket.write(`${JSON.stringify({ type: "view", view })}\n`);
-			} else if (request.type === "status")
+				if (view !== null) socket.write(`${JSON.stringify({ type: "view", view })}\n`);
+				firstWatch.resolve();
+			} else if (request.type === "status") {
+				const statusView = view ?? base;
 				socket.end(
 					`${JSON.stringify({
 						type: "status",
 						pid: 42,
 						version: "0.0.7",
-						name: view.name,
-						installationId: view.installationId,
-						busy: view.busy,
+						name: statusView.name,
+						installationId: statusView.installationId,
+						busy: statusView.busy,
 						inhibited: false,
 						maintenance: { protocol: 1, state: "open", operationId: null },
 						runtime: {
 							application: "unit-001",
-							name: view.name,
+							name: statusView.name,
 							pid: 42,
 							provider: "faux",
 							modelId: "faux-1",
@@ -87,7 +90,7 @@ async function owner() {
 						},
 					})}\n`,
 				);
-			else if (request.type === "cancel") socket.end('{"type":"cancelled"}\n');
+			} else if (request.type === "cancel") socket.end('{"type":"cancelled"}\n');
 			else if (request.type === "memory") memorySockets.add(socket);
 			else if (request.type === "send") sendSockets.add(socket);
 			// A rejected send was refused before admission, so the client's follow-up lookup finds no record.
@@ -111,6 +114,7 @@ async function owner() {
 	return {
 		requests,
 		open,
+		firstWatch: firstWatch.promise,
 		rejectSend() {
 			for (const socket of sendSockets) socket.end('{"type":"error","message":"Owner rejected send"}\n');
 			sendSockets.clear();
@@ -188,6 +192,48 @@ describe("remote observation and single-attempt admission", () => {
 		expect(await controller.closed).toBe(0);
 		expect(controller.state.unresolvedRequestIds).toEqual(ids);
 	});
+
+	it("#55 retries a silent first watch after five seconds without replaying an unconfirmed send", async () => {
+		const peer = await owner(null);
+		const signal = new AbortController();
+		const client = await connectRemoteClient(profile, "default", signal.signal);
+		cleanups.push(() => client.close());
+		try {
+			const events: ServiceClientEvent[] = [];
+			const send = client
+				.request({ type: "send", prompt: "persist once", requestId: "before-first-view" }, signal.signal)
+				.catch((error: unknown) => error);
+			await expect.poll(() => peer.requests.some((request) => request.type === "send")).toBe(true);
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			const watch = client.watch((event) => events.push(event), signal.signal);
+			void watch.catch(() => {});
+			await peer.firstWatch;
+			await vi.advanceTimersByTimeAsync(4_999);
+			expect(events).toEqual([]);
+			expect(peer.open).toHaveBeenCalledTimes(1);
+
+			await vi.advanceTimersByTimeAsync(1);
+			expect(events.map((event) => event.type)).toEqual(["connecting"]);
+			expect(await send).toMatchObject({ message: expect.stringMatching(/before-first-view.*No request was replayed/) });
+			await expect(client.request({ type: "cancel" }, signal.signal)).rejects.toThrow(/not sent/);
+			peer.view({ ...base, busy: true });
+			await vi.advanceTimersByTimeAsync(250);
+			await expect.poll(() => events.at(-1)).toMatchObject({ type: "view", view: { busy: true } });
+			expect(peer.open).toHaveBeenCalledTimes(2);
+			expect(peer.requests).toEqual([
+				{ type: "status" },
+				{ type: "send", prompt: "persist once", requestId: "before-first-view" },
+				{ type: "watch" },
+				{ type: "status" },
+				{ type: "watch" },
+			]);
+			signal.abort();
+			await watch;
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("#55 performs exactly five SSH reconnect attempts when the host stays offline", async () => {
 		const peer = await owner();
 		const signal = new AbortController();

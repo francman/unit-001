@@ -326,16 +326,10 @@ export async function runServiceAttach(
 			});
 		}
 	};
-	const startup = setTimeout(() => {
-		if (view !== undefined) return;
-		code = 1;
-		err("Service did not provide initial state within 5 seconds.\n");
-		detach();
-	}, 5_000);
 	try {
+		// The client owns its first-view deadline and any recovery from missing it; no timer here can abort that.
 		await client.watch((event) => {
 			if (event.type === "connecting") {
-				clearTimeout(startup);
 				connected = false;
 				cancelAfterAdmission = false;
 				forget = undefined;
@@ -347,7 +341,6 @@ export async function runServiceAttach(
 			const first = view === undefined;
 			view = next;
 			if (first) {
-				clearTimeout(startup);
 				err(
 					`Attached to ${next.name}; session ${client.session}; PID ${next.pid}; version ${next.version}.\n${HELP}\n`,
 				);
@@ -379,7 +372,6 @@ export async function runServiceAttach(
 			err(`Service disconnected: ${describeError(error)}. Reattach to inspect persisted work.\n`);
 		}
 	} finally {
-		clearTimeout(startup);
 		signal.removeEventListener("abort", onSignal);
 		terminal.input.off("data", onData);
 		terminal.input.off("keypress", onKeypress);

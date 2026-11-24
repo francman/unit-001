@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { runAttach } from "../src/attach.ts";
+import { runAttach, runServiceAttach } from "../src/attach.ts";
 import type { Terminal } from "../src/repl.ts";
 import type { ServiceRequest, ServiceView } from "../src/service.ts";
+import type { ServiceClient } from "../src/service-client.ts";
 
 let directory: string;
 const cleanups: (() => Promise<void>)[] = [];
@@ -500,4 +501,32 @@ describe.skipIf(process.platform === "win32")("service terminal", () => {
 		expect(await running).toBe(1);
 		expect(io.err()).toContain("within 5 seconds");
 	}, 8000);
+
+	// omp-4: a watch client owns its first-view deadline and recovery, so attach adds no earlier timer.
+	it("is not aborted by an outer timer while the client's own watch is still recovering", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		try {
+			const client: ServiceClient = {
+				session: "recovering",
+				ownerSession: "recovering",
+				request: () => Promise.reject(new Error("unused")),
+				async watch(listener, signal) {
+					await new Promise((resolve) => setTimeout(resolve, 7_000));
+					listener({ type: "view", view: base });
+					await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+				},
+			};
+			const io = terminal();
+			const controller = new AbortController();
+			const running = runServiceAttach(client, io.io, controller.signal);
+			await vi.advanceTimersByTimeAsync(6_500);
+			expect(io.err()).not.toContain("within 5 seconds");
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(io.err()).toContain("Attached to bob");
+			controller.abort();
+			expect(await running).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });

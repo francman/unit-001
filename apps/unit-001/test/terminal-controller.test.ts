@@ -7,11 +7,13 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText } from "@earendil-works/pi-ai/providers/faux";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "../src/agent.ts";
 import type { ServiceRequest, ServiceView } from "../src/service.ts";
+import type { ServiceClient } from "../src/service-client.ts";
 import {
 	createForegroundTerminalController,
+	createServiceTerminalController,
 	createTerminalController,
 	type TerminalState,
 } from "../src/terminal-controller.ts";
@@ -524,9 +526,86 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 		expect(await controller.closed).toBe(1);
 		expect(controller.state.notices.map((notice) => notice.text).join(" ")).toContain("within 5 seconds");
 	}, 8000);
+
+	// omp-4: a watch client owns its first-view deadline and recovery, so the controller adds no earlier timer.
+	it("is not failed by a controller timer while the client's own watch is still recovering", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		try {
+			const client: ServiceClient = {
+				session: "recovering",
+				ownerSession: "recovering",
+				request: () => Promise.reject(new Error("unused")),
+				async watch(listener, signal) {
+					await new Promise((resolve) => setTimeout(resolve, 7_000));
+					listener({ type: "view", view: base });
+					await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+				},
+			};
+			const signal = new AbortController();
+			const controller = createServiceTerminalController(client, () => {}, signal.signal);
+			await vi.advanceTimersByTimeAsync(6_500);
+			expect(controller.state.connection).toBe("connecting");
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(controller.state.connection).toBe("attached");
+			signal.abort();
+			expect(await controller.closed).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });
 
 describe("foreground terminal controller", () => {
+	// omp-4: the foreground adapter bounds its own first view; the shared controller has no timer.
+	describe("first view bound", () => {
+		function silentAgent(open: () => Promise<unknown>): Agent {
+			return { name: "bob", watchConversation: open } as unknown as Agent;
+		}
+
+		it("fails a foreground watch that never supplies a first view within its bound", async () => {
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			try {
+				const controller = createForegroundTerminalController(
+					silentAgent(() => new Promise(() => {})),
+					"work",
+					"0.0.4",
+					() => {},
+					new AbortController().signal,
+				);
+				await vi.advanceTimersByTimeAsync(4_999);
+				expect(controller.state.connection).toBe("connecting");
+				await vi.advanceTimersByTimeAsync(1);
+				expect(await controller.closed).toBe(1);
+				expect(controller.state.connection).toBe("failed");
+				expect(controller.state.notices.map((notice) => notice.text).join(" ")).toContain("within 5 seconds");
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("stops a foreground watch that opens after its bound", async () => {
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			try {
+				const late = Promise.withResolvers<{ value: unknown; stop: () => Promise<void> }>();
+				const stop = vi.fn(async () => {});
+				const controller = createForegroundTerminalController(
+					silentAgent(() => late.promise),
+					"work",
+					"0.0.4",
+					() => {},
+					new AbortController().signal,
+				);
+				await vi.advanceTimersByTimeAsync(5_000);
+				expect(await controller.closed).toBe(1);
+				late.resolve({ value: undefined, stop });
+				await vi.advanceTimersByTimeAsync(0);
+				expect(stop).toHaveBeenCalledOnce();
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	});
+
 	async function foreground(responses: Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0]) {
 		const faux = fauxProvider();
 		faux.setResponses(responses);

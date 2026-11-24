@@ -25,6 +25,29 @@ export function localServiceClient(endpoint: string): ServiceClient {
 		session: basename(endpoint, ".sock"),
 		ownerSession: basename(endpoint, ".sock"),
 		request: (request, signal) => requestService(endpoint, request, signal),
-		watch: (listener, signal) => watchService(endpoint, (view) => listener({ type: "view", view }), signal),
+		async watch(listener, signal) {
+			if (signal.aborted) return;
+			const startup = new AbortController();
+			let deadline: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+				startup.abort(new Error("Service did not provide initial state within 5 seconds"));
+			}, 5_000);
+			try {
+				await watchService(
+					endpoint,
+					(view) => {
+						if (deadline !== undefined) {
+							clearTimeout(deadline);
+							deadline = undefined;
+						}
+						listener({ type: "view", view });
+					},
+					AbortSignal.any([signal, startup.signal]),
+				);
+				// The socket watch resolves on abort; only the startup deadline is a failure.
+				startup.signal.throwIfAborted();
+			} finally {
+				clearTimeout(deadline);
+			}
+		},
 	};
 }

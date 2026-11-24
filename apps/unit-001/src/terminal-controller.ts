@@ -193,7 +193,14 @@ export function createForegroundTerminalController(
 				const abort = () => cancel();
 				signal.addEventListener("abort", abort, { once: true });
 				if (signal.aborted) abort();
-				const watch = await agent.watchConversation(context);
+				let watch: Awaited<ReturnType<Agent["watchConversation"]>>;
+				try {
+					watch = await withinFirstView(agent.watchConversation(context), cancel);
+				} catch (error) {
+					signal.removeEventListener("abort", abort);
+					cancel();
+					throw error;
+				}
 				try {
 					const identity = { pid: process.pid, version, name: agent.name, installationId: null };
 					listener(serviceView(watch.value, identity));
@@ -290,7 +297,6 @@ class OwnerTerminalController implements TerminalController {
 	#state: TerminalState = { connection: "connecting", sending: false, cancelling: false, notices: [] };
 	#cancelAfterAdmission = false;
 	#finished = false;
-	#startup: ReturnType<typeof setTimeout> | undefined;
 	#forget: { readonly id: string; readonly requestId: string } | undefined;
 	#interpretation: AbortController | undefined;
 	/** Sequence of the newest evidence request; a reply carrying an older number is stale. */
@@ -310,10 +316,6 @@ class OwnerTerminalController implements TerminalController {
 			return;
 		}
 		signal.addEventListener("abort", this.#onSignal, { once: true });
-		this.#startup = setTimeout(() => {
-			this.#notice("Agent did not provide initial state within 5 seconds.", "error");
-			this.#finish("failed", 1);
-		}, 5_000);
 		void this.#observe();
 	}
 
@@ -519,12 +521,12 @@ class OwnerTerminalController implements TerminalController {
 		this.#finish("detached", 0);
 	}
 
+	// The transport's watch owns its first-view deadline; the controller adds no timer that could pre-empt its recovery.
 	async #observe(): Promise<void> {
 		try {
 			await this.#transport.watch(
 				(view) => {
 					const first = this.#state.view === undefined;
-					clearTimeout(this.#startup);
 					this.#state = { ...this.#state, connection: "attached", view };
 					this.#publish();
 					if (this.#cancelAfterAdmission && view.busy) this.cancel();
@@ -532,7 +534,6 @@ class OwnerTerminalController implements TerminalController {
 				},
 				this.#local.signal,
 				(message) => {
-					clearTimeout(this.#startup);
 					this.#cancelAfterAdmission = false;
 					this.#forget = undefined;
 					this.#state = { ...this.#state, connection: "connecting" };
@@ -766,12 +767,31 @@ class OwnerTerminalController implements TerminalController {
 	#finish(connection: "detached" | "failed", code: number): void {
 		if (this.#finished) return;
 		this.#finished = true;
-		clearTimeout(this.#startup);
 		this.#signal.removeEventListener("abort", this.#onSignal);
 		this.#local.abort();
 		this.#state = { ...this.#state, connection, sending: false, cancelling: false };
 		this.#publish();
 		this.#resolveClose(code);
+	}
+}
+
+const FIRST_VIEW_MS = 5_000;
+
+// The foreground watch owns its first-view deadline like every other watch client; a watch that opens after the
+// deadline is stopped rather than left running with no observer.
+async function withinFirstView<T extends { stop(): Promise<unknown> }>(opening: Promise<T>, cancel: () => void): Promise<T> {
+	const deadline = Promise.withResolvers<never>();
+	const timer = setTimeout(() => {
+		cancel();
+		deadline.reject(new Error("Agent did not provide initial state within 5 seconds"));
+	}, FIRST_VIEW_MS);
+	try {
+		return await Promise.race([opening, deadline.promise]);
+	} catch (error) {
+		void opening.then((late) => late.stop()).catch(() => {});
+		throw error;
+	} finally {
+		clearTimeout(timer);
 	}
 }
 
