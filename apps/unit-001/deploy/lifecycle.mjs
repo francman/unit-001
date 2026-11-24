@@ -77,6 +77,13 @@ export async function lifecycle(record, action, context, newName) {
 		return;
 	}
 	await writeInstallation({ ...record, desiredState: "stopped" }, root);
+	// A previous uninstall may have deleted unit files before its daemon reload failed.
+	if (action === "uninstall") {
+		const unitFile = await lstat(paths.unitFile).catch((error) => {
+			if (error.code !== "ENOENT") throw error;
+		});
+		if (unitFile === undefined) await systemctl("daemon-reload");
+	}
 	const installedUnit = await context.unitExists(unit);
 	if (installedUnit) await systemctl("disable", unit);
 	for (const updater of [paths.updaterTimer, paths.updaterService, paths.updaterRecovery]) {
@@ -129,18 +136,18 @@ export async function lifecycle(record, action, context, newName) {
 		if (releaseInfo === undefined || !contents.equals(await readFile(join(release, "deploy", file))))
 			throw new Error(`Preserving unexpected management helper: ${target}`);
 	}
-	// Complete ownership checks before removing any path used to retry this command.
+	// Keep the named dispatcher's wrapper, runtime and helpers through systemd teardown.
 	assertUpdateCoreOwned(record, root);
 	assertUpdateSchedulingOwned(record, root);
 	await removeWebActivation(record, context);
-	await removeOwnedAgentCommand(record, root);
-	if (link !== undefined) await rm(paths.current);
 	if (text !== undefined) await rm(paths.unitFile);
 	await systemctl("daemon-reload");
-	for (const file of helpers) await rm(join(paths.management, file), { force: true });
 	removeUpdateCore(record, root);
 	removeUpdateScheduling(record, root);
 	await systemctl("daemon-reload");
+	await removeOwnedAgentCommand(record, root);
+	if (link !== undefined) await rm(paths.current);
+	for (const file of helpers) await rm(join(paths.management, file), { force: true });
 	for (const directory of [paths.management, paths.agentRoot]) {
 		const entries = await readdir(directory).catch((error) => {
 			if (error.code !== "ENOENT") throw error;

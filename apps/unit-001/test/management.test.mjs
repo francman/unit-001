@@ -597,7 +597,8 @@ test("#20 stop and kill persist stopped intent before preventing restart", async
 });
 
 test("#20 a failed stop prevents uninstall removal", async () => {
-	const { record, context, paths } = await setup();
+	const { record, context, paths, root } = await setup();
+	const release = await software(record, root, paths);
 	await assert.rejects(
 		lifecycle(record, "uninstall", {
 			...context,
@@ -609,6 +610,10 @@ test("#20 a failed stop prevents uninstall removal", async () => {
 		/stop failed/,
 	);
 	assert.equal(JSON.parse(await readFile(paths.record, "utf8")).desiredState, "stopped");
+	for (const path of [paths.unitFile, paths.wrapper(record.name), join(paths.management, "agent-command.mjs")])
+		assert.ok(await readFile(path));
+	assert.equal(await readlink(paths.current), `../../releases/${record.releaseVersion}`);
+	assert.equal(await readFile(join(release, "VERSION"), "utf8"), `${record.releaseVersion}\n`);
 });
 
 test("#19 rename preserves UUID and state, removes old command, and rejects collisions", async () => {
@@ -682,6 +687,84 @@ test("#20 uninstall removes owned software and unused release while preserving s
 			return false;
 		},
 	});
+});
+
+// codex-3: Both reload boundaries must leave the documented named command callable.
+test("named uninstall can retry after either manager reload fails", async (t) => {
+	for (const failedReload of [1, 2]) {
+		await t.test(`reload ${failedReload}`, async () => {
+			const { record, root, paths, context } = await setup();
+			const release = await software(record, root, paths);
+			const runtime = join(paths.current, "runtime/bin/node");
+			await mkdir(join(release, "runtime/bin"), { recursive: true });
+			await writeFile(runtime, "fixture runtime", { mode: 0o755 });
+			const wrapper = paths.wrapper(record.name);
+			const wrapperBytes = await readFile(wrapper, "utf8");
+			const helpers = ["agent-command.mjs", "lifecycle.mjs", "installation.mjs", "update-activation.mjs"];
+			const schedule = updateScheduling(record, root);
+			await writeFile(schedule.servicePath, schedule.serviceContents);
+			await writeFile(schedule.timerPath, schedule.timerContents);
+			const unitFiles = new Map([
+				[paths.unit, paths.unitFile],
+				[schedule.serviceName, schedule.servicePath],
+				[schedule.timerName, schedule.timerPath],
+			]);
+			const loaded = new Set(unitFiles.keys());
+			const second = { ...record, id: otherId, name: "bob", account: "ua-222222222222422282222222" };
+			await writeInstallation(second, root);
+			const otherPaths = installationPaths(otherId, root);
+			await software(second, root, otherPaths);
+			writeReleaseChecksums(release);
+			await mkdir(paths.state, { recursive: true });
+			const credentials = join(paths.state, "credentials.json");
+			await writeFile(credentials, "keep");
+			let reloads = 0;
+			const uninstall = () => dispatchAgent(id, record.name, ["uninstall", "--yes"], {
+				...context,
+				async unitExists(unit) {
+					return loaded.has(unit);
+				},
+				async run(command, [action, ...args]) {
+					assert.equal(command, "systemctl");
+					assert.equal(readInstallation(id, root).desiredState, "stopped");
+					if (action === "daemon-reload") {
+						if (++reloads === failedReload) throw new Error("reload failed");
+						for (const [unit, path] of unitFiles) {
+							try {
+								await stat(path);
+							} catch (error) {
+								if (error.code !== "ENOENT") throw error;
+								loaded.delete(unit);
+							}
+						}
+					} else {
+						const unit = args.at(-1);
+						assert.ok(unitFiles.has(unit), `unexpected unit ${unit}`);
+						if (action === "disable") await stat(unitFiles.get(unit));
+					}
+					return 0;
+				},
+			});
+
+			await assert.rejects(uninstall(), /reload failed/);
+			assert.equal(readInstallation(id, root).desiredState, "stopped");
+			assert.equal(await readFile(wrapper, "utf8"), wrapperBytes);
+			assert.equal(await readlink(paths.current), `../../releases/${record.releaseVersion}`);
+			assert.equal((await stat(runtime)).mode & 0o111, 0o111);
+			for (const file of helpers) assert.ok(await readFile(join(paths.management, file)));
+			assert.equal(await readFile(credentials, "utf8"), "keep");
+
+			assert.equal(await uninstall(), 0);
+			assert.equal(readInstallation(id, root).desiredState, "uninstalled");
+			assert.equal(loaded.size, 0);
+			for (const path of [wrapper, paths.current, paths.management])
+				await assert.rejects(lstat(path), { code: "ENOENT" });
+			assert.equal(await readFile(credentials, "utf8"), "keep");
+			assert.deepEqual(readInstallation(otherId, root), second);
+			assert.ok(await readFile(otherPaths.wrapper(second.name)));
+			assert.equal(await readFile(join(release, "VERSION"), "utf8"), `${record.releaseVersion}\n`);
+		});
+	}
 });
 
 test("#20 uninstall preserves a release referenced by another stopped installation", async () => {

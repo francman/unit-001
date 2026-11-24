@@ -19,22 +19,17 @@ unit_name="unit-001@$id.service"
 unit="$root/etc/systemd/system/$unit_name"
 command="$root/usr/local/bin/$name"
 release="$root/opt/unit-001/releases/$version"
-backup=$(mktemp -d)
+backup=$(mktemp -d "$config/.activation-backup.XXXXXX")
 was_running=false
 was_enabled=false
 activation_started=false
 activation_complete=false
 candidate_started=false
-previous=$(readlink "$prefix/current" || true)
-for item in record command unit; do
-  path="${!item}"
-  if [[ -e "$path" ]]; then cp -p -- "$path" "$backup/$item"; fi
-done
-if [[ -d "$management" ]]; then cp -R -- "$management" "$backup/management"; fi
+previous=
 
 atomic_link() {
   local target="$1" path="$2" next="${2}.next.$$"
-  ln -s -- "$target" "$next"
+  ln -s -- "$target" "$next" || return
   if [[ $(uname -s) == Darwin ]]; then mv -fh -- "$next" "$path"; else mv -Tf -- "$next" "$path"; fi
 }
 
@@ -46,31 +41,48 @@ publish_file() {
   mv -f -- "$temporary" "$path"
 }
 
+restore_activation() {
+  local item path
+  if [[ "$service_action" == manage ]]; then
+    if [[ "$candidate_started" == true ]] && ! systemctl stop "$unit_name"; then
+      printf 'unit-001 install: cannot stop candidate; leaving selected software unchanged.\n' >&2
+      return 1
+    fi
+    if [[ -f "$unit" ]]; then systemctl disable "$unit_name" || return; fi
+  fi
+  rm -f -- "$prefix/current.next.$$" || return
+  if [[ -n "$previous" ]]; then
+    atomic_link "$previous" "$prefix/current" || return
+  else
+    rm -f -- "$prefix/current" || return
+  fi
+  for item in record command unit; do
+    path="${!item}"
+    if [[ -f "$backup/$item" ]]; then
+      cp -p -- "$backup/$item" "$path" || return
+    else
+      rm -f -- "$path" || return
+    fi
+  done
+  rm -rf -- "$management" || return
+  if [[ -d "$backup/management" ]]; then cp -pR -- "$backup/management" "$management" || return; fi
+  if [[ "$service_action" == manage ]]; then
+    systemctl daemon-reload || return
+    if [[ "$was_enabled" == true ]]; then systemctl enable "$unit_name" || return; fi
+    if [[ "$was_running" == true ]]; then systemctl start "$unit_name" || return; fi
+  fi
+}
+
 cleanup() {
   local status=$?
   trap - EXIT
-  set +e
   if [[ "$activation_started" == true && "$activation_complete" == false ]]; then
-    if [[ "$service_action" == manage ]]; then
-      if [[ "$candidate_started" == true ]] && ! systemctl stop "$unit_name"; then
-        printf 'unit-001 install: cannot stop candidate; leaving selected software unchanged. Recovery backup: %s\n' "$backup" >&2
-        exit "$status"
-      fi
-      systemctl disable "$unit_name"
+    if ! restore_activation; then
+      printf 'unit-001 install: restoration failed for installation %s. Recovery backup: %s\n' "$id" "$backup" >&2
+      rm -f -- "$prefix/current.next.$$" || true
+      exit "$status"
     fi
-    if [[ -n "$previous" ]]; then atomic_link "$previous" "$prefix/current"; else rm -f -- "$prefix/current"; fi
-    for item in record command unit; do
-      path="${!item}"
-      if [[ -f "$backup/$item" ]]; then cp -p -- "$backup/$item" "$path"; else rm -f -- "$path"; fi
-    done
-    rm -rf -- "$management"
-    if [[ -d "$backup/management" ]]; then cp -R -- "$backup/management" "$management"; fi
-    if [[ "$service_action" == manage ]]; then
-      systemctl daemon-reload
-      if [[ "$was_enabled" == true ]]; then systemctl enable "$unit_name"; fi
-      if [[ "$was_running" == true ]]; then systemctl start "$unit_name"; fi
-    fi
-    printf 'unit-001 install: activation failed; attempted restoration of installation %s.\n' "$id" >&2
+    printf 'unit-001 install: activation failed; restored installation %s.\n' "$id" >&2
   fi
   rm -f -- "$prefix/current.next.$$"
   rm -rf -- "$backup"
@@ -79,6 +91,16 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+if [[ -L "$prefix/current" ]]; then
+  previous=$(readlink "$prefix/current")
+  printf '%s\n' "$previous" > "$backup/current"
+fi
+for item in record command unit; do
+  path="${!item}"
+  if [[ -e "$path" ]]; then cp -p -- "$path" "$backup/$item"; fi
+done
+if [[ -d "$management" ]]; then cp -pR -- "$management" "$backup/management"; fi
 
 if [[ "$service_action" == manage ]] && systemctl is-active --quiet "$unit_name"; then was_running=true; fi
 if [[ "$service_action" == manage ]] && systemctl is-enabled --quiet "$unit_name"; then was_enabled=true; fi
