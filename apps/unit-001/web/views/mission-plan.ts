@@ -6,9 +6,10 @@ import { button } from "../ui/controls.ts";
 import { attrs, type Child, el } from "../ui/dom.ts";
 import { duration } from "../ui/format.ts";
 import { facts, panel, section } from "../ui/page.ts";
+import { encodeExactText, visibleExactText as visibleText } from "./exact-text.ts";
 import {
-	encodePlanText, exactPlanTerms as exactTerms, noSeparateReviewCap, overallRows, planDisclosure as disclosure, type PlanTerminalCommand,
-	planTermRows as termRows, planTermsDiff as termsDiff, strategicRows, tacticalRows, visiblePlanText as visibleText,
+	exactPlanTerms as exactTerms, noSeparateReviewCap, overallRows, planDisclosure as disclosure, type PlanTerminalCommand,
+	planTermRows as termRows, planTermsDiff as termsDiff, strategicRows, tacticalRows,
 } from "./mission-plan-display.ts";
 
 /** The caller supplies closed projection data and chooses which actions are available. */
@@ -174,7 +175,7 @@ function reviewsSection(plan: PlanView, options: MissionPlanOptions): HTMLElemen
 			const actions: Child[] = [];
 			if (!review.disposition) {
 				const { onDismissReview, onDraftFromReview } = options;
-				const reviewName = `${triggerWords[review.trigger.kind]}, ${date(review.createdAt)}, review ${encodePlanText(review.reviewId)}`;
+				const reviewName = `${triggerWords[review.trigger.kind]}, ${date(review.createdAt)}, review ${encodeExactText(review.reviewId)}`;
 				if (onDismissReview) actions.push(attrs(
 					button({ label: "Dismiss", key: `mission-plan-dismiss-${review.reviewId}`, onClick: () => onDismissReview(review.reviewId) }),
 					{ "aria-label": `Dismiss ${reviewName}` },

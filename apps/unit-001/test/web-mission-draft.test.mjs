@@ -57,6 +57,11 @@ function exercise() {
 	const saved = calls.pop();
 	check(saved.revision === 12 && saved.submitted.objective === `updated ${hostile}`, "saving an edited field round-trips controls and Unicode spaces and binds the expected revision");
 	check(saved.submitted.successCriteria[0] === terms.successCriteria[0] && saved.submitted.policy.deadlineAt === terms.policy.deadlineAt, "untouched multiline and timestamp terms survive edits");
+	// The plan editor already kept these literal; this editor once sent an isolated surrogate to the owner.
+	objective.value = "typed \\uD800 \\u{DFFF} \\u{110000} \\u0041";
+	objective.dispatchEvent(new Event("input", { bubbles: true }));
+	byKey("mission-draft-save").click();
+	check(calls.pop().submitted.objective === "typed \\uD800 \\u{DFFF} \\u{110000} A", "a typed surrogate or out-of-range escape stays literal and other escapes decode");
 
 	insert(createMissionDraftEditor({ ...editing, terms: {}, saved: false, expectedRevision: 10 }).root);
 	byKey("mission-draft-tools-none").click();

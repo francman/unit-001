@@ -1,8 +1,9 @@
 // Shares exact plan terms and diffs between the timeline and the approval card.
 import type { PlanTerms } from "../mission-plan-contract.ts";
 import { text } from "../ui/classes.ts";
-import { attrs, type Child, el } from "../ui/dom.ts";
+import { type Child, el } from "../ui/dom.ts";
 import { facts } from "../ui/page.ts";
+import { visibleExactText } from "./exact-text.ts";
 
 type TermRow = readonly [string, string | number | readonly string[] | { readonly note: string } | null | undefined];
 
@@ -15,29 +16,13 @@ const disabledReviewLimit = { note: "Not applicable: model reviews disabled" };
 
 const stack = "flex min-w-0 flex-col gap-3";
 const heading = `${text.heading} [overflow-wrap:anywhere]`;
-const escaped = /[\\\p{Cc}\p{Cs}\p{Default_Ignorable_Code_Point}\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/gu;
-
-/** Encodes text without normalizing it, including isolated surrogate code units. */
-export function encodePlanText(value: string): string {
-	return value.replace(escaped, (character) => {
-		if (character === "\\") return "\\\\";
-		const point = character.codePointAt(0) ?? 0;
-		const hex = point.toString(16).toUpperCase();
-		return point <= 0xffff ? `\\u${hex.padStart(4, "0")}` : `\\u{${hex}}`;
-	});
-}
-
-/** Quotes and isolates text so invisible differences remain visible without changing the terms. */
-export function visiblePlanText(value: string): HTMLElement {
-	return attrs(el("bdi", `whitespace-pre-wrap ${text.mono}`, `"${encodePlanText(value).replaceAll('"', '\\"')}"`), { dir: "auto" });
-}
 
 /** Renders the reported value, distinguishing empty, absent and unreported terms. */
 export function planTermRows(rows: readonly TermRow[]): HTMLDListElement {
 	return facts(rows.map(([label, value]) => [label,
 		value === undefined ? "Not reported" : value === null ? "None" : typeof value === "number" ? String(value) :
-			typeof value === "string" ? visiblePlanText(value) : "note" in value ? value.note : value.length
-				? el("ol", "m-0 list-decimal pl-5", ...value.map((item) => el("li", "", visiblePlanText(item)))) : "None (empty list)",
+			typeof value === "string" ? visibleExactText(value) : "note" in value ? value.note : value.length
+				? el("ol", "m-0 list-decimal pl-5", ...value.map((item) => el("li", "", visibleExactText(item)))) : "None (empty list)",
 	]));
 }
 
@@ -45,9 +30,9 @@ export function planTermRows(rows: readonly TermRow[]): HTMLDListElement {
 export function exactPlanTerms(terms: PlanTerms): HTMLElement {
 	return el("div", stack,
 		el("h3", heading, "Overall"), planTermRows(overallRows(terms.overall)),
-		...terms.strategics.map((strategic) => el("div", "min-w-0", el("h3", heading, "Strategy ", visiblePlanText(strategic.id)), planTermRows(strategicRows(strategic)))),
+		...terms.strategics.map((strategic) => el("div", "min-w-0", el("h3", heading, "Strategy ", visibleExactText(strategic.id)), planTermRows(strategicRows(strategic)))),
 		terms.strategics.length ? null : el("p", text.description, "No strategies (empty list)."),
-		...terms.tacticals.map((tactical) => el("div", "min-w-0", el("h3", heading, "Tactic ", visiblePlanText(tactical.id)), planTermRows(tacticalRows(tactical)))),
+		...terms.tacticals.map((tactical) => el("div", "min-w-0", el("h3", heading, "Tactic ", visibleExactText(tactical.id)), planTermRows(tacticalRows(tactical)))),
 		terms.tacticals.length ? null : el("p", text.description, "No tactics (empty list)."),
 	);
 }
@@ -75,12 +60,12 @@ export function planTermsDiff(before: PlanTerms, after: PlanTerms, label: string
 	for (const id of new Set([...before.strategics, ...after.strategics].map(({ id }) => id))) {
 		const old = before.strategics.find((item) => item.id === id);
 		const current = after.strategics.find((item) => item.id === id);
-		add(el("span", "", "Strategy ", visiblePlanText(id)), old && strategicRows(old), current && strategicRows(current), descendants(id));
+		add(el("span", "", "Strategy ", visibleExactText(id)), old && strategicRows(old), current && strategicRows(current), descendants(id));
 	}
 	for (const id of new Set([...before.tacticals, ...after.tacticals].map(({ id }) => id))) {
 		const old = before.tacticals.find((item) => item.id === id);
 		const current = after.tacticals.find((item) => item.id === id);
-		add(el("span", "", "Tactic ", visiblePlanText(id)), old && tacticalRows(old), current && tacticalRows(current));
+		add(el("span", "", "Tactic ", visibleExactText(id)), old && tacticalRows(old), current && tacticalRows(current));
 	}
 	for (const [label, old, current] of [["Strategy order", before.strategics, after.strategics], ["Tactic order", before.tacticals, after.tacticals]] as const) {
 		add(label, [["Ordered IDs", old.map(({ id }) => id)]], [["Ordered IDs", current.map(({ id }) => id)]]);

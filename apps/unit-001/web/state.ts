@@ -215,12 +215,24 @@ export function runBlocked(run: MissionRunView | null): boolean {
 	return run !== null && (run.status === "blocked" || unknownResults(run) > 0);
 }
 
+/** One connection as the owner reports it. */
+export type Channel = WorkspaceDetails["channels"][number];
+
+/** Connected: identity verified, no step open or failing, and the last check passed. Delivery is not tested. */
+export function channelConnected(channel: Channel): boolean {
+	return channel.status === "ready" && channel.failure === null && channel.awaiting === null && channel.lastHealth?.healthy !== false;
+}
+
+/** Needs the owner: not connected and not switched off, so an open step, a failure, a failed check or an unconfirmed attempt. */
+export function channelNeedsOwner(channel: Channel): boolean {
+	return channel.status !== "disabled" && !channelConnected(channel);
+}
+
 /** How many things on a page need the person, for the count on its nav row; 0 means none. */
 export function attentionCount(ui: Readonly<Ui>, section: Section): number {
 	const details = ui.details;
 	if (!details) return 0;
-	if (section === "connections")
-		return details.channels.filter((channel) => channel.status !== "ready").length;
+	if (section === "connections") return details.channels.filter(channelNeedsOwner).length;
 	if (section === "status")
 		return [details.owner?.held === true, !isConfigured(ui), runBlocked(details.mission.run)].filter(Boolean).length;
 	if (section === "mission") return runBlocked(details.mission.run) ? 1 : 0;

@@ -8,6 +8,7 @@ import { attrs, type Child, el } from "../ui/dom.ts";
 import { ago, clock, count, dateTime, duration, money, plural, until } from "../ui/format.ts";
 import { facts, pageFrame, panel, section } from "../ui/page.ts";
 import { meter, runStates, unknownSentence } from "../ui/run.ts";
+import { connectionSentence } from "./connections.ts";
 
 /** Memories at which the capacity evidence recommends a review; a recommendation, not a limit. */
 const capacityReview = 1000;
@@ -61,7 +62,7 @@ export function renderActivity(ctx: Ctx): HTMLElement {
 		railGroup("Purpose", el("p", text.strong, details.mission.objective ?? "No purpose agreed yet.")),
 		railGroup("Scheduled work", ...railWork(data)),
 		railGroup("Memory", el("p", text.body, details.memory.stats ? memorySentence(details.memory.stats) : "Counts could not be read.")),
-		railGroup("Connections", el("p", text.body, channelSentence(details.channels))),
+		railGroup("Connections", el("p", text.body, connectionSentence(details.channels))),
 	);
 	if (ctx.ui.connection !== "connected") root.append(el("p", text.description, "Last reported before the connection dropped."));
 	root.append(el("div", "mt-auto pt-1", fullStatus(ctx)));
@@ -211,14 +212,6 @@ function runtimeSection(ctx: Ctx, data: Facts): HTMLElement {
 function missingDetails(ctx: Ctx): HTMLElement {
 	if (ctx.ui.detailsFailed) return emptyState("alert", "Status could not be loaded. It is read again when you open this page.");
 	return emptyState("clock", `Loading what ${ctx.name} reports.`);
-}
-
-function channelSentence(channels: WorkspaceDetails["channels"]): string {
-	if (channels.length === 0) return "No connections set up.";
-	const waiting = channels.filter((channel) => channel.status !== "ready");
-	if (waiting.length === 0) return `${plural(channels.length, "connection", "connections")}, all ready.`;
-	const approval = waiting.every((channel) => channel.awaiting === "grant" || channel.status === "awaiting_authorization");
-	return `${waiting.length} of ${plural(channels.length, "connection", "connections")} ${waiting.length === 1 ? "needs" : "need"} ${approval ? "your approval" : "attention"}.`;
 }
 
 function railGroup(title: string, ...children: Child[]): HTMLElement {

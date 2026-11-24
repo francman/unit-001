@@ -6,6 +6,7 @@ import { button } from "../ui/controls.ts";
 import { attrs, el } from "../ui/dom.ts";
 import { dateTime, humanize } from "../ui/format.ts";
 import { panel, section } from "../ui/page.ts";
+import { decodeExactText, encodeExactText, visibleExactText } from "./exact-text.ts";
 
 type Editing = {
 	expectedRevision: number;
@@ -68,8 +69,6 @@ const limits = [
 	["maxEstimatedCost", "Maximum estimated cost (USD)"],
 ] as const;
 const fieldLayout = "flex min-w-0 flex-col gap-1.5";
-// Unicode separators other than ASCII space, plus controls and literal backslashes.
-const escapedTermCharacters = /[\\\p{Cc}\p{Cs}\p{Default_Ignorable_Code_Point}\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/gu;
 
 /** Keeps the native form and its raw input alive while the shell checks the saved revision. */
 export function createMissionDraftEditor(options: Editing): MissionDraftEditor {
@@ -159,19 +158,12 @@ function setTerm<T, K extends keyof T>(terms: T, key: K, value: T[K]): void {
 function textArea(id: string, label: string, original: string | undefined): TermField<string> & { input: HTMLTextAreaElement } {
 	const input = attrs(el("textarea", `${fields.input} min-h-16 resize-y py-1.5`), { id, rows: "2", "aria-describedby": "mission-draft-text-hint" });
 	// Keep the editor's value reversible even when the browser normalizes textarea line endings.
-	input.value = original?.replace(escapedTermCharacters, escapeCharacter) ?? "";
+	input.value = original === undefined ? "" : encodeExactText(original);
 	const initial = input.value;
 	return {
 		root: el("div", fieldLayout, attrs(el("label", fields.label, label), { for: id }), input),
 		input,
-		read: () => {
-			if (input.value === initial) return original;
-			return input.value.replace(/\\\\|\\u(?:([\dA-Fa-f]{4})|\{([\dA-Fa-f]{1,6})\})/g, (match, bmp: string | undefined, extended: string | undefined) => {
-				if (match === "\\\\") return "\\";
-				const point = Number.parseInt((bmp ?? extended) || "", 16);
-				return point <= 0x10ffff ? String.fromCodePoint(point) : match;
-			}) || undefined;
-		},
+		read: () => (input.value === initial ? original : decodeExactText(input.value) || undefined),
 	};
 }
 
@@ -348,21 +340,9 @@ function reviewRows(rows: readonly TermRow[]): HTMLElement {
 		else if (typeof value === "number") {
 			const date = label.startsWith("Deadline") ? new Date(value) : null;
 			shown = date && Number.isFinite(date.getTime()) ? `${date.toISOString()} (${value} ms)` : String(value);
-		} else if (typeof value === "string") shown = visibleText(value);
-		else shown = value.length ? el("ol", "m-0 list-decimal pl-5", ...value.map((item) => el("li", "", visibleText(item)))) : "None (empty list)";
+		} else if (typeof value === "string") shown = visibleExactText(value);
+		else shown = value.length ? el("ol", "m-0 list-decimal pl-5", ...value.map((item) => el("li", "", visibleExactText(item)))) : "None (empty list)";
 		list.append(el("div", "min-w-0", el("dt", fields.label, label), el("dd", `m-0 ${text.strong}`, shown)));
 	}
 	return list;
-}
-
-function visibleText(value: string): HTMLElement {
-	const escaped = `"${value.replace(escapedTermCharacters, escapeCharacter).replaceAll('"', '\\"')}"`;
-	return attrs(el("bdi", `whitespace-pre-wrap ${text.mono}`, escaped), { dir: "auto" });
-}
-
-function escapeCharacter(character: string): string {
-	if (character === "\\") return "\\\\";
-	const point = character.codePointAt(0) ?? 0;
-	const hex = point.toString(16).toUpperCase();
-	return point <= 0xffff ? `\\u${hex.padStart(4, "0")}` : `\\u{${hex}}`;
 }

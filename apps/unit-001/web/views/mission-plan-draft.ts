@@ -7,9 +7,8 @@ import { button } from "../ui/controls.ts";
 import { attrs, type Child, el } from "../ui/dom.ts";
 import { duration } from "../ui/format.ts";
 import { panel, section } from "../ui/page.ts";
-import {
-	encodePlanText, exactPlanTerms, type PlanTerminalCommand, planTermRows, planTermsDiff, visiblePlanText,
-} from "./mission-plan-display.ts";
+import { decodeExactText, encodeExactText, visibleExactText } from "./exact-text.ts";
+import { exactPlanTerms, type PlanTerminalCommand, planTermRows, planTermsDiff } from "./mission-plan-display.ts";
 
 type Strategic = PlanTerms["strategics"][number];
 type Tactical = PlanTerms["tacticals"][number];
@@ -86,8 +85,8 @@ export function createMissionPlanDraftEditor(options: MissionPlanEditorOptions):
 			: `Revision ${expectedRevision} saved by ${savedBy} (base ${draft.baseRevision}).`;
 	const form = el("form", stack,
 		el("p", text.body, savedStatus),
-		draft?.fromReview != null ? el("p", text.body, "Drafted from review ", visiblePlanText(draft.fromReview), ".") : null,
-		draft?.missing.length ? el("p", text.body, `Still needed: ${draft.missing.map(encodePlanText).join(", ")}.`) : null,
+		draft?.fromReview != null ? el("p", text.body, "Drafted from review ", visibleExactText(draft.fromReview), ".") : null,
+		draft?.missing.length ? el("p", text.body, `Still needed: ${draft.missing.map(encodeExactText).join(", ")}.`) : null,
 		status,
 		attrs(el("p", text.description, "Text escapes: \\u000A is a line break, \\u0009 is a tab, and \\\\ is a literal backslash."), { id: textHint }),
 		controls);
@@ -335,16 +334,9 @@ function labelled(id: string, label: string, input: HTMLInputElement | HTMLTextA
 function textField(id: string, label: string, original: string): Field<string> {
 	const input = attrs(el("textarea", `${fields.input} min-h-16 resize-y py-1.5`), { rows: "2", "aria-describedby": textHint });
 	// Encode before assigning to the textarea, whose value normalizes raw line endings.
-	const encoded = encodePlanText(original);
+	const encoded = encodeExactText(original);
 	input.value = encoded;
-	return { root: labelled(id, label, input), read: () => input.value === encoded ? original :
-		input.value.replace(/\\\\|\\u(?:([\dA-Fa-f]{4})|\{([\dA-Fa-f]{1,6})\})/g,
-			(match, bmp: string | undefined, extended: string | undefined) => {
-				if (match === "\\\\") return "\\";
-				const point = Number.parseInt((bmp ?? extended) || "", 16);
-				// Do not turn newly typed escapes into isolated UTF-16 surrogate code units.
-				return point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff) ? match : String.fromCodePoint(point);
-			}) };
+	return { root: labelled(id, label, input), read: () => input.value === encoded ? original : decodeExactText(input.value) };
 }
 
 function slugField(id: string, label: string, value: string): { root: HTMLElement; input: HTMLInputElement } {
@@ -384,16 +376,16 @@ function bindingField(id: string, bindings: readonly Binding[], original: Bindin
 		binding.purposeRevision === original.purposeRevision && binding.purposeDigest === original.purposeDigest);
 	const input = el("select", fields.input,
 		attrs(el("option", "", bindings.length ? "Choose an agreed purpose" : "No agreed purpose available"), { value: "" }),
-		...bindings.map((binding, i) => attrs(el("option", "", encodePlanText(label(binding))), { value: String(i) })));
+		...bindings.map((binding, i) => attrs(el("option", "", encodeExactText(label(binding))), { value: String(i) })));
 	const root = labelled(id, "Exact agreed purpose binding", input);
 	if (initial !== null && initial >= 0) input.selectedIndex = initial + 1;
 	const detail = el("p", text.description);
 	const describe = () => {
 		const selected = bindings[input.selectedIndex - 1];
 		detail.replaceChildren();
-		if (selected) detail.append(visiblePlanText(label(selected)));
+		if (selected) detail.append(visibleExactText(label(selected)));
 		else if (original && initial === -1)
-			detail.append("Current binding is not one of the allowed choices: ", visiblePlanText(label(original)));
+			detail.append("Current binding is not one of the allowed choices: ", visibleExactText(label(original)));
 		detail.hidden = detail.childNodes.length === 0;
 	};
 	input.addEventListener("input", describe);

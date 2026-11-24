@@ -7,6 +7,7 @@ import { button } from "../ui/controls.ts";
 import { attrs, type Child, el } from "../ui/dom.ts";
 import { duration, plural } from "../ui/format.ts";
 import { facts, listRow, pageFrame, panel, rowList, section } from "../ui/page.ts";
+import { connectionSentence } from "./connections.ts";
 
 /** The published releases page named in the README; the only external link, since the docs host is not decided. */
 const releasesUrl = "https://github.com/francman/unit-001-releases/releases";
@@ -192,8 +193,3 @@ function memorySentence(working: number, episodic: number): string {
 	return `${plural(working, "memory", "memories")} in mind and ${plural(episodic, "older one", "older ones")}.`;
 }
 
-function connectionSentence(channels: Details["channels"]): string {
-	if (channels.length === 0) return "No connections set up.";
-	const ready = channels.filter((channel) => channel.status === "ready" && channel.failure === null && channel.awaiting === null).length;
-	return `${plural(channels.length, "connection", "connections")}, ${ready} ready.`;
-}

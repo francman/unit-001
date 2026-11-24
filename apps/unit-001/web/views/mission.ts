@@ -8,7 +8,8 @@ import { type Child, el } from "../ui/dom.ts";
 import { ago, count, dateTime, duration, humanize, money, until } from "../ui/format.ts";
 import { facts, listRow, pageFrame, panel, rowList, section } from "../ui/page.ts";
 import { type MissionPlanOptions, renderMissionPlan } from "./mission-plan.ts";
-import { encodePlanText, type PlanTerminalCommand } from "./mission-plan-display.ts";
+import { encodeExactText } from "./exact-text.ts";
+import type { PlanTerminalCommand } from "./mission-plan-display.ts";
 import { bullets, chips, limitRow, runStates, unknownSentence } from "../ui/run.ts";
 
 const approvers: Record<MissionAgreementView["approvedBy"], string> = {
@@ -42,7 +43,7 @@ export function renderMission(ctx: Ctx, openDraft?: () => void, planActions?: Pl
 	const { root, body } = pageFrame({
 		title: "Mission",
 		key: "mission",
-		lead: mission?.plan?.head ? encodePlanText(mission.plan.head.terms.overall.purpose) : mission?.objective ?? "No purpose agreed yet.",
+		lead: mission?.plan?.head ? encodeExactText(mission.plan.head.terms.overall.purpose) : mission?.objective ?? "No purpose agreed yet.",
 		actions: [state ? tag(state.word, state.tone) : null, planEntry, entry],
 	});
 	if (!details) {
