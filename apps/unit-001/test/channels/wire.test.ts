@@ -5,11 +5,10 @@ import { parseChannelResult } from "../../src/channels/wire.ts";
 import { grantFixture } from "./fixtures.ts";
 
 describe("channel result wire", () => {
-	it("reconstructs public fields and rejects contradictory status, invalid health and oversized registries", () => {
+	it("reconstructs public fields and rejects invalid health, capabilities and oversized registries", () => {
 		const fixture = grantFixture();
 		const record = {
 			request: fixture.request,
-			status: "configured",
 			outcome: { kind: "configured", token: "secret" },
 			lastHealth: null,
 		};
@@ -20,9 +19,12 @@ describe("channel result wire", () => {
 			token: "secret",
 		};
 		expect(JSON.stringify(parseChannelResult(result))).not.toContain("secret");
-		expect(() =>
-			parseChannelResult({ ...result, view: { ...result.view, channels: [{ ...record, status: "ready" }] } }),
-		).toThrow("status");
+		// The outcome is the only channel state; an unknown attempt is never relabelled.
+		const unknown = { ...record, status: "failed", outcome: { kind: "unknown", attemptId: "attempt-1" } };
+		const parsed = parseChannelResult({ ...result, view: { ...result.view, channels: [unknown] } });
+		expect(parsed.operation === "status" && parsed.view.channels).toEqual([
+			{ request: fixture.request, outcome: { kind: "unknown", attemptId: "attempt-1" }, lastHealth: null },
+		]);
 		expect(() =>
 			parseChannelResult({
 				...result,
@@ -32,6 +34,14 @@ describe("channel result wire", () => {
 		expect(() =>
 			parseChannelResult({ ...result, view: { ...result.view, channels: Array(17).fill(record) } }),
 		).toThrow("capacity");
+		const adapter = (capabilities: unknown) => ({
+			...result,
+			view: { ...result.view, available: [{ ...TELEGRAM_ADAPTER, capabilities }] },
+		});
+		// Adapter metadata may list no capability; requests and grants may not.
+		expect(parseChannelResult(adapter([]))).toMatchObject({ view: { available: [{ capabilities: [] }] } });
+		expect(() => parseChannelResult(adapter(["status", "status"]))).toThrow("unique");
+		expect(() => parseChannelResult(adapter(["inbox"]))).toThrow("Unknown channel capability");
 	});
 	it("accepts closed setup outcomes and only managed-bot confirmation links", () => {
 		for (const outcome of [

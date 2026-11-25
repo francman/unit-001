@@ -169,8 +169,6 @@ describe("channel integration", () => {
 		expect(observed).toContain("setup-1");
 		expect(observed).toContain("awaiting_creator");
 		expect(observed).toContain("unit_channel_setup");
-		expect(observed).toContain("You operate inside unit-001");
-		expect(observed).toContain("unit_inspect_os");
 		expect(observed).toContain("Never request credentials");
 	});
 

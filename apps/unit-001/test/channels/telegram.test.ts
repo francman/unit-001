@@ -32,7 +32,7 @@ describe("Telegram managed provisioning", () => {
 		const client = await api((path, body) => {
 			calls.push(path);
 			if (path.endsWith("getUpdates")) {
-				expect(body).toMatchObject({ offset: 10, allowed_updates: ["managed_bot"], limit: 100 });
+				expect(body).toMatchObject({ offset: 0, allowed_updates: ["managed_bot"], limit: 100 });
 				return {
 					result: [
 						{
@@ -51,10 +51,9 @@ describe("Telegram managed provisioning", () => {
 		expect(client.creationLink("manager_bot", "agent_child_bot", "unit-001")).toBe(
 			"https://t.me/newbot/manager_bot/agent_child_bot?name=unit-001",
 		);
-		expect(await client.managedBots("12:manager_secret", 10)).toEqual({
-			nextOffset: 11,
-			bots: [{ botId: 81, creatorId: 42, username: "agent_child_bot" }],
-		});
+		expect(await client.managedBots("12:manager_secret")).toEqual([
+			{ botId: 81, creatorId: 42, username: "agent_child_bot" },
+		]);
 		const token = await client.managedToken("12:manager_secret", 81);
 		await client.verifyBot(token, 81);
 		expect(calls.map((path) => path.split("/").at(-1))).toEqual(["getUpdates", "getManagedBotToken", "getMe"]);
@@ -74,9 +73,33 @@ describe("Telegram managed provisioning", () => {
 		}
 	});
 
+	it("classifies a well-formed managed-bot identity mismatch apart from malformed provider data", async () => {
+		const event = (bot: unknown, user: unknown = { id: 42 }) => ({ update_id: 1, managed_bot: { user, bot } });
+		const responses: Record<string, unknown[]> = {
+			identity: [event({ id: 81, is_bot: false, username: "agent_child_bot" })],
+			creatorBot: [event({ id: 81, is_bot: true, username: "agent_child_bot" }, { id: 42, is_bot: true })],
+			malformed: [event({ id: "81", is_bot: true, username: "agent_child_bot" })],
+			noUpdateId: [
+				{ managed_bot: { user: { id: 42 }, bot: { id: 81, is_bot: true, username: "agent_child_bot" } } },
+			],
+		};
+		let current = "identity";
+		const client = await api((path) =>
+			path.endsWith("getMe") ? { result: "not-an-object" } : { result: responses[current] },
+		);
+		await expect(client.managedBots("12:manager_secret")).rejects.toThrow("identity");
+		current = "creatorBot";
+		await expect(client.managedBots("12:manager_secret")).rejects.toThrow("identity");
+		current = "malformed";
+		await expect(client.managedBots("12:manager_secret")).rejects.toThrow("provider");
+		current = "noUpdateId";
+		await expect(client.managedBots("12:manager_secret")).rejects.toThrow("provider");
+		await expect(client.verifyBot("81:child_secret", 81)).rejects.toThrow("provider");
+	});
+
 	it("bounds malformed update batches and rejects public plaintext endpoints", async () => {
 		const client = await api(() => ({ result: Array.from({ length: 101 }, () => ({})) }));
-		await expect(client.managedBots("12:manager_secret", 0)).rejects.toThrow("provider");
+		await expect(client.managedBots("12:manager_secret")).rejects.toThrow("provider");
 		expect(() => new TelegramClient("http://example.com")).toThrow("HTTPS");
 		expect(() => client.creationLink("bad/path", "agent_child_bot", "agent")).toThrow("username");
 	});

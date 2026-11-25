@@ -1,33 +1,37 @@
 // Connects the channel foundation to one owner and drains external setup before maintenance or close.
 import type { Context } from "@earendil-works/chord/context";
 import type { Extension, Harness } from "@earendil-works/pi-durable";
-import { MaintenanceDoc } from "../maintenance.ts";
 import type { MissionLocation } from "../missions/authority.ts";
 import { readChannelAuthority } from "./authority.ts";
-import { type ChannelCommand, type ChannelResult, handleChannelCommand, parseChannelCommand } from "./control.ts";
+import type { ChannelAdapter } from "./contract.ts";
+import { type ChannelCommand, type ChannelResult, handleChannelCommand } from "./control.ts";
 import { ChannelCredentials } from "./credentials.ts";
 import { channelExtension } from "./extension.ts";
-import { ChannelDoc } from "./registry.ts";
+import { ChannelDoc, changeChannels } from "./registry.ts";
 import type { ChannelAuthorityReader, ChannelSetupAdapter } from "./setup.ts";
 import { TELEGRAM_ADAPTER, TelegramClient } from "./telegram.ts";
 import { telegramSetupAdapter } from "./telegram-setup.ts";
 
 export type ChannelHost = {
 	extension: Extension;
+	/** The one adapter catalog both the model tools and direct owner commands admit requests against. */
+	adapters: readonly ChannelAdapter[];
 	readAuthority: ChannelAuthorityReader;
 	setupAdapters: readonly ChannelSetupAdapter[];
 };
 
 /** Assembles only implemented adapters; no credentials are read and no network call occurs at owner startup. */
 export function defaultChannelHost(location: MissionLocation, credentialDirectory: string): ChannelHost {
+	const adapters = [TELEGRAM_ADAPTER];
 	const readAuthority = () => readChannelAuthority(location);
 	const setupAdapters = [
 		telegramSetupAdapter(new ChannelCredentials(credentialDirectory), new TelegramClient(), Date.now),
 	];
 	return {
+		adapters,
 		readAuthority,
 		setupAdapters,
-		extension: channelExtension([TELEGRAM_ADAPTER], readAuthority, setupAdapters),
+		extension: channelExtension(adapters, readAuthority, setupAdapters),
 	};
 }
 
@@ -57,9 +61,8 @@ export class ChannelOwner {
 		await Promise.all(this.#pending.values());
 	}
 
-	/** Runs bounded host-granted channel operations through the same store as model tools. */
-	async request(command: ChannelCommand, context: Context): Promise<ChannelResult> {
-		const input = parseChannelCommand(command);
+	/** Runs bounded host-granted channel operations through the same store as model tools; callers pass parsed commands. */
+	async request(input: ChannelCommand, context: Context): Promise<ChannelResult> {
 		if (input.operation !== "setup" && input.operation !== "reconcile")
 			return this.execute(input, context, context.abortSignal);
 		const controller = new AbortController();
@@ -85,15 +88,10 @@ export class ChannelOwner {
 			input,
 			{
 				read: () => this.#harness.snapshot(ChannelDoc, context),
-				commit: (change) =>
-					this.#harness.commit(async (tx) => {
-						if ((await tx.doc(MaintenanceDoc)).current.state === "held")
-							throw new Error("Service is held for maintenance.");
-						return change(await tx.doc(ChannelDoc));
-					}, context),
+				commit: (change) => this.#harness.commit((tx) => changeChannels(tx, change), context),
 			},
 			this.#host.readAuthority,
-			[TELEGRAM_ADAPTER],
+			this.#host.adapters,
 			this.#host.setupAdapters,
 			Date.now,
 			{ signal },

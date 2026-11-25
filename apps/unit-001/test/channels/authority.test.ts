@@ -7,6 +7,7 @@ import {
 	channelAuthorityPath,
 	issueChannelGrant,
 	matchingChannelGrant,
+	parseChannelAuthority,
 	readChannelAuthority,
 	writeChannelAuthority,
 } from "../../src/channels/authority.ts";
@@ -75,6 +76,24 @@ describe("channel authority", () => {
 		expect(
 			matchingChannelGrant(fixture.request, { ...fixture, creator: { ...fixture.creator, revision: 2 } }, 1000),
 		).toBeUndefined();
+	});
+
+	it("parses protected ceilings and grants as nonempty, unique, known capability lists", () => {
+		const fixture = grantFixture();
+		expect(parseChannelAuthority(fixture.channels)).toEqual(fixture.channels);
+		const withCeiling = (capabilities: unknown) => ({
+			...fixture.channels,
+			ceiling: [{ ...fixture.channels.ceiling[0], capabilities }],
+		});
+		const withGrant = (capabilities: unknown) => ({
+			...fixture.channels,
+			grants: [{ ...fixture.channels.grants[0], capabilities }],
+		});
+		for (const build of [withCeiling, withGrant]) {
+			expect(() => parseChannelAuthority(build([]))).toThrow("Invalid channel capabilities");
+			expect(() => parseChannelAuthority(build(["notify", "notify"]))).toThrow("unique");
+			expect(() => parseChannelAuthority(build(["inbox"]))).toThrow("Unknown channel capability");
+		}
 	});
 
 	it("persists developer grants through protected files and rejects symlink/writable authority", async () => {

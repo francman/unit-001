@@ -29,8 +29,8 @@ export function telegramSetupAdapter(
 						: undefined;
 				// A managed_bot event is provider evidence of creator ownership, not a model-supplied bot identity.
 				await authorized();
-				const updates = await client.managedBots(managerToken, 0, signal);
-				const matches = updates.bots.filter(
+				const bots = await client.managedBots(managerToken, signal);
+				const matches = bots.filter(
 					(bot) =>
 						bot.creatorId === creatorId &&
 						(requestedBotId === null ? bot.username === suggestedUsername : bot.botId === requestedBotId),

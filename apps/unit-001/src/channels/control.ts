@@ -54,16 +54,14 @@ export async function handleChannelCommand(
 		};
 	}
 	const view = channelView(await store.read(), adapters);
+	// The displayed outcome is the saved one filtered by current authority; historical health never implies a grant.
 	for (const channel of view.channels) {
-		if (authority?.channels?.disabled.includes(channel.request.channelId)) {
-			channel.status = "disabled";
-			channel.outcome = { kind: "disabled" };
-			continue;
-		}
-		if (channel.status !== "disabled" && (!authority || !matchingChannelGrant(channel.request, authority, now()))) {
-			channel.status = "awaiting_creator";
+		if (authority?.channels?.disabled.includes(channel.request.channelId)) channel.outcome = { kind: "disabled" };
+		else if (
+			channel.outcome.kind !== "disabled" &&
+			(!authority || !matchingChannelGrant(channel.request, authority, now()))
+		)
 			channel.outcome = { kind: "awaiting_creator", step: "grant" };
-		}
 	}
 	return { operation: "status" as const, observedAt: now(), view };
 }

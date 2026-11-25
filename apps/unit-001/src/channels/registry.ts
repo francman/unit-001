@@ -1,6 +1,7 @@
-// Stores replay-safe channel setup requests and projects observed channel state.
+// Stores replay-safe channel setup requests, admits their writes and projects observed channel state.
 import { createHash } from "node:crypto";
-import { defineDoc } from "@earendil-works/pi-durable";
+import { defineDoc, type Tx } from "@earendil-works/pi-durable";
+import { MaintenanceDoc } from "../maintenance.ts";
 import type { MissionAuthority } from "../missions/contract.ts";
 import type {
 	ChannelAdapter,
@@ -119,9 +120,14 @@ export function channelView(state: ChannelState | undefined, adapters: readonly 
 		available: adapters,
 		channels: Object.values(state?.channels ?? {}).map((record) => ({
 			request: record.request,
-			status: record.outcome.kind === "unknown" ? "failed" : record.outcome.kind,
 			outcome: record.outcome,
 			lastHealth: record.lastHealth,
 		})),
 	};
+}
+
+/** Admits one channel mutation inside the caller's transaction; a maintenance hold blocks every channel write. */
+export async function changeChannels<T>(tx: Tx, change: (state: ChannelState) => T): Promise<T> {
+	if ((await tx.doc(MaintenanceDoc)).current.state === "held") throw new Error("Service is held for maintenance.");
+	return change(await tx.doc(ChannelDoc));
 }

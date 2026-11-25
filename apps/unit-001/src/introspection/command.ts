@@ -9,11 +9,13 @@ import {
 /** Resolves explicit selectors without probabilistic inference or an arbitrary filesystem path. */
 export function inspectionCommand(scope = "runtime", path?: string, offset = 0): InspectionQuery {
 	if (scope === "file") return parseInspectionQuery({ scope, path, offset });
-	if (path !== undefined || offset !== 0 || !INSPECTION_SCOPES.some((value) => value === scope))
+	const selected = INSPECTION_SCOPES.find((value) => value === scope);
+	// Checked here rather than by parseInspectionQuery so an operator typo gets the usage text.
+	if (path !== undefined || offset !== 0 || selected === undefined)
 		throw new Error(
 			"Usage: inspect runtime|configuration|tools|channels|mission|tasks|host, or inspect file PATH [--offset N].",
 		);
-	return parseInspectionQuery({ scope });
+	return { scope: selected };
 }
 
 /** Labels a bounded owner summary with the observation time and its explicitly limited coverage. */

@@ -48,9 +48,10 @@ describe("channel registry", () => {
 		expect(request.creator.kind).toBe("organization");
 		expect(requestChannelSetup(state, input(), authority, adapters, 1000)).toBe(request);
 		expect(state.revision).toBe(1);
-		expect(channelView(state, adapters).channels[0]).toMatchObject({
-			status: "awaiting_creator",
-			outcome: { step: "grant" },
+		expect(channelView(state, adapters).channels[0]).toEqual({
+			request,
+			outcome: { kind: "awaiting_creator", step: "grant" },
+			lastHealth: null,
 		});
 	});
 
@@ -90,6 +91,7 @@ describe("channel registry", () => {
 			"expire",
 		);
 		expect(() => parseChannelSetupInput({ ...proposal, capabilities: ["notify", "notify"] })).toThrow("unique");
+		expect(() => parseChannelSetupInput({ ...proposal, capabilities: [] })).toThrow("nonempty");
 	});
 
 	it("blocks replacing an unresolved request that can still be granted", () => {

@@ -13,6 +13,7 @@ import { channelExtension } from "../../src/channels/extension.ts";
 import { ChannelOwner } from "../../src/channels/owner.ts";
 import { ChannelDoc } from "../../src/channels/registry.ts";
 import { TELEGRAM_ADAPTER } from "../../src/channels/telegram.ts";
+import { inspectAgent } from "../../src/introspection/report.ts";
 import { writeMissionAuthority } from "../../src/missions/authority.ts";
 import { grantFixture } from "./fixtures.ts";
 
@@ -125,6 +126,7 @@ describe("channel owner", () => {
 			},
 		];
 		const owner = new ChannelOwner(harness, {
+			adapters: [TELEGRAM_ADAPTER],
 			readAuthority,
 			setupAdapters,
 			extension: channelExtension([TELEGRAM_ADAPTER], readAuthority, setupAdapters),
@@ -136,5 +138,73 @@ describe("channel owner", () => {
 		expect((await pending).operation).toBe("setup");
 		expect(owner.pending).toBe(0);
 		expect((await harness.snapshot(ChannelDoc, BACKGROUND_CONTEXT))?.channels.creator.outcome.kind).toBe("unknown");
+	});
+
+	it("agrees with inspection on an unknown attempt and admits proposals against the host catalog", async () => {
+		const fixture = grantFixture();
+		fixture.request.expiresAt = Date.now() + 60000;
+		fixture.channels.grants[0].expiresAt = fixture.request.expiresAt;
+		const attempt = { id: "attempt-1", grantId: fixture.channels.grants[0].id, startedAt: 1000 };
+		fixture.state.channels.creator.attempt = attempt;
+		fixture.state.channels.creator.outcome = { kind: "unknown", attemptId: attempt.id };
+		const harness = await Harness.open(
+			await openNodeSqliteStorage(join(directory, "inspect.sqlite")),
+			{ registry: createRegistry(), models: createModels() },
+			BACKGROUND_CONTEXT,
+		);
+		owners.push(harness);
+		await harness.commit(async (tx) => Object.assign(await tx.doc(ChannelDoc), fixture.state), BACKGROUND_CONTEXT);
+		const readAuthority = async () => fixture;
+		const adapters = [{ id: "test-mail", capabilities: ["notify"] as const, setup: "external" as const }];
+		const owner = new ChannelOwner(harness, {
+			adapters,
+			readAuthority,
+			setupAdapters: [],
+			extension: channelExtension(adapters, readAuthority),
+		});
+		const status = await owner.request({ operation: "status" }, BACKGROUND_CONTEXT);
+		expect(status.operation === "status" && status.view.channels[0].outcome).toEqual({
+			kind: "unknown",
+			attemptId: attempt.id,
+		});
+		const unused = () => {
+			throw new Error("Only the channel scope is inspected.");
+		};
+		const report = await inspectAgent(
+			{ scope: "channels" },
+			{
+				harness,
+				runtime: unused,
+				mission: { inspect: unused },
+				channels: owner,
+				tools: [],
+				workspace: directory,
+				implementationRoot: directory,
+			},
+			BACKGROUND_CONTEXT,
+		);
+		expect(report.data).toMatchObject({
+			scope: "channels",
+			available: ["test-mail"],
+			channels: [{ id: "creator", state: "unknown" }],
+		});
+		const proposal = (adapter: string) =>
+			owner.request(
+				{
+					operation: "request",
+					input: {
+						requestId: `request-${adapter}`,
+						channelId: adapter,
+						expectedRevision: 0,
+						adapter,
+						destination: "42",
+						capabilities: ["notify"],
+						expiresAt: Date.now() + 60000,
+					},
+				},
+				BACKGROUND_CONTEXT,
+			);
+		await expect(proposal("telegram")).rejects.toThrow("does not support");
+		expect((await proposal("test-mail")).operation).toBe("request");
 	});
 });

@@ -38,40 +38,41 @@ export class TelegramClient {
 		return `https://t.me/newbot/${managerUsername}/${suggestedUsername}?${new URLSearchParams({ name: channelText(name, 64) })}`;
 	}
 
-	/** Reads a bounded update batch; the owner persists its cursor only after processing every event. */
-	async managedBots(
-		token: string,
-		offset: number,
-		signal?: AbortSignal,
-	): Promise<{ nextOffset: number; bots: TelegramManagedBot[] }> {
+	/** Reads at most 100 managed-bot events from offset zero; setup owns no update cursor and never advances one. */
+	async managedBots(token: string, signal?: AbortSignal): Promise<TelegramManagedBot[]> {
 		const result = await this.call(
 			token,
 			"getUpdates",
-			{ offset: channelInteger(offset), limit: 100, timeout: 0, allowed_updates: ["managed_bot"] },
+			{ offset: 0, limit: 100, timeout: 0, allowed_updates: ["managed_bot"] },
 			signal,
 		);
 		if (!Array.isArray(result) || result.length > 100) throw new TelegramFailure("provider");
-		let nextOffset = offset;
-		const bots: TelegramManagedBot[] = [];
-		try {
-			for (const value of result) {
+		const events = providerShape(() =>
+			result.flatMap((value) => {
 				const update = channelObject(value);
-				nextOffset = Math.max(nextOffset, channelInteger(update.update_id) + 1);
-				if (update.managed_bot === undefined) continue;
+				channelInteger(update.update_id);
+				if (update.managed_bot === undefined) return [];
 				const managed = channelObject(update.managed_bot);
 				const bot = channelObject(managed.bot);
 				const user = channelObject(managed.user);
-				if (bot.is_bot !== true || user.is_bot === true) throw new TelegramFailure("identity");
-				bots.push({
-					botId: channelInteger(bot.id),
-					creatorId: channelInteger(user.id),
-					username: channelText(bot.username),
-				});
-			}
-		} catch {
-			throw new TelegramFailure("provider");
-		}
-		return { nextOffset, bots };
+				return [
+					{
+						botIsBot: bot.is_bot,
+						userIsBot: user.is_bot,
+						bot: {
+							botId: channelInteger(bot.id),
+							creatorId: channelInteger(user.id),
+							username: channelText(bot.username),
+						},
+					},
+				];
+			}),
+		);
+		// A well-formed event naming a non-bot account, or a bot as its creator, is an identity mismatch, not bad data.
+		return events.map((event) => {
+			if (event.botIsBot !== true || event.userIsBot === true) throw new TelegramFailure("identity");
+			return event.bot;
+		});
 	}
 
 	/** Retrieves only a managed bot's token; it never invokes user-only bots.createBot or rotates credentials. */
@@ -85,12 +86,8 @@ export class TelegramClient {
 	/** Verifies that a retrieved credential belongs to the exact creator-confirmed bot. */
 	async verifyBot(token: string, botId: number, signal?: AbortSignal): Promise<void> {
 		const result = await this.call(token, "getMe", {}, signal);
-		try {
-			const bot = channelObject(result);
-			if (bot.id !== botId || bot.is_bot !== true) throw new TelegramFailure("identity");
-		} catch {
-			throw new TelegramFailure("identity");
-		}
+		const bot = providerShape(() => channelObject(result));
+		if (bot.id !== botId || bot.is_bot !== true) throw new TelegramFailure("identity");
 	}
 
 	private async call(
@@ -141,5 +138,14 @@ export class TelegramClient {
 		} catch {
 			throw new TelegramFailure("provider");
 		}
+	}
+}
+
+// Malformed provider data is a provider failure, kept apart from a well-formed identity mismatch; no parse text escapes.
+function providerShape<T>(read: () => T): T {
+	try {
+		return read();
+	} catch {
+		throw new TelegramFailure("provider");
 	}
 }

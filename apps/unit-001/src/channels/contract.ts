@@ -70,15 +70,8 @@ export function parseChannelSetupInput(value: unknown): ChannelSetupInput {
 		"expiresAt",
 	];
 	if (Object.keys(input).some((key) => !allowed.includes(key))) throw new Error("Unknown channel setup field.");
-	if (!Array.isArray(input.capabilities) || input.capabilities.length > CHANNEL_CAPABILITIES.length)
-		throw new Error("Invalid channel capabilities.");
-	const capabilities = input.capabilities.map((value) => {
-		if (!CHANNEL_CAPABILITIES.some((capability) => capability === value))
-			throw new Error("Unknown channel capability.");
-		return value as ChannelCapability;
-	});
-	if (!capabilities.length || new Set(capabilities).size !== capabilities.length)
-		throw new Error("Channel capabilities must be nonempty and unique.");
+	const capabilities = parseChannelCapabilities(input.capabilities);
+	if (!capabilities.length) throw new Error("Channel capabilities must be nonempty.");
 	return {
 		requestId: channelIdentity(input.requestId),
 		channelId: channelIdentity(input.channelId),
@@ -88,6 +81,18 @@ export function parseChannelSetupInput(value: unknown): ChannelSetupInput {
 		capabilities,
 		expiresAt: channelInteger(input.expiresAt),
 	};
+}
+
+/** Reads an ordered, duplicate-free list of known capabilities; boundaries that need a nonempty list check it. */
+export function parseChannelCapabilities(value: unknown): ChannelCapability[] {
+	if (!Array.isArray(value) || value.length > CHANNEL_CAPABILITIES.length)
+		throw new Error("Invalid channel capabilities.");
+	if (new Set(value).size !== value.length) throw new Error("Channel capabilities must be unique.");
+	return value.map((item) => {
+		const capability = CHANNEL_CAPABILITIES.find((entry) => entry === item);
+		if (capability === undefined) throw new Error("Unknown channel capability.");
+		return capability;
+	});
 }
 
 /** Validates dictionary identities at model and operator wire boundaries. */

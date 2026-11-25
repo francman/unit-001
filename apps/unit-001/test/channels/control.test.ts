@@ -33,16 +33,37 @@ describe("channel control", () => {
 				() => now,
 			);
 		const ready = await inspect(1000);
-		expect(ready.operation === "status" && ready.view.channels[0].status).toBe("ready");
+		expect(ready.operation === "status" && ready.view.channels[0].outcome.kind).toBe("ready");
 		const expired = await inspect(5000);
-		expect(expired.operation === "status" && expired.view.channels[0].status).toBe("awaiting_creator");
+		expect(expired.operation === "status" && expired.view.channels[0].outcome.kind).toBe("awaiting_creator");
 		fixture.channels.disabled = ["creator"];
 		const disabled = await inspect(1000);
-		expect(disabled.operation === "status" && disabled.view.channels[0].status).toBe("disabled");
+		expect(disabled.operation === "status" && disabled.view.channels[0].outcome.kind).toBe("disabled");
 		fixture.channels.disabled = [];
 		fixture.creator.revision++;
 		const changed = await inspect(1000);
-		expect(changed.operation === "status" && changed.view.channels[0].status).toBe("awaiting_creator");
+		expect(changed.operation === "status" && changed.view.channels[0].outcome.kind).toBe("awaiting_creator");
+	});
+
+	it("reports a granted unknown attempt as unknown, with one state and never as failed", async () => {
+		const fixture = grantFixture();
+		const attempt = { id: "attempt-1", grantId: fixture.channels.grants[0].id, startedAt: 1000 };
+		fixture.state.channels.creator.attempt = attempt;
+		fixture.state.channels.creator.outcome = { kind: "unknown", attemptId: attempt.id };
+		const result = await handleChannelCommand(
+			{ operation: "status" },
+			{ read: async () => structuredClone(fixture.state), commit: async (change) => change(fixture.state) },
+			async () => fixture,
+			[{ id: "telegram", capabilities: ["notify"], setup: "managed-bot" }],
+			[],
+			() => 1000,
+		);
+		// Before omp-13 the view also carried status "failed" beside this outcome.
+		expect(result.operation === "status" && result.view.channels[0]).toEqual({
+			request: fixture.request,
+			outcome: { kind: "unknown", attemptId: attempt.id },
+			lastHealth: null,
+		});
 	});
 
 	it("runs a second host-registered adapter through the same request, grant and journal contract", async () => {

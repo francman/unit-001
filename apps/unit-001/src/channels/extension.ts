@@ -9,10 +9,9 @@ import {
 	section,
 	type ToolExecutionApi,
 } from "@earendil-works/pi-durable";
-import { MaintenanceDoc } from "../maintenance.ts";
 import { CHANNEL_CAPABILITIES, type ChannelAdapter } from "./contract.ts";
 import { handleChannelCommand, parseChannelCommand } from "./control.ts";
-import { ChannelDoc } from "./registry.ts";
+import { ChannelDoc, changeChannels } from "./registry.ts";
 import type { ChannelAuthorityReader, ChannelSetupAdapter, ChannelStore } from "./setup.ts";
 
 /** Registers only metadata and exact-grant setup tools; a model cannot issue grants or receive credentials. */
@@ -109,11 +108,6 @@ export function channelExtension(
 function channelToolStore(api: ToolExecutionApi, context: Context): ChannelStore {
 	return {
 		read: () => api.snapshot(ChannelDoc, context),
-		commit: (change) =>
-			api.commit(async (tx) => {
-				if ((await tx.doc(MaintenanceDoc)).current.state === "held")
-					throw new Error("Service is held for maintenance.");
-				return change(await tx.doc(ChannelDoc));
-			}, context),
+		commit: (change) => api.commit((tx) => changeChannels(tx, change), context),
 	};
 }

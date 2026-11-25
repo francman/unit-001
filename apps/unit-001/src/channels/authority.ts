@@ -7,12 +7,12 @@ import { dirname, join } from "node:path";
 import { type MissionLocation, missionAuthorityPath, readMissionAuthority } from "../missions/authority.ts";
 import { type MissionAuthority, parseMissionCreator } from "../missions/contract.ts";
 import {
-	CHANNEL_CAPABILITIES,
 	type ChannelCapability,
 	type ChannelRequest,
 	channelInteger,
 	channelObject,
 	channelText,
+	parseChannelCapabilities,
 	parseChannelSetupInput,
 } from "./contract.ts";
 import { channelRequestDigest } from "./registry.ts";
@@ -255,16 +255,9 @@ export function matchingChannelGrant(
 	);
 }
 
+// Ceilings and grants permit something, so an empty list is malformed rather than "nothing allowed".
 function capabilities(value: unknown): ChannelCapability[] {
-	if (
-		!Array.isArray(value) ||
-		value.length < 1 ||
-		value.length > CHANNEL_CAPABILITIES.length ||
-		new Set(value).size !== value.length
-	)
-		throw new Error("Invalid channel capabilities.");
-	return value.map((item) => {
-		if (!CHANNEL_CAPABILITIES.some((entry) => entry === item)) throw new Error("Unknown channel capability.");
-		return item as ChannelCapability;
-	});
+	const capabilities = parseChannelCapabilities(value);
+	if (!capabilities.length) throw new Error("Invalid channel capabilities.");
+	return capabilities;
 }

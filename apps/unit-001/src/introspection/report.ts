@@ -4,7 +4,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import type { ChannelOwner } from "../channels/owner.ts";
 import type { MissionControl } from "../missions/control.ts";
 import type { RuntimeFacts } from "../orientation.ts";
-import { type InspectionData, type InspectionQuery, type InspectionReport, parseInspectionQuery } from "./contract.ts";
+import type { InspectionData, InspectionQuery, InspectionReport } from "./contract.ts";
 import { implementationExcerpt } from "./files.ts";
 import { hostResources } from "./host.ts";
 
@@ -18,15 +18,14 @@ export type InspectionHost = {
 	implementationRoot: string;
 };
 
-/** Collects one bounded read-only view; tool registration and saved configuration never imply a healthy integration. */
+/** Collects one bounded read-only view of a query its ingress already parsed; registration and saved configuration never imply a healthy integration. */
 export async function inspectAgent(
 	query: InspectionQuery,
 	host: InspectionHost,
 	context: Context,
 ): Promise<InspectionReport> {
-	const input = parseInspectionQuery(query);
 	let data: InspectionData;
-	switch (input.scope) {
+	switch (query.scope) {
 		case "runtime":
 			data = { scope: "runtime", facts: host.runtime() };
 			break;
@@ -103,7 +102,10 @@ export async function inspectAgent(
 			data = { scope: "host", facts: await hostResources(host.workspace) };
 			break;
 		case "file":
-			data = { scope: "file", result: await implementationExcerpt(host.implementationRoot, input.path, input.offset) };
+			data = {
+				scope: "file",
+				result: await implementationExcerpt(host.implementationRoot, query.path, query.offset),
+			};
 			break;
 	}
 	const report: InspectionReport = {
