@@ -32,6 +32,7 @@ import {
 	createUpdateContext,
 	installUpdateCore,
 	readUpdateJournal,
+	recoveryDropIn,
 	recoveryUnit,
 	restartUpdateScheduling,
 	smokeCandidateWebCore,
@@ -526,6 +527,15 @@ export async function removeWebActivation(record, context) {
 	syncWebParent(paths.config);
 }
 
+/** Refuses, without changing anything, persistent web files that removeWebActivation would preserve. */
+export function assertWebActivationOwned(record, root = "/") {
+	const paths = webPaths(record, root);
+	const config = readWebActivation(record, root);
+	inspectWebFiles(paths, webUnits(record, config?.uid, paths), config, root);
+	// Whether a registered listener's socket is active needs the manager; removal checks that after the owner stop.
+	inspectWebListener(paths, config, root);
+}
+
 // The shell installer calls this after the owner stop, under its existing management lock.
 async function quiesceWebActivation(record, context) {
 	const { root } = context;
@@ -687,17 +697,21 @@ function inspectWebFiles(paths, units, config, root) {
 }
 
 function checkWebListener(paths, config, socketState, root) {
+	if (inspectWebListener(paths, config, root) && !["active", "activating", "deactivating"].includes(socketState))
+		throw new Error(`Preserving unexpected persistent web listener: ${paths.listenerPath}`);
+}
+
+// The filesystem half of checkWebListener: it reads only, so uninstall can run it before the owner stop.
+function inspectWebListener(paths, config, root) {
 	const directory = dirname(paths.listenerPath);
 	const parent = protectedWebPath(directory, root);
 	if (parent && (!parent.isDirectory() || parent.uid !== webRootUid(root) || (parent.mode & 0o7777) !== 0o755))
 		throw new Error(`Preserving unexpected persistent web directory: ${directory}`);
 	const info = protectedWebPath(paths.listenerPath, root);
 	// The operator can chmod their own socket, but only the administrator can replace it in this directory.
-	if (
-		info &&
-		(!config || !["active", "activating", "deactivating"].includes(socketState) || !info.isSocket() || info.uid !== config.uid)
-	)
+	if (info && (!config || !info.isSocket() || info.uid !== config.uid))
 		throw new Error(`Preserving unexpected persistent web listener: ${paths.listenerPath}`);
+	return info !== null;
 }
 
 async function webUnitStartState(unit, context) {
@@ -913,10 +927,9 @@ async function assertWebManagement(record, release, context) {
 	}
 	const updates = updatePaths(record.id, root);
 	const directory = dirname(paths.unitFile);
-	const recoveryDropIn = join(directory, `${paths.unit}.d/update.conf`);
-	const dropInBytes = `[Unit]\nRequires=${updates.prepareUnit}\nAfter=${updates.prepareUnit}\nWants=${updates.finalizeUnit}\n`;
-	trustedFile(recoveryDropIn, root);
-	if (readFileSync(recoveryDropIn, "utf8") !== dropInBytes)
+	const dropIn = join(directory, `${paths.unit}.d/update.conf`);
+	trustedFile(dropIn, root);
+	if (readFileSync(dropIn, "utf8") !== recoveryDropIn(record))
 		throw new Error("Unexpected persistent web recovery drop-in.");
 	const owner = ownedServiceUnit(record, root);
 	if (owner.installed !== owner.selected) throw new Error("Persistent web requires the current operator-capable owner unit.");
@@ -1257,11 +1270,16 @@ export function writeAgentCommand(record, root = "/") {
 
 /** Removes a command only when its contents and administrative ownership identify this installation. */
 export function removeOwnedAgentCommand(record, root = "/") {
+	assertAgentCommandOwned(record, root);
+	const path = installationPaths(record.id, root).wrapper(record.name);
+	if (existsSync(path)) rmSync(path);
+}
+
+/** Refuses, without changing anything, a command at this installation's path that removeOwnedAgentCommand would preserve. */
+export function assertAgentCommandOwned(record, root = "/") {
 	validateRecord(record);
 	const path = installationPaths(record.id, root).wrapper(record.name);
-	if (!existsSync(path)) return;
-	if (!isOwnedCommand(path, record, root)) throw new Error(`Preserving unexpected command: ${path}`);
-	rmSync(path);
+	if (existsSync(path) && !isOwnedCommand(path, record, root)) throw new Error(`Preserving unexpected command: ${path}`);
 }
 
 /** Serializes install/update/lifecycle operations with a kernel-released lock outside removable installations. */
@@ -1363,10 +1381,7 @@ export function validateRelease(directory, root = "/", { protectedContents = fal
 	trustedFile(join(directory, "SHA256SUMS"), root);
 	const manifest = readFileSync(join(directory, "SHA256SUMS"), "utf8");
 	verifyCopiedRelease(directory, manifest, protectedContents ? root : undefined);
-	return {
-		version: readFileSync(join(directory, "VERSION"), "utf8").trim(),
-		files: ["SHA256SUMS", ...releaseInventory(directory)],
-	};
+	return { version: readFileSync(join(directory, "VERSION"), "utf8").trim() };
 }
 
 /** Removes the verified release only when no other installation may need its inventory. */

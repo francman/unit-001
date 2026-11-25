@@ -47,15 +47,11 @@ fi
 release=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 [[ -f "$release/SHA256SUMS" && ! -L "$release/SHA256SUMS" ]] || fail 'Missing SHA256SUMS; run the installer from a complete release.'
 verification=$(mktemp -d)
-stage=""
-lock=""
 cleanup() {
   local status=$?
   trap - EXIT
   set +e
   rm -rf -- "$verification"
-  [[ -z "$stage" ]] || rm -rf -- "$stage"
-  [[ -z "$lock" ]] || rmdir -- "$lock"
   exit "$status"
 }
 trap cleanup EXIT
@@ -99,7 +95,7 @@ if [[ -n "$root" ]]; then
   root=$(cd -- "$root" && pwd -P)
   [[ "$root" != / ]] || fail '--root must be a staging directory, not /.'
   [[ "$root" != "$release" && "$root" != "$release/"* ]] || fail 'The staging root must be outside the release directory.'
-elif [[ "$dry_run" == false ]]; then
+else
   [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'Live installation requires Linux x64.'
   [[ $EUID -eq 0 ]] || fail 'Run the live installer as root, or use --dry-run/--root.'
   [[ -f /etc/os-release ]] || fail 'Cannot identify the operating system.'
@@ -110,7 +106,7 @@ elif [[ "$dry_run" == false ]]; then
   command -v systemctl >/dev/null || fail 'systemctl is required.'
 fi
 node="$release/runtime/bin/node"
-if [[ -n "$root" || ( "$dry_run" == true && $(uname -s) != Linux ) ]]; then
+if [[ -n "$root" ]]; then
   node=$(command -v node) || fail 'Filesystem staging on another OS requires a host Node.js runtime.'
 fi
-"$node" "$release/deploy/installation.mjs" install "$release" "$root" "$name" "$dry_run"
+"$node" "$release/deploy/installation.mjs" install "$release" "$root" "$name" false

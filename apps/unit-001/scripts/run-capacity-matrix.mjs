@@ -176,6 +176,7 @@ export function resolveCells(source) {
 		};
 		if (typeof cell.id !== "string" || !CELL_ID.test(cell.id)) fail(`id must match ${CELL_ID}`);
 		for (const field of NUMERIC_CELL_FIELDS) if (cell[field] !== undefined && !(typeof cell[field] === "number" && Number.isFinite(cell[field]))) fail(`${field} must be a number`);
+		if (!Number.isSafeInteger(cell.repeat) || cell.repeat < 1) fail("repeat must be a positive integer");
 		if (cell.topology !== "chain" && cell.topology !== "dense") fail("topology must be chain or dense");
 		if (cell.mutate !== undefined && !MUTATE_MIXES.includes(cell.mutate)) fail(`mutate must be one of ${MUTATE_MIXES.join(", ")}`);
 		for (const field of ["split", "seedUnderLimit"]) if (typeof cell[field] !== "boolean") fail(`${field} must be a boolean`);
@@ -220,6 +221,26 @@ export function resolveCells(source) {
 // Turns an --only pattern into an anchored RegExp where only * is a wildcard.
 export function globToRegExp(glob) {
 	return new RegExp(`^${glob.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*")}$`);
+}
+
+/** Lists every run with the result ID its files use; refuses an ID that would overwrite another run or the manifest. */
+export function resolveRuns(cells, repeatOverride) {
+	const runs = cells.flatMap((cell) => {
+		const repeat = repeatOverride ?? cell.repeat;
+		return Array.from({ length: repeat }, (_, index) => ({
+			cell,
+			run: index + 1,
+			id: repeat > 1 ? `${cell.id}.r${index + 1}` : cell.id,
+		}));
+	});
+	// Compared case-insensitively: an out-dir on a case-insensitive filesystem would merge "A.json" and "a.json".
+	const seen = new Set(["manifest"]);
+	for (const { id } of runs) {
+		if (seen.has(id.toLowerCase()))
+			throw new Error(`result id ${JSON.stringify(id)} collides with another run or the manifest`);
+		seen.add(id.toLowerCase());
+	}
+	return runs;
 }
 
 // ---- run state (set by main) ---------------------------------------------------------------------------------
@@ -299,6 +320,12 @@ async function main() {
 	}
 	only = values.only === undefined ? undefined : values.only.split(",").map(globToRegExp);
 	const cells = allCells.filter((cell) => only === undefined || only.some((pattern) => pattern.test(cell.id)));
+	let runs;
+	try {
+		runs = resolveRuns(cells, repeatOverride);
+	} catch (error) {
+		return usageError(`invalid matrix ${matrixPath}: ${error.message}`);
+	}
 	const uid = process.getuid?.();
 	if (uid === 0 && process.platform === "linux") {
 		const untrusted = untrustedCodePaths([scriptsDirectory, profiler, profilerModule, matrixPath, dirname(agentBuild), agentBuild], 0);
@@ -395,17 +422,14 @@ async function main() {
 	if (hostClass !== null) console.log(`host class: ${hostClass}`);
 	let anyFailed = false;
 	try {
-		for (const cell of cells) {
-			const repeat = repeatOverride ?? cell.repeat;
-			for (let run = 1; run <= repeat && interruptedSignal === undefined; run++) {
-				const id = repeat > 1 ? `${cell.id}.r${run}` : cell.id;
-				const document = cell.disabled !== undefined && !isSelected(cell) ? skippedCell(cell, id) : await runCell(cell, id, run);
-				writeAtomic(join(outDir, `${id}.json`), document);
-				if (document.status !== "complete" && document.status !== "skipped") anyFailed = true;
-				manifest.cells.push({ id, status: document.status, file: `${id}.json` });
-				writeManifest();
-				console.log(`${id}: ${document.status}`);
-			}
+		for (const { cell, run, id } of runs) {
+			if (interruptedSignal !== undefined) break;
+			const document = cell.disabled !== undefined && !isSelected(cell) ? skippedCell(cell, id) : await runCell(cell, id, run);
+			writeAtomic(join(outDir, `${id}.json`), document);
+			if (document.status !== "complete" && document.status !== "skipped") anyFailed = true;
+			manifest.cells.push({ id, status: document.status, file: `${id}.json` });
+			writeManifest();
+			console.log(`${id}: ${document.status}`);
 		}
 	} finally {
 		if (!values["keep-fixtures"]) rmSync(runDir, { recursive: true, force: true });

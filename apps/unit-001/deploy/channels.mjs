@@ -2,7 +2,6 @@
 // Issues separate root-owned channel grants and securely captures owner-private bootstrap credentials.
 import { execFileSync } from "node:child_process";
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
-import { createConnection } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -14,6 +13,7 @@ import {
 } from "../app/dist/channels/authority.js";
 import { channelInteger, channelObject, channelText, parseChannelRequest } from "../app/dist/channels/contract.js";
 import { ChannelCredentials } from "../app/dist/channels/credentials.js";
+import { readOwnerFrame } from "./control.mjs";
 import { installationPaths, readInstallation, withManagementLock } from "./installation.mjs";
 import { assertSelectedIssuer } from "./issuer-release.mjs";
 import { readUpdateJournal } from "./update-activation.mjs";
@@ -229,30 +229,9 @@ function protectedInput(path, actorUid) {
 	}
 }
 
-function owner(directory) {
-	return new Promise((resolve, reject) => {
-		const socket = createConnection(join(directory, "control/default.sock"));
-		let bytes = "";
-		socket.setEncoding("utf8");
-		socket.setTimeout(5000, () => socket.destroy(new Error("Owner unavailable.")));
-		socket.once("error", reject);
-		socket.once("connect", () =>
-			socket.write(`${JSON.stringify({ type: "channels", request: { operation: "status" } })}\n`),
-		);
-		socket.on("data", (chunk) => {
-			bytes += chunk;
-			if (Buffer.byteLength(bytes) > 1048576) return socket.destroy(new Error("Owner response exceeds limit."));
-			const newline = bytes.indexOf("\n");
-			if (newline < 0) return;
-			try {
-				const response = channelObject(JSON.parse(bytes.slice(0, newline)));
-				if (response.type !== "channels") throw new Error("Unexpected owner response.");
-				resolve(response);
-			} catch (error) {
-				reject(error);
-			}
-			socket.destroy();
-		});
-		socket.once("end", () => reject(new Error("Owner disconnected.")));
-	});
+async function owner(directory) {
+	const frame = { type: "channels", request: { operation: "status" } };
+	const response = channelObject(await readOwnerFrame(join(directory, "control/default.sock"), frame, 5000, 1024 * 1024));
+	if (response.type !== "channels") throw new Error("Unexpected owner response.");
+	return response;
 }

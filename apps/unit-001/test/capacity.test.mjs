@@ -33,6 +33,7 @@ import {
 	outputDirectoryProblem,
 	parseMeminfo,
 	resolveCells,
+	resolveRuns,
 	scrubbedEnvironment,
 	tmpParentProblem,
 	unitOomLines,
@@ -556,6 +557,27 @@ test("growth fixture matrix rejects incompatible workload options", () => {
 		{ captureCycles: 5, mutate: "mixed" },
 		{ captureCycles: 1, seedUnderLimit: false },
 	]) assert.throws(() => resolveCells({ cells: [{ id: "invalid", ...fields }] }), /cell "invalid"/);
+});
+
+// codex-15: every manifest row owns one result file and one set of raw outputs.
+test("matrix run IDs are resolved before work and never overwrite each other or the manifest", () => {
+	const cells = (...entries) => resolveCells({ cells: entries.map((id) => (typeof id === "string" ? { id } : id)) });
+	assert.deepEqual(
+		resolveRuns(cells("a", "b"), 2).map(({ id, run, cell }) => [id, run, cell.id]),
+		[["a.r1", 1, "a"], ["a.r2", 2, "a"], ["b.r1", 1, "b"], ["b.r2", 2, "b"]],
+	);
+	assert.deepEqual(resolveRuns(cells("a", "a.r1"), 2).map(({ id }) => id), ["a.r1", "a.r2", "a.r1.r1", "a.r1.r2"]);
+	assert.deepEqual(resolveRuns(cells("a"), undefined).map(({ id }) => id), ["a"]);
+	for (const entries of [
+		[{ id: "a", repeat: 2 }, "a.r1"],
+		["a", "a"],
+		["A", "a"],
+		["manifest"],
+		["Manifest"],
+	])
+		assert.throws(() => resolveRuns(cells(...entries), undefined), /collides/, JSON.stringify(entries));
+	for (const repeat of [0, -1, 1.5])
+		assert.throws(() => resolveCells({ cells: [{ id: "invalid", repeat }] }), /repeat must be a positive integer/);
 });
 
 test("matrix driver reports a failed cell and --require-scope refuses to run unlimited", (t) => {

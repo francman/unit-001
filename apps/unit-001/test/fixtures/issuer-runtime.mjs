@@ -2,7 +2,6 @@
 // Durable state under the root: mission-authority.json (protected authority), mission-owner-view.json (the owner's
 // mission view), authority-events (one line per authority read or write) and owner-requests (one JSON line per frame).
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { join } from "node:path";
@@ -31,7 +30,7 @@ registerHooks({
 		if (
 			[
 				"node:child_process",
-				"node:net",
+				"./control.mjs",
 				"./installation.mjs",
 				"./issuer-release.mjs",
 				"./update-activation.mjs",
@@ -87,23 +86,14 @@ export function execFileSync(command, [database, uid]) {
 	return `fixture:x:${uid}:`;
 }
 
-export function createConnection() {
-	const socket = new EventEmitter();
-	socket.setEncoding = () => {};
-	socket.setTimeout = () => {};
-	socket.destroy = () => {};
-	socket.write = (frame) => {
-		const { type, request } = JSON.parse(frame);
-		assert.equal(type, "mission");
-		appendFileSync(join(root, "owner-requests"), `${JSON.stringify(request)}\n`);
-		const view = ownerView();
-		if (request.operation === "status") socket.emit("data", `${JSON.stringify({ type: "mission", result: view })}\n`);
-		else if (request.operation === "reconcile-operation")
-			socket.emit("data", `${JSON.stringify({ type: "mission", result: { purpose: view.purpose } })}\n`);
-		else assert.fail(`The fixture owner does not serve ${request.operation}.`);
-	};
-	queueMicrotask(() => socket.emit("connect"));
-	return socket;
+export async function readOwnerFrame(endpoint, { type, request }) {
+	assert.ok(endpoint.startsWith(`${root}/`) && endpoint.endsWith("/control/default.sock"));
+	assert.equal(type, "mission");
+	appendFileSync(join(root, "owner-requests"), `${JSON.stringify(request)}\n`);
+	const view = ownerView();
+	if (request.operation === "status") return { type: "mission", result: view };
+	if (request.operation === "reconcile-operation") return { type: "mission", result: { purpose: view.purpose } };
+	assert.fail(`The fixture owner does not serve ${request.operation}.`);
 }
 
 function ownerView() {

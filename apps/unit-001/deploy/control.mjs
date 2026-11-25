@@ -23,6 +23,18 @@ export function readOwnerControl(endpoint, args, timeoutMs) {
 	if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 35000)
 		throw new Error("Owner control timeout must be between 1 and 35000 ms.");
 	const request = controlRequest(args);
+	return readOwnerFrame(endpoint, request, timeoutMs, 16 * 1024).then((response) => {
+		if (response?.type !== (request.type === "status" ? "status" : "maintenance"))
+			throw new Error("Unexpected owner control response.");
+		return response;
+	});
+}
+
+/**
+ * Sends one frame to the private owner socket and parses its first reply line. One total deadline bounds the
+ * exchange, so a reply trickling in under the management lock cannot hold the lock past the caller's limit.
+ */
+export function readOwnerFrame(endpoint, frame, timeoutMs, maxBytes) {
 	return new Promise((resolveResponse, reject) => {
 		const socket = createConnection(endpoint);
 		const chunks = [];
@@ -37,20 +49,18 @@ export function readOwnerControl(endpoint, args, timeoutMs) {
 			else resolveResponse(response);
 		};
 		const timer = setTimeout(() => finish(new Error("Owner control deadline expired.")), timeoutMs);
-		socket.once("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+		socket.once("connect", () => socket.write(`${JSON.stringify(frame)}\n`));
 		socket.once("error", (error) => finish(error));
 		socket.once("end", () => finish(new Error("Owner closed before a complete control response.")));
 		socket.on("data", (chunk) => {
 			size += chunk.length;
-			if (size > 16384) return finish(new Error("Owner control response exceeds 16 KiB."));
+			if (size > maxBytes) return finish(new Error(`Owner control response exceeds ${maxBytes / 1024} KiB.`));
 			chunks.push(chunk);
 			if (!chunk.includes(10)) return;
 			try {
 				const bytes = Buffer.concat(chunks);
 				const response = JSON.parse(bytes.subarray(0, bytes.indexOf(10)).toString("utf8"));
 				if (response?.type === "error") throw new Error(response.message);
-				if (response?.type !== (request.type === "status" ? "status" : "maintenance"))
-					throw new Error("Unexpected owner control response.");
 				finish(null, response);
 			} catch (error) {
 				finish(error);

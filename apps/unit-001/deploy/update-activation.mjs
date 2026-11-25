@@ -262,6 +262,12 @@ export function recoveryUnit(record, phase) {
 	return `[Unit]\nDescription=unit-001 update ${phase} ${record.id}\n${ordering}=${installationPaths(record.id).unit}\n[Service]\nType=oneshot\nExecStart=${prefix}/runtime/bin/node ${prefix}/lib/update.mjs recover --id ${record.id} --phase ${phase}\n`;
 }
 
+/** Renders the exact owner drop-in that ties startup to both boot recovery phases. */
+export function recoveryDropIn(record) {
+	const { prepareUnit, finalizeUnit } = updatePaths(record.id);
+	return `[Unit]\nRequires=${prepareUnit}\nAfter=${prepareUnit}\nWants=${finalizeUnit}\n`;
+}
+
 /** Verifies every retained updater-core file and generated launch path before uninstall removes application entries. */
 export function assertUpdateCoreOwned(record, root) {
 	const paths = updatePaths(record.id, root);
@@ -305,8 +311,7 @@ export function assertUpdateCoreOwned(record, root) {
 			throw new Error("Preserving unexpected recovery unit.");
 	}
 	const dropin = join(resolve(root), "etc/systemd/system", `${installationPaths(record.id).unit}.d/update.conf`);
-	const expected = `[Unit]\nRequires=${paths.prepareUnit}\nAfter=${paths.prepareUnit}\nWants=${paths.finalizeUnit}\n`;
-	if (existsSync(dropin) && readFileSync(dropin, "utf8") !== expected)
+	if (existsSync(dropin) && readFileSync(dropin, "utf8") !== recoveryDropIn(record))
 		throw new Error("Preserving unexpected recovery drop-in.");
 }
 
@@ -318,28 +323,43 @@ export function removeUpdateCore(record, root) {
 	for (const unit of [paths.prepareUnit, paths.finalizeUnit])
 		rmSync(join(resolve(root), "etc/systemd/system", unit), { force: true });
 	const dropin = join(resolve(root), "etc/systemd/system", `${installationPaths(record.id).unit}.d/update.conf`);
-	const expected = `[Unit]\nRequires=${paths.prepareUnit}\nAfter=${paths.prepareUnit}\nWants=${paths.finalizeUnit}\n`;
-	if (existsSync(dropin) && readFileSync(dropin, "utf8") !== expected)
+	if (existsSync(dropin) && readFileSync(dropin, "utf8") !== recoveryDropIn(record))
 		throw new Error("Preserving unexpected recovery drop-in.");
+	const launcher = lastUpdateLauncher(record, root);
 	rmSync(dropin, { force: true });
 	rmSync(paths.updaterRoot, { recursive: true });
-	const launcher = join(resolve(root), "usr/local/sbin/unit-001-update");
-	if (readdirSync(dirname(paths.updaterRoot)).length === 0 && existsSync(launcher)) {
+	if (launcher !== null) {
 		trustedFile(launcher, root);
 		if (readFileSync(launcher, "utf8") === updaterLauncher()) rmSync(launcher);
 	}
+}
+
+/** Refuses, without changing anything, a shared update launcher that removeUpdateCore would read but cannot trust. */
+export function assertUpdateLauncherOwned(record, root) {
+	const launcher = lastUpdateLauncher(record, root);
+	if (launcher !== null) trustedFile(launcher, root);
+}
+
+// The shared launcher leaves with the last updater root; other installations still run it.
+function lastUpdateLauncher(record, root) {
+	const { updaterRoot } = updatePaths(record.id, root);
+	const launcher = join(resolve(root), "usr/local/sbin/unit-001-update");
+	if (!existsSync(updaterRoot) || !existsSync(launcher)) return null;
+	return readdirSync(dirname(updaterRoot)).every((name) => name === record.id) ? launcher : null;
 }
 
 function updaterLauncher() {
 	return '#!/bin/sh\nset -eu\n[ "$#" -ge 1 ] || { echo "Usage: unit-001-update UUID command" >&2; exit 2; }\nid=$1\nshift\ncase "$id" in *[!a-f0-9-]*|\'\') echo \'Invalid installation ID\' >&2; exit 2;; esac\nunset NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH\nexec "/usr/lib/unit-001/updaters/$id/current/runtime/bin/node" "/usr/lib/unit-001/updaters/$id/current/lib/update.mjs" --id "$id" "$@"\n';
 }
 
-/** Installs a versioned updater core without relying on the selected application's code or Node runtime. */
+/**
+ * Installs a versioned updater core without relying on the selected application's code or Node runtime. The caller
+ * verified releasePath under the same management lock (install staging or update staging), so it is not hashed again.
+ */
 export function installUpdateCore(record, releasePath, context) {
 	const { root } = context;
 	const paths = updatePaths(record.id, root);
 	if (!existsSync(join(releasePath, "updater"))) return false;
-	validateRelease(releasePath, root);
 	for (const path of [paths.updaterRoot, paths.cores, paths.configDirectory]) {
 		assertSafePath(path, root);
 		mkdirSync(path, { recursive: true, mode: 0o755 });
@@ -377,7 +397,7 @@ export function installUpdateCore(record, releasePath, context) {
 	const dropin = join(units, `${installationPaths(record.id, root).unit}.d`);
 	assertSafePath(join(dropin, "update.conf"), root);
 	mkdirSync(dropin, { recursive: true });
-	const dropinContents = `[Unit]\nRequires=${paths.prepareUnit}\nAfter=${paths.prepareUnit}\nWants=${paths.finalizeUnit}\n`;
+	const dropinContents = recoveryDropIn(record);
 	if (existsSync(join(dropin, "update.conf")) && readFileSync(join(dropin, "update.conf"), "utf8") !== dropinContents)
 		throw new Error("Preserving unexpected recovery drop-in.");
 	writeFileSync(join(dropin, "update.conf"), dropinContents, { mode: 0o644 });
@@ -904,12 +924,7 @@ function dropinApplies(name, unit, template) {
 }
 
 function ownRecoveryDropin(record, path) {
-	const paths = updatePaths(record.id);
-	return (
-		lstatSync(path).isFile() &&
-		readFileSync(path, "utf8") ===
-			`[Unit]\nRequires=${paths.prepareUnit}\nAfter=${paths.prepareUnit}\nWants=${paths.finalizeUnit}\n`
-	);
+	return lstatSync(path).isFile() && readFileSync(path, "utf8") === recoveryDropIn(record);
 }
 
 /** Confirms after daemon-reload that systemd loaded only the managed unit file and the updater's own drop-in. */

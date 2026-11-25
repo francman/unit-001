@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { controlRequest, readOwnerControl } from "../deploy/control.mjs";
+import { controlRequest, readOwnerControl, readOwnerFrame } from "../deploy/control.mjs";
 
 test("#18 control entry point executes through the installation's current symlink", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "unit-owner-entry-"));
@@ -105,6 +105,43 @@ test("#18 ongoing bytes cannot extend the total control deadline", async () => {
 		},
 		async (endpoint) => {
 			await assert.rejects(readOwnerControl(endpoint, ["service-status"], 40), /deadline/);
+		},
+	);
+});
+
+// codex-12: mission and channel administration hold the management lock while they wait for this reply.
+test("owner frames keep one total deadline and their caller's size limit", async () => {
+	await withOwner(
+		(socket) => {
+			const interval = setInterval(() => socket.write(" "), 5);
+			socket.once("close", () => clearInterval(interval));
+		},
+		async (endpoint) => {
+			await assert.rejects(readOwnerFrame(endpoint, { type: "mission" }, 40, 1024 * 1024), /deadline/);
+		},
+	);
+	for (const [bytes, expected] of [
+		[`${"x".repeat(2049)}\n`, /exceeds 2 KiB/],
+		['{"type":"mission"', /complete control response/],
+		['{"type":"error","message":"denied"}\n', /denied/],
+	])
+		await withOwner(
+			(socket) => socket.once("data", () => socket.end(bytes)),
+			async (endpoint) => {
+				await assert.rejects(readOwnerFrame(endpoint, { type: "mission" }, 1000, 2048), expected);
+			},
+		);
+	await withOwner(
+		(socket) =>
+			socket.once("data", (request) => {
+				assert.deepEqual(JSON.parse(request), { type: "channels", request: { operation: "status" } });
+				socket.end('{"type":"channels","result":{}}\n');
+			}),
+		async (endpoint) => {
+			assert.deepEqual(
+				await readOwnerFrame(endpoint, { type: "channels", request: { operation: "status" } }, 1000, 2048),
+				{ type: "channels", result: {} },
+			);
 		},
 	);
 });

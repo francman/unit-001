@@ -3,7 +3,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
-import { createConnection } from "node:net";
 import { join } from "node:path";
 import { isDeepStrictEqual, parseArgs } from "node:util";
 import {
@@ -19,6 +18,7 @@ import { matchingPlanApproval, planDigest, planReceiptsRecorded } from "../app/d
 import { missingPlanTerms, reviewAllowanceDenial } from "../app/dist/missions/plan-terms.js";
 import { parsePurposeCeiling, parsePurposeTerms, purposeDigest, validatePurposeTerms } from "../app/dist/missions/purpose-authority.js";
 import { parseMissionView } from "../app/dist/missions/wire.js";
+import { readOwnerFrame } from "./control.mjs";
 import { installationPaths, readInstallation, withManagementLock } from "./installation.mjs";
 import { assertSelectedIssuer } from "./issuer-release.mjs";
 import { readUpdateJournal } from "./update-activation.mjs";
@@ -643,30 +643,5 @@ async function owner(request) {
 }
 
 function ownerFrame(frame) {
-	return new Promise((resolve, reject) => {
-		const socket = createConnection(join(installationPaths(record.id).state, "control/default.sock"));
-		let buffer = "";
-		socket.setEncoding("utf8");
-		socket.setTimeout(5000, () =>
-			socket.destroy(new Error(`Owner unavailable; run sudo ${record.name} start before forming its mission.`)),
-		);
-		socket.once("error", reject);
-		socket.once("connect", () => socket.write(`${JSON.stringify(frame)}\n`));
-		socket.on("data", (chunk) => {
-			buffer += chunk;
-			if (Buffer.byteLength(buffer) > 1048576)
-				return socket.destroy(new Error("Mission owner response exceeds 1 MiB."));
-			const newline = buffer.indexOf("\n");
-			if (newline < 0) return;
-			try {
-				const response = JSON.parse(buffer.slice(0, newline));
-				if (response.type === "error") throw new Error(response.message);
-				resolve(response);
-			} catch (error) {
-				reject(error);
-			}
-			socket.destroy();
-		});
-		socket.once("end", () => reject(new Error("Mission owner disconnected before responding.")));
-	});
+	return readOwnerFrame(join(installationPaths(record.id).state, "control/default.sock"), frame, 5000, 1024 * 1024);
 }

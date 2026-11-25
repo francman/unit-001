@@ -639,6 +639,152 @@ test("#19 interrupted rename removes only the nonauthoritative owned wrapper", a
 	await assert.rejects(dispatchAgent(id, "bob", ["status"], context), /renamed/);
 });
 
+// codex-9: the rename journal outlives a failed restart, so the owner never keeps the previous name unnoticed.
+test("a failed rename restart leaves a same-name retry able to restart the owner", async () => {
+	const { record, context, calls, root, paths } = await setup();
+	await writeAgentCommand(record, root);
+	const ready = [];
+	let restarts = 0;
+	const renaming = {
+		...context,
+		async run(command, args) {
+			calls.push([command, ...args]);
+			if (args[0] === "restart" && ++restarts === 1) throw new Error("restart failed");
+			return 0;
+		},
+		async ready(current) {
+			ready.push(current.name);
+		},
+	};
+	await assert.rejects(dispatchAgent(id, "agent", ["rename", "bob", "--yes"], renaming), /restart failed/);
+	assert.equal(readInstallation(id, root).name, "bob");
+	await assert.rejects(readFile(paths.wrapper("agent")), { code: "ENOENT" });
+	await dispatchAgent(id, "bob", ["rename", "bob", "--yes"], renaming);
+	assert.equal(restarts, 2);
+	assert.deepEqual(ready, ["bob"]);
+	await assert.rejects(readFile(join(paths.config, "rename.json")), { code: "ENOENT" });
+	assert.equal(readInstallation(id, root).id, id);
+	// Without a pending restart, renaming to the current name changes nothing.
+	calls.length = 0;
+	await dispatchAgent(id, "bob", ["rename", "bob", "--yes"], renaming);
+	assert.deepEqual(calls, []);
+});
+
+test("a rename interrupted after the record switch keeps the owner restart for a same-name retry", async () => {
+	const { record, root, paths } = await setup();
+	const updated = { ...record, name: "bob" };
+	await writeAgentCommand(record, root);
+	await writeAgentCommand(updated, root);
+	await writeInstallation(updated, root);
+	await writeFile(join(paths.config, "rename.json"), JSON.stringify({ oldName: "agent", newName: "bob" }));
+	await recoverRename(updated, root);
+	await assert.rejects(readFile(paths.wrapper("agent")), { code: "ENOENT" });
+	assert.deepEqual(JSON.parse(await readFile(join(paths.config, "rename.json"), "utf8")), { newName: "bob" });
+	await recoverRename(updated, root);
+	assert.ok(await readFile(paths.wrapper("bob")));
+	await recoverRename({ ...updated, desiredState: "stopped" }, root);
+	await assert.rejects(readFile(join(paths.config, "rename.json")), { code: "ENOENT" });
+});
+
+// codex-11: a foreign unit is detected before uninstall changes operator intent or the service manager.
+test("uninstall of a foreign unit changes no intent, manager state or files", async () => {
+	const { record, context, calls, root, paths } = await setup();
+	const release = await software(record, root, paths);
+	const foreign = `${await readFile(paths.unitFile, "utf8")}# administrator customization\n`;
+	await writeFile(paths.unitFile, foreign);
+	await assert.rejects(dispatchAgent(id, "agent", ["uninstall", "--yes"], context), /unowned service unit/);
+	assert.deepEqual(calls, []);
+	assert.equal(readInstallation(id, root).desiredState, "running");
+	assert.equal(await readFile(paths.unitFile, "utf8"), foreign);
+	for (const path of [paths.wrapper(record.name), join(paths.management, "agent-command.mjs"), join(release, "VERSION")])
+		assert.ok(await readFile(path));
+	assert.equal(await readlink(paths.current), `../../releases/${record.releaseVersion}`);
+});
+
+// xr-rd-1: unexpected persistent web files are refused before the owner is stopped.
+test("uninstall refuses unexpected persistent web files before any intent or manager change", async () => {
+	const socket = `unit-001-web@${id}.socket`;
+	// No web-activation.json exists, so every one of these belongs to someone else.
+	const cases = [
+		["unregistered unit", /unregistered persistent web unit/, (units) =>
+			writeFile(join(units, socket), "[Socket]\nListenStream=/tmp/x\n")],
+		["unregistered enablement", /unexpected persistent web enablement/, async (units, paths) => {
+			await mkdir(join(units, `${paths.unit}.wants`));
+			await symlink(`/etc/systemd/system/${socket}`, join(units, `${paths.unit}.wants`, socket));
+		}],
+		["unregistered listener", /unexpected persistent web listener/, async (units, paths, root) => {
+			await mkdir(join(root, "run/unit-001-web"), { recursive: true });
+			await writeFile(join(root, `run/unit-001-web/${id}.sock`), "");
+		}],
+	];
+	for (const [name, message, plant] of cases) {
+		const { record, context, calls, root, paths } = await setup();
+		await software(record, root, paths);
+		await plant(join(root, "etc/systemd/system"), paths, root);
+		await assert.rejects(dispatchAgent(id, "agent", ["uninstall", "--yes"], context), message, name);
+		assert.deepEqual(calls, [], name);
+		assert.equal(readInstallation(id, root).desiredState, "running", name);
+		assert.ok(await readFile(paths.unitFile), name);
+	}
+});
+
+// xr-rd2-1, xr-rd2-2: the wrapper, the shared update launcher and a registered listener are refused before any change.
+test("uninstall refuses a foreign command, update launcher or registered listener before any change", async () => {
+	const cases = [
+		["foreign command", /unexpected command/, (record, root, paths) =>
+			writeFile(paths.wrapper(record.name), "#!/bin/sh\necho administrator\n", { mode: 0o755 })],
+		["writable update launcher", /not owned and protected/, async (record, root) => {
+			await mkdir(updatePaths(id, root).cores, { recursive: true });
+			const launcher = join(root, "usr/local/sbin/unit-001-update");
+			await mkdir(join(root, "usr/local/sbin"), { recursive: true });
+			await writeFile(launcher, "#!/bin/sh\n");
+			await chmod(launcher, 0o666);
+		}],
+		["registered non-socket listener", /unexpected persistent web listener/, async (record, root, paths) => {
+			const config = join(paths.config, "web-activation.json");
+			await writeFile(config, `${JSON.stringify({ schemaVersion: 1, id, operator: "op", uid: 1001, state: "configured" })}\n`);
+			await chmod(config, 0o644);
+			const directory = join(root, "run/unit-001-web");
+			await mkdir(directory, { recursive: true });
+			await chmod(directory, 0o755);
+			await writeFile(join(directory, `${id}.sock`), "");
+		}],
+	];
+	// Web units are absent from the manager, so without the preflight uninstall reaches the listener after the owner stop.
+	const absent = "LoadState=not-found\nActiveState=inactive\nFragmentPath=\nDropInPaths=\nNeedDaemonReload=no\nJob=\nMainPID=0\nControlPID=0\nControlGroup=\n";
+	for (const [name, message, plant] of cases) {
+		const { record, context, calls, root, paths } = await setup();
+		const release = await software(record, root, paths);
+		await plant(record, root, paths);
+		const manager = {
+			...context,
+			async run(command, args) {
+				calls.push([command, ...args]);
+				return args[0] === "show" ? absent : 0;
+			},
+		};
+		await assert.rejects(dispatchAgent(id, "agent", ["uninstall", "--yes"], manager), message, name);
+		assert.deepEqual(calls, [], name);
+		assert.equal(readInstallation(id, root).desiredState, "running", name);
+		for (const path of [paths.unitFile, paths.wrapper(record.name), join(paths.management, "agent-command.mjs"), join(release, "VERSION")])
+			assert.ok(await readFile(path), `${name}: ${path}`);
+		assert.equal(await readlink(paths.current), `../../releases/${record.releaseVersion}`, name);
+	}
+	// Only the last installation's uninstall reads the launcher: another updater root still needs it.
+	const { record, context, calls, root, paths } = await setup();
+	await software(record, root, paths);
+	await mkdir(updatePaths(id, root).cores, { recursive: true });
+	await mkdir(updatePaths(otherId, root).updaterRoot, { recursive: true });
+	const launcher = join(root, "usr/local/sbin/unit-001-update");
+	await mkdir(join(root, "usr/local/sbin"), { recursive: true });
+	await writeFile(launcher, "#!/bin/sh\n");
+	await chmod(launcher, 0o666);
+	await lifecycle(record, "uninstall", context);
+	assert.equal(readInstallation(id, root).desiredState, "uninstalled");
+	assert.ok(calls.length > 0);
+	assert.equal(await readFile(launcher, "utf8"), "#!/bin/sh\n");
+});
+
 async function software(record, root, paths) {
 	const release = join(root, "opt/unit-001/releases", record.releaseVersion);
 	await mkdir(join(release, "deploy"), { recursive: true });
@@ -1061,6 +1207,23 @@ test("unit-off.8 named stop and start publish a service-readable record under um
 	assert.equal((await stat(paths.environment)).mode & 0o777, 0o600);
 });
 
+// codex-10: a restrictive administrator umask must not cut operators off from the renamed command.
+test("rename under umask 077 publishes a 0755 wrapper and keeps private files private", async () => {
+	const { context, record, root, paths } = await setup();
+	await writeAgentCommand(record, root);
+	await writeFile(paths.environment, "UNIT_001_MODEL=faux/faux-1\n", { mode: 0o600 });
+	const previousUmask = process.umask(0o077);
+	try {
+		await dispatchAgent(id, record.name, ["rename", "bob", "--yes"], context);
+	} finally {
+		process.umask(previousUmask);
+	}
+	assert.equal((await stat(paths.wrapper("bob"))).mode & 0o777, 0o755);
+	assert.equal((await stat(paths.record)).mode & 0o777, 0o644);
+	assert.equal((await stat(paths.environment)).mode & 0o777, 0o600);
+	assert.equal(readInstallation(id, root).name, "bob");
+});
+
 test("#20 uninstall preserves unexpected helper bytes instead of recursively deleting them", async () => {
 	const { context, record, root, paths } = await setup();
 	const release = await software(record, root, paths);
@@ -1070,7 +1233,8 @@ test("#20 uninstall preserves unexpected helper bytes instead of recursively del
 	assert.ok(await readFile(paths.wrapper(record.name)));
 	assert.ok(await readFile(join(paths.current, "VERSION")));
 	assert.equal(await readFile(join(release, "VERSION"), "utf8"), "0.0.1\n");
-	assert.equal(readInstallation(id, root).desiredState, "stopped");
+	// codex-11: the ownership refusal precedes any intent change.
+	assert.equal(readInstallation(id, root).desiredState, "running");
 });
 
 test("#20 terminal EOF and nonterminal input decline confirmation without hanging", { timeout: 1000 }, async () => {
