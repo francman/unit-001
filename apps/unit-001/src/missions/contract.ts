@@ -143,7 +143,6 @@ export type IssuedAgreement = {
 	issuedAt: number;
 };
 
-/** The only work kind a purpose can list: write one declared workspace file whose SHA-256 the creator fixed. */
 /** One listed work item: an artifact the host verifies by digest, or a bounded research run (#27). */
 export type WorkTerms = ArtifactWorkTerms | ResearchWorkTerms;
 

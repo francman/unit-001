@@ -50,11 +50,6 @@ export function chargeCycle(
 	return undefined;
 }
 
-/** Request attempts a run has consumed: every reserved attempt, dispatched or not. */
-export function runRequests(run: LoopRun): number {
-	return run.attempts.length;
-}
-
 /**
  * Reserves one provider attempt with its exact ceiling; refuses on any uncertain earlier effect, an exhausted
  * allowance, or a spend cap that a known ceiling cannot fit or an unbounded earlier attempt makes uncomputable.
@@ -69,7 +64,7 @@ export function reserveAttempt(
 	if (run.attempts.some((attempt) => attempt.status === "reserved"))
 		return { denial: "An interrupted mission request needs reconciliation." };
 	if (run.pendingTools.length !== 0) return { denial: "An interrupted mission tool needs reconciliation." };
-	if (runRequests(run) >= work.maxRequests || loop.ledger.requests >= lifetime.maxRequests)
+	if (run.attempts.length >= work.maxRequests || loop.ledger.requests >= lifetime.maxRequests)
 		return { denial: "Mission request allowance is exhausted." };
 	const cap = lifetime.maxEstimatedCost;
 	const spend = cap === undefined ? undefined : attemptCapDenial(loop.ledger, cap, ceiling);

@@ -27,7 +27,12 @@ import type {
 } from "../../src/missions/contract.ts";
 import { MissionControl } from "../../src/missions/control.ts";
 import { type MissionExecution, MissionExecutionDoc } from "../../src/missions/execution-state.ts";
-import { MissionPurposeDoc, type MissionPurposeState, readMissionPurpose } from "../../src/missions/purpose.ts";
+import {
+	MissionPurposeDoc,
+	type MissionPurposeState,
+	readMissionPurpose,
+	validPurposeLoop,
+} from "../../src/missions/purpose.ts";
 import { initialLoop } from "../../src/missions/purpose-loop.ts";
 import { MissionDoc, MissionFoundation, type MissionRecord } from "../../src/missions/state.ts";
 
@@ -539,6 +544,8 @@ describe("stored purpose records are a trust boundary", () => {
 		await expect(second.mission.initialize(context)).resolves.toBeUndefined();
 		expect(await second.harness.snapshot(MissionPurposeDoc, context)).toEqual(tampered);
 		await expect(readMissionPurpose(second.harness, context)).rejects.toThrow(/^Invalid stored mission/);
+		// The maintenance drain reads the loop through the same whole-document check: a refused document is never parked.
+		expect(validPurposeLoop(tampered)).toBeUndefined();
 	});
 
 	it("#72 imports nothing from a saved agreement whose terms differ from its receipt digest", async () => {

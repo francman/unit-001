@@ -2,7 +2,7 @@
 import type { MissionAuthority } from "./contract.ts";
 import { planGate, planHeadValid, planIssued } from "./plan-gate.ts";
 import { dueTriggers, reviewNote } from "./plan-review.ts";
-import { type PlanAgreement, type PlanProposal, type PlanState, planAdopted } from "./plan-state.ts";
+import { type PlanAgreement, type PlanProposal, type PlanState } from "./plan-state.ts";
 import { missingPlanTerms, planTermsDenial } from "./plan-terms.ts";
 import type { PlanRevisionView, PlanView, ReviewAllowanceView, ReviewTurnView } from "./plan-wire.ts";
 import { MAX_PURPOSE_WORKS } from "./purpose-authority.ts";
@@ -18,20 +18,9 @@ export function missionPlanView(
 	now: number,
 ): PlanView {
 	const head = plan.agreed.at(-1);
-	const adopting = head !== undefined || (authority !== null && planIssued(authority));
 	const headValid = authority !== null && planHeadValid(authority, plan);
-	// Without a readable loop the binding cannot be judged, but a broken head or history is still reported as such.
-	const gate = !adopting
-		? "not-adopted"
-		: !authority
-			? "receipt"
-			: loop
-				? planGate(authority, plan, loop)
-				: !head
-					? "head-missing"
-					: headValid
-						? "binding"
-						: "receipt";
+	// Without a readable loop `planGate` still reports a broken head or history, and judges nothing about the binding.
+	const gate = authority ? planGate(authority, plan, loop) : head ? "receipt" : "not-adopted";
 	const due = dueTriggers(plan, loop, now);
 	const draft = plan.draft;
 	// A finished turn that still holds a request of unknown outcome blocks later reviews; it is shown on its own, so it
@@ -39,7 +28,7 @@ export function missionPlanView(
 	const blocker = reviews?.turns.find((turn) => turn.state.status !== "running" && unresolvedTurn(turn));
 	return {
 		missionId: plan.missionId,
-		adopted: planAdopted(plan),
+		adopted: plan.agreed.length !== 0,
 		head: head ? revisionView(head) : null,
 		headValid,
 		previous: plan.agreed.length > 1 ? revisionView(plan.agreed.at(-2)!) : null,

@@ -71,8 +71,7 @@ import { missionDraftTool } from "./missions/draft-tool.ts";
 import { planDraftTool } from "./missions/plan-draft-tool.ts";
 import { MissionOwner } from "./missions/owner.ts";
 import { isLoopTask, loopParkedForMaintenance } from "./missions/loop-drain.ts";
-import { MissionPurposeDoc } from "./missions/purpose.ts";
-import { validLoop } from "./missions/purpose-loop.ts";
+import { MissionPurposeDoc, validPurposeLoop } from "./missions/purpose.ts";
 import { isMissionHoldTask, MissionDoc, MissionFoundation } from "./missions/state.ts";
 import { createRuntimeFacts, orientationExtension, type RuntimeFacts } from "./orientation.ts";
 import type { ModelChoice } from "./provider.ts";
@@ -735,7 +734,7 @@ export class Agent {
 			const inspection = await this.#harness.inspect(context);
 			const legacy = (await this.#harness.snapshot(MissionDoc, context))?.current ?? null;
 			// An unreadable or invalid purpose document identifies no run work, so anything it would own stays busy.
-			const loop = validLoop((await this.#harness.snapshot(MissionPurposeDoc, context).catch(() => undefined))?.loop);
+			const loop = validPurposeLoop(await this.#harness.snapshot(MissionPurposeDoc, context).catch(() => undefined));
 			if (
 				inspection.tasks.every(
 					(task) =>

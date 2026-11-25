@@ -80,11 +80,6 @@ export function dueTriggers(plan: PlanState, loop: LoopState | undefined, now: n
 	return triggers.filter((trigger) => !plan.reviewKeys.includes(trigger.key)).slice(0, MAX_DUE_TRIGGERS);
 }
 
-// The trigger an explicit owner review uses when nothing else is due; its request ID keeps it distinct.
-function ownerTrigger(head: PlanAgreement, requestId: string): ReviewTrigger {
-	return reviewTrigger(head, "owner", requestId);
-}
-
 /** Builds the review note for one trigger from the plan head, the stored loop and the time; the same inputs give the same note. */
 export function reviewNote(
 	plan: PlanState,
@@ -137,7 +132,8 @@ export function storeReview(plan: PlanState, loop: LoopState | undefined, reques
 			throw new MissionRefusal("conflicting-request", "That review request's note is no longer stored; use a new request ID.");
 		return replayed;
 	}
-	const trigger = dueTriggers(plan, loop, now)[0] ?? ownerTrigger(head, requestId);
+	// With nothing else due, an explicit owner review uses a trigger whose request ID keeps it distinct.
+	const trigger = dueTriggers(plan, loop, now)[0] ?? reviewTrigger(head, "owner", requestId);
 	const note = reviewNote(plan, head, loop, trigger, now);
 	saveReview(plan, note, requestId);
 	return note;

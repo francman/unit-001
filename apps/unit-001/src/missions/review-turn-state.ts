@@ -17,6 +17,7 @@ import type { ReviewTrigger } from "./plan-review.ts";
 import type { ReviewAllowance } from "./plan-terms.ts";
 import { MAX_REVIEW_TURNS } from "./plan-wire.ts";
 import type { LoopState } from "./purpose-loop.ts";
+import { readDoc, storedDoc } from "./stored-doc.ts";
 
 /** Where one review turn is; `skipped` turns run once their reason clears, and a turn is never run twice. */
 export type ReviewTurnState =
@@ -58,18 +59,12 @@ export const MissionReviewDoc = defineDoc<ReviewState>({
 
 /** Reads the stored review state after validation; throws on a malformed document. */
 export async function readReviewState(harness: Harness, context: Context): Promise<ReviewState | undefined> {
-	const saved = await harness.snapshot(MissionReviewDoc, context);
-	if (saved !== undefined) checkReviewState(saved);
-	return saved;
+	return readDoc(harness, context, MissionReviewDoc, checkReviewState);
 }
 
 /** The review state validated inside the caller's transaction; undefined when unreadable or invalid, which admits nothing. */
 export async function storedReviewState(tx: Tx): Promise<ReviewState | undefined> {
-	try {
-		return checkReviewState(await tx.doc(MissionReviewDoc));
-	} catch {
-		return undefined;
-	}
+	return storedDoc(tx, MissionReviewDoc, checkReviewState);
 }
 
 /** Whether a turn still holds a request of unknown outcome; such a turn blocks every later one and is never evicted. */

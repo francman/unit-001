@@ -115,7 +115,7 @@ export function planTermsDenial(terms: PlanTerms, loop: LoopState | undefined): 
 	const orphan = terms.tacticals.find((tactical) => !strategicIds.includes(tactical.strategic));
 	if (orphan) return `Tactical ${orphan.id} names no strategic in this plan.`;
 	const runnable = terms.tacticals.filter((tactical) => tactical.mode === "runnable");
-	if (runnable.length > 1) return "At most one tactical can be runnable in this slice.";
+	if (runnable.length > 1) return "At most one tactical can be runnable.";
 	for (const tactical of terms.tacticals) {
 		if ((tactical.mode === "runnable") !== (tactical.binding !== null))
 			return `Tactical ${tactical.id}: only a runnable tactical binds a purpose, and it must.`;

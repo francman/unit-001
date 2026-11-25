@@ -248,18 +248,6 @@ export function checkLoopState(value: unknown): LoopState {
 	return loop;
 }
 
-/**
- * The stored loop if its loop part validates, else undefined. Execution and status validate the whole document
- * (`validPurposeLoop` in purpose.ts); this loop-only check serves the agent's maintenance drain.
- */
-export function validLoop(value: unknown): LoopState | undefined {
-	try {
-		return checkLoopState(value);
-	} catch {
-		return undefined;
-	}
-}
-
 function storedCount(value: unknown): boolean {
 	return Number.isSafeInteger(value) && (value as number) >= 0;
 }

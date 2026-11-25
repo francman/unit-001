@@ -8,6 +8,7 @@ import { type MissionAgreement, type MissionCreator, missionObject } from "./con
 import { MissionExecutionDoc } from "./execution-state.ts";
 import { checkLoopState, initialLoop, type LoopState } from "./purpose-loop.ts";
 import { MissionDoc } from "./state.ts";
+import { readDoc } from "./stored-doc.ts";
 
 /** What the creator approved beyond individual work; an imported one-shot approval approves nothing further. */
 export type StandingAuthority = {
@@ -67,9 +68,7 @@ export const MissionPurposeDoc = defineDoc<MissionPurposeState>({
 
 /** Reads the stored purpose records after full validation; throws on a newer, malformed or self-inconsistent document. */
 export async function readMissionPurpose(harness: Harness, context: Context): Promise<MissionPurposeState | undefined> {
-	const saved = await harness.snapshot(MissionPurposeDoc, context);
-	if (saved !== undefined) checkPurposeState(saved);
-	return saved;
+	return readDoc(harness, context, MissionPurposeDoc, checkPurposeState);
 }
 
 /**
@@ -155,7 +154,7 @@ function parseLegacyAgreement(value: unknown): MissionAgreement {
 
 // The legacy part must be what recording its own agreements produces (links, purpose, closed operation); the loop part
 // is checked against its own receipts and ledger.
-function checkPurposeState(state: MissionPurposeState): void {
+function checkPurposeState(state: unknown): void {
 	const input = missionObject(state);
 	if (!Array.isArray(input.work)) throw new Error("Invalid stored mission purpose records.");
 	const agreements = input.work.map((item) =>

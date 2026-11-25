@@ -8,6 +8,7 @@ import { planDigest } from "./plan-authority.ts";
 import type { ReviewNote } from "./plan-review.ts";
 import { type PlanTerms, parsePlanTerms } from "./plan-terms.ts";
 import { parseReviewNote } from "./plan-wire.ts";
+import { readDoc, storedDoc } from "./stored-doc.ts";
 
 /** One agreed plan revision; valid only as exactly what its embedded protected receipt approved. */
 export type PlanAgreement = {
@@ -109,9 +110,7 @@ export const MissionPlanDoc = defineDoc<PlanState>({
 
 /** Reads the stored plan after full validation; throws on a malformed or self-inconsistent document. */
 export async function readMissionPlan(harness: Harness, context: Context): Promise<PlanState | undefined> {
-	const saved = await harness.snapshot(MissionPlanDoc, context);
-	if (saved !== undefined) checkPlanState(saved);
-	return saved;
+	return readDoc(harness, context, MissionPlanDoc, checkPlanState);
 }
 
 /**
@@ -120,16 +119,7 @@ export async function readMissionPlan(harness: Harness, context: Context): Promi
  * change such as an acknowledgment still lands.
  */
 export async function storedPlan(tx: Tx): Promise<PlanState | undefined> {
-	try {
-		return checkPlanState(await tx.doc(MissionPlanDoc));
-	} catch {
-		return undefined;
-	}
-}
-
-/** Whether the owner has adopted the plan: some revision is agreed and recorded. */
-export function planAdopted(plan: PlanState): boolean {
-	return plan.agreed.length !== 0;
+	return storedDoc(tx, MissionPlanDoc, checkPlanState);
 }
 
 /** Records one more used review key, newest kept. */

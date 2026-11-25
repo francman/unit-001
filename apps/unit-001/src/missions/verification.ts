@@ -5,7 +5,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { MissionEvidence } from "./execution-state.ts";
 
-/** Reports whether every criterion has a deterministic verifier in this first execution slice. */
+/** Reports whether every criterion has a deterministic verifier. */
 export function supportedMissionCriteria(criteria: readonly string[]): boolean {
 	return criteria.every((criterion) => parseCriterion(criterion) !== null);
 }

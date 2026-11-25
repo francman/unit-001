@@ -64,7 +64,7 @@ export async function readMissionAuthority(location: MissionLocation): Promise<M
 	)
 		throw new Error("Untrusted mission authority file.");
 	// Developer data may use the platform's root-controlled /var or /tmp alias; managed paths are fixed and literal.
-	await validateParents(location.kind === "developer-local" ? await realpath(path) : path, owner, location.kind);
+	await validateParents(location.kind === "developer-local" ? await realpath(path) : path, owner, location.kind, "read");
 	const authority = parseMissionAuthority(JSON.parse(await readFile(path, "utf8")));
 	if (
 		authority.installationId !== (location.kind === "managed" ? location.installationId : null) ||
@@ -87,20 +87,16 @@ export async function writeMissionAuthority(location: MissionLocation, authority
 	const path = missionAuthorityPath(location);
 	if (location.kind === "developer-local") await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	await readMissionAuthority(location);
-	// Even the first write must validate its parent before creating a temporary file.
+	// Even the first write must validate its parent before creating a temporary file. The raw directory is checked
+	// before resolving it, so a symlinked directory is refused and never followed.
 	const parent = await lstat(dirname(path));
+	if (parent.isSymbolicLink()) throw new Error("Untrusted mission authority directory.");
 	const owner = location.kind === "managed" ? 0 : (process.getuid?.() ?? parent.uid);
-	if (
-		!parent.isDirectory() ||
-		parent.isSymbolicLink() ||
-		((location.kind === "managed" || process.platform !== "win32") &&
-			(parent.uid !== owner || (parent.mode & 0o022) !== 0))
-	)
-		throw new Error("Untrusted mission authority directory.");
 	await validateParents(
 		location.kind === "developer-local" ? join(await realpath(dirname(path)), "mission-authority.json") : path,
 		owner,
 		location.kind,
+		"write",
 	);
 	const data = `${JSON.stringify(parseMissionAuthority(authority))}\n`;
 	if (Buffer.byteLength(data) > 65536) throw new Error("Mission authority exceeds 64 KiB.");
@@ -127,16 +123,23 @@ export async function writeMissionAuthority(location: MissionLocation, authority
 	}
 }
 
-async function validateParents(path: string, owner: number, provenance: MissionLocation["kind"]): Promise<void> {
+// Every ancestor must be a directory only its owner or root can write. A write also holds the directory the file is
+// created in to the stricter rule: owned by the file's owner, with no root or sticky-bit exemption.
+async function validateParents(
+	path: string,
+	owner: number,
+	provenance: MissionLocation["kind"],
+	use: "read" | "write",
+): Promise<void> {
 	for (let parent = dirname(path); parent !== dirname(parent); parent = dirname(parent)) {
 		const entry = await lstat(parent);
-		const stickyRoot = entry.uid === 0 && (entry.mode & 0o1000) !== 0;
+		const strict = use === "write" && parent === dirname(path);
+		const stickyRoot = !strict && provenance === "developer-local" && entry.uid === 0 && (entry.mode & 0o1000) !== 0;
 		if (
 			!entry.isDirectory() ||
 			entry.isSymbolicLink() ||
 			((provenance === "managed" || process.platform !== "win32") &&
-				((entry.uid !== 0 && entry.uid !== owner) ||
-					((entry.mode & 0o022) !== 0 && !(provenance === "developer-local" && stickyRoot))))
+				((entry.uid !== owner && (strict || entry.uid !== 0)) || ((entry.mode & 0o022) !== 0 && !stickyRoot)))
 		)
 			throw new Error("Untrusted mission authority directory.");
 	}

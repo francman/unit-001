@@ -42,9 +42,30 @@ export function matchingPlanApproval(
 	previousDigest: string | null,
 	terms: PlanTerms,
 ): MissionApproval | undefined {
+	return matchingPlanDigest(
+		authority,
+		receiptId,
+		missionId,
+		revision,
+		previousDigest,
+		planDigest(terms, missionId, revision, previousDigest, authority),
+	);
+}
+
+/**
+ * The same check for a digest already computed from the terms under the current authority. A validated stored plan
+ * (`checkPlanState`) has already hashed each agreed revision, so its head passes its stored digest and is not hashed twice.
+ */
+export function matchingPlanDigest(
+	authority: MissionAuthority,
+	receiptId: string,
+	missionId: string,
+	revision: number,
+	previousDigest: string | null,
+	digest: string,
+): MissionApproval | undefined {
 	const receipt = authority.planApprovals?.at(-1);
 	if (!receipt || receipt.receiptId !== receiptId || !planReceiptsRecorded(authority)) return undefined;
-	const digest = planDigest(terms, missionId, revision, previousDigest, authority);
 	if (
 		!receiptBinds(authority, receipt, { receiptId, missionId, revision, digest }) ||
 		!creatorApproved(authority, receipt) ||
