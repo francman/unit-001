@@ -393,7 +393,13 @@ async function trustEntry(path: string, uid: number): Promise<Stats> {
 	const status = await lstat(path);
 	const owned = status.uid === 0 || status.uid === uid;
 	const shielded = status.isSymbolicLink() || (status.mode & 0o022) === 0 || (status.mode & 0o1000) !== 0;
-	if (!owned || !shielded) throw new Error(`drafts path ${path} can be changed by other users`);
+	// A group-writable entry (mode 775, what umask 002 gives its creator) is refused as well: group membership is not
+	// checked, so the entry is treated as writable by others. Recovery is unavailable until the entry is fixed; nothing
+	// is moved to another location.
+	if (!owned || !shielded)
+		throw new Error(
+			`drafts path ${path} can be changed by other users (mode ${(status.mode & 0o777).toString(8)}); draft recovery is unavailable until it is owned by you or root and not writable by group or others`,
+		);
 	return status;
 }
 

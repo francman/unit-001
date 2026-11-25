@@ -20,6 +20,8 @@ export interface RemoteCommandContext {
 	readonly colorMode: "color" | "monochrome";
 }
 
+const EXPECTED_RESPONSE = { send: "reply", cancel: "cancelled", status: "status" } as const;
+
 /** Runs an explicit command against a profile while preserving the existing remote owner. */
 export async function runRemoteCommand(
 	command: RemoteCommand,
@@ -95,6 +97,11 @@ export async function runRemoteCommand(
 		);
 		if (response.type === "error") {
 			terminal.err(`${sanitizeTerminalText(response.message)}\n`);
+			return 1;
+		}
+		// A reply of another kind answers some other operation; reporting it as this one's result is a false success.
+		if (response.type !== EXPECTED_RESPONSE[command.action]) {
+			terminal.err(`Unexpected remote ${sanitizeTerminalText(response.type)} response to ${command.action}.\n`);
 			return 1;
 		}
 		if (response.type === "reply") {

@@ -15,7 +15,6 @@ const profile: RemoteProfile = {
 	schema: 1,
 	name: "remote",
 	host: "ssh-alias",
-	agentName: "agent",
 	session: "default",
 	installationId: "aa49e3de-4cb1-4caf-9b98-26e4c399c12d",
 };
@@ -314,6 +313,44 @@ describe("remote observation and single-attempt admission", () => {
 		expect(peer.open).toHaveBeenLastCalledWith(profile, "default", expect.any(AbortSignal));
 		signal.abort();
 		await watch;
+	});
+
+	it("stops a reconnect that is opening a tunnel when the watch is cancelled", async () => {
+		const peer = await owner();
+		const watchSignal = new AbortController();
+		const client = await connectRemoteClient(profile, "default", new AbortController().signal);
+		cleanups.push(() => client.close());
+		const events: ServiceClientEvent[] = [];
+		const watch = client.watch((event) => events.push(event), watchSignal.signal);
+		await expect.poll(() => events.at(-1)?.type).toBe("view");
+		let reconnect: AbortSignal | undefined;
+		peer.open.mockImplementation(
+			(_profile, _session, signal) =>
+				new Promise((_resolve, reject) => {
+					reconnect = signal;
+					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+				}),
+		);
+		peer.disconnect();
+		await expect.poll(() => reconnect).toBeDefined();
+		watchSignal.abort();
+		await watch;
+		expect(reconnect?.aborted).toBe(true);
+	});
+
+	it("ends the watch normally when it is cancelled during the reconnect backoff", async () => {
+		const peer = await owner();
+		const watchSignal = new AbortController();
+		const client = await connectRemoteClient(profile, "default", new AbortController().signal);
+		cleanups.push(() => client.close());
+		const events: ServiceClientEvent[] = [];
+		const watch = client.watch((event) => events.push(event), watchSignal.signal);
+		await expect.poll(() => events.at(-1)?.type).toBe("view");
+		peer.disconnect();
+		await expect.poll(() => events.at(-1)?.type).toBe("connecting");
+		watchSignal.abort();
+		await expect(watch).resolves.toBeUndefined();
+		expect(peer.open).toHaveBeenCalledTimes(1);
 	});
 
 	it("clears a pre-admission cancellation after transport loss and detaches without cancellation", async () => {

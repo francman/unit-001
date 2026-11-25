@@ -91,6 +91,18 @@ describe("guided setup configuration", () => {
 		expect(await readFile(state.file, "utf8")).toBe(before);
 	});
 
+	it("reads the credential list before the first screen only when no model is saved", async () => {
+		const state = await fixture([]);
+		const list = vi.spyOn(state.credentials, "list");
+		expect(await runSetup({ ...state.options, currentModel: "openai/gpt-5" }, state.controller.signal)).toEqual({
+			kind: "cancelled",
+		});
+		expect(list).toHaveBeenCalledTimes(1);
+		list.mockClear();
+		expect(await runSetup(state.options, state.controller.signal)).toEqual({ kind: "cancelled" });
+		expect(list).toHaveBeenCalledTimes(2);
+	});
+
 	it("keeps an environment key without copying it into the credential store", async () => {
 		const state = await fixture(["google", "keep", "", "save"]);
 		await runSetup({ ...state.options, env: { GEMINI_API_KEY: "env-secret" } }, state.controller.signal);

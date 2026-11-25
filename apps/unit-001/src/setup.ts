@@ -33,10 +33,13 @@ export async function runSetup(options: SetupOptions, outerSignal: AbortSignal):
 	try {
 		signal.throwIfAborted();
 		let stage: Stage = "provider";
-		const stored = await options.credentials.list({ signal });
+		// The saved model names the starting provider; only without one is the credential file read to guess it.
 		const previous =
 			options.currentModel?.split("/", 1)[0] ??
-			detectModel(options.env, new Set(stored.map((entry) => entry.providerId)))?.provider;
+			detectModel(
+				options.env,
+				new Set((await options.credentials.list({ signal })).map((entry) => entry.providerId)),
+			)?.provider;
 		let provider = PROVIDERS.find((entry) => entry.id === previous) ?? PROVIDERS[0];
 		let models: MutableModels | undefined;
 		let key: string | undefined;

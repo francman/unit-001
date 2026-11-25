@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ConfigurationError } from "../src/errors.ts";
 import { createConfiguredModels, createOwnerModels, detectModel, PROVIDERS, parseModelSpec } from "../src/provider.ts";
 
@@ -57,6 +57,22 @@ describe("createConfiguredModels", () => {
 			}),
 		).rejects.toThrow("invalid credential store");
 	});
+	it("never reads the credential list when a model is chosen explicitly, by spec or UNIT_001_MODEL", async () => {
+		const list = vi.fn(async () => {
+			throw new Error("unrelated credential problem");
+		});
+		const credentials = { list, read: async () => undefined, modify: async () => undefined, delete: async () => {} };
+		expect((await createOwnerModels({}, "openai/gpt-5", credentials)).choice).toEqual({
+			provider: "openai",
+			modelId: "gpt-5",
+		});
+		expect((await createOwnerModels({ UNIT_001_MODEL: "openai/gpt-5" }, undefined, credentials)).choice).toEqual({
+			provider: "openai",
+			modelId: "gpt-5",
+		});
+		expect(list).not.toHaveBeenCalled();
+	});
+
 	it("explains how to configure a provider when there is none", async () => {
 		await expect(createConfiguredModels({})).rejects.toThrow(
 			/No model provider is configured.*login subcommand.*ANTHROPIC_API_KEY/,

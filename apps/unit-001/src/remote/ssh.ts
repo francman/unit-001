@@ -50,7 +50,7 @@ export async function discoverRemote(
 	if (response.type !== "status" || response.installationId === null)
 		throw new Error("Remote discovery requires a running managed unit-001 installation with operator access.");
 	operatorEndpoint(response.installationId, session);
-	return { host, agentName: response.name, installationId: response.installationId, session };
+	return { host, installationId: response.installationId, session };
 }
 
 async function sshOutput(args: readonly string[], signal: AbortSignal): Promise<string> {

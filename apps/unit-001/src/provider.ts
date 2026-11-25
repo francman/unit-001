@@ -107,8 +107,11 @@ export async function createOwnerModels(
 	credentials?: CredentialStore,
 ): Promise<{ readonly models: MutableModels; readonly choice: ModelChoice | null }> {
 	const requested = spec ?? (env[MODEL_VARIABLE] || undefined);
-	const stored = new Set((await credentials?.list())?.map((entry) => entry.providerId));
-	const choice = requested === undefined ? detectModel(env, stored) : parseModelSpec(requested);
+	// Only detection needs to know what is signed in; an explicit model never reads the credential file here.
+	const choice =
+		requested === undefined
+			? detectModel(env, new Set((await credentials?.list())?.map((entry) => entry.providerId)))
+			: parseModelSpec(requested);
 	if (choice === undefined) return { models: createModels(), choice: null };
 	const models = await createModelsFor(choice.provider, credentials);
 	if (models.getModel(choice.provider, choice.modelId) === undefined) {

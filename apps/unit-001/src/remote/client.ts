@@ -54,14 +54,15 @@ class SshServiceClient implements RemoteServiceClient {
 		if (signal.aborted) this.#abort();
 	}
 
-	async connect(): Promise<void> {
-		this.#local.signal.throwIfAborted();
-		const tunnel = await openRemoteTunnel(this.#profile, this.#remoteSession, this.#local.signal);
+	/** Opens and verifies a tunnel; a watch passes its own scope so a reconnect stops when the watch does. */
+	async connect(signal: AbortSignal = this.#local.signal): Promise<void> {
+		signal.throwIfAborted();
+		const tunnel = await openRemoteTunnel(this.#profile, this.#remoteSession, signal);
 		try {
 			const response = await requestService(
 				tunnel.endpoint,
 				{ type: "status" },
-				AbortSignal.any([this.#local.signal, AbortSignal.timeout(5_000)]),
+				AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
 			);
 			if (response.type !== "status" || response.installationId !== this.#profile.installationId)
 				throw new RemoteIdentityError(
@@ -141,9 +142,11 @@ class SshServiceClient implements RemoteServiceClient {
 						type: "connecting",
 						message: `Remote disconnected. Reconnecting view (${failures}/5); drafts retained and requests never replayed.`,
 					});
-					await delay(Math.min(250 * 2 ** (failures - 1), 4_000), undefined, { signal: combined });
+					// An abort during the backoff ends the watch like any other abort, not as a rejection.
+					await delay(Math.min(250 * 2 ** (failures - 1), 4_000), undefined, { signal: combined }).catch(() => {});
+					if (combined.aborted) return;
 					try {
-						await this.connect();
+						await this.connect(combined);
 					} catch (reconnectError) {
 						if (combined.aborted) return;
 						if (reconnectError instanceof RemoteIdentityError) throw reconnectError;

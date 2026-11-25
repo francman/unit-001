@@ -16,12 +16,32 @@ function code(error: unknown): string | undefined {
 	return error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
 }
 
-function isEntries(value: unknown): value is Entries {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-	return Object.values(value).every(
-		(entry) =>
-			typeof entry === "object" && entry !== null && ["api_key", "oauth"].includes((entry as Credential).type),
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// The file is a trust boundary (hand-edited, restored, or written by an older version), so every field the auth layer
+// reads is checked here once; callers get typed credentials and never re-check them.
+function isCredential(value: unknown): value is Credential {
+	if (!isRecord(value)) return false;
+	if (value.type === "api_key") {
+		const { key, env } = value;
+		return (
+			(key === undefined || typeof key === "string") &&
+			(env === undefined || (isRecord(env) && Object.values(env).every((entry) => typeof entry === "string")))
+		);
+	}
+	return (
+		value.type === "oauth" &&
+		typeof value.refresh === "string" &&
+		typeof value.access === "string" &&
+		typeof value.expires === "number" &&
+		Number.isFinite(value.expires)
 	);
+}
+
+function isEntries(value: unknown): value is Entries {
+	return isRecord(value) && Object.values(value).every(isCredential);
 }
 
 /**
@@ -97,14 +117,15 @@ export class FileCredentialStore implements CredentialStore {
 
 	async #save(entries: Entries): Promise<void> {
 		const temporary = `${this.#path}.${randomUUID()}.tmp`;
-		const handle = await open(temporary, "wx", 0o600);
+		// Every failure from creating the temporary file to the final rename removes it; it can hold credentials.
 		try {
-			await handle.writeFile(`${JSON.stringify(entries, null, "\t")}\n`);
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
-		try {
+			const handle = await open(temporary, "wx", 0o600);
+			try {
+				await handle.writeFile(`${JSON.stringify(entries, null, "\t")}\n`);
+				await handle.sync();
+			} finally {
+				await handle.close();
+			}
 			// Windows can refuse to replace a file that a scanner or indexer has open for a moment.
 			for (let attempt = 0; ; attempt++) {
 				try {

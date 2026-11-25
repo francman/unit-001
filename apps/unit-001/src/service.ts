@@ -95,10 +95,14 @@ export function serviceEndpoint(directory: string, session: string, platform: No
 	return path;
 }
 
+/** Whether `id` is an installation identity as the installer writes it: a lowercase version-4 UUID. */
+export function isInstallationId(id: string): boolean {
+	return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id);
+}
+
 /** Resolves the installation's operator socket outside its private state directory. */
 export function operatorEndpoint(id: string, session: string): string {
-	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id))
-		throw new ConfigurationError("Invalid operator installation identity.");
+	if (!isInstallationId(id)) throw new ConfigurationError("Invalid operator installation identity.");
 	const path = join(`/run/unit-001-${id}`, `${validateSessionName(session)}.sock`);
 	if (Buffer.byteLength(path) > 103) throw new ConfigurationError("The operator socket path is too long.");
 	return path;

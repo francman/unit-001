@@ -210,6 +210,37 @@ describe("draft store ancestors", () => {
 		expect(loaded.status === "refused" ? loaded.reason : "").toContain("can be changed by other users");
 	});
 
+	// Follow-up from the 2026-11-22 review: a group-writable (mode 775) ancestor stays refused; recovery is reported
+	// unavailable, nothing is written there and nothing is moved to another path.
+	it("refuses a group-writable ancestor for load and save and reports recovery unavailable", async () => {
+		const shared = join(root, "shared");
+		await mkdir(shared);
+		await chmod(shared, 0o775);
+		directory = join(shared, "drafts");
+		const reason = await failure({ text: "must not be written" });
+		expect(reason).toContain(`drafts path ${shared} can be changed by other users (mode 775)`);
+		expect(reason).toContain("draft recovery is unavailable");
+		expect(await readdir(shared)).toEqual([]);
+		await mkdir(directory, { mode: 0o700 });
+		const loaded = await store().load();
+		expect(loaded).toMatchObject({ status: "refused" });
+		expect(loaded.status === "refused" ? loaded.reason : "").toContain("draft recovery is unavailable");
+		expect(await readdir(directory)).toEqual([]);
+	});
+
+	it.skipIf(process.platform === "win32")("creates private directories under a umask of 002", async () => {
+		const previous = process.umask(0o002);
+		try {
+			directory = join(root, "state", "unit-001", "drafts");
+			expect(await failure({ text: "kept" })).toBe("saved");
+			for (const path of [join(root, "state"), join(root, "state", "unit-001"), directory])
+				expect((await stat(path)).mode & 0o777).toBe(0o700);
+			expect(await restored()).toEqual({ text: "kept" });
+		} finally {
+			process.umask(previous);
+		}
+	});
+
 	it("refuses a symlinked ancestor whose own directory others can write", async () => {
 		const shared = join(root, "shared");
 		const safe = join(root, "safe");

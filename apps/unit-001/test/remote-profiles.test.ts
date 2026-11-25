@@ -18,7 +18,6 @@ const profile: RemoteProfile = {
 	host: "unit-01",
 	installationId: "aa49e3de-4cb1-4caf-9b98-26e4c399c12d",
 	session: "default",
-	agentName: "agent",
 };
 
 afterEach(async () => {
@@ -81,8 +80,9 @@ describe("private remote profiles", () => {
 			{ name: "../other" },
 			{ host: "-oProxyCommand=evil" },
 			{ host: "host;id" },
-			{ agentName: "agent && id" },
 			{ installationId: "/tmp/other.sock" },
+			// The endpoint grammar is lowercase; a bookmark the endpoint would reject must not be pinned.
+			{ installationId: "AA49E3DE-4CB1-4CAF-9B98-26E4C399C12D" },
 			{ session: "../session" },
 		])
 			await expect(addRemoteProfile(directory, { ...profile, ...change })).rejects.toThrow();

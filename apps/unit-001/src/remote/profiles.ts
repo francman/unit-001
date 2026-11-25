@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { link, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { validateSessionName } from "../paths.ts";
+import { isInstallationId } from "../service.ts";
 
 export interface RemoteProfile {
 	readonly schema: 1;
@@ -11,7 +12,6 @@ export interface RemoteProfile {
 	readonly host: string;
 	readonly installationId: string;
 	readonly session: string;
-	readonly agentName: string;
 }
 
 /** Rejects option-like names, path syntax and shell metacharacters at the SSH argument boundary. */
@@ -30,14 +30,12 @@ export function parseRemoteProfile(value: unknown): RemoteProfile {
 		typeof profile.name !== "string" ||
 		typeof profile.host !== "string" ||
 		typeof profile.installationId !== "string" ||
-		!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(profile.installationId) ||
-		typeof profile.session !== "string" ||
-		typeof profile.agentName !== "string"
+		!isInstallationId(profile.installationId) ||
+		typeof profile.session !== "string"
 	)
 		throw new Error("Invalid remote profile.");
 	validateRemoteName(profile.name);
 	validateRemoteName(profile.host);
-	validateRemoteName(profile.agentName);
 	validateSessionName(profile.session);
 	return {
 		schema: 1,
@@ -45,7 +43,6 @@ export function parseRemoteProfile(value: unknown): RemoteProfile {
 		host: profile.host,
 		installationId: profile.installationId,
 		session: profile.session,
-		agentName: profile.agentName,
 	};
 }
 

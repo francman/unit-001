@@ -1,9 +1,10 @@
 import { fork, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Credential } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileCredentialStore } from "../src/credentials.ts";
 
@@ -89,6 +90,47 @@ describe("FileCredentialStore", () => {
 			await writeFile(file, content);
 			await expect(store.read("anthropic")).rejects.toThrow(/not a valid credentials file/);
 		}
+	});
+
+	it("refuses entries missing the fields the auth layer reads, and never overwrites the file", async () => {
+		await store.modify("anthropic", async () => oauth("a"));
+		const invalid = [
+			{ anthropic: { type: "oauth" } },
+			{ anthropic: { type: "oauth", access: "a", refresh: "r" } },
+			{ anthropic: { type: "oauth", access: "a", refresh: 1, expires: 1 } },
+			{ anthropic: { type: "oauth", access: "a", refresh: "r", expires: "soon" } },
+			{ anthropic: { type: "api_key", key: 7 } },
+			{ anthropic: { type: "api_key", key: "k", env: { ACCOUNT: 1 } } },
+			{ anthropic: { type: "api_key", key: "k", env: ["x"] } },
+		];
+		for (const entries of invalid) {
+			const content = JSON.stringify(entries);
+			await writeFile(file, content);
+			await expect(store.list()).rejects.toThrow(/not a valid credentials file/);
+			await expect(store.modify("openai", async () => key("k"))).rejects.toThrow(/not a valid credentials file/);
+			expect(await readFile(file, "utf8")).toBe(content);
+		}
+	});
+
+	it("accepts an api key with provider environment, a keyless api_key entry and extra OAuth fields", async () => {
+		const entries = {
+			cloudflare: { type: "api_key", key: "k", env: { ACCOUNT: "a" } },
+			local: { type: "api_key" },
+			anthropic: { ...oauth("a"), accountId: "acct" },
+		};
+		await mkdir(join(directory, "nested"));
+		await writeFile(file, JSON.stringify(entries));
+		expect(await store.list()).toHaveLength(3);
+		expect(await store.read("anthropic")).toEqual(entries.anthropic);
+	});
+
+	it("removes its temporary file when the write fails before the rename", async () => {
+		await store.modify("anthropic", async () => oauth("a"));
+		const circular: Record<string, unknown> = { ...oauth("b") };
+		circular.self = circular;
+		await expect(store.modify("anthropic", async () => circular as unknown as Credential)).rejects.toThrow();
+		expect((await readdir(join(directory, "nested"))).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+		expect(await store.read("anthropic")).toEqual(oauth("a"));
 	});
 
 	it("reads a file saved with a byte order mark", async () => {
