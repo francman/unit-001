@@ -8,7 +8,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import { ProcessTerminal } from "@earendil-works/pi-tui";
 import { Agent } from "./agent.ts";
 import { type Command, parseArguments, type ServiceOptions, USAGE } from "./args.ts";
-import { runAttach } from "./attach.ts";
+import { runServiceAttach } from "./attach.ts";
 import { commandCatalog } from "./commands/catalog.ts";
 import { isOperatingSystemQuestion, OS_INSPECTION_PROMPT } from "./commands/facts.ts";
 import { describeCommandSuggestions, resolveLocalCommand } from "./commands/resolution.ts";
@@ -35,7 +35,7 @@ import { credentialsFile, dataDirectory, sessionFile } from "./paths.ts";
 import { createConfiguredModels, createModelsFor, createOwnerModels } from "./provider.ts";
 import { runRemoteCommand } from "./remote/cli.ts";
 import { sanitizeTerminalText } from "./render.ts";
-import { runPrint, runRepl, type Terminal } from "./repl.ts";
+import { runPrint, runRepl } from "./repl.ts";
 import {
 	type MaintenanceRequest,
 	operatorEndpoint,
@@ -44,8 +44,10 @@ import {
 	type ServiceRequest,
 	serviceEndpoint,
 } from "./service.ts";
+import { localServiceClient } from "./service-client.ts";
 import { readDefaultModel, saveDefaultModel } from "./settings.ts";
 import { runSetup } from "./setup.ts";
+import type { TerminalIO } from "./terminal-io.ts";
 import { runRichAttach, runRichForeground } from "./terminal-ui.ts";
 import { runWebWorkspace } from "./web/launcher.ts";
 
@@ -97,8 +99,7 @@ async function readAll(stream: NodeJS.ReadableStream): Promise<string> {
 }
 
 function describeReport(report: Report): string {
-	const error = (report as { error?: unknown }).error;
-	return `[report] ${report.kind}${error instanceof Error ? `: ${error.message}` : ""}\n`;
+	return `[report] ${report.kind}${report.error instanceof Error ? `: ${report.error.message}` : ""}\n`;
 }
 
 function resolveDirectory(dataDir: string | undefined, runtime: Runtime): string {
@@ -126,7 +127,16 @@ export function draftsFor(runtime: Runtime, installationId: string, session: str
 	});
 }
 
-function terminalFor(runtime: Runtime): Terminal {
+/** Colour is on unless NO_COLOR is set or the terminal is dumb. */
+function colorEnabled(runtime: Runtime): boolean {
+	return runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb";
+}
+
+function colorModeFor(runtime: Runtime): "color" | "monochrome" {
+	return colorEnabled(runtime) ? "color" : "monochrome";
+}
+
+function terminalFor(runtime: Runtime): TerminalIO {
 	return {
 		input: runtime.stdin,
 		...(runtime.interactive ? { output: runtime.stdout } : {}),
@@ -185,7 +195,7 @@ async function setup(command: Extract<Command, { kind: "setup" }>, runtime: Runt
 	const result = await runSetup(
 		{
 			terminal: terminalFor(runtime),
-			interactive: runtime.interactive,
+			color: colorEnabled(runtime),
 			env: runtime.env,
 			credentials: credentialStore(directory, runtime),
 			platform: runtime.platform,
@@ -259,10 +269,9 @@ async function run(
 			},
 			BACKGROUND_CONTEXT,
 		);
-		const opened = agent;
 		if (endpoint !== undefined) {
 			await runService(
-				opened,
+				agent,
 				endpoint,
 				appVersion,
 				terminal.err,
@@ -272,13 +281,14 @@ async function run(
 			);
 			return 0;
 		}
+		const opened = agent;
 		signal.addEventListener("abort", () => void opened.abort(BACKGROUND_CONTEXT).catch(() => {}), { once: true });
 		if (prompt !== undefined) return await runPrint(agent, prompt, terminal, signal);
 		const rich = richTerminalFor(runtime);
 		return rich === undefined
 			? await runRepl(agent, terminal, signal)
 			: await runRichForeground(agent, options.session, appVersion, rich, signal, {
-					colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+					colorMode: colorModeFor(runtime),
 					drafts: draftsFor(runtime, runtime.managed?.id ?? `local:${directory}`, options.session),
 					missionSetup: (flowSignal) =>
 						runMissionSetup(
@@ -286,7 +296,7 @@ async function run(
 							opened.name,
 							(request) => opened.mission(request, BACKGROUND_CONTEXT),
 							flowSignal,
-							runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb",
+							colorEnabled(runtime),
 						),
 				});
 	} finally {
@@ -489,7 +499,7 @@ function missionSetupArguments(
 		runtime.managed?.name ?? "agent",
 		request,
 		signal,
-		runtime.env.NO_COLOR === undefined && runtime.env.TERM !== "dumb",
+		colorEnabled(runtime),
 	];
 }
 
@@ -590,9 +600,9 @@ async function controlAttach(
 	signal: AbortSignal,
 ): Promise<number> {
 	const terminal = command.options.plain ? undefined : richTerminalFor(runtime);
-	if (terminal === undefined) return runAttach(endpoint, terminalFor(runtime), signal);
+	if (terminal === undefined) return runServiceAttach(localServiceClient(endpoint), terminalFor(runtime), signal);
 	return runRichAttach(endpoint, terminal, signal, {
-		colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+		colorMode: colorModeFor(runtime),
 		drafts: draftsFor(
 			runtime,
 			runtime.managed?.id ?? `local:${resolveDirectory(command.options.dataDir, runtime)}`,
@@ -715,7 +725,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 					),
 					terminal: terminalFor(runtime),
 					richTerminal: richTerminalFor(runtime),
-					colorMode: runtime.env.NO_COLOR === undefined ? "color" : "monochrome",
+					colorMode: colorModeFor(runtime),
 				},
 				signal,
 			);
@@ -775,7 +785,7 @@ export async function main(argv: readonly string[], runtime: Runtime, signal: Ab
 			);
 		} else if (command.kind === "setup") code = await setup(command, runtime, signal);
 		else if (command.kind === "run" && argv.length === 0 && runtime.managed !== undefined && runtime.interactive) {
-			// The normal installed entry is a client; explicit foreground flags retain their existing owner semantics.
+			// The normal installed entry is a client; explicit foreground flags still run an owner in this process (owner decision pending).
 			try {
 				code = await control({ kind: "attach", options: { session: command.options.session } }, runtime, signal);
 			} catch (error) {

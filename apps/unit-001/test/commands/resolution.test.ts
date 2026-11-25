@@ -58,6 +58,14 @@ describe("local command resolution", () => {
 		}
 	});
 
+	it("treats a misspelled subcommand as an operand of the exact parent, not a suggestion (rv-cli-13)", () => {
+		expect(resolveLocalCommand("/mission setpu", "slash")).toMatchObject({
+			kind: "exact",
+			command: { id: "mission" },
+			text: "mission setpu",
+		});
+	});
+
 	it("leaves unsupported input unresolved and bounds ranking work", () => {
 		expect(resolveLocalCommand("/xyzzy", "slash")).toEqual({ kind: "unresolved" });
 		expect(resolveLocalCommand("x".repeat(513), "cli")).toEqual({ kind: "unresolved" });

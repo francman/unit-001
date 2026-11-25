@@ -18,7 +18,7 @@ export type RuntimeFacts = RuntimeIdentity &
 		| { readonly configuration: "unconfigured"; readonly provider: null; readonly modelId: null }
 	);
 
-/** Creates one owner's monotonic runtime clock; it is never reconstructed from shell or SSH timestamps. */
+/** Creates one owner's runtime facts: wall-clock start and observation times plus a monotonic uptime; never reconstructed from shell or SSH timestamps. */
 export function createRuntimeFacts(name: string, model: ModelChoice | null): () => RuntimeFacts {
 	const startedAt = Math.floor(performance.timeOrigin);
 	return () => ({

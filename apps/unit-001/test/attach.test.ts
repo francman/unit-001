@@ -5,10 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { runAttach, runServiceAttach } from "../src/attach.ts";
-import type { Terminal } from "../src/repl.ts";
+import { runServiceAttach } from "../src/attach.ts";
 import type { ServiceView } from "../src/service.ts";
-import type { ServiceClient } from "../src/service-client.ts";
+import type { TerminalIO } from "../src/terminal-io.ts";
+import { localServiceClient, type ServiceClient } from "../src/service-client.ts";
 import { startFakeOwner } from "./fixtures/fake-owner.ts";
 
 let directory: string;
@@ -43,7 +43,7 @@ function terminal() {
 	const output = new PassThrough();
 	const out: string[] = [];
 	const err: string[] = [];
-	const io: Terminal = {
+	const io: TerminalIO = {
 		input,
 		output,
 		out: (text) => {
@@ -65,7 +65,7 @@ async function server(initial: ServiceView | null = base) {
 async function attach(service: Awaited<ReturnType<typeof server>>) {
 	const io = terminal();
 	const controller = new AbortController();
-	const running = runAttach(service.endpoint, io.io, controller.signal);
+	const running = runServiceAttach(localServiceClient(service.endpoint), io.io, controller.signal);
 	cleanups.push(async () => {
 		controller.abort();
 		await running;
@@ -79,7 +79,7 @@ describe.skipIf(process.platform === "win32")("service terminal", () => {
 		const service = await server(null);
 		const io = terminal();
 		const controller = new AbortController();
-		const running = runAttach(service.endpoint, io.io, controller.signal);
+		const running = runServiceAttach(localServiceClient(service.endpoint), io.io, controller.signal);
 		cleanups.push(async () => {
 			controller.abort();
 			await running;
@@ -372,7 +372,7 @@ describe.skipIf(process.platform === "win32")("service terminal", () => {
 		const service = await server();
 		const io = terminal();
 		const controller = new AbortController();
-		const running = runAttach(service.endpoint, { ...io.io, output: undefined }, controller.signal);
+		const running = runServiceAttach(localServiceClient(service.endpoint), { ...io.io, output: undefined }, controller.signal);
 		cleanups.push(async () => {
 			controller.abort();
 			await running;
@@ -444,7 +444,7 @@ describe.skipIf(process.platform === "win32")("service terminal", () => {
 		const service = await server(null);
 		const io = terminal();
 		const controller = new AbortController();
-		const running = runAttach(service.endpoint, io.io, controller.signal);
+		const running = runServiceAttach(localServiceClient(service.endpoint), io.io, controller.signal);
 		cleanups.push(async () => {
 			controller.abort();
 			await running;

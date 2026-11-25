@@ -114,6 +114,7 @@ function launch(drafts?: DraftStore) {
 		cancel: vi.fn(),
 		detach: vi.fn(),
 		dismissSuggestions: vi.fn(),
+		admission: vi.fn((): Promise<never> => new Promise(() => {})),
 	};
 	const view = new RichAttachView(tui, "default", actions, {
 		colorMode: "monochrome",
@@ -719,6 +720,8 @@ describe("rich service terminal", () => {
 			submit: vi.fn((): TerminalInputResult => ({ status: "command" })),
 			cancel: vi.fn(),
 			detach: vi.fn(),
+			dismissSuggestions: vi.fn(),
+			admission: vi.fn((): Promise<never> => new Promise(() => {})),
 		};
 		const view = new RichAttachView(tui, "default", actions, { ownership: "foreground", colorMode: "monochrome" });
 		tui.setLayoutRoot(view);
@@ -774,6 +777,8 @@ describe("rich service terminal", () => {
 			submit: vi.fn((): TerminalInputResult => ({ status: "rejected" })),
 			cancel: vi.fn(),
 			detach: vi.fn(),
+			dismissSuggestions: vi.fn(),
+			admission: vi.fn((): Promise<never> => new Promise(() => {})),
 		};
 		const view = new RichAttachView(tui, "default", actions, {
 			name: "bob",

@@ -6,7 +6,7 @@ import { runServiceAttach } from "../attach.ts";
 import { createDraftStore } from "../draft-store.ts";
 import { runMissionSetup } from "../missions/setup.ts";
 import { sanitizeTerminalText } from "../render.ts";
-import type { Terminal } from "../repl.ts";
+import type { TerminalIO } from "../terminal-io.ts";
 import { runRichServiceAttach } from "../terminal-ui.ts";
 import { REMOTE_USAGE, type RemoteCommand } from "./args.ts";
 import { connectRemoteClient } from "./client.ts";
@@ -15,7 +15,7 @@ import { discoverRemote } from "./ssh.ts";
 
 export interface RemoteCommandContext {
 	readonly directory: string;
-	readonly terminal: Terminal;
+	readonly terminal: TerminalIO;
 	readonly richTerminal?: RichTerminal;
 	readonly colorMode: "color" | "monochrome";
 }

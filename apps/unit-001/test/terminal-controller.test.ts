@@ -10,11 +10,10 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "../src/agent.ts";
 import type { ServiceView } from "../src/service.ts";
-import type { ServiceClient } from "../src/service-client.ts";
+import { localServiceClient, type ServiceClient } from "../src/service-client.ts";
 import {
 	createForegroundTerminalController,
 	createServiceTerminalController,
-	createTerminalController,
 	type TerminalState,
 } from "../src/terminal-controller.ts";
 import { startFakeOwner } from "./fixtures/fake-owner.ts";
@@ -55,7 +54,7 @@ async function server(initial: ServiceView | null = base) {
 async function connect(owner: Awaited<ReturnType<typeof server>>) {
 	const states: TerminalState[] = [];
 	const signal = new AbortController();
-	const controller = createTerminalController(owner.endpoint, (state) => states.push(state), signal.signal);
+	const controller = createServiceTerminalController(localServiceClient(owner.endpoint), (state) => states.push(state), signal.signal);
 	cleanup.push(async () => {
 		controller.detach();
 		await controller.closed;
@@ -114,7 +113,7 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 		const owner = await server(null);
 		const states: TerminalState[] = [];
 		const signal = new AbortController();
-		const controller = createTerminalController(owner.endpoint, (state) => states.push(state), signal.signal);
+		const controller = createServiceTerminalController(localServiceClient(owner.endpoint), (state) => states.push(state), signal.signal);
 		cleanup.push(async () => {
 			controller.detach();
 			await controller.closed;
@@ -455,7 +454,7 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 		const owner = await server();
 		const signal = new AbortController();
 		signal.abort();
-		const controller = createTerminalController(owner.endpoint, () => {}, signal.signal);
+		const controller = createServiceTerminalController(localServiceClient(owner.endpoint), () => {}, signal.signal);
 		expect(await controller.closed).toBe(0);
 		expect(owner.requests).toEqual([]);
 	});
@@ -463,7 +462,7 @@ describe.skipIf(process.platform === "win32")("owner terminal controller", () =>
 	it("closes a peer that never supplies an initial view", async () => {
 		const owner = await server(null);
 		const signal = new AbortController();
-		const controller = createTerminalController(owner.endpoint, () => {}, signal.signal);
+		const controller = createServiceTerminalController(localServiceClient(owner.endpoint), () => {}, signal.signal);
 		cleanup.push(async () => {
 			controller.detach();
 			await controller.closed;

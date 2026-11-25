@@ -19,17 +19,16 @@ export function resolveLocalCommand(input: string, surface: CommandSurface): Loc
 	}
 	if (text.length > 512) return { kind: "unresolved" };
 	// Operands never influence local ranking; a private query or memory body is not command vocabulary.
-	const words = text.toLowerCase().split(/\s+/, 1);
-	const phrase = words.join(" ");
+	const word = text.toLowerCase().split(/\s+/, 1)[0];
 	const ranked = catalog
 		.map((command) => {
 			let score = 0;
 			for (const spelling of [command.invocation, ...command.aliases]) {
-				const distance = editDistance(words.slice(0, spelling.split(" ").length).join(" "), spelling);
+				const distance = editDistance(word, spelling);
 				if (distance <= Math.max(1, Math.floor(spelling.length / 3))) score = Math.max(score, 100 - distance * 10);
 			}
-			for (const keyword of command.keywords) if (words.includes(keyword)) score += 15;
-			if (command.invocation.startsWith(phrase)) score = Math.max(score, 70);
+			if (command.keywords.includes(word)) score += 15;
+			if (command.invocation.startsWith(word)) score = Math.max(score, 70);
 			return { command, score };
 		})
 		.filter((item) => item.score > 0)

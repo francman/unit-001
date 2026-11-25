@@ -9,7 +9,6 @@ export interface CommandDefinition {
 	readonly summary: string;
 	readonly aliases: readonly string[];
 	readonly keywords: readonly string[];
-	readonly effect: "read" | "write" | "administrator";
 }
 
 /** Version of the declared aliases and deterministic ranking rules. */
@@ -24,7 +23,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Read owner runtime, configuration, tools, channels, mission, tasks, host or public files",
 		aliases: [],
 		keywords: ["runtime", "configuration", "tools", "channels", "mission", "tasks", "host", "file", "introspect"],
-		effect: "read",
 	},
 	{
 		id: "inspect.os",
@@ -33,7 +31,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Read observed operating-system facts",
 		aliases: [],
 		keywords: ["operating", "system", "distribution", "kernel", "architecture"],
-		effect: "read",
 	},
 	{
 		id: "evidence",
@@ -42,7 +39,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Show one tool call's bounded, redacted arguments, output and diff",
 		aliases: [],
 		keywords: ["tool", "arguments", "output", "diff", "failure"],
-		effect: "read",
 	},
 	{
 		id: "help",
@@ -51,7 +47,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Show available commands",
 		aliases: ["?"],
 		keywords: ["commands", "usage"],
-		effect: "read",
 	},
 	{
 		id: "status",
@@ -60,7 +55,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Inspect agent status",
 		aliases: [],
 		keywords: ["health", "uptime", "running"],
-		effect: "read",
 	},
 	{
 		id: "memory",
@@ -69,7 +63,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Inspect memory statistics",
 		aliases: ["brain"],
 		keywords: ["memories", "remembered", "knowledge"],
-		effect: "read",
 	},
 	{
 		id: "memory.recall",
@@ -78,7 +71,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Search remembered information",
 		aliases: [],
 		keywords: ["search", "retrieve", "remembered"],
-		effect: "read",
 	},
 	{
 		id: "memory.remember",
@@ -87,7 +79,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Save an explicit memory",
 		aliases: [],
 		keywords: ["save", "memorize"],
-		effect: "write",
 	},
 	{
 		id: "memory.forget",
@@ -96,7 +87,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Forget one memory after confirmation",
 		aliases: [],
 		keywords: ["delete", "remove", "erase"],
-		effect: "write",
 	},
 	{
 		id: "memory.sleep",
@@ -105,7 +95,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Schedule pending memory consolidation",
 		aliases: [],
 		keywords: ["consolidate"],
-		effect: "write",
 	},
 	{
 		id: "mission",
@@ -114,7 +103,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Inspect the saved mission",
 		aliases: [],
 		keywords: ["purpose", "objective", "agreement"],
-		effect: "read",
 	},
 	{
 		id: "mission.setup",
@@ -123,7 +111,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Form a mission draft",
 		aliases: [],
 		keywords: ["purpose", "objective", "draft"],
-		effect: "write",
 	},
 	{
 		id: "mission.draft",
@@ -132,7 +119,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Save mission terms from a file",
 		aliases: [],
 		keywords: ["terms"],
-		effect: "write",
 	},
 	{
 		id: "mission.propose",
@@ -141,7 +127,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Propose an exact mission revision",
 		aliases: [],
 		keywords: ["agreement"],
-		effect: "write",
 	},
 	{
 		id: "mission.creator",
@@ -150,7 +135,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Configure creator authority",
 		aliases: [],
 		keywords: ["authority"],
-		effect: "administrator",
 	},
 	{
 		id: "mission.approve",
@@ -159,7 +143,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Approve an exact mission revision",
 		aliases: [],
 		keywords: ["approval"],
-		effect: "administrator",
 	},
 	...(
 		[
@@ -175,7 +158,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary,
 		aliases: [],
 		keywords: ["mission", action],
-		effect: "administrator" as const,
 	})),
 	{
 		id: "setup",
@@ -184,7 +166,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Configure provider authentication and model",
 		aliases: [],
 		keywords: ["configure", "provider", "model", "key"],
-		effect: "administrator",
 	},
 	{
 		id: "login",
@@ -193,7 +174,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Sign in to a provider",
 		aliases: [],
 		keywords: ["authenticate", "subscription"],
-		effect: "administrator",
 	},
 	{
 		id: "logout",
@@ -202,7 +182,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Remove a provider sign-in",
 		aliases: [],
 		keywords: ["signout"],
-		effect: "administrator",
 	},
 	{
 		id: "serve",
@@ -211,7 +190,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Run the storage owner without terminal input",
 		aliases: [],
 		keywords: ["headless", "daemon"],
-		effect: "write",
 	},
 	{
 		id: "attach",
@@ -220,7 +198,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Open the running owner's terminal interface",
 		aliases: [],
 		keywords: ["connect", "chat", "interactive"],
-		effect: "read",
 	},
 	{
 		id: "remote",
@@ -229,7 +206,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Manage SSH profiles and connect to a remote owner",
 		aliases: [],
 		keywords: ["ssh", "connection", "profile"],
-		effect: "write",
 	},
 	{
 		id: "send",
@@ -238,7 +214,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Send a prompt to the running owner",
 		aliases: [],
 		keywords: ["ask", "question", "message"],
-		effect: "write",
 	},
 	{
 		id: "service-status",
@@ -247,7 +222,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Inspect the running owner",
 		aliases: [],
 		keywords: ["service", "health"],
-		effect: "read",
 	},
 	{
 		id: "cancel",
@@ -256,7 +230,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Cancel shared conversation work",
 		aliases: [],
 		keywords: ["abort", "interrupt"],
-		effect: "write",
 	},
 	{
 		id: "exit",
@@ -265,7 +238,6 @@ export const COMMANDS: readonly CommandDefinition[] = [
 		summary: "Close this terminal connection",
 		aliases: ["quit", "detach"],
 		keywords: ["close", "disconnect"],
-		effect: "read",
 	},
 ];
 

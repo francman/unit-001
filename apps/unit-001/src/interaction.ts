@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import type { AuthEvent, AuthInteraction, AuthPrompt } from "@earendil-works/pi-ai";
-import type { Terminal } from "./repl.ts";
+import type { TerminalIO } from "./terminal-io.ts";
 
 /** The command that opens a URL in the user's browser, per platform; `undefined` where there is none. */
 export function browserCommand(platform: NodeJS.Platform, url: string): readonly [string, ...string[]] | undefined {
@@ -34,7 +34,7 @@ export interface LoginInteraction {
  * terminal, and asks for pasted codes. Secret prompts are refused, since pasting an API key would echo it.
  */
 export function createLoginInteraction(
-	terminal: Terminal,
+	terminal: TerminalIO,
 	signal: AbortSignal,
 	platform: NodeJS.Platform = process.platform,
 ): LoginInteraction {

@@ -20,22 +20,17 @@ import { describeInspection, inspectionText } from "./introspection/command.ts";
 import { describeMemory, type MemoryRequest } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
 import { sanitizeTerminalText } from "./render.ts";
-import type { Terminal } from "./repl.ts";
+import type { TerminalIO } from "./terminal-io.ts";
 import { sendDigest } from "./send-receipt.ts";
 import type { ServiceView } from "./service.ts";
-import { localServiceClient, type ServiceClient } from "./service-client.ts";
+import type { ServiceClient } from "./service-client.ts";
 import { providerProblemSummary, runFailureSummary, toolFailureSummary } from "./service-view.ts";
 import { evidenceLines } from "./tool-evidence.ts";
 
-/** Runs a service terminal client; exit, EOF, signals, or connection loss never abort admitted service work. */
-export async function runAttach(endpoint: string, terminal: Terminal, signal: AbortSignal): Promise<number> {
-	return runServiceAttach(localServiceClient(endpoint), terminal, signal);
-}
-
-/** Uses the existing plain terminal for a local or authenticated remote service client. */
+/** Runs a plain terminal client for a local or authenticated remote service; exit, EOF, signals, or connection loss never abort admitted service work. */
 export async function runServiceAttach(
 	client: ServiceClient,
-	terminal: Terminal,
+	terminal: TerminalIO,
 	signal: AbortSignal,
 ): Promise<number> {
 	if (signal.aborted) return 0;
@@ -392,7 +387,7 @@ export async function runServiceAttach(
 }
 
 class AttachedOutput {
-	readonly #terminal: Terminal;
+	readonly #terminal: TerminalIO;
 	#lastEntryId = -1;
 	#livePrinted = "";
 	#lineOpen = false;
@@ -403,7 +398,7 @@ class AttachedOutput {
 	#historyNotice = false;
 	#liveNotice = false;
 
-	constructor(terminal: Terminal) {
+	constructor(terminal: TerminalIO) {
 		this.#terminal = terminal;
 	}
 

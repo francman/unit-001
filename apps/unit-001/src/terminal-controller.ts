@@ -26,7 +26,7 @@ import type { MissionRequest, MissionView } from "./missions/contract.ts";
 import type { RuntimeFacts } from "./orientation.ts";
 import { type SendAdmission, sendDigest } from "./send-receipt.ts";
 import type { ServiceView } from "./service.ts";
-import { localServiceClient, type ServiceClient } from "./service-client.ts";
+import type { ServiceClient } from "./service-client.ts";
 import { serviceView } from "./service-view.ts";
 import type { ToolEvidence } from "./tool-evidence.ts";
 
@@ -104,16 +104,7 @@ export interface TerminalController {
 	admission(requestId: string, digest: string | undefined): Promise<SendAdmission>;
 }
 
-/** Connects a terminal controller without opening storage or creating another agent owner. */
-export function createTerminalController(
-	endpoint: string,
-	onChange: (state: TerminalState) => void,
-	signal: AbortSignal,
-): TerminalController {
-	return createServiceTerminalController(localServiceClient(endpoint), onChange, signal);
-}
-
-/** Attaches the same terminal controller to a local or authenticated remote owner. */
+/** Connects a terminal controller to a local or authenticated remote owner without opening storage or creating another agent owner. */
 export function createServiceTerminalController(
 	client: ServiceClient,
 	onChange: (state: TerminalState) => void,

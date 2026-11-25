@@ -18,7 +18,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { sanitizeTerminalText } from "./render.ts";
-import type { Terminal } from "./repl.ts";
+import type { TerminalIO } from "./terminal-io.ts";
 
 declare module "@earendil-works/pi-tui" {
 	interface Keybindings {
@@ -81,7 +81,7 @@ export class SetupUI implements Component {
 	#running = false;
 	#pending: { resolve: (value: string) => void; reject: (error: Error) => void; cleanup: () => void } | undefined;
 
-	constructor(terminal: Terminal, name: string, color: boolean) {
+	constructor(terminal: TerminalIO, name: string, color: boolean) {
 		this.#name = safe(name);
 		this.#color = color;
 		this.#terminal = new SetupStreamTerminal(terminal, () => this.cancel());
@@ -437,7 +437,7 @@ class SetupStreamTerminal implements TuiTerminal {
 	#pasteBytes = 0;
 	#discardPaste = false;
 
-	constructor(terminal: Terminal, onEnd: () => void) {
+	constructor(terminal: TerminalIO, onEnd: () => void) {
 		this.#input = terminal.input;
 		if (!terminal.output) throw new Error("Setup requires terminal output.");
 		this.#output = terminal.output;

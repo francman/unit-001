@@ -9,7 +9,8 @@ import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@ear
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "../src/agent.ts";
-import { runPrint, runRepl, type Terminal } from "../src/repl.ts";
+import { runPrint, runRepl } from "../src/repl.ts";
+import type { TerminalIO } from "../src/terminal-io.ts";
 
 const context = BACKGROUND_CONTEXT;
 const model = { provider: "faux", modelId: "faux-1" };
@@ -38,7 +39,7 @@ async function launch(responses: Parameters<ReturnType<typeof fauxProvider>["set
 	return agent;
 }
 
-function terminal(lines: string): { terminal: Terminal; out: () => string; err: () => string } {
+function terminal(lines: string): { terminal: TerminalIO; out: () => string; err: () => string } {
 	const input = new PassThrough();
 	input.end(lines);
 	const out: string[] = [];

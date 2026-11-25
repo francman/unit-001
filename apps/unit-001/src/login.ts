@@ -2,7 +2,7 @@ import type { CredentialStore, Models } from "@earendil-works/pi-ai";
 import { UsageError } from "./errors.ts";
 import { createLoginInteraction } from "./interaction.ts";
 import { PROVIDERS } from "./provider.ts";
-import type { Terminal } from "./repl.ts";
+import type { TerminalIO } from "./terminal-io.ts";
 
 /** Providers that can be signed in to with a subscription, by the name used on the command line. */
 export const SUBSCRIPTIONS: Readonly<Record<string, { readonly provider: string; readonly label: string }>> = {
@@ -26,7 +26,7 @@ export function subscriptionFor(name: string): { readonly provider: string; read
 export async function runLogin(
 	models: Pick<Models, "login">,
 	name: string,
-	terminal: Terminal,
+	terminal: TerminalIO,
 	signal: AbortSignal,
 	platform: NodeJS.Platform = process.platform,
 	launch: LoginLaunch = { kind: "foreground", name: "agent" },
@@ -53,7 +53,7 @@ export async function runLogin(
 }
 
 /** Removes the stored sign-in of a provider. Returns the exit code. */
-export async function runLogout(credentials: CredentialStore, name: string, terminal: Terminal): Promise<number> {
+export async function runLogout(credentials: CredentialStore, name: string, terminal: TerminalIO): Promise<number> {
 	const subscription = subscriptionFor(name);
 	const stored = (await credentials.list()).some((entry) => entry.providerId === subscription.provider);
 	await credentials.delete(subscription.provider);

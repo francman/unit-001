@@ -28,12 +28,11 @@ import { describeError } from "./errors.ts";
 import { cutText, sanitizeTerminalText } from "./render.ts";
 import { type SendAdmission, sendDigest } from "./send-receipt.ts";
 import type { ServiceView } from "./service.ts";
-import type { ServiceClient } from "./service-client.ts";
+import { localServiceClient, type ServiceClient } from "./service-client.ts";
 import { providerProblemSummary, runFailureSummary, toolFailureSummary } from "./service-view.ts";
 import {
 	createForegroundTerminalController,
 	createServiceTerminalController,
-	createTerminalController,
 	type PendingSend,
 	type SendOutcome,
 	type TerminalController,
@@ -71,8 +70,7 @@ export interface RichAttachOptions {
 	readonly drafts?: DraftStore | undefined;
 }
 
-type Actions = Pick<TerminalController, "submit" | "cancel" | "detach"> &
-	Partial<Pick<TerminalController, "dismissSuggestions" | "admission">>;
+type Actions = Pick<TerminalController, "submit" | "cancel" | "detach" | "dismissSuggestions" | "admission">;
 
 /**
  * The one send whose outcome this view has not settled. The draft file keeps it beside the editor text until the owner
@@ -112,7 +110,7 @@ export async function runRichAttach(
 		basename(endpoint, ".sock"),
 		terminal,
 		signal,
-		(onChange) => createTerminalController(endpoint, onChange, signal),
+		(onChange) => createServiceTerminalController(localServiceClient(endpoint), onChange, signal),
 		options,
 	);
 }
@@ -422,7 +420,6 @@ export class RichAttachView extends VStack {
 	private checkUnconfirmed(send: UnconfirmedSend, below: boolean): void {
 		this.#open = { kind: "replayable", send, below };
 		const lookup = this.#actions.admission;
-		if (lookup === undefined) return;
 		// The first view can arrive while the controller is still being constructed; ask once that has returned.
 		void Promise.resolve()
 			.then(() => lookup(send.requestId, send.digest))
@@ -555,7 +552,7 @@ export class RichAttachView extends VStack {
 		const suggestions = this.#state.suggestions;
 		if ((suggestions?.length ?? 0) > 0 || this.#state.suggesting) {
 			if (this.#keys.matches(data, "unit.commands.dismiss")) {
-				this.#actions.dismissSuggestions?.();
+				this.#actions.dismissSuggestions();
 				return { consume: true };
 			}
 			if (suggestions !== undefined && suggestions.length > 0) {
@@ -573,13 +570,13 @@ export class RichAttachView extends VStack {
 						.trimStart()
 						.replace(/^\/\S*/, "");
 					this.editor.setText(`/${suggestions[this.#selectedSuggestion].invocation}${operands}`);
-					this.#actions.dismissSuggestions?.();
+					this.#actions.dismissSuggestions();
 					this.#tui.requestRender();
 					return { consume: true };
 				}
 			}
 			// Editing abandons the old query so a later Enter cannot replace the new draft.
-			this.#actions.dismissSuggestions?.();
+			this.#actions.dismissSuggestions();
 		}
 		if (this.#keys.matches(data, "unit.attach.detach")) {
 			this.#actions.detach();

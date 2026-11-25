@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline/promises";
-import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, type Context, withCancel } from "@earendil-works/chord/context";
 import type { Agent, Reply } from "./agent.ts";
 import { describeCommandSuggestions } from "./commands/resolution.ts";
 import {
@@ -15,24 +15,23 @@ import { describeInspection, inspectionText } from "./introspection/command.ts";
 import { describeMemory, type MemoryRequest } from "./memory-control.ts";
 import { describeMission } from "./missions/command.ts";
 import { DeltaPrinter, liveText, sanitizeTerminalText, ToolAnnouncer } from "./render.ts";
-
-export interface Terminal {
-	readonly input: NodeJS.ReadableStream;
-	/** Given to readline for line editing; present only when the terminal is interactive. */
-	readonly output?: NodeJS.WritableStream;
-	readonly out: (text: string) => void;
-	readonly err: (text: string) => void;
-}
+import type { TerminalIO } from "./terminal-io.ts";
 
 const HELP =
 	"Commands: /help, /status, /mission, /memory [stats|recall <query>|remember <text>|forget <id>|sleep], /exit (or Ctrl+D). Ctrl+C cancels the chat.";
 
-/** Runs one prompt, streaming the answer to `terminal.out` and tool use to `terminal.err`. */
-async function turn(agent: Agent, prompt: string, terminal: Terminal, signal: AbortSignal): Promise<Reply> {
+/** A context that cancels when `signal` aborts; `release` detaches it once the work is done. */
+function cancelledBy(signal: AbortSignal): { readonly context: Context; readonly release: () => void } {
 	const { context, cancel } = withCancel(BACKGROUND_CONTEXT);
 	const onAbort = () => cancel();
 	signal.addEventListener("abort", onAbort, { once: true });
 	if (signal.aborted) onAbort();
+	return { context, release: () => signal.removeEventListener("abort", onAbort) };
+}
+
+/** Runs one prompt, streaming the answer to `terminal.out` and tool use to `terminal.err`. */
+async function turn(agent: Agent, prompt: string, terminal: TerminalIO, signal: AbortSignal): Promise<Reply> {
+	const { context, release } = cancelledBy(signal);
 	const printer = new DeltaPrinter(terminal.out);
 	const tools = new ToolAnnouncer();
 	try {
@@ -49,22 +48,19 @@ async function turn(agent: Agent, prompt: string, terminal: Terminal, signal: Ab
 		if (reply.status === "answered") printer.finish(reply.text);
 		return reply;
 	} finally {
-		signal.removeEventListener("abort", onAbort);
+		release();
 	}
 }
 
-function report(reply: Reply, terminal: Terminal): void {
+function report(reply: Reply, terminal: TerminalIO): void {
 	if (reply.status === "failed") {
 		terminal.err(`unanswered: ${reply.reason}${reply.detail === undefined ? "" : ` (${reply.detail})`}\n`);
 	}
 }
 
 /** Runs one prompt and prints only its answer, for scripts and pipes. Returns the exit code. */
-export async function runPrint(agent: Agent, prompt: string, terminal: Terminal, signal: AbortSignal): Promise<number> {
-	const { context, cancel } = withCancel(BACKGROUND_CONTEXT);
-	const onAbort = () => cancel();
-	signal.addEventListener("abort", onAbort, { once: true });
-	if (signal.aborted) onAbort();
+export async function runPrint(agent: Agent, prompt: string, terminal: TerminalIO, signal: AbortSignal): Promise<number> {
+	const { context, release } = cancelledBy(signal);
 	const tools = new ToolAnnouncer();
 	try {
 		const stop = await agent.watch((live) => {
@@ -82,12 +78,12 @@ export async function runPrint(agent: Agent, prompt: string, terminal: Terminal,
 			await stop();
 		}
 	} finally {
-		signal.removeEventListener("abort", onAbort);
+		release();
 	}
 }
 
 /** The interactive chat loop. Returns the exit code. */
-export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSignal): Promise<number> {
+export async function runRepl(agent: Agent, terminal: TerminalIO, signal: AbortSignal): Promise<number> {
 	const interactive = terminal.output !== undefined;
 	const readline = createInterface({ input: terminal.input, output: terminal.output, terminal: interactive });
 	let current: AbortController | undefined;
@@ -121,9 +117,7 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 		if (agent.interrupted && initial.runtime.configuration === "configured") {
 			current = new AbortController();
 			const recovering = current;
-			const { context, cancel } = withCancel(BACKGROUND_CONTEXT);
-			const onRecoveryAbort = () => cancel();
-			recovering.signal.addEventListener("abort", onRecoveryAbort, { once: true });
+			const { context, release } = cancelledBy(recovering.signal);
 			terminal.err("Resuming the run that was interrupted.\n");
 			const printer = new DeltaPrinter(terminal.out);
 			const stop = await agent.watch((live) => printer.update(liveText(live)), BACKGROUND_CONTEXT);
@@ -132,7 +126,7 @@ export async function runRepl(agent: Agent, terminal: Terminal, signal: AbortSig
 			} catch (error) {
 				if (!current.signal.aborted) throw error;
 			} finally {
-				recovering.signal.removeEventListener("abort", onRecoveryAbort);
+				release();
 				await stop();
 				await stopping;
 				stopping = undefined;

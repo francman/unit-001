@@ -1,7 +1,7 @@
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { browserCommand, createLoginInteraction } from "../src/interaction.ts";
-import type { Terminal } from "../src/repl.ts";
+import type { TerminalIO } from "../src/terminal-io.ts";
 
 describe("browserCommand", () => {
 	it("uses the opener of each platform and passes the URL as one argument", () => {
@@ -23,7 +23,7 @@ function setup(lines = "") {
 	const input = new PassThrough();
 	input.end(lines);
 	const err: string[] = [];
-	const terminal: Terminal = { input, out: () => {}, err: (text) => void err.push(text) };
+	const terminal: TerminalIO = { input, out: () => {}, err: (text) => void err.push(text) };
 	const controller = new AbortController();
 	// Not interactive (no output stream), so no browser is ever launched by these tests.
 	const login = createLoginInteraction(terminal, controller.signal, "linux");
@@ -154,7 +154,7 @@ describe("createLoginInteraction", () => {
 
 	it("cancels a pending prompt when the login is aborted", async () => {
 		const input = new PassThrough(); // never answers
-		const terminal: Terminal = { input, out: () => {}, err: () => {} };
+		const terminal: TerminalIO = { input, out: () => {}, err: () => {} };
 		const controller = new AbortController();
 		const login = createLoginInteraction(terminal, controller.signal, "linux");
 		const pending = login.interaction.prompt({ type: "text", message: "Name:" });

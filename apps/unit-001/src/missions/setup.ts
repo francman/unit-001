@@ -1,7 +1,7 @@
 // Guides saved mission drafting through the existing native setup editor; approval remains a separate authority action.
 import { randomUUID } from "node:crypto";
-import type { Terminal } from "../repl.ts";
 import { SetupBack, SetupCancelled, SetupUI } from "../setup-ui.ts";
+import type { TerminalIO } from "../terminal-io.ts";
 import type { MissionDraftTerms, MissionRequest, MissionView } from "./contract.ts";
 
 type Field =
@@ -72,7 +72,7 @@ const FIELDS: readonly Field[] = [
 
 /** Saves each submitted field so cancellation and restart reopen the exact draft without starting execution. */
 export async function runMissionSetup(
-	terminal: Terminal,
+	terminal: TerminalIO,
 	name: string,
 	request: (input: MissionRequest) => Promise<MissionView>,
 	signal: AbortSignal,

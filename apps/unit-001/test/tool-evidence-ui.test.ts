@@ -55,6 +55,7 @@ function launch(columns: number, rows: number) {
 		cancel: vi.fn(),
 		detach: vi.fn(),
 		dismissSuggestions: vi.fn(),
+		admission: vi.fn((): Promise<never> => new Promise(() => {})),
 	};
 	const view = new RichAttachView(tui, "default", actions, { colorMode: "monochrome" });
 	tui.setLayoutRoot(view);

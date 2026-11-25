@@ -37,7 +37,7 @@ async function fixture(answers: readonly (string | Error)[], initial: Record<str
 				output += text;
 			},
 		},
-		interactive: true,
+		color: false,
 		env: {},
 		credentials,
 		platform: "linux",
@@ -242,11 +242,11 @@ describe("guided setup configuration", () => {
 		expect(state.choose.mock.calls.at(-1)?.[0].detail).toContain("UNIT_001_MODEL overrides this saved model.");
 	});
 
-	it("refuses noninteractive input before opening the UI", async () => {
+	it("refuses a terminal without output before opening the UI", async () => {
 		const state = await fixture([]);
-		await expect(runSetup({ ...state.options, interactive: false }, state.controller.signal)).rejects.toThrow(
-			"interactive terminal",
-		);
+		await expect(
+			runSetup({ ...state.options, terminal: { ...state.options.terminal, output: undefined } }, state.controller.signal),
+		).rejects.toThrow("interactive terminal");
 		expect(state.choose).not.toHaveBeenCalled();
 	});
 });

@@ -4,12 +4,13 @@ import type { MutableModels } from "@earendil-works/pi-ai/models";
 import { ConfigurationError } from "./errors.ts";
 import { type LoginLaunch, runLogin, SUBSCRIPTIONS } from "./login.ts";
 import { createModelsFor, detectModel, PROVIDERS } from "./provider.ts";
-import type { Terminal } from "./repl.ts";
 import { SetupBack, SetupCancelled, type SetupChoice, SetupUI } from "./setup-ui.ts";
+import type { TerminalIO } from "./terminal-io.ts";
 
 export interface SetupOptions {
-	readonly terminal: Terminal;
-	readonly interactive: boolean;
+	readonly terminal: TerminalIO;
+	/** Whether the UI draws colour; the caller decides from NO_COLOR and TERM. */
+	readonly color: boolean;
 	readonly env: Readonly<Record<string, string | undefined>>;
 	readonly credentials: CredentialStore;
 	readonly platform: NodeJS.Platform;
@@ -23,13 +24,9 @@ type Stage = "provider" | "authentication" | "key" | "model" | "review";
 
 /** Runs explicit setup without provider requests or service startup, restoring the terminal on every exit. */
 export async function runSetup(options: SetupOptions, outerSignal: AbortSignal): Promise<SetupResult> {
-	if (!options.interactive || !options.terminal.output)
+	if (!options.terminal.output)
 		throw new ConfigurationError("Setup requires an interactive terminal. Connect with ssh -t and run setup again.");
-	const ui = new SetupUI(
-		options.terminal,
-		options.launch.name,
-		options.env.NO_COLOR === undefined && options.env.TERM !== "dumb",
-	);
+	const ui = new SetupUI(options.terminal, options.launch.name, options.color);
 	const signal = AbortSignal.any([outerSignal, ui.signal]);
 	let credentialSaved: "api_key" | "oauth" | undefined;
 	let modelSaved = false;
@@ -190,7 +187,7 @@ export async function runSetup(options: SetupOptions, outerSignal: AbortSignal):
 						{
 							step: 4,
 							title: "Review setup",
-							description: "Save your choices. Service startup is a separate confirmation.",
+							description: "Save your choices.",
 							detail,
 						},
 						[
@@ -232,7 +229,7 @@ export async function runSetup(options: SetupOptions, outerSignal: AbortSignal):
 		}
 	} catch (error) {
 		await ui.close();
-		if (modelSaved) options.terminal.err("Default model saved. Setup did not finish; the service was not started.\n");
+		if (modelSaved) options.terminal.err("Default model saved. Setup did not finish.\n");
 		else if (credentialSaved)
 			options.terminal.err(
 				`${credentialSaved === "api_key" ? "API key" : "Subscription sign-in"} saved; default model was not saved. Rerun setup to finish.\n`,

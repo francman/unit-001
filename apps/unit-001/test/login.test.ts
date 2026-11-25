@@ -3,7 +3,7 @@ import type { AuthInteraction, Credential, CredentialStore } from "@earendil-wor
 import { describe, expect, it } from "vitest";
 import { UsageError } from "../src/errors.ts";
 import { describeStatus, runLogin, runLogout, subscriptionFor } from "../src/login.ts";
-import type { Terminal } from "../src/repl.ts";
+import type { TerminalIO } from "../src/terminal-io.ts";
 
 function memoryStore(initial: Record<string, Credential> = {}): CredentialStore {
 	const entries = new Map(Object.entries(initial));
@@ -23,7 +23,7 @@ function terminal() {
 	const input = new PassThrough();
 	input.end();
 	const err: string[] = [];
-	const value: Terminal = { input, out: () => {}, err: (text) => void err.push(text) };
+	const value: TerminalIO = { input, out: () => {}, err: (text) => void err.push(text) };
 	return { terminal: value, err: () => err.join("") };
 }
 

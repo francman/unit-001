@@ -35,7 +35,9 @@ describe("cutText", () => {
 		expect(cutText("abcd", 2)).toBe("ab");
 		expect(cutText("ab", 5)).toBe("ab");
 	});
+});
 
+describe("DeltaPrinter escape handling", () => {
 	it("withholds split escape tails in cumulative snapshots without leaking sequence payloads", () => {
 		const sink = collect();
 		const printer = new DeltaPrinter(sink.write);
