@@ -1,12 +1,12 @@
 // #26 (sec-ipc Low 1): the browser receives only the closed workspace projection of each owner frame.
 import { once } from "node:events";
-import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ServiceView } from "../src/service.ts";
 import type { ServiceClient } from "../src/service-client.ts";
 import { parseWebRequest } from "../src/web/contract.ts";
 import { createWebGateway } from "../src/web/gateway.ts";
 import { projectWebResponse } from "../src/web/post-response.ts";
+import { freePort } from "./helpers/web.ts";
 
 const servers: ReturnType<typeof createWebGateway>[] = [];
 afterEach(async () => {
@@ -40,16 +40,7 @@ async function gateway(view: ServiceView) {
 			await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
 		},
 	};
-	// Reserve an ephemeral port first so the gateway can enforce its exact configured origin.
-	const reservation = createWebGateway({
-		client,
-		origin: "http://127.0.0.1:1",
-		assets: new Map(),
-	});
-	reservation.server.listen(0, "127.0.0.1");
-	await once(reservation.server, "listening");
-	const port = (reservation.server.address() as AddressInfo).port;
-	await reservation.close();
+	const port = await freePort();
 	const origin = `http://127.0.0.1:${port}`;
 	const server = createWebGateway({ client, origin, assets: new Map() });
 	servers.push(server);

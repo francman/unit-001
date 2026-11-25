@@ -1,15 +1,14 @@
 // Exercises #65 in a real Chromium browser through its native debug protocol, without a test dependency.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { assertFreshWebAssets } from "../scripts/build-web-freshness.mjs";
+import { freePort } from "./helpers/web.ts";
 import { executable, launchChrome, openTab, stopProcess, until } from "./support/browser.mjs";
 
 const fixtureAssets = process.env.UNIT_001_TEST_WEB_ASSETS;
@@ -20,11 +19,7 @@ test(
 	async () => {
 		await assertFreshWebAssets(fixtureAssets);
 		const directory = await mkdtemp(join(tmpdir(), "unit-web-browser-"));
-		const reservation = createServer();
-		reservation.listen(0, "127.0.0.1");
-		await once(reservation, "listening");
-		const port = reservation.address().port;
-		await new Promise((resolve) => reservation.close(resolve));
+		const port = await freePort();
 		const origin = `http://127.0.0.1:${port}`;
 		let output = "",
 			errors = "";
@@ -154,7 +149,6 @@ test(
 			await evaluate(`window.beforeHistoryReload = true`);
 			await call("Page.reload");
 			await until(() => evaluate(`!window.beforeHistoryReload && window.lastView?.historyTruncated && document.querySelector('#composer') !== null`));
-			assert.equal(await evaluate(`document.querySelector('input[type="password"], [data-key="signout"]')`), null);
 			assert.deepEqual(await evaluate(`[localStorage.length, sessionStorage.length]`), [0, 0], "a clean profile stores no gateway credentials");
 			const sentinel = "Retained browser message 1: oldest SQLite sentinel";
 			const transcript = () =>

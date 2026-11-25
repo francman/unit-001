@@ -171,7 +171,7 @@ function limitRows(run: MissionRunView, limits: MissionAgreementView["limits"]):
 		{ name: "Cycles", value: run.cycles, max: limits.maxCycles, words: `${count(run.cycles)} of ${count(limits.maxCycles)}` },
 		{ name: "Model requests", value: run.requests, max: limits.maxRequests, words: `${count(run.requests)} of ${count(limits.maxRequests)}` },
 		{ name: "Retries", value: run.retries, max: limits.maxRetries, words: `${count(run.retries)} of ${count(limits.maxRetries)}` },
-		{ name: "Runs without progress", value: run.noProgress, max: limits.maxNoProgress, words: `${count(run.noProgress)} of ${count(limits.maxNoProgress)}` },
+		{ name: "Runs without progress", value: run.noProgress, max: limits.maxConsecutiveNoProgress, words: `${count(run.noProgress)} of ${count(limits.maxConsecutiveNoProgress)}` },
 	];
 	if (limits.maxEstimatedCost !== null && limits.maxEstimatedCost > 0)
 		entries.push({

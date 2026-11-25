@@ -5,6 +5,7 @@ import { parsePlanView, type PlanView } from "../missions/plan-wire.ts";
 import type { MissionRefusalCode } from "../missions/refusal.ts";
 import type { ServiceRequest } from "../service.ts";
 import { type ChatHistoryPage, parseChatHistoryPage } from "../service-view.ts";
+import { isMutation } from "./contract.ts";
 import {
 	APPROVER_KINDS,
 	type ApproverKind,
@@ -185,13 +186,6 @@ type MemoryGraph = {
 	limited: boolean;
 };
 
-/** Identifies the mission changes available on the browser surface. */
-export function isWebMissionMutation(operation: ServiceRequest): boolean {
-	return operation.type === "mission" &&
-		["draft", "propose", "agree", "plan-draft", "plan-propose", "plan-agree", "review-now", "review-dismiss"]
-			.includes(operation.request.operation);
-}
-
 /** Rejects unexpected owner replies; the gateway still knows the operation was dispatched. */
 export function projectWebResponse(
 	operation: ServiceRequest,
@@ -227,7 +221,7 @@ export function projectWebResponse(
 			break;
 		case "mission":
 			if (
-				(operation.request.operation === "status" || isWebMissionMutation(operation)) &&
+				(operation.request.operation === "status" || isMutation(operation)) &&
 				response.type === "mission"
 			)
 				return { type: "mission", result: mission(object(response.result), managed, planReview) };

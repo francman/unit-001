@@ -16,7 +16,6 @@
 	--breakpoint-md: 48rem; /* 768 px: sidebar stops being an overlay */
 	--breakpoint-lg: 64rem; /* 1024 px */
 	--breakpoint-xl: 90rem; /* 1440 px: the Activity pane opens beside the chat */
-	--breakpoint-2xl: 120rem; /* 1920 px */
 	/* Hermes.app type scale: 13 px UI text, 11 px chrome, 12 px buttons, 15 px dialog titles. */
 	--text-2xs: 0.625rem;
 	--text-2xs--line-height: 0.875rem;
@@ -42,7 +41,6 @@
 	--radius-full: 9999px;
 	--shadow-composer: 0 1px 2px rgb(0 0 0 / 0.05);
 	--shadow-float: 0 2px 4px -2px rgb(0 0 0 / 0.07), 0 8px 12px -6px rgb(0 0 0 / 0.06), 0 20px 28px -14px rgb(0 0 0 / 0.06);
-	--shadow-menu: 0 0 0 1px var(--line), 0 4px 16px rgb(0 0 0 / 0.08), 0 16px 32px -24px rgb(0 0 0 / 0.18);
 	--animate-spin: spin 0.9s linear infinite;
 	--animate-pulse: pulse 1.4s ease-in-out infinite;
 	--animate-caret: pulse 1s steps(2) infinite;

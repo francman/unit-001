@@ -1,4 +1,5 @@
 // Mounts the workspace: owns state and actions, builds the shell once (sidebar, top bar, bands, page, status bar) and patches it.
+import { PLAN_PROJECTION_LIMITS } from "../src/missions/plan-limits.ts";
 import { describeMissionRefusal } from "../src/missions/refusal.ts";
 import type {
 	ChatHistoryPage, MissionDraftTerms, MissionMutation, MissionMutationOutcome, MissionPlanMutation,
@@ -25,6 +26,7 @@ import {
 	workspaceRecovery,
 } from "./state.ts";
 import { callout, command, dot, tag } from "./ui/blocks.ts";
+import { rows } from "./ui/classes.ts";
 import { button, iconButton } from "./ui/controls.ts";
 import { dialogTitleId } from "./ui/dialog.ts";
 import { attrs, coarsePointer, el, srOnly } from "./ui/dom.ts";
@@ -318,7 +320,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			case "plan-propose":
 				if (!ui.planDraft || ui.planDraft.unsaved || !samePlanDraft(shown, mission) ||
 					!plan || draft?.status !== "editing" || draft.revision !== change.expectedRevision ||
-					draft.missing.length || plan.history.length >= 32 || !bindingsMatch(draft.terms, runnablePurposeBinding)) return;
+					draft.missing.length || plan.history.length >= PLAN_PROJECTION_LIMITS.history || !bindingsMatch(draft.terms, runnablePurposeBinding)) return;
 				break;
 			case "plan-agree": {
 				const exact = planProposal(ui, mission);
@@ -703,7 +705,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 	const main = attrs(el("main", "flex min-h-0 min-w-0 flex-1 flex-col outline-none"), { id: "main", tabindex: "-1" });
 	const navButtons = new Map<Section, HTMLButtonElement>();
 	const agentTab = el("span", "truncate");
-	const version = el("span", "");
+	const versionLabel = el("span", "");
 	const themeButton = iconButton({ icon: "monitor", label: "Theme", key: "theme", onClick: () => act.setTheme(nextTheme[ui.theme]) });
 	const sidebar = buildSidebar();
 	const menuButton = iconButton({ icon: "menu", label: "Menu", key: "menu", onClick: () => act.setNav(!ui.navOpen) });
@@ -819,7 +821,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		}
 		themeButton.replaceChildren(icon(themeIcons[ui.theme], "size-3.5 shrink-0"), srOnly(`Theme: ${themeWords[ui.theme]}`));
 		themeButton.title = `Theme: ${themeWords[ui.theme]} (click to change)`;
-		version.textContent = ui.view ? `v${ui.view.version}` : "";
+		versionLabel.textContent = ui.view ? `v${ui.view.version}` : "";
 	}
 
 	function patchTopbar(): void {
@@ -835,18 +837,19 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 	}
 
 	function patchPage(change: Change): void {
-		if (ui.section === "chat") {
+		const section = ui.section;
+		if (section === "chat") {
 			if (pageShown !== "chat") main.replaceChildren(chatPage);
 			pageShown = "chat";
 			chat.update(change);
 			if (change === "state") patchMissionDraft();
 			return;
 		}
-		if (change === "stream" && pageShown === ui.section) return;
-		pageShown = ui.section;
-		preserve(main, () => ui.section === "mission"
+		if (change === "stream" && pageShown === section) return;
+		pageShown = section;
+		preserve(main, () => section === "mission"
 			? renderMission(context(), missionEntryAvailable(ui) && !ui.planDraft ? openMissionDraft : undefined, planActions(ui.details?.mission))
-			: pages[ui.section as Exclude<Section, "chat" | "mission">](context()));
+			: pages[section](context()));
 	}
 
 	function patchMissionDraft(): void {
@@ -963,7 +966,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		const head = plan?.head;
 		const expectedRevision = planRevision(plan);
 		const canSave = planWritesAvailable(ui, mission) && !unsaved?.conflicted;
-		const canReview = canSave && draft?.status === "editing" && !!plan && plan.history.length < 32 &&
+		const canReview = canSave && draft?.status === "editing" && !!plan && plan.history.length < PLAN_PROJECTION_LIMITS.history &&
 			bindingsMatch(draft.terms, runnablePurposeBinding);
 		const exact = planProposal(ui, mission);
 		const writing = ui.planChange.kind === "writing";
@@ -1092,7 +1095,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 		for (const section of sections) {
 			const item = el(
 				"button",
-				"group flex h-7 w-full min-w-0 shrink-0 items-center gap-2 rounded-xs px-2 text-left text-base font-medium text-fg-2 transition-colors duration-100 hover:bg-hover hover:text-fg aria-[current=page]:bg-fill aria-[current=page]:text-fg pointer-coarse:h-11",
+				`${rows.nav} shrink-0`,
 				icon(section.icon, "size-4 shrink-0 text-fg-3 group-hover:text-fg-2 group-aria-[current=page]:text-fg"),
 				el("span", "truncate", section.label),
 			);
@@ -1120,7 +1123,7 @@ export function mountWorkspace(root: HTMLElement, port: WorkspacePort, options: 
 			"div",
 			"flex h-[34px] shrink-0 items-center gap-0.5 px-2.5 max-md:h-12",
 			themeButton,
-			el("span", "ml-auto truncate pr-1 font-mono text-2xs text-fg-3", version),
+			el("span", "ml-auto truncate pr-1 font-mono text-2xs text-fg-3", versionLabel),
 		);
 		return attrs(el("aside", "", head, tabs, nav, foot), { id: "sidebar", "aria-label": "Workspace menu" });
 	}
@@ -1326,7 +1329,7 @@ function agreedTerms(mission: MissionSnapshot, agreement: NonNullable<MissionSna
 			maxCycles: limits.maxCycles,
 			maxRequests: limits.maxRequests,
 			maxRetries: limits.maxRetries,
-			maxConsecutiveNoProgress: limits.maxNoProgress,
+			maxConsecutiveNoProgress: limits.maxConsecutiveNoProgress,
 			deadlineAt: limits.deadlineAt,
 			maxEstimatedCost: limits.maxEstimatedCost ?? undefined,
 		},

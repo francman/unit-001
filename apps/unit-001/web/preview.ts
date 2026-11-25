@@ -120,7 +120,7 @@ const sampleAgreement: MissionAgreementView = {
 	approvedAt: now - 2 * day,
 	approvedBy: "local-creator",
 	allowedTools: ["read_file", "run_tests"],
-	limits: { maxCycles: 20, maxRequests: 200, maxRetries: 5, maxNoProgress: 3, deadlineAt: now + 30 * day, maxEstimatedCost: 5 },
+	limits: { maxCycles: 20, maxRequests: 200, maxRetries: 5, maxConsecutiveNoProgress: 3, deadlineAt: now + 30 * day, maxEstimatedCost: 5 },
 };
 
 const details: WorkspaceDetails = {

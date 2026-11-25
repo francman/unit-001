@@ -81,7 +81,7 @@ function totals(data: Facts): HTMLElement | null {
 	if (!run) return null;
 	const cells = [stat(count(run.cycles), "Cycles"), stat(count(run.requests), "Model requests"), stat(money(run.estimatedCost), "Estimated cost")];
 	if (run.retries > 0 || (limits?.maxRetries ?? 0) > 0) cells.push(stat(count(run.retries), "Retries"));
-	if (run.noProgress > 0 || (limits?.maxNoProgress ?? 0) > 0) cells.push(stat(count(run.noProgress), "Runs without progress"));
+	if (run.noProgress > 0 || (limits?.maxConsecutiveNoProgress ?? 0) > 0) cells.push(stat(count(run.noProgress), "Runs without progress"));
 	const strip = attrs(
 		el("div", `grid grid-cols-[repeat(auto-fit,minmax(7.5rem,1fr))] gap-x-6 gap-y-4 ${surfaces.panel} ${surfaces.panelBody}`, ...cells),
 		{ role: "group", "aria-label": "Totals for the work run" },

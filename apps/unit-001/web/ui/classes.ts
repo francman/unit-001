@@ -37,9 +37,6 @@ export const buttons = {
 	link: "inline-flex min-h-6 items-center gap-1 rounded-xs text-sm font-medium text-accent underline-offset-2 hover:underline pointer-coarse:min-h-11",
 	/** 24 px icon-only button (Hermes chrome icons); give it a `srOnly` name. */
 	icon: "inline-grid size-6 shrink-0 place-items-center rounded-xs text-fg-3 transition-colors duration-100 hover:bg-hover hover:text-fg disabled:pointer-events-none disabled:opacity-50 pointer-coarse:size-11",
-	/** 28 px icon-only button for page toolbars. */
-	iconLarge:
-		"inline-grid size-7 shrink-0 place-items-center rounded-sm text-fg-2 transition-colors duration-100 hover:bg-hover hover:text-fg disabled:pointer-events-none disabled:opacity-50 pointer-coarse:size-11",
 } as const;
 
 /** Form fields: 28 px, field fill, hairline that turns accent on focus. */
@@ -73,14 +70,12 @@ export const surfaces = {
 	panel: "rounded-md border border-stroke-3 bg-card",
 	/** Inner padding of a panel. */
 	panelBody: "px-4 py-3 max-sm:px-3",
-	/** A hairline between blocks of a page. */
-	divider: "border-t border-stroke-3",
 } as const;
 
 /** Page layout for non-chat pages: one centered reading column, header then sections. */
 export const page = {
 	scroll: "min-h-0 flex-1 overflow-y-auto",
-	column: "mx-auto flex w-full max-w-[52rem] flex-col gap-8 px-6 pt-6 pb-12 max-sm:gap-6 max-sm:px-3 max-sm:pt-4",
+	column: "mx-auto flex w-full max-w-[52rem] flex-col gap-8 px-6 pt-6 max-sm:gap-6 max-sm:px-3 max-sm:pt-4",
 	header: "flex min-w-0 flex-wrap items-start justify-between gap-x-4 gap-y-2",
 	section: "flex min-w-0 flex-col gap-3",
 	sectionHeader: "flex min-h-6 min-w-0 items-center justify-between gap-3",

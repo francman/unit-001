@@ -37,7 +37,6 @@ const unmount =mountWorkspace(document.querySelector("#app"), {
 	memoryGraph: () => defer("graph"),
 	recall: (query) => defer("recall", query),
 	forget: (id, requestId) => defer("forget", id, requestId),
-	logout: async () => "revoked",
 }, { preview: true, section: "memory" });
 
 window.memoryPreview = { requests, records, memory, details, graph, unmount };

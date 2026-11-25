@@ -17,6 +17,8 @@ export function pageFrame(options: {
 	actions?: Child[];
 	/** Unique per page, for scroll restore: "status", "memory", "connections". */
 	key: string;
+	/** The page continues with a full-width section right below the column: leave less space under it. */
+	fullWidthBelow?: boolean;
 }): { root: HTMLElement; body: HTMLElement } {
 	const heading = el("h1", `flex min-w-0 items-baseline gap-2 ${text.title}`, options.title);
 	if (options.count !== undefined && options.count !== null)
@@ -24,7 +26,7 @@ export function pageFrame(options: {
 	const titles = el("div", "flex min-w-0 flex-col gap-1", heading, options.lead ? el("p", text.body, options.lead) : null);
 	const header = el("header", pageClasses.header, titles);
 	if (options.actions?.length) header.append(el("div", "flex shrink-0 items-center gap-2", ...options.actions));
-	const body = el("div", pageClasses.column, header);
+	const body = el("div", `${pageClasses.column} ${options.fullWidthBelow ? "pb-4" : "pb-12"}`, header);
 	const root = attrs(el("div", pageClasses.scroll, body), { "data-scroll": options.key });
 	return { root, body };
 }

@@ -689,7 +689,7 @@ describe("browser operator details", () => {
 			approvedAt: 1000,
 			approvedBy: "local-creator",
 			allowedTools: ["read"],
-			limits: { maxCycles: 5, maxRequests: 50, maxRetries: 2, maxNoProgress: 3, deadlineAt: 2000, maxEstimatedCost: null },
+			limits: { maxCycles: 5, maxRequests: 50, maxRetries: 2, maxConsecutiveNoProgress: 3, deadlineAt: 2000, maxEstimatedCost: null },
 		});
 		expect(details.mission.run).toEqual(run);
 		expect(details.memory.count).toBe(3);

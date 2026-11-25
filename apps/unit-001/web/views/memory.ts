@@ -6,7 +6,7 @@ import { dialogContent, dialogTitleId } from "../ui/dialog.ts";
 import { attrs, el, srOnly } from "../ui/dom.ts";
 import { humanize, memorySentence, plural } from "../ui/format.ts";
 import { listRow, pageFrame, rowList, section } from "../ui/page.ts";
-import { fields, text } from "../ui/classes.ts";
+import { text } from "../ui/classes.ts";
 import { memoryMap } from "./memory-graph.ts";
 
 type MemoryRecord = NonNullable<Ctx["ui"]["details"]>["memory"]["records"][number];
@@ -24,6 +24,7 @@ export function renderMemory(ctx: Ctx): HTMLElement {
 		lead: map.isEmpty ? undefined : lead(ctx),
 		key: "memory",
 		actions: [map.switcher],
+		fullWidthBelow: map.hasNodes,
 	});
 	body.append(searchForm(ctx, map.highlight));
 	if (recall.kind === "failed")
@@ -46,7 +47,6 @@ export function renderMemory(ctx: Ctx): HTMLElement {
 		);
 	// The map comes after search results, so a search result's Forget button stays the first one on the page.
 	// It spans the work area, outside the reading column, and sits right under the search.
-	if (map.hasNodes) body.classList.replace("pb-12", "pb-4");
 	root.append(map.section);
 	return root;
 }
@@ -94,11 +94,8 @@ function searchForm(ctx: Ctx, highlight: (query: string) => void): HTMLElement {
 			highlight(value);
 		},
 	});
-	const label = el("label", fields.label, "Search memories");
-	label.htmlFor = field.input.id;
 	const help = el("p", text.description, "Search by topic, preference or rule.");
 	help.id = "memory-query-help";
-	field.input.removeAttribute("aria-label");
 	field.input.setAttribute("aria-describedby", help.id);
 	const submit = button({
 		label: "Search",
@@ -106,10 +103,8 @@ function searchForm(ctx: Ctx, highlight: (query: string) => void): HTMLElement {
 		variant: "primary",
 		type: "submit",
 		disabled: ui.connection !== "connected",
-		// The form's submit handler does the work.
-		onClick: () => undefined,
 	});
-	const form = el("form", "flex min-w-0 flex-col gap-1.5", label, el("div", "flex min-w-0 items-center gap-3", field.root, submit), help);
+	const form = el("form", "flex min-w-0 flex-col gap-1.5", field.label, el("div", "flex min-w-0 items-center gap-3", field.root, submit), help);
 	form.addEventListener("submit", (event) => {
 		event.preventDefault();
 		act.search();

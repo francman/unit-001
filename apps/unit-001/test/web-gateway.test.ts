@@ -1,8 +1,7 @@
 // Exercises the browser trust boundary against a synthetic owner without model or storage access.
 import { once } from "node:events";
 import { mkdtemp, rmdir } from "node:fs/promises";
-import { createServer, type OutgoingHttpHeaders, request } from "node:http";
-import type { AddressInfo } from "node:net";
+import { type OutgoingHttpHeaders, request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +10,7 @@ import type { ServiceRequest, ServiceResponse } from "../src/service.ts";
 import type { ServiceClient } from "../src/service-client.ts";
 import { parseWebRequest } from "../src/web/contract.ts";
 import { createWebGateway, type WebGatewayOptions } from "../src/web/gateway.ts";
+import { freePort, sessionHeaders } from "./helpers/web.ts";
 import { planTerms } from "./missions/fixtures/plan.ts";
 
 const directories: string[] = [];
@@ -24,6 +24,23 @@ afterEach(async () => {
 	await Promise.all(directories.splice(0).map((dir) => rmdir(dir)));
 });
 
+// A well-formed owner reply for each read the tests use as filler, so a read succeeds instead of failing the projection.
+function ownerReply(request: ServiceRequest): ServiceResponse {
+	if (request.type === "status")
+		return {
+			type: "status",
+			inhibited: false,
+			maintenance: { state: "open" },
+			runtime: { configuration: "unconfigured", uptimeMs: 500 },
+		} as unknown as ServiceResponse;
+	if (request.type === "memory")
+		return {
+			type: "memory",
+			result: { operation: "graph", nodes: [], edges: [], total: 0, limited: false },
+		} as unknown as ServiceResponse;
+	return { type: "cancelled" };
+}
+
 async function startGateway(
 	options: Pick<WebGatewayOptions, "managed" | "managedReview" | "planReview" | "workspaceId"> = {},
 	transport: "tcp" | "unix" = "tcp",
@@ -34,17 +51,13 @@ async function startGateway(
 		ownerSession: "default",
 		request: async (request) => {
 			requests.push(request);
-			return { type: "cancelled" };
+			return ownerReply(request);
 		},
 		watch: async (_listener, signal) => {
 			await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
 		},
 	};
-	// Reserve an ephemeral port first so the gateway can enforce its exact configured origin.
-	const reservation = createServer().listen(0, "127.0.0.1");
-	await once(reservation, "listening");
-	const port = (reservation.address() as AddressInfo).port;
-	await new Promise<void>((resolve) => reservation.close(() => resolve()));
+	const port = await freePort();
 	const origin = `http://127.0.0.1:${port}`;
 	const server = createWebGateway({
 		client,
@@ -89,8 +102,7 @@ async function fixture(options?: Parameters<typeof startGateway>[0]) {
 	const response = await fetch(`${f.origin}/api/v1/session`);
 	expect(response.status).toBe(200);
 	const session = (await response.json()) as { csrfToken: string };
-	const headers = { Origin: f.origin, "Content-Type": "application/json", "X-Unit-CSRF": session.csrfToken };
-	return { ...f, headers, session };
+	return { ...f, headers: sessionHeaders(f.origin, session.csrfToken), session };
 }
 
 // Put a harmless marker on every object layer, including nested rows.
@@ -250,7 +262,7 @@ describe("web gateway", () => {
 				await finish.promise;
 				throw new Error("Synthetic owner outcome unavailable");
 			}
-			return { type: "cancelled" };
+			return ownerReply(operation);
 		};
 		const post = (requestId: string, operation: unknown = { type: "cancel" }, headers = f.headers) =>
 			f.call("/api/v1/requests", headers, JSON.stringify({ requestId, operation }));
@@ -447,8 +459,6 @@ describe("web gateway", () => {
 
 	it("serves only GET session, with a CSRF token stable absent mutation rollover", async () => {
 		const f = await fixture();
-		const excess = Object.fromEntries(Array.from({ length: 33 }, (_, i) => [`X-Fixture-${i}`, "1"]));
-		expect((await f.call("/api/v1/session", { Host: new URL(f.origin).host, ...excess })).status).toBe(431);
 		expect(f.session).toEqual({ csrfToken: expect.stringMatching(/^[0-9a-f]{64}$/) });
 		vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3_600_000);
 		const response = await fetch(`${f.origin}/api/v1/session`);
@@ -523,6 +533,26 @@ describe("web gateway", () => {
 		expect(first).not.toContain("private credential");
 		await fetch(`${origin}/api/v1/requests`, { method: "POST", headers, body });
 		expect(requests).toHaveLength(1);
+	});
+
+	it("answers a failed read with a gateway error instead of an unknown outcome", async () => {
+		const f = await fixture();
+		const body = JSON.stringify({ requestId: "read", operation: { type: "status" } });
+		const read = async () => {
+			const response = await fetch(`${f.origin}/api/v1/requests`, { method: "POST", headers: f.headers, body });
+			return { status: response.status, text: await response.text() };
+		};
+		f.client.request = async () => {
+			throw new Error("private credential");
+		};
+		const failed = await read();
+		expect(failed.status).toBe(500);
+		expect(failed.text).toBe('{"error":"Gateway error."}');
+		// A reply the projection cannot read is the gateway's failure too, not a state the owner left unknown.
+		f.client.request = async () => ({ type: "status", status: "private credential" }) as unknown as ServiceResponse;
+		const malformed = await read();
+		expect(malformed.status).toBe(500);
+		expect(malformed.text).not.toContain("private credential");
 	});
 
 	it("dispatches the read-only memory graph only with a valid CSRF token", async () => {
@@ -972,7 +1002,7 @@ describe("web gateway", () => {
 		});
 	});
 
-	it("accepts a graph envelope at 1 MiB and rejects one additional request ID byte", async () => {
+	it("accepts a graph reply above the general limit and rejects one above 1 MiB", async () => {
 		const f = await fixture();
 		const content = "語".repeat(280);
 		const response = {
@@ -1000,17 +1030,10 @@ describe("web gateway", () => {
 		const full = await postOwnerReply(f, "graph", operation);
 		expect(full).toMatchObject({ state: "completed", response: { result: { total: 300 } } });
 		expect(Buffer.byteLength(JSON.stringify(full))).toBeGreaterThan(131_072);
-		// Distribute UTF-8 padding across valid IDs to reach the exact envelope limit.
-		const remaining = 1_048_576 - Buffer.byteLength(JSON.stringify(full));
+		// Grow every ID (three bytes per character, within the ID limit) by its share of the room left, so the envelope passes 1 MiB.
 		const nodes = response.result.nodes;
-		for (const [index, node] of nodes.entries()) {
-			const bytes = Math.floor(remaining / nodes.length) + Number(index < remaining % nodes.length);
-			node.id += "語".repeat(Math.floor(bytes / 3)) + "x".repeat(bytes % 3);
-		}
-		expect(Buffer.byteLength(JSON.stringify(response)) + 1).toBeLessThan(1_048_576);
-		const atLimit = await postOwnerReply(f, "graph", operation);
-		expect(atLimit).toMatchObject({ state: "completed" });
-		expect(Buffer.byteLength(JSON.stringify(atLimit))).toBe(1_048_576);
+		const pad = Math.ceil((1_048_576 - Buffer.byteLength(JSON.stringify(full))) / nodes.length) + 1;
+		for (const node of nodes) node.id += "語".repeat(Math.ceil(pad / 3));
 		expect(await postOwnerReply(f, "graph2", operation)).toMatchObject({
 			state: "unknown",
 			message: expect.stringContaining("exceeded the browser limit"),

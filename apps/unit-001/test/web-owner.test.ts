@@ -1,8 +1,5 @@
 // Verifies #65 against a real SQLite owner and Unix operator socket with no paid provider.
-import { once } from "node:events";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
-import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -14,6 +11,7 @@ import { Agent } from "../src/agent.ts";
 import { acquireSessionLock } from "../src/lock.ts";
 import { requestService, runService, serviceEndpoint } from "../src/service.ts";
 import { runWebWorkspace } from "../src/web/launcher.ts";
+import { freePort, sessionHeaders } from "./helpers/web.ts";
 
 it("#65 serves packaged assets from the sole owner, streams, deduplicates and forgets explicitly", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "u1-web-"));
@@ -56,11 +54,7 @@ it("#65 serves packaged assets from the sole owner, streams, deduplicates and fo
 	let stream: ReadableStreamDefaultReader<Uint8Array> | undefined;
 	try {
 		await Promise.race([ready, owner]);
-		const reservation = createServer();
-		reservation.listen(0, "127.0.0.1");
-		await once(reservation, "listening");
-		const port = (reservation.address() as AddressInfo).port;
-		await new Promise<void>((resolve) => reservation.close(() => resolve()));
+		const port = await freePort();
 		let printed = "";
 		let webReady!: () => void;
 		const listening = new Promise<void>((resolve) => {
@@ -89,11 +83,7 @@ it("#65 serves packaged assets from the sole owner, streams, deduplicates and fo
 		expect(workspaceId).toMatch(/^[a-f0-9]{64}$/);
 		const session = (await metadata.json()) as { csrfToken: string };
 		expect(session).toEqual({ csrfToken: expect.stringMatching(/^[a-f0-9]{64}$/) });
-		const headers = {
-			Origin: origin,
-			"Content-Type": "application/json",
-			"X-Unit-CSRF": session.csrfToken,
-		};
+		const headers = sessionHeaders(origin, session.csrfToken);
 		const call = async (requestId: string, operation: unknown) => {
 			const response = await fetch(`${origin}/api/v1/requests`, {
 				method: "POST",

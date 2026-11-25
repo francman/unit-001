@@ -598,7 +598,7 @@ function parseAgreement(value: unknown): MissionAgreementView {
 			maxCycles: number(policy.maxCycles),
 			maxRequests: number(policy.maxRequests),
 			maxRetries: number(policy.maxRetries),
-			maxNoProgress: number(policy.maxConsecutiveNoProgress),
+			maxConsecutiveNoProgress: number(policy.maxConsecutiveNoProgress),
 			deadlineAt: number(policy.deadlineAt),
 			maxEstimatedCost: policy.maxEstimatedCost === undefined ? null : number(policy.maxEstimatedCost),
 		},

@@ -89,6 +89,32 @@ export function parseWebRequest(value: unknown): { requestId: string; operation:
 	throw new Error("Operation is unavailable on the browser surface.");
 }
 
+const MISSION_MUTATIONS: ReadonlySet<string> = new Set([
+	"draft",
+	"propose",
+	"agree",
+	"plan-draft",
+	"plan-propose",
+	"plan-agree",
+	"review-now",
+	"review-dismiss",
+]);
+
+/** True for an operation that changes owner state: a send, a cancel, a mission change or forgetting a memory. */
+export function isMutation(operation: ServiceRequest): boolean {
+	switch (operation.type) {
+		case "send":
+		case "cancel":
+			return true;
+		case "mission":
+			return MISSION_MUTATIONS.has(operation.request.operation);
+		case "memory":
+			return operation.request.operation === "forget";
+		default:
+			return false;
+	}
+}
+
 // Mission definition: status, draft and propose as the operator CLI has them, and one agreement that names the exact
 // proposed revision and digest the owner reviewed. The envelope's request ID makes each change idempotent.
 function missionRequest(value: unknown, requestId: string): MissionRequest {

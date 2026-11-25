@@ -87,14 +87,6 @@ export function spinner(className = "size-3.5 shrink-0 text-accent"): SVGSVGElem
 	return icon("spinner", `${className} animate-spin`);
 }
 
-/** A keyboard hint chip (Hermes kbd): decorative, hidden from screen readers. */
-export function kbd(keys: string): HTMLElement {
-	return attrs(
-		el("kbd", "inline-grid h-4 min-w-4 place-items-center rounded-xs border border-stroke-3 px-1 font-sans text-2xs text-fg-3", keys),
-		{ "aria-hidden": "true" },
-	);
-}
-
 /** A labelled number for a stats strip: value above, label below. */
 export function stat(value: string, label: string): HTMLElement {
 	return el("div", "flex min-w-0 flex-col gap-0.5", el("span", text.stat, value), el("span", text.meta, label));

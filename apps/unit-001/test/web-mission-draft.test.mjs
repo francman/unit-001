@@ -169,7 +169,7 @@ async function exerciseShell() {
 		agreement: {
 			revision, approvedAt: Date.now(), approvedBy, reviewEveryMs: terms.reviewEveryMs,
 			successCriteria: terms.successCriteria, approvalBoundary: [], allowedTools: terms.policy.allowedTools,
-			limits: { ...terms.policy, maxNoProgress: terms.policy.maxConsecutiveNoProgress, maxEstimatedCost: null },
+			limits: { ...terms.policy, maxEstimatedCost: null },
 		},
 	});
 	const initial = proposal(3, "e", null);

@@ -5,9 +5,8 @@ import type { MissionView } from "../missions/contract.ts";
 import { parseMissionRefusalCode } from "../missions/refusal.ts";
 import type { ServiceView } from "../service.ts";
 import type { ServiceClient } from "../service-client.ts";
-import { parseWebRequest, type WebSession } from "./contract.ts";
+import { isMutation, parseWebRequest, type WebSession } from "./contract.ts";
 import {
-	isWebMissionMutation,
 	type ManagedMissionReview,
 	projectWebResponse,
 	type WebPlanReview,
@@ -26,6 +25,18 @@ export type WebGatewayOptions = {
 };
 
 export type WebGateway = { server: Server; close(): Promise<void> };
+
+/** The most bytes an event stream may hold unsent before the gateway drops that browser. */
+const STREAM_QUEUE_LIMIT = 1_048_576;
+
+/** The browser reply limit of a memory graph or a mission plan; the owner's own frame is bounded by the service transport. */
+const LARGE_REPLY_LIMIT = 1_048_576;
+
+/** The browser reply limit of every other operation. */
+const REPLY_LIMIT = 131_072;
+
+/** The most bytes of a browser request body. */
+const REQUEST_LIMIT = 65_536;
 
 /** Builds an inactive server for developer-local TCP or managed filesystem socket connections. */
 export function createWebGateway(options: WebGatewayOptions): WebGateway {
@@ -47,13 +58,12 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 	const rolloverThreshold = 24;
 	const server = createServer({ headersTimeout: 5000, requestTimeout: 10_000, maxHeaderSize: 8192 }, (req, res) => {
 		void handle(req, res).catch(() => {
-			if (!res.headersSent) json(res, 400, { error: "Invalid request." });
+			// A malformed request is answered inside `handle`; an error that reaches here is the gateway's own.
+			if (!res.headersSent) json(res, 500, { error: "Gateway error." });
 			else res.destroy();
 		});
 	});
 	server.maxConnections = 32;
-	// Node truncates the header list at this count. Keep one extra so oversized lists can be rejected.
-	server.maxHeadersCount = 33;
 	server.once("close", () => shutdown.abort());
 	return {
 		server,
@@ -75,7 +85,6 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 			"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
 		);
 		res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-		if (req.rawHeaders.length > 32 * 2) return json(res, 431, { error: "Too many headers." });
 		// Verify the actual listening transport and accepted peer independently of HTTP headers.
 		const listener = server.address();
 		// Node supplies no pathname for a listener adopted by descriptor. The launcher checks its exact binding first.
@@ -115,7 +124,7 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 				signal.addEventListener("abort", abort, { once: true });
 				res.once("close", () => disconnected.abort());
 				const writeFrame = (frame: string) => {
-					if (signal.aborted || res.writableLength + Buffer.byteLength(frame) > 1_048_576) disconnected.abort();
+					if (signal.aborted || res.writableLength + Buffer.byteLength(frame) > STREAM_QUEUE_LIMIT) disconnected.abort();
 					else res.write(frame);
 				};
 				const heartbeat = setInterval(() => writeFrame(": heartbeat\n\n"), 15_000);
@@ -141,21 +150,27 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 					return json(res, 403, { error: "Same-origin JSON is required." });
 				const csrfToken = req.headers["x-unit-csrf"];
 				if (csrfToken !== session.csrfToken) return json(res, 403, { error: "CSRF check failed." });
-				const body = await readJson(req);
+				let body: unknown;
+				try {
+					body = await readJson(req);
+				} catch {
+					return json(res, 400, { error: "Invalid request." });
+				}
 				// Another request may have retired this token while the body was arriving.
 				if (csrfToken !== session.csrfToken) return json(res, 403, { error: "CSRF check failed." });
-				const parsed = parseWebRequest(body);
+				let parsed: ReturnType<typeof parseWebRequest>;
+				try {
+					parsed = parseWebRequest(body);
+				} catch {
+					return json(res, 400, { error: "Invalid request." });
+				}
 				if (shutdown.signal.aborted) return json(res, 503, { error: "Gateway is closing." });
 				const fingerprint = JSON.stringify(parsed);
-				const missionMutation = isWebMissionMutation(parsed.operation);
-				const mutation =
-					parsed.operation.type === "send" ||
-					parsed.operation.type === "cancel" ||
-					missionMutation ||
-					(parsed.operation.type === "memory" && parsed.operation.request.operation === "forget");
+				const mutation = isMutation(parsed.operation);
+				const missionMutation = mutation && parsed.operation.type === "mission";
 				// A full memory graph (300 nodes of 280 code points) exceeds the general browser limit; it stays within the owner's 1 MiB frame.
-				const limit =
-					parsed.operation.type === "memory" && parsed.operation.request.operation === "graph" ? 1_048_576 : 131_072;
+				const replyLimit =
+					parsed.operation.type === "memory" && parsed.operation.request.operation === "graph" ? LARGE_REPLY_LIMIT : REPLY_LIMIT;
 				let record = mutation ? requests.get(parsed.requestId) : undefined;
 				if (record !== undefined && record.fingerprint !== fingerprint)
 					return json(res, 409, { error: "Request ID already belongs to another operation." });
@@ -225,7 +240,7 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 							),
 						};
 						const browserLimit =
-							completed.response.type === "mission" && completed.response.result.plan !== null ? 1_048_576 : limit;
+							completed.response.type === "mission" && completed.response.result.plan !== null ? LARGE_REPLY_LIMIT : replyLimit;
 						if (Buffer.byteLength(JSON.stringify(completed)) > browserLimit)
 							return {
 								requestId: parsed.requestId,
@@ -234,13 +249,16 @@ export function createWebGateway(options: WebGatewayOptions): WebGateway {
 							};
 						return completed;
 					})()
-						.catch(
-							(): WebResult => ({
+						.catch((error: unknown): WebResult => {
+							// A read has no write to be unsure about: its failure surfaces as the gateway's 500, with no owner text.
+							// A close during the read still answers "session ended" below.
+							if (!mutation && !shutdown.signal.aborted) throw error;
+							return {
 								requestId: parsed.requestId,
 								state: "unknown",
 								message: "Owner outcome is unknown. Inspect current state before acting again.",
-							}),
-						)
+							};
+						})
 						.finally(() => {
 							inFlight--;
 							if (mutation) unsettledMutations--;
@@ -325,7 +343,7 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
 	for await (const chunk of req) {
 		const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 		bytes += data.length;
-		if (bytes > 65_536) throw new Error("Request exceeds 64 KiB.");
+		if (bytes > REQUEST_LIMIT) throw new Error("Request exceeds 64 KiB.");
 		chunks.push(data);
 	}
 	return JSON.parse(Buffer.concat(chunks).toString("utf8"));

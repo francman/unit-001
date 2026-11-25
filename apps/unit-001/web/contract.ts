@@ -60,7 +60,7 @@ export interface MissionAgreementView {
 		maxCycles: number;
 		maxRequests: number;
 		maxRetries: number;
-		maxNoProgress: number;
+		maxConsecutiveNoProgress: number;
 		deadlineAt: number;
 		maxEstimatedCost: number | null;
 	};

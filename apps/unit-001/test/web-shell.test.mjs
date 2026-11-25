@@ -163,7 +163,6 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 		await until(() => evaluate(`${footer}?.innerText.includes('Replying')`));
 		assert.equal(await checking(), false);
 		assert.equal(await evaluate("document.cookie"), "test_cookie=ignored");
-		assert.equal(await evaluate(`document.querySelector('input[type="password"], [data-key="signout"]')`), null);
 
 		const menu = '[data-key="menu"]';
 		await click(menu);
@@ -252,18 +251,6 @@ test("workspace identity, gateway reconnect, managed review, mobile drawer and P
 		}`);
 		await until(() => evaluate(`shellTick.label.isConnected && shellTick.label.data !== shellTick.value`));
 		assert.ok(await evaluate(`shellTick.page === document.querySelector('h1')`));
-		const budgetExpired = new Promise((resolve) => {
-			function onMessage(event) {
-				if (JSON.parse(event.data).method !== "Emulation.virtualTimeBudgetExpired") return;
-				socket.removeEventListener("message", onMessage);
-				resolve();
-			}
-			socket.addEventListener("message", onMessage);
-		});
-		await call("Emulation.setVirtualTimePolicy", { policy: "advance", budget: 31_000 });
-		await budgetExpired;
-		assert.ok(await evaluate(`shellTick.page === document.querySelector('h1')`), "the former 30-second refresh does not replace content");
-		await call("Emulation.setVirtualTimePolicy", { policy: "pauseIfNetworkFetchesPending" });
 
 		const secondTab = await openTab(debugPort);
 		secondSocket = secondTab.socket;

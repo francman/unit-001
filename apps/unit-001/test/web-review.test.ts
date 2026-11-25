@@ -1,10 +1,10 @@
 // Independently exercises live HTTP stream and owner-request cleanup at session boundaries.
 import { once } from "node:events";
-import { createServer, ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { ServerResponse } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ServiceClient } from "../src/service-client.ts";
 import { createWebGateway, type WebGateway } from "../src/web/gateway.ts";
+import { freePort, sessionHeaders } from "./helpers/web.ts";
 
 const gateways: WebGateway[] = [];
 
@@ -14,11 +14,7 @@ afterEach(async () => {
 });
 
 async function fixture() {
-	const reservation = createServer();
-	reservation.listen(0, "127.0.0.1");
-	await once(reservation, "listening");
-	const port = (reservation.address() as AddressInfo).port;
-	await new Promise<void>((resolve) => reservation.close(() => resolve()));
+	const port = await freePort();
 	const origin = `http://127.0.0.1:${port}`;
 	let streamAborted = false;
 	const client: ServiceClient = {
@@ -46,11 +42,7 @@ async function fixture() {
 	const response = await fetch(`${origin}/api/v1/session`);
 	expect(response.status).toBe(200);
 	const session = (await response.json()) as { csrfToken: string };
-	const headers = {
-		Origin: origin,
-		"Content-Type": "application/json",
-		"X-Unit-CSRF": session.csrfToken,
-	};
+	const headers = sessionHeaders(origin, session.csrfToken);
 	return { gateway, origin, headers, client, streamAborted: () => streamAborted };
 }
 
