@@ -20,7 +20,17 @@ export function memoryEvidence(results: readonly MemoryRecallResult[]): string {
 			tier: record.tier.kind,
 			entryIds: record.provenance.entryIds,
 			...(record.via.kind === "relation"
-				? { relatedTo: { id: record.via.memoryId, relation: record.via.relation } }
+				? {
+						relatedTo:
+							record.via.relation === "relates"
+								? { id: record.via.memoryId, relation: record.via.relation }
+								: {
+										id: record.via.memoryId,
+										relation: record.via.relation,
+										from: record.via.from,
+										to: record.via.to,
+									},
+					}
 				: {}),
 			content,
 		});

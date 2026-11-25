@@ -3,8 +3,15 @@ import type { LiveMemory, MemoryState } from "./memory.ts";
 import type { MemoryRelation, MemoryRelationKind, MemoryRelationsState } from "./relations-doc.ts";
 import { isLiveRelation } from "./relations.ts";
 
-/** Why a record was recalled: it matched the query, or it is related to a record that did. */
-export type MemoryRecallVia = { kind: "match" } | { kind: "relation"; relation: MemoryRelationKind; memoryId: string };
+/**
+ * Why a record was recalled: it matched the query, or it is related to a record that did (`memoryId`). A relation
+ * other than the symmetric `relates` carries the stored orientation, "`from` supports/contradicts/updates `to`",
+ * as the two memory IDs, so it reads the same from either end.
+ */
+export type MemoryRecallVia =
+	| { kind: "match" }
+	| { kind: "relation"; relation: "relates"; memoryId: string }
+	| { kind: "relation"; relation: Exclude<MemoryRelationKind, "relates">; memoryId: string; from: string; to: string };
 
 /** A bounded evidence record with its relevance score and how it was reached. */
 export type MemoryRecallResult = LiveMemory & { score: number; via: MemoryRecallVia };
@@ -120,7 +127,7 @@ export class MemoryRecall {
 				pool.set(otherId, {
 					record,
 					score,
-					via: { kind: "relation", relation: relation.kind, memoryId: match.record.id },
+					via: relatedVia(relation, match.record.id),
 				});
 			}
 		}
@@ -165,6 +172,19 @@ export class MemoryRecall {
 			}
 		}
 	}
+}
+
+// The stored orientation travels as IDs, never as a direction relative to the matched record: the model reads the
+// result on the recalled record, so a relative word would point the wrong way.
+function relatedVia(relation: MemoryRelation, matchedId: string): MemoryRecallVia {
+	if (relation.kind === "relates") return { kind: "relation", relation: "relates", memoryId: matchedId };
+	return {
+		kind: "relation",
+		relation: relation.kind,
+		memoryId: matchedId,
+		from: relation.from.id,
+		to: relation.to.id,
+	};
 }
 
 // A summary whose sources changed or were forgotten no longer states current evidence.

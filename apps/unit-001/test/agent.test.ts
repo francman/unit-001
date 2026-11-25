@@ -357,6 +357,34 @@ describe("Agent", () => {
 		expect(await agent.ask("And of Germany?", context)).toEqual({ status: "answered", text: "Berlin." });
 	});
 
+	it("clears the stored model when reopened without one and keeps the history", async () => {
+		const first = await launch([reply("Paris.")]);
+		await first.agent.ask("Capital of France?", context);
+		await first.agent.close(context);
+		open.splice(open.indexOf(first.agent), 1);
+
+		const faux = fauxProvider();
+		const models = createModels();
+		models.setProvider(faux.provider);
+		const agent = await Agent.open(
+			{ storage: await openNodeSqliteStorage(file), models, model: null, cwd: directory },
+			context,
+		);
+		open.push(agent);
+		expect(await agent.status(context)).toMatchObject({ runtime: { configuration: "unconfigured" } });
+		expect((await agent.chatHistory(null, context)).entries.map((entry) => entry.text)).toContain("Paris.");
+		await agent.close(context);
+		open.splice(open.indexOf(agent), 1);
+
+		const harness = await Harness.open(await openNodeSqliteStorage(file), { models, registry: createRegistry() }, context);
+		try {
+			expect((await (await harness.root(context)).agent(context)).model).toBeUndefined();
+		} finally {
+			await harness.close(context);
+		}
+		expect(faux.state.callCount).toBe(0);
+	});
+
 	it("streams committed live state to a watcher", async () => {
 		const { agent } = await launch([reply("Paris.")]);
 		const states: unknown[] = [];

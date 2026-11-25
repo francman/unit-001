@@ -249,12 +249,12 @@ export class Agent {
 			const root = await harness.root(context, { agent: options.model === null ? {} : { model: options.model } });
 			// The model is stored with the session; this launch's choice wins, so changing provider keys never strands it.
 			const stored = (await root.agent(context)).model;
-			if (
-				options.model !== null &&
-				(stored?.provider !== options.model.provider || stored.modelId !== options.model.modelId)
-			) {
-				await root.configure({ model: options.model }, context);
-			}
+			// An unconfigured launch (`null`) clears the stored model rather than leaving the previous launch's.
+			const changed =
+				options.model === null
+					? stored !== undefined
+					: stored?.provider !== options.model.provider || stored.modelId !== options.model.modelId;
+			if (changed) await root.configure({ model: options.model }, context);
 			const interrupted = (await harness.snapshot(LiveDoc, root.id, context))?.run !== undefined;
 			const held = await harness.commit(async (tx) => {
 				await tx.doc(MissionDoc);
@@ -348,9 +348,11 @@ export class Agent {
 				const digest = sendDigest(text);
 				const receipts = await tx.doc(SendReceiptsDoc, this.#root.id);
 				// Read before admission writes, which would create the submission this checks for.
-				const admitted = (await tx.submissionByRequest(this.#root.id, requestId)) !== undefined;
-				checkSendReplay(receipts, requestId, digest, admitted);
-				if (!admitted) fresh = (id) => recordSendReceipt(receipts, requestId, digest, id);
+				const admitted = await tx.submissionByRequest(this.#root.id, requestId);
+				checkSendReplay(receipts, requestId, digest, admitted !== undefined);
+				// The receipt proved this exact prompt was admitted: the replay writes and wakes nothing.
+				if (admitted !== undefined) return admitted.id;
+				fresh = (id) => recordSendReceipt(receipts, requestId, digest, id);
 			}
 			const id = await this.#root.submit(tx, {
 				type: "input",

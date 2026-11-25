@@ -33,6 +33,7 @@ import {
 	MISSION_AUTHORITIES,
 	RUN_STATES,
 	type RunState,
+	withinCodePoints,
 } from "./payload.ts";
 
 type PostResponse =
@@ -430,9 +431,12 @@ function memory(result: Record<string, unknown>): MemoryResult {
 				operation: "recall",
 				records: rows(result.records, 5, (item) => {
 					const record = object(item);
+					// The owner caps recall content at 2,000 code points, each at most two UTF-16 units.
+					const content = text(record.content, 2000 * 2);
+					if (!withinCodePoints(content, 2000)) return invalid();
 					return {
 						id: text(record.id, 1000),
-						content: text(record.content, 2000),
+						content,
 						origin: oneOf(record.origin, MEMORY_ORIGINS),
 						tier: oneOf(record.tier, MEMORY_TIERS),
 					};

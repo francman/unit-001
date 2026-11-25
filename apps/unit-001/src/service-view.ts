@@ -148,12 +148,12 @@ export function serviceView(view: ConversationView, identity: ServiceIdentity): 
 				? null
 				: { provider: cutText(agent.model.provider, 128), modelId: cutText(agent.model.modelId, 256) },
 		usage: usage === undefined ? null : modelUsage(usage.models),
-		entries: entries.slice(-20),
+		entries,
 		busy: live?.run !== undefined,
 		text: cutText(text, 8192),
 		textTruncated: text.length > 8192,
 		tools: [...tools.values()].slice(-32),
-		historyTruncated: view.before !== undefined || entries.length > 20,
+		historyTruncated: view.before !== undefined,
 		...runProblems(live),
 	};
 }

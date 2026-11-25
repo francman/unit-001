@@ -200,6 +200,12 @@ describe("tool evidence projection", () => {
 		expect(await projectToolEvidence(entries, "missing-call", scope)).toEqual({ kind: "unavailable", reason: "not-found" });
 	});
 
+	it("finds a call whose ID is the same text as a lookup outcome", async () => {
+		const entries = [result(2, "not-found", "named output"), call(1, "not-found", "bash", {})];
+		expect(found(await projectToolEvidence(entries, "not-found", scope)).output?.text).toBe("named output");
+		expect(found(await projectToolEvidence([call(1, "ambiguous", "bash", {})], "ambiguous", scope)).callId).toBe("ambiguous");
+	});
+
 	it("validates owner replies at the wire boundary", async () => {
 		const evidence = await project("bash", {}, "ok");
 		expect(parseToolEvidence(JSON.parse(JSON.stringify(evidence)))).toEqual(evidence);

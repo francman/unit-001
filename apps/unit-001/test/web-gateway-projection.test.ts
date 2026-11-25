@@ -130,6 +130,21 @@ describe("browser operation response projection", () => {
 		).toThrow();
 	});
 
+	it("measures recall content in code points like the owner", () => {
+		const operation = { type: "memory", request: { operation: "recall", query: "example" } } as const;
+		const recall = (points: number) => ({
+			type: "memory",
+			result: {
+				operation: "recall",
+				records: [{ id: "memory:a", content: "😀".repeat(points), origin: "user", tier: "working", score: 0.5 }],
+			},
+		});
+		expect(projectWebResponse(operation, recall(2000))).toMatchObject({
+			result: { records: [{ content: "😀".repeat(2000) }] },
+		});
+		expect(() => projectWebResponse(operation, recall(2001))).toThrow();
+	});
+
 	it.each([
 		{
 			authority: "invalid",

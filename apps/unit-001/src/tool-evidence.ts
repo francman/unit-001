@@ -87,8 +87,9 @@ export async function projectToolEvidence(
 	callId: string,
 	scope: EvidenceScope,
 ): Promise<ToolEvidence> {
-	const id = resolveCallId(entries, callId);
-	if (id === "not-found" || id === "ambiguous") return { kind: "unavailable", reason: id };
+	const lookup = resolveCallId(entries, callId);
+	if (lookup.kind === "unavailable") return lookup;
+	const { id } = lookup;
 	let result: { readonly entry: EntryRecord; readonly message: EvidenceMessage } | undefined;
 	for (const entry of entries) {
 		const message = entry.model?.[0] as EvidenceMessage | undefined;
@@ -122,8 +123,11 @@ export async function projectToolEvidence(
 }
 
 // An exact ID wins; otherwise a unique prefix of at least EVIDENCE_MIN_PREFIX characters selects the call.
-function resolveCallId(entries: readonly EntryRecord[], wanted: string): string {
-	if (wanted.length < EVIDENCE_MIN_PREFIX) return "not-found";
+function resolveCallId(
+	entries: readonly EntryRecord[],
+	wanted: string,
+): { readonly kind: "found"; readonly id: string } | Extract<ToolEvidence, { readonly kind: "unavailable" }> {
+	if (wanted.length < EVIDENCE_MIN_PREFIX) return { kind: "unavailable", reason: "not-found" };
 	const matches = new Set<string>();
 	for (const entry of entries) {
 		const message = entry.model?.[0] as EvidenceMessage | undefined;
@@ -135,8 +139,9 @@ function resolveCallId(entries: readonly EntryRecord[], wanted: string): string 
 					: [];
 		for (const id of ids) if (id !== undefined && id.startsWith(wanted)) matches.add(id);
 	}
-	if (matches.has(wanted)) return wanted;
-	return matches.size === 0 ? "not-found" : matches.size === 1 ? [...matches][0] : "ambiguous";
+	if (matches.has(wanted)) return { kind: "found", id: wanted };
+	if (matches.size === 1) return { kind: "found", id: [...matches][0] };
+	return { kind: "unavailable", reason: matches.size === 0 ? "not-found" : "ambiguous" };
 }
 
 function toolCalls(message: EvidenceMessage): Block[] {

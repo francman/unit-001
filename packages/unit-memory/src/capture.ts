@@ -98,7 +98,8 @@ export const MemoryCapture = defineTask<CaptureInput, CaptureCheckpoint, { memor
 								},
 								now: runtime.now(),
 							});
-							if (!ids.includes(id)) ids.push(id);
+							// Keys name the entry and ordinal, and the page commits with its cursor, so no ID repeats.
+							ids.push(id);
 						}
 					}
 					await scheduleMemoryConsolidation(tx, task.input.conversationId, runtime.now());

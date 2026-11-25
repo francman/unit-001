@@ -196,7 +196,14 @@ describe("bounded lexical recall", () => {
 });
 
 describe("one-hop relation recall", () => {
-	function note(memory: Store, key: string, conversation: number, content: string, relates?: string) {
+	function note(
+		memory: Store,
+		key: string,
+		conversation: number,
+		content: string,
+		relates?: string,
+		kind: "relates" | "supports" | "contradicts" | "updates" = "contradicts",
+	) {
 		return rememberMemory(
 			memory,
 			{
@@ -209,7 +216,7 @@ describe("one-hop relation recall", () => {
 					entryIds: [],
 					derivation: "explicit",
 				},
-				...(relates === undefined ? {} : { relations: [{ id: relates, kind: "contradicts" as const }] }),
+				...(relates === undefined ? {} : { relations: [{ id: relates, kind }] }),
 			},
 			memory.links,
 		);
@@ -224,10 +231,52 @@ describe("one-hop relation recall", () => {
 		const results = recall.recall(memory, memory.links, "launch budget", { now: 0 });
 		expect(results.map((result) => [result.id, result.via])).toEqual([
 			[budget, { kind: "match" }],
-			[cut, { kind: "relation", relation: "contradicts", memoryId: budget }],
+			[cut, { kind: "relation", relation: "contradicts", memoryId: budget, from: cut, to: budget }],
 		]);
 		expect(results[1]!.score).toBeCloseTo(results[0]!.score / 2);
-		expect(memoryEvidence(results)).toContain(`"relatedTo":{"id":"${budget}","relation":"contradicts"}`);
+		expect(memoryEvidence(results)).toContain(
+			`"relatedTo":{"id":"${budget}","relation":"contradicts","from":"${cut}","to":"${budget}"}`,
+		);
+	});
+
+	it("carries the stored orientation of an updates link when recalled from either end", () => {
+		const memory = state();
+		const recall = new MemoryRecall();
+		const old = note(memory, "old", 1, "The launch budget is ten thousand");
+		const fresh = note(memory, "fresh", 2, "Finance cut spending for next quarter", old, "updates");
+		// `fresh` updates `old`: the same from/to whichever end matched the query.
+		for (const [query, matched, reached] of [
+			["launch budget", old, fresh],
+			["finance spending", fresh, old],
+		] as const) {
+			const results = recall.recall(memory, memory.links, query, { now: 0 });
+			expect(results.map((result) => [result.id, result.via])).toEqual([
+				[matched, { kind: "match" }],
+				[reached, { kind: "relation", relation: "updates", memoryId: matched, from: fresh, to: old }],
+			]);
+			expect(memoryEvidence(results)).toContain(
+				`"relatedTo":{"id":"${matched}","relation":"updates","from":"${fresh}","to":"${old}"}`,
+			);
+			expect(JSON.stringify(results)).toContain(`"from":"${fresh}","to":"${old}"`);
+		}
+	});
+
+	it("leaves the symmetric relates link without an orientation", () => {
+		const memory = state();
+		const recall = new MemoryRecall();
+		const a = note(memory, "a", 1, "The launch budget is ten thousand");
+		const b = note(memory, "b", 2, "Finance cut spending for next quarter", a, "relates");
+		for (const [query, matched, reached] of [
+			["launch budget", a, b],
+			["finance spending", b, a],
+		] as const) {
+			const results = recall.recall(memory, memory.links, query, { now: 0 });
+			expect(results.map((result) => [result.id, result.via])).toEqual([
+				[matched, { kind: "match" }],
+				[reached, { kind: "relation", relation: "relates", memoryId: matched }],
+			]);
+			expect(memoryEvidence(results)).toContain(`"relatedTo":{"id":"${matched}","relation":"relates"}`);
+		}
 	});
 
 	it("follows only one hop, respects topK and drops relations of forgotten memories", () => {

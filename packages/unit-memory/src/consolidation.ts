@@ -17,12 +17,15 @@ const age = 12 * 60 * 60 * 1000;
 
 /** Select pending statements in stable creation order. */
 export function pendingMemories(state: MemoryState): LiveMemory[] {
-	return Object.values(state.records)
-		.filter(
-			(record): record is LiveMemory =>
-				record.state === "live" && record.tier.kind === "working" && record.tier.consolidation.state === "pending",
-		)
-		.sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+	return Object.values(state.records).filter(isPending).sort(byCreation);
+}
+
+function isPending(record: MemoryState["records"][string]): record is LiveMemory {
+	return record.state === "live" && record.tier.kind === "working" && record.tier.consolidation.state === "pending";
+}
+
+function byCreation(a: LiveMemory, b: LiveMemory): number {
+	return a.createdAt - b.createdAt || a.id.localeCompare(b.id);
 }
 
 /** Produce exact source-labelled chunks without combining provenance or splitting statements. */
@@ -126,7 +129,7 @@ export const MemoryConsolidation = defineTask<null, ConsolidationCheckpoint, nul
 		select: async (_task, runtime, context) => {
 			await runtime.commit(async (tx) => {
 				const state = await tx.doc(MemoryDoc);
-				const pending = pendingMemories(state);
+				const pending = Object.values(state.records).filter(isPending);
 				if (pending.length === 0) {
 					if (state.consolidation.state === "scheduled" && state.consolidation.taskId === runtime.taskId) {
 						state.consolidation = { state: "idle" };
@@ -135,17 +138,21 @@ export const MemoryConsolidation = defineTask<null, ConsolidationCheckpoint, nul
 					return { status: "terminal", outcome: { status: "completed", result: null } };
 				}
 				const now = runtime.now();
-				if (pending.length < 100 && pending[0]!.createdAt + age > now)
+				// A sleeping probe needs only the oldest record; the full order is for a batch that will run.
+				const oldest = pending.reduce((first, record) => (byCreation(first, record) <= 0 ? first : record));
+				if (pending.length < 100 && oldest.createdAt + age > now)
 					return {
 						status: "sleeping",
-						until: Math.min(pending[0]!.createdAt + age, now + 60_000),
+						until: Math.min(oldest.createdAt + age, now + 60_000),
 						checkpoint: { phase: "select" },
 					};
 				return {
 					status: "running",
 					checkpoint: {
 						phase: "publish",
-						sources: pending.slice(0, 50).map(({ id, revision }) => ({ id, revision })),
+						sources: pendingMemories(state)
+							.slice(0, 50)
+							.map(({ id, revision }) => ({ id, revision })),
 					},
 				};
 			}, context);
@@ -253,7 +260,7 @@ export async function scheduleMemoryConsolidation(
 ): Promise<TaskId | undefined> {
 	const state = await tx.doc(MemoryDoc);
 	if (state.consolidation.state === "scheduled") return state.consolidation.taskId;
-	if (pendingMemories(state).length === 0) return undefined;
+	if (!Object.values(state.records).some(isPending)) return undefined;
 	const taskId = await tx.createTask(MemoryConsolidation, null, {
 		conversationId,
 		ownership: { kind: "conversation" },
